@@ -54,17 +54,36 @@ SLEEP_POLL_INTERVAL = 60
 # Timeout for a single CLI task call (seconds)
 TASK_TIMEOUT_SEC = 5 * 60  # 5 minutes
 
+# Timeout for interactive Telegram chat responses (shorter than queue tasks)
+TELEGRAM_CHAT_TIMEOUT_SEC = 60
+
 # Max retries per provider before falling back to next provider
 MAX_RETRIES_PER_PROVIDER = 2
 
 # Max file size for context injection (bytes)
 MAX_CONTEXT_FILE_SIZE = 1_000_000  # 1 MB
 
+# --- Safety Guardrails ---
+SAFETY_RULES = """\
+Safety rules (MUST follow):
+- NEVER run: rm -rf, git push --force, git reset --hard, DROP TABLE, format, mkfs
+- NEVER delete more than 5 files in a single operation
+- NEVER push to remote repositories unless the task explicitly says to
+- NEVER modify files outside the working directory unless the task explicitly says to
+- Prefer creating new files/branches over overwriting existing ones
+- If unsure whether an action is destructive, skip it and report what you would have done"""
+
+# Safety: track file changes before/after tasks
+TRACK_FILE_CHANGES = True
+# Safety: auto-stash in git repos before task execution
+GIT_AUTO_STASH = True
+
 # System prompts per provider (prepended to each task)
+_BASE_PROMPT = "Antworte auf Deutsch, praegnant und strukturiert."
 SYSTEM_PROMPTS: dict[str, str] = {
-    "claude": "Antworte auf Deutsch, praegnant und strukturiert.",
-    "gemini": "Antworte auf Deutsch, praegnant und strukturiert.",
-    "codex": "Antworte auf Deutsch, praegnant und strukturiert.",
+    "claude": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
+    "gemini": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
+    "codex": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
 }
 
 # --- Telegram Notifications ---
@@ -77,6 +96,20 @@ NOTIFY_ON_TASK_DONE = True
 NOTIFY_ON_ERROR = True
 NOTIFY_ON_QUEUE_COMPLETE = True
 NOTIFY_ON_ALL_PROVIDERS_EXHAUSTED = True
+
+# --- Security ---
+# Allowed root directories for cwd: tags (empty list = allow all).
+# When set, only tasks with cwd paths under these roots will be executed.
+# Example: ALLOWED_CWD_ROOTS = [Path("D:/programmieren"), Path("C:/projects")]
+ALLOWED_CWD_ROOTS: list[Path] = [
+    Path("D:/programmieren"),
+    Path(r"literal:/path/to/your/obsidian_vault"),
+    Path(r"literal:D:\projects\work"),
+    Path(r"literal:D:\OneDrive - YourOrg\YourOrg-Data\marketing\AI_Marketing")
+]
+
+# Max task length accepted via Telegram /task command (characters)
+TELEGRAM_MAX_TASK_LENGTH = 500
 
 # --- Tools ---
 # Max iterations for review/fix loops

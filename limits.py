@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from config import MIN_CAPACITY_PERCENT
 
 # On Windows, npm-installed CLIs are .cmd files
 _CMD_SUFFIX = ".cmd" if sys.platform == "win32" else ""
@@ -76,7 +77,7 @@ def _parse_claude(data: dict) -> ProviderLimits:
     resets_in = min(t for _, t in windows if t > 0) if any(t > 0 for _, t in windows) else 0
 
     return ProviderLimits(
-        available=remaining > 5,
+        available=remaining > MIN_CAPACITY_PERCENT,
         remaining_pct=remaining,
         resets_in_sec=resets_in,
     )
@@ -105,7 +106,7 @@ def _parse_gemini(data: dict) -> ProviderLimits:
     min_reset = min(tier_resets) if tier_resets else 0
 
     return ProviderLimits(
-        available=max_remaining > 5,
+        available=max_remaining > MIN_CAPACITY_PERCENT,
         remaining_pct=max_remaining,
         resets_in_sec=min_reset,
     )
@@ -128,7 +129,7 @@ def _parse_codex(data: dict) -> ProviderLimits:
     resets_in = min(t for _, t in windows if t > 0) if any(t > 0 for _, t in windows) else 0
 
     return ProviderLimits(
-        available=remaining > 5,
+        available=remaining > MIN_CAPACITY_PERCENT,
         remaining_pct=remaining,
         resets_in_sec=resets_in,
     )
@@ -139,7 +140,11 @@ def get_limits() -> AllLimits:
     try:
         result = subprocess.run(
             [NPX_CMD, "cclimits", "--json"],
-            capture_output=True, text=True, timeout=30
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
         )
         raw = json.loads(result.stdout)
     except subprocess.TimeoutExpired:

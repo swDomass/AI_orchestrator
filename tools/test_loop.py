@@ -6,15 +6,16 @@ Usage in queue:
     - [ ] pytest tests/ bis alles grün #tool:test-loop cwd:/d/programmieren/projekt
 """
 
-import re
 import time
 
-from config import TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC
+from config import SAFETY_RULES, TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
 from tools.base_tool import BaseTool, ToolResult
 
-_TEST_PROMPT = """Run the test suite in the current working directory.
+_TEST_PROMPT = SAFETY_RULES + """
+
+Run the test suite in the current working directory.
 
 Instructions:
 - Identify the test framework used (pytest, unittest, jest, etc.)
@@ -24,7 +25,9 @@ Instructions:
 - If tests fail, list each failure with file path and error message
 """
 
-_FIX_PROMPT = """Fix the failing tests from iteration {iteration}.
+_FIX_PROMPT = SAFETY_RULES + """
+
+Fix the failing tests from iteration {iteration}.
 
 Instructions:
 - Fix the code (NOT the tests) to make them pass, unless the test itself is clearly wrong.
@@ -36,12 +39,7 @@ Test failures:
 {failures}
 """
 
-# Simple check: does the output indicate all tests passed?
-PASS_PATTERNS = [
-    "ALL TESTS PASSED",
-    "passed",  # pytest: "5 passed"
-    "OK",      # unittest
-]
+# Patterns that indicate failure (checked first — takes priority over pass patterns)
 FAIL_PATTERNS = [
     "FAILED",
     "failed",
@@ -50,14 +48,34 @@ FAIL_PATTERNS = [
     "FAILURES",
 ]
 
+# Regex patterns for pass detection to avoid substring false positives
+# e.g. "OK" matching inside "token", "passed" is safe since "failed" is checked first
+import re
+_PYTEST_PASSED_RE = re.compile(r"\d+\s+passed")
+_UNITTEST_OK_RE = re.compile(r"^OK\b", re.MULTILINE)
+
 
 def _tests_passed(output: str) -> bool:
     """Heuristic: check if test output indicates all tests passed."""
     lower = output.lower()
     if "all tests passed" in lower:
         return True
+
+    # Do not treat "no tests found/ran" as a success signal.
+    if any(p in lower for p in ("no tests ran", "collected 0 items", "ran 0 tests")):
+        return False
+
     has_fail = any(p.lower() in lower for p in FAIL_PATTERNS)
-    return not has_fail
+    if has_fail:
+        return False
+
+    # Use regex to avoid false positives (e.g. "OK" matching inside "token")
+    if _PYTEST_PASSED_RE.search(output):
+        return True
+    if _UNITTEST_OK_RE.search(output):
+        return True
+
+    return False
 
 
 class TestLoopTool(BaseTool):

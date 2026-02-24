@@ -29,6 +29,30 @@ _stats = {
 }
 
 
+def _escape_markdown(text: str) -> str:
+    """Escape Telegram legacy Markdown control chars in dynamic text.
+
+    Note: This escapes for *inline* use only. Text placed inside backtick
+    blocks (``...``) should NOT be escaped — use _strip_backticks() instead.
+    """
+    escaped = []
+    for ch in str(text):
+        if ch in "\\_*`[]()":
+            escaped.append("\\")
+        escaped.append(ch)
+    return "".join(escaped)
+
+
+def _strip_backticks(text: str) -> str:
+    """Remove backticks from text intended for use inside Telegram backtick blocks."""
+    return str(text).replace("`", "'")
+
+
+def send_message(text: str) -> bool:
+    """Send a raw Telegram message. Public API for use by other modules."""
+    return _send(text)
+
+
 def _send(text: str) -> bool:
     """Send a Telegram message. Returns True on success."""
     if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -64,7 +88,7 @@ def start_session() -> None:
     _stats["providers_used"] = {}
 
 
-def notify_task_done(task: str, provider: str, output: str) -> None:
+def notify_task_done(task: str, provider: str, output: str, change_summary: str | None = None) -> None:
     """Notify that a task was completed successfully."""
     if not NOTIFY_ON_TASK_DONE:
         return
@@ -72,10 +96,18 @@ def notify_task_done(task: str, provider: str, output: str) -> None:
     _stats["tasks_done"] += 1
     _stats["providers_used"][provider] = _stats["providers_used"].get(provider, 0) + 1
 
+    provider_safe = _escape_markdown(provider)
+    task_safe = _strip_backticks(_truncate(task, 100))
+    output_safe = _escape_markdown(_truncate(output))
+
+    changes_block = ""
+    if change_summary:
+        changes_block = f"\n\n📁 *Änderungen:*\n{_escape_markdown(_truncate(change_summary, 500))}"
+
     _send(
-        f"✅ *Task erledigt* ({provider})\n"
-        f"`{_truncate(task, 100)}`\n\n"
-        f"{_truncate(output)}"
+        f"✅ *Task erledigt* ({provider_safe})\n"
+        f"`{task_safe}`\n\n"
+        f"{output_safe}{changes_block}"
     )
 
 
@@ -86,10 +118,14 @@ def notify_error(task: str, provider: str, error: str) -> None:
 
     _stats["tasks_failed"] += 1
 
+    provider_safe = _escape_markdown(provider)
+    task_safe = _strip_backticks(_truncate(task, 100))
+    error_safe = _escape_markdown(str(error))
+
     _send(
-        f"❌ *Fehler* ({provider})\n"
-        f"`{_truncate(task, 100)}`\n\n"
-        f"Fehler: {error}"
+        f"❌ *Fehler* ({provider_safe})\n"
+        f"`{task_safe}`\n\n"
+        f"Fehler: {error_safe}"
     )
 
 
@@ -120,6 +156,7 @@ def notify_queue_complete(remaining: int = 0) -> None:
     providers_str = ", ".join(
         f"{name}: {count}" for name, count in _stats["providers_used"].items()
     ) or "keine"
+    providers_safe = _escape_markdown(providers_str)
 
     status = "✅ Alle Tasks erledigt!" if remaining == 0 else f"⚠️ {remaining} Task(s) noch offen"
 
@@ -128,15 +165,15 @@ def notify_queue_complete(remaining: int = 0) -> None:
         f"{status}\n"
         f"Erledigt: {_stats['tasks_done']}\n"
         f"Fehler: {_stats['tasks_failed']}\n"
-        f"Provider: {providers_str}{duration}"
+        f"Provider: {providers_safe}{duration}"
     )
 
 
 def notify_tool_progress(tool_name: str, iteration: int, max_iter: int, message: str) -> None:
     """Notify about tool progress (e.g. review loop iteration)."""
     _send(
-        f"🔄 *{tool_name}* ({iteration}/{max_iter})\n"
-        f"{message}"
+        f"🔄 *{_escape_markdown(tool_name)}* ({iteration}/{max_iter})\n"
+        f"{_escape_markdown(message)}"
     )
 
 
@@ -144,7 +181,7 @@ def notify_tool_done(tool_name: str, iterations: int, success: bool, summary: st
     """Notify when a tool loop finishes."""
     icon = "✅" if success else "⚠️"
     _send(
-        f"{icon} *{tool_name} abgeschlossen*\n"
+        f"{icon} *{_escape_markdown(tool_name)} abgeschlossen*\n"
         f"Iterationen: {iterations}\n\n"
-        f"{_truncate(summary)}"
+        f"{_escape_markdown(_truncate(summary))}"
     )

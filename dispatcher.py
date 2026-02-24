@@ -37,7 +37,7 @@ def _limits_ok(name: str, limits: AllLimits) -> bool:
     return getattr(limits, name).available
 
 
-def select_provider(task: str, limits: AllLimits) -> BaseProvider | None:
+def select_provider(task: str, limits: AllLimits, exclude: set[str] | None = None) -> BaseProvider | None:
     """
     Returns the best available provider for this task, or None if all are blocked.
     If the task contains a #provider tag, that provider is tried first.
@@ -53,7 +53,11 @@ def select_provider(task: str, limits: AllLimits) -> BaseProvider | None:
         # Move forced provider to front
         order = [forced.name] + [n for n in order if n != forced.name]
 
+    excluded = exclude or set()
+
     for name in order:
+        if name in excluded:
+            continue
         provider = _providers[name]
         if provider.is_cooling_down():
             print(f"  [{name}] Cooldown aktiv, noch {provider.cooldown_remaining_str()}")
@@ -69,3 +73,15 @@ def select_provider(task: str, limits: AllLimits) -> BaseProvider | None:
 
 def all_providers() -> list[BaseProvider]:
     return list(_providers.values())
+
+
+def earliest_cooldown_reset() -> int | None:
+    """Return seconds until the earliest provider cooldown ends, or None if none are in cooldown."""
+    times = [
+        int(p.cooldown_remaining()) for p in _providers.values()
+        if p.is_cooling_down()
+    ]
+    if not times:
+        return None
+    return min(times)
+

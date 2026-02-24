@@ -28,12 +28,14 @@ class GeminiProvider(BaseProvider):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 cwd=cwd,
             )
 
-            output = result.stdout.strip()
-            stderr = result.stderr.strip()
+            output = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
 
             if result.returncode == 0 and output:
                 return RunResult(success=True, output=output)
@@ -47,7 +49,7 @@ class GeminiProvider(BaseProvider):
             return RunResult(success=False, error=stderr or output or "empty output")
 
         except subprocess.TimeoutExpired:
-            return RunResult(success=False, error="unreachable")
+            return RunResult(success=False, error="timeout")
         except FileNotFoundError:
             return RunResult(success=False, error="gemini CLI not found")
         except Exception as e:

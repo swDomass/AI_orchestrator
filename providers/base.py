@@ -1,5 +1,6 @@
 """Base class for all CLI providers."""
 
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -16,20 +17,34 @@ class RunResult:
 
 class BaseProvider(ABC):
     name: str = "base"
-    _cooldown_until: float = 0.0
+
+    def __init__(self) -> None:
+        self._cooldown_until: float = 0.0
+        self._lock = threading.Lock()
 
     def is_cooling_down(self) -> bool:
-        return time.time() < self._cooldown_until
+        with self._lock:
+            return time.time() < self._cooldown_until
 
     def set_cooldown(self, seconds: int = PROVIDER_COOLDOWN_SEC) -> None:
-        self._cooldown_until = time.time() + seconds
+        with self._lock:
+            self._cooldown_until = time.time() + seconds
         remaining_min = seconds // 60
         print(f"  [{self.name}] Cooldown für {remaining_min} Min gesetzt.")
 
     def cooldown_remaining_str(self) -> str:
-        remaining = max(0, self._cooldown_until - time.time())
+        with self._lock:
+            until = self._cooldown_until
+        remaining = max(0, until - time.time())
         m, s = divmod(int(remaining), 60)
         return f"{m}m {s}s"
+
+    def cooldown_remaining(self) -> float:
+        """Return remaining seconds in cooldown."""
+        with self._lock:
+            until = self._cooldown_until
+        return max(0.0, until - time.time())
+
 
     @abstractmethod
     def run(self, task: str, cwd: str | None = None, timeout: int = TASK_TIMEOUT_SEC) -> RunResult:

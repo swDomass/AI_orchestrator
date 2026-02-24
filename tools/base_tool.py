@@ -7,7 +7,7 @@ They run iterative loops (review→fix→recheck) and report progress.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from providers.base import BaseProvider, RunResult
+from providers.base import BaseProvider
 
 
 @dataclass

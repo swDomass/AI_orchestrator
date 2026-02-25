@@ -54,8 +54,11 @@ SLEEP_POLL_INTERVAL = 60
 # Timeout for a single CLI task call (seconds)
 TASK_TIMEOUT_SEC = 5 * 60  # 5 minutes
 
-# Timeout for interactive Telegram chat responses (shorter than queue tasks)
-TELEGRAM_CHAT_TIMEOUT_SEC = 60
+# Timeout for interactive Telegram chat responses (seconds)
+TELEGRAM_CHAT_TIMEOUT_SEC = 180  # 3 minutes
+
+# Send "still thinking..." notification after this many seconds without response
+TELEGRAM_CHAT_THINKING_SEC = 30
 
 # Max retries per provider before falling back to next provider
 MAX_RETRIES_PER_PROVIDER = 2
@@ -116,3 +119,8 @@ TELEGRAM_MAX_TASK_LENGTH = 500
 TOOL_MAX_ITERATIONS = 10
 TOOL_REVIEW_TIMEOUT_SEC = 20 * 60  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 40 * 60     # 40 min per fix
+
+# --- Logging ---
+LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
+LOG_BACKUP_COUNT = 3

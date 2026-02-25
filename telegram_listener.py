@@ -16,16 +16,26 @@ response is sent back to the same chat.
 """
 
 import json
+import logging
 import threading
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED, TELEGRAM_CHAT_TIMEOUT_SEC, TELEGRAM_MAX_TASK_LENGTH
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    TELEGRAM_CHAT_THINKING_SEC,
+    TELEGRAM_CHAT_TIMEOUT_SEC,
+    TELEGRAM_ENABLED,
+    TELEGRAM_MAX_TASK_LENGTH,
+)
 from dispatcher import select_provider
 from limits import get_limits
 from notifier import send_message
 from queue_manager import append_task, read_queue
+
+logger = logging.getLogger("telegram-listener")
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -75,7 +85,7 @@ def _api_get(method: str, params: dict) -> dict | None:
         with urllib.request.urlopen(url, timeout=35) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        print(f"  [telegram-listener] API error ({method}): {e}")
+        logger.warning("API error (%s): %s", method, e)
         return None
 
 
@@ -121,10 +131,10 @@ class TelegramListener:
 
     def start(self) -> None:
         if not TELEGRAM_ENABLED:
-            print("  [telegram-listener] Telegram nicht konfiguriert, Listener wird nicht gestartet.")
+            logger.info("Telegram nicht konfiguriert, Listener wird nicht gestartet.")
             return
         self._thread.start()
-        print("  [telegram-listener] Gestartet (long-polling).")
+        logger.info("Gestartet (long-polling).")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -274,12 +284,12 @@ class TelegramListener:
     def _cmd_pause(self) -> None:
         self._pause_event.set()
         send_message("⏸️ Orchestrator *pausiert*.\nNeue Tasks werden nicht verarbeitet.\n/resume zum Fortsetzen.")
-        print("  [telegram-listener] Orchestrator durch Telegram pausiert.")
+        logger.info("Orchestrator durch Telegram pausiert.")
 
     def _cmd_resume(self) -> None:
         self._pause_event.clear()
         send_message("▶️ Orchestrator *läuft wieder*.")
-        print("  [telegram-listener] Orchestrator durch Telegram fortgesetzt.")
+        logger.info("Orchestrator durch Telegram fortgesetzt.")
 
     def _cmd_add_task(self, task_text: str) -> None:
         task_text = task_text.strip()
@@ -299,7 +309,7 @@ class TelegramListener:
         append_task(task_text)
         safe = task_text[:100].replace("`", "'")
         send_message(f"✅ Task zur Queue hinzugefügt:\n`{safe}`")
-        print(f"  [telegram-listener] Task hinzugefügt: {task_text[:60]}")
+        logger.info("Task hinzugefügt: %s", task_text[:60])
 
     # ------------------------------------------------------------------
     # AI chat
@@ -312,6 +322,8 @@ class TelegramListener:
             send_message("⏳ Bereits eine KI-Anfrage läuft – bitte kurz warten...")
             return
 
+        logger.info("Chat-Anfrage erhalten: %s", text[:80])
+
         try:
             limits = get_limits()
             tried_providers: set[str] = set()
@@ -321,22 +333,60 @@ class TelegramListener:
 
                 if provider is None:
                     if not tried_providers:
+                        logger.warning("Kein Provider verfügbar")
                         send_message("❌ Kein Provider verfügbar (alle voll oder im Cooldown).")
                     else:
+                        logger.warning("Alle Provider fehlgeschlagen: %s", tried_providers)
                         send_message("❌ Alle Provider fehlgeschlagen.")
                     return
 
                 # Defensive guard: avoid infinite retry loops if select_provider
                 # ignores the exclude set (e.g. in tests/mocks or future regressions).
                 if provider.name in tried_providers:
+                    logger.error("Provider-Auswahl wiederholt sich: %s", provider.name)
                     send_message("❌ Interner Fehler: Provider-Auswahl wiederholt sich (Retry abgebrochen).")
                     return
 
                 tried_providers.add(provider.name)
+                logger.info("Versuche Provider: %s", provider.name)
                 send_message(f"⏳ Frage {provider.name}...")
-                result = provider.run(text, timeout=TELEGRAM_CHAT_TIMEOUT_SEC)
+
+                # Run provider in a thread so we can send a "thinking" notification
+                result_holder: list = []
+                error_holder: list = []
+
+                def _run_provider():
+                    try:
+                        result_holder.append(provider.run(text, timeout=TELEGRAM_CHAT_TIMEOUT_SEC))
+                    except Exception as exc:
+                        error_holder.append(exc)
+
+                worker = threading.Thread(target=_run_provider, daemon=True)
+                worker.start()
+
+                # Phase 1: wait THINKING_SEC, send notification if still running
+                worker.join(timeout=TELEGRAM_CHAT_THINKING_SEC)
+                if worker.is_alive():
+                    logger.info("%s denkt noch nach (>%ds)", provider.name, TELEGRAM_CHAT_THINKING_SEC)
+                    send_message(f"⏳ {provider.name} denkt noch nach...")
+                    # Phase 2: wait for remaining time
+                    remaining = TELEGRAM_CHAT_TIMEOUT_SEC - TELEGRAM_CHAT_THINKING_SEC
+                    worker.join(timeout=max(0, remaining))
+
+                if worker.is_alive():
+                    logger.warning("%s Timeout nach %ds", provider.name, TELEGRAM_CHAT_TIMEOUT_SEC)
+                    # Thread is stuck — we can't kill it, but we move on to next provider
+                    err = _escape_telegram_markdown("Timeout")
+                    send_message(f"⚠️ {provider.name} fehlgeschlagen: {err} – versuche anderen Provider...")
+                    continue
+
+                if error_holder:
+                    raise error_holder[0]
+
+                result = result_holder[0]
 
                 if result.success:
+                    logger.info("Antwort von %s erhalten (%d Zeichen)", provider.name, len(result.output))
                     provider_name = _escape_telegram_markdown(provider.name)
                     reply = _escape_telegram_markdown(result.output)
                     header = f"🤖 *{provider_name}*:\n\n"
@@ -344,9 +394,11 @@ class TelegramListener:
                     send_message(f"{header}{reply}")
                     return
                 else:
+                    logger.warning("%s fehlgeschlagen: %s", provider.name, result.error)
                     err = _escape_telegram_markdown(str(result.error))
                     send_message(f"⚠️ {provider.name} fehlgeschlagen: {err} – versuche anderen Provider...")
         except Exception as e:
+            logger.error("Interner Fehler bei Chat-Verarbeitung: %s", e, exc_info=True)
             send_message(f"❌ Interner Fehler: {_escape_telegram_markdown(str(e))}")
         finally:
             self._chat_sem.release()

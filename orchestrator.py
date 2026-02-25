@@ -31,6 +31,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime, timedelta
 
+from logging_setup import setup_logging
+
 from config import (
     GIT_AUTO_STASH,
     MAX_RETRIES_PER_PROVIDER,
@@ -527,6 +529,8 @@ def run_watch(dry_run: bool = False) -> None:
 
 
 def main() -> None:
+    setup_logging()
+
     parser = argparse.ArgumentParser(description="AI Task Orchestrator")
     parser.add_argument("--watch", "-w", action="store_true",
                         help="Läuft kontinuierlich, retried automatisch")

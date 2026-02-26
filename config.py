@@ -218,17 +218,16 @@ def load_soul() -> dict[str, str]:
         return {}
 
     try:
-        mtime = soul_file.stat().st_mtime
         with _soul_lock:
+            mtime = soul_file.stat().st_mtime
             if _soul_cache is not None and mtime == _soul_mtime:
                 return _soul_cache
 
-        content = soul_file.read_text(encoding="utf-8")
-        sections = _parse_soul_sections(content)
-        with _soul_lock:
+            content = soul_file.read_text(encoding="utf-8")
+            sections = _parse_soul_sections(content)
             _soul_cache = sections
             _soul_mtime = mtime
-        return sections
+            return sections
     except Exception:
         return {}
 

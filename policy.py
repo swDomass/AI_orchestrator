@@ -185,32 +185,37 @@ class PolicyEngine:
         from notifier import notify_approval_required
 
         event = threading.Event()
-        self._approval_response = ""
-        self._approval_event = event
+        with self._lock:
+            self._approval_response = ""
+            self._approval_event = event
 
         notify_approval_required(task_text, reasons, timeout_sec)
         logger.info("policy: approval requested for: %s", task_text[:80])
 
         responded = event.wait(timeout=timeout_sec)
 
-        self._approval_event = None
+        with self._lock:
+            self._approval_event = None
+            result = self._approval_response
 
         if not responded:
             logger.info("policy: approval timed out")
             return "timeout"
 
-        result = self._approval_response
         logger.info("policy: approval response: %s", result)
         return result
 
     def _respond(self, response: str) -> None:
         """Called by TelegramListener commands (/approve, /deny, /skip)."""
-        self._approval_response = response
-        if self._approval_event is not None:
-            self._approval_event.set()
+        with self._lock:
+            self._approval_response = response
+            event = self._approval_event
+        if event is not None:
+            event.set()
 
     def has_pending_approval(self) -> bool:
-        return self._approval_event is not None
+        with self._lock:
+            return self._approval_event is not None
 
 
 # ------------------------------------------------------------------

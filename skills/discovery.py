@@ -2,7 +2,7 @@ import os
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 @dataclass
 class SkillConfig:
@@ -12,7 +12,7 @@ class SkillConfig:
     version: str = "1.0"
     requires: Dict[str, List[str]] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
-    config: Dict[str, any] = field(default_factory=dict)
+    config: Dict[str, Any] = field(default_factory=dict)
     prompt: str = ""
 
 def parse_skill_md(file_path: Path) -> Optional[SkillConfig]:

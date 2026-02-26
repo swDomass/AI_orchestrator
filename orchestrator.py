@@ -799,8 +799,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
                 print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
 
-            # Feature 10: trigger shutdown after tool task if tagged
-            if task_has_shutdown:
+            # Feature 10: trigger shutdown after tool task if tagged (only on success)
+            if task_has_shutdown and outcome.success:
                 from shutdown import request_shutdown
                 if request_shutdown():
                     print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")
@@ -815,6 +815,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
         # Standard single-shot task with provider fallback in the same run
         tried_providers: set[str] = set()
+        single_shot_success = False
         while True:
             if pause_event and pause_event.is_set():
                 print("\n[pause] Queue-Verarbeitung pausiert.")
@@ -871,6 +872,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 )
                 append_log(f"Task erledigt via {provider.name}: {task[:60]}")
                 notify_task_done(task, provider.name, result.output, change_summary=change_summary)
+                single_shot_success = True
                 break
 
             tried_providers.add(provider.name)
@@ -894,8 +896,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             notify_error(task, provider.name, error)
             print("  Task bleibt in Queue - versuche nächsten Provider...")
 
-        # Feature 10: trigger shutdown after single-shot task if tagged
-        if task_has_shutdown:
+        # Feature 10: trigger shutdown after single-shot task if tagged (only on success)
+        if task_has_shutdown and single_shot_success:
             from shutdown import request_shutdown
             if request_shutdown():
                 print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")

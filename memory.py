@@ -124,12 +124,19 @@ def _parse_memory_file(path: Path) -> Optional[dict]:
     if not content.startswith("---"):
         return None
 
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return None
-
-    frontmatter_raw = parts[1].strip()
-    body = parts[2].strip()
+    # Find the closing --- delimiter on its own line (not just any --- in body)
+    end_match = re.search(r"\n---\s*\n", content[3:])
+    if not end_match:
+        # Fallback: try split-based approach
+        parts = content.split("---", 2)
+        if len(parts) < 3:
+            return None
+        frontmatter_raw = parts[1].strip()
+        body = parts[2].strip()
+    else:
+        offset = end_match.start()
+        frontmatter_raw = content[3:3 + offset].strip()
+        body = content[3 + end_match.end():].strip()
 
     # Minimal YAML-style parser (key: value, no nested structures)
     meta: dict = {}

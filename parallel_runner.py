@@ -186,10 +186,16 @@ def run_parallel(
         threads.append(t)
         t.start()
 
-    for t in threads:
-        t.join()
+    # Compute a generous join timeout: max subtask timeout + buffer
+    max_subtask_timeout = max(st.timeout for st in subtasks) if subtasks else 600
+    join_timeout = max_subtask_timeout + 120  # extra 2 min buffer
 
-    # Replace any None slots (shouldn't happen) with error results
+    for t in threads:
+        t.join(timeout=join_timeout)
+        if t.is_alive():
+            logger.warning("parallel: thread %s still alive after %ds timeout", t.name, join_timeout)
+
+    # Replace any None slots (thread timed out or internal error) with error results
     final: list[SubTaskResult] = []
     for i, r in enumerate(all_results):
         if r is None:

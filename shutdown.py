@@ -103,4 +103,7 @@ def execute_shutdown(
     except Exception:
         pass
 
-    subprocess.run(SHUTDOWN_COMMAND, check=False)
+    try:
+        subprocess.run(SHUTDOWN_COMMAND, check=False)
+    except Exception as e:
+        logger.error("shutdown: OS shutdown command failed: %s", e)

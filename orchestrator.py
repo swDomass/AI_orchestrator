@@ -641,16 +641,25 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         try:
             from policy import get_engine, TIER_DENY, TIER_APPROVE, _TIER_ORDER
             engine = get_engine()
-            
+
+            # Build profile policy once; used for both parent task and subtasks
+            profile_policy = profile.policy if profile else {}
+
             # Check parent task
             clean_task_for_policy = strip_metadata_tags(task)
-            verdict, reasons_list = engine.check_task(clean_task_for_policy)
+            verdict, reasons_list = engine.check_task(
+                clean_task_for_policy,
+                profile_rules=profile_policy or None,
+            )
             reasons = set(reasons_list)
-            
+
             # Check subtasks (if any)
             if getattr(queue_task, "subtasks", None):
                 for st in queue_task.subtasks:
-                    st_verdict, st_reasons = engine.check_task(strip_metadata_tags(st))
+                    st_verdict, st_reasons = engine.check_task(
+                        strip_metadata_tags(st),
+                        profile_rules=profile_policy or None,
+                    )
                     # Lower index means higher priority (DENY < APPROVE < AUTO)
                     if _TIER_ORDER.index(st_verdict) < _TIER_ORDER.index(verdict):
                         verdict = st_verdict

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from config import POLICY_APPROVAL_TIMEOUT_SEC, POLICY_FILE
+from config import POLICY_APPROVAL_TIMEOUT_SEC
 
 if TYPE_CHECKING:
     pass
@@ -46,6 +46,26 @@ class PolicyRule:
         return bool(self._compiled.search(text))
 
 
+def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
+    """Build PolicyRule list from a raw YAML dict (same schema as policy.yaml)."""
+    rules: list[PolicyRule] = []
+    for pattern in data.get("auto", []):
+        if isinstance(pattern, str):
+            rules.append(PolicyRule(pattern=pattern, message=pattern, tier=TIER_AUTO))
+    for item in data.get("approve", []):
+        if isinstance(item, str):
+            rules.append(PolicyRule(pattern=item, message=item, tier=TIER_APPROVE))
+        elif isinstance(item, dict):
+            pat = str(item.get("pattern", ""))
+            msg = str(item.get("message", pat))
+            if pat:
+                rules.append(PolicyRule(pattern=pat, message=msg, tier=TIER_APPROVE))
+    for pattern in data.get("deny", []):
+        if isinstance(pattern, str):
+            rules.append(PolicyRule(pattern=pattern, message=pattern, tier=TIER_DENY))
+    return rules
+
+
 class PolicyEngine:
     """Load policy.yaml, classify tasks, manage approval flow."""
 
@@ -70,7 +90,7 @@ class PolicyEngine:
 
     def _reload_if_changed(self) -> None:
         """Reload policy.yaml if the file has changed since last load."""
-        path = POLICY_FILE
+        path = self._vault_path / "99_System" / "AI" / "policy.yaml"
         if not path.exists():
             return
 
@@ -99,24 +119,7 @@ class PolicyEngine:
         if not isinstance(data, dict):
             return
 
-        rules: list[PolicyRule] = []
-
-        for pattern in data.get("auto", []):
-            if isinstance(pattern, str):
-                rules.append(PolicyRule(pattern=pattern, message=pattern, tier=TIER_AUTO))
-
-        for item in data.get("approve", []):
-            if isinstance(item, str):
-                rules.append(PolicyRule(pattern=item, message=item, tier=TIER_APPROVE))
-            elif isinstance(item, dict):
-                pat = str(item.get("pattern", ""))
-                msg = str(item.get("message", pat))
-                if pat:
-                    rules.append(PolicyRule(pattern=pat, message=msg, tier=TIER_APPROVE))
-
-        for pattern in data.get("deny", []):
-            if isinstance(pattern, str):
-                rules.append(PolicyRule(pattern=pattern, message=pattern, tier=TIER_DENY))
+        rules = _parse_rules_from_dict(data)
 
         with self._lock:
             self._rules = rules
@@ -127,32 +130,37 @@ class PolicyEngine:
     # Classification
     # ------------------------------------------------------------------
 
-    def check_task(self, task_text: str) -> tuple[str, list[str]]:
+    def _classify(self, task_text: str, rules: list[PolicyRule]) -> tuple[str, list[str], bool]:
+        """Returns (tier, messages, had_any_match)."""
+        matches_by_tier: dict[str, list[str]] = {TIER_DENY: [], TIER_APPROVE: [], TIER_AUTO: []}
+        for rule in rules:
+            if rule.matches(task_text):
+                matches_by_tier[rule.tier].append(rule.message)
+        for tier in _TIER_ORDER:
+            if matches_by_tier[tier]:
+                return tier, matches_by_tier[tier], True
+        return TIER_AUTO, [], False
+
+    def check_task(self, task_text: str, profile_rules: dict | None = None) -> tuple[str, list[str]]:
         """Scan task text for all rule patterns.
 
         Returns (highest_tier, [matching_messages]).
         Tier order: deny > approve > auto.
+
+        If profile_rules is provided and matches the task, its verdict takes
+        priority over global rules (layering: profile > global).
         """
         self._reload_if_changed()
 
+        if profile_rules:
+            p_tier, p_msgs, p_matched = self._classify(task_text, _parse_rules_from_dict(profile_rules))
+            if p_matched:
+                return p_tier, p_msgs
+
         with self._lock:
-            rules = list(self._rules)
-
-        matches_by_tier: dict[str, list[str]] = {
-            TIER_DENY: [],
-            TIER_APPROVE: [],
-            TIER_AUTO: [],
-        }
-
-        for rule in rules:
-            if rule.matches(task_text):
-                matches_by_tier[rule.tier].append(rule.message)
-
-        for tier in _TIER_ORDER:
-            if matches_by_tier[tier]:
-                return tier, matches_by_tier[tier]
-
-        return TIER_AUTO, []
+            global_rules = list(self._rules)
+        g_tier, g_msgs, _ = self._classify(task_text, global_rules)
+        return g_tier, g_msgs
 
     # ------------------------------------------------------------------
     # Session preapprovals

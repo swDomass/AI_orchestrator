@@ -27,30 +27,23 @@ deny:
         encoding="utf-8"
     )
     
-    # Mock config.POLICY_FILE to use our temp file
-    import policy
-    original_policy_file = policy.POLICY_FILE
-    policy.POLICY_FILE = policy_file
-    try:
-        engine = PolicyEngine(vault_path=tmp_path)
-        
-        tier, reasons = engine.check_task("pytest")
-        assert tier == TIER_AUTO
-        assert reasons == ["pytest"]
-        
-        tier, reasons = engine.check_task("git push origin master")
-        assert tier == TIER_APPROVE
-        assert reasons == ["pushing to remote"]
-        
-        tier, reasons = engine.check_task("rm -rf /tmp")
-        assert tier == TIER_DENY
-        assert reasons == ["rm -rf /"]
-        
-        tier, reasons = engine.check_task("ls -la")
-        assert tier == TIER_AUTO
-        assert reasons == []
-    finally:
-        policy.POLICY_FILE = original_policy_file
+    engine = PolicyEngine(vault_path=tmp_path)
+    
+    tier, reasons = engine.check_task("pytest")
+    assert tier == TIER_AUTO
+    assert reasons == ["pytest"]
+    
+    tier, reasons = engine.check_task("git push origin master")
+    assert tier == TIER_APPROVE
+    assert reasons == ["pushing to remote"]
+    
+    tier, reasons = engine.check_task("rm -rf /tmp")
+    assert tier == TIER_DENY
+    assert reasons == ["rm -rf /"]
+    
+    tier, reasons = engine.check_task("ls -la")
+    assert tier == TIER_AUTO
+    assert reasons == []
 
 def test_preapprovals():
     engine = PolicyEngine(vault_path=Path("/tmp"))
@@ -71,13 +64,7 @@ def test_policy_engine_multi_match(tmp_path):
 """,
         encoding="utf-8"
     )
-    import policy
-    original_policy_file = policy.POLICY_FILE
-    policy.POLICY_FILE = policy_file
-    try:
-        engine = PolicyEngine(vault_path=tmp_path)
-        tier, reasons = engine.check_task("git push and npm publish")
-        assert tier == TIER_APPROVE
-        assert set(reasons) == {"push", "publish"}
-    finally:
-        policy.POLICY_FILE = original_policy_file
+    engine = PolicyEngine(vault_path=tmp_path)
+    tier, reasons = engine.check_task("git push and npm publish")
+    assert tier == TIER_APPROVE
+    assert set(reasons) == {"push", "publish"}

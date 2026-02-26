@@ -32,6 +32,7 @@ class ProfileConfig:
     timeout_minutes: int = 0   # 0 = use TASK_TIMEOUT_SEC default
     sandbox: str = "off"       # off | ro | rw
     safety_level: str = "standard"  # strict | standard | yolo
+    policy: dict = field(default_factory=dict)   # {"auto": [...], "approve": [...], "deny": [...]}
 
 
 def get_default_profile() -> ProfileConfig:
@@ -120,4 +121,5 @@ def _build_profile_config(name: str, data: dict) -> ProfileConfig:
         timeout_minutes=int(data.get("timeout_minutes", 0)),
         sandbox=str(data.get("sandbox", "off")),
         safety_level=str(data.get("safety_level", "standard")),
+        policy=data.get("policy") or {},
     )

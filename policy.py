@@ -75,6 +75,9 @@ class PolicyEngine:
         self._mtime: float = 0.0
         self._lock = threading.Lock()
 
+        # Cache for parsed profile rules: {id(profile_dict): (timestamp, [PolicyRule])}
+        self._profile_cache: dict[int, tuple[float, list[PolicyRule]]] = {}
+
         # Session-wide preapprovals (category → approved for this process lifetime)
         self._preapprovals: set[str] = set()
 
@@ -148,7 +151,19 @@ class PolicyEngine:
         self._reload_if_changed()
 
         if profile_rules:
-            p_tier, p_msgs, p_matched = self._classify(task_text, _parse_rules_from_dict(profile_rules))
+            dict_id = id(profile_rules)
+            with self._lock:
+                p_rules = self._profile_cache.get(dict_id)
+            
+            if p_rules is None:
+                p_rules = _parse_rules_from_dict(profile_rules)
+                with self._lock:
+                    # Clear cache occasionally to prevent memory leak (crude)
+                    if len(self._profile_cache) > 50:
+                        self._profile_cache.clear()
+                    self._profile_cache[dict_id] = p_rules
+
+            p_tier, p_msgs, p_matched = self._classify(task_text, p_rules)
             if p_matched:
                 return p_tier, p_msgs
 

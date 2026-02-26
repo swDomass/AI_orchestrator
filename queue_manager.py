@@ -376,8 +376,13 @@ def extract_cwd(task: str) -> str | None:
         print(f"  [cwd] Warnung: Verzeichnis existiert nicht: {cwd}")
         return None
 
-    if ALLOWED_CWD_ROOTS:
+    try:
         resolved = cwd_path.resolve()
+    except Exception:
+        print(f"  [cwd] Warnung: Verzeichnis konnte nicht aufgelöst werden: {cwd}")
+        return None
+
+    if ALLOWED_CWD_ROOTS:
         if not any(
             resolved == root.resolve() or resolved.is_relative_to(root.resolve())
             for root in ALLOWED_CWD_ROOTS
@@ -385,7 +390,7 @@ def extract_cwd(task: str) -> str | None:
             print(f"  [cwd] Warnung: Verzeichnis nicht in erlaubten Roots: {cwd}")
             return None
 
-    return cwd
+    return str(resolved)
 
 
 def has_cwd_tag(task: str) -> bool:

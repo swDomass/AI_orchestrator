@@ -799,8 +799,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
                 print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
 
-            # Feature 10: trigger shutdown after tool task if tagged (only on success)
-            if task_has_shutdown and outcome.success:
+            # Feature 10: trigger shutdown after tool task if tagged
+            if task_has_shutdown:
                 from shutdown import request_shutdown
                 if request_shutdown():
                     print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")
@@ -896,8 +896,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             notify_error(task, provider.name, error)
             print("  Task bleibt in Queue - versuche nächsten Provider...")
 
-        # Feature 10: trigger shutdown after single-shot task if tagged (only on success)
-        if task_has_shutdown and single_shot_success:
+        # Feature 10: trigger shutdown after single-shot task if tagged
+        if task_has_shutdown:
             from shutdown import request_shutdown
             if request_shutdown():
                 print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")

@@ -49,18 +49,23 @@ def select_provider(
     limits: AllLimits,
     exclude: set[str] | None = None,
     profile=None,  # ProfileConfig | None
+    force_name: str | None = None,
 ) -> BaseProvider | None:
     """
     Returns the best available provider for this task, or None if all are blocked.
-    If the task contains a #provider tag, that provider is tried first.
+    If 'force_name' is given or the task contains a #provider tag, that provider is tried first.
     If a profile is given, its provider order overrides the default priority.
     """
     # Check for explicit provider tag
     task_lower = task.lower()
-    forced = next(
-        (_providers[v] for tag, v in _TAG_MAP.items() if _TAG_RE_BY_PROVIDER[tag].search(task_lower)),
-        None
-    )
+    forced = None
+    if force_name and force_name in _providers:
+        forced = _providers[force_name]
+    else:
+        forced = next(
+            (_providers[v] for tag, v in _TAG_MAP.items() if _TAG_RE_BY_PROVIDER[tag].search(task_lower)),
+            None
+        )
 
     # Profile provider order overrides _PRIORITY
     if profile and getattr(profile, "providers", None):

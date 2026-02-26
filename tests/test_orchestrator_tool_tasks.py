@@ -64,7 +64,7 @@ def test_run_once_retries_tool_task_with_next_provider_and_passes_timeout(monkey
         orchestrator.ToolTaskExecutionOutcome(success=True, finalized=True),
     ])
 
-    def fake_select_provider(_task, _limits, exclude=None):
+    def fake_select_provider(_task, _limits, exclude=None, **_kwargs):
         exclude = exclude or set()
         if "claude" not in exclude:
             return p1

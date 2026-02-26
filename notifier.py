@@ -169,6 +169,54 @@ def notify_queue_complete(remaining: int = 0) -> None:
     )
 
 
+def notify_shutdown_pending(delay_sec: int) -> None:
+    """Notify that an OS shutdown countdown has started."""
+    _send(f"⏾ Shutting down in {delay_sec}s. Send any message to cancel.")
+
+
+def notify_shutdown_cancelled() -> None:
+    """Notify that the shutdown countdown was cancelled."""
+    _send("✋ Shutdown cancelled.")
+
+
+def notify_shutdown_executing() -> None:
+    """Notify that the OS shutdown command is about to be executed."""
+    _send("⏾ Shutting down now.")
+
+
+def notify_approval_required(task_text: str, reasons: list[str], timeout_sec: int) -> None:
+    """Send a Telegram approval request for a risky action."""
+    task_safe = _strip_backticks(_truncate(task_text, 100))
+    reasons_safe = _escape_markdown("; ".join(reasons[:5]))
+    timeout_min = timeout_sec // 60
+
+    _send(
+        f"🔒 *Approval required*\n\n"
+        f"Task: `{task_safe}`\n"
+        f"Action: {reasons_safe}\n\n"
+        f"Reply within {timeout_min} min:\n"
+        f"/approve — allow this action\n"
+        f"/approve\\-all \\<category\\> — allow all in session\n"
+        f"/deny — block, pause task\n"
+        f"/skip — skip action, continue task"
+    )
+
+
+def notify_approval_timeout(task_text: str) -> None:
+    """Notify that the approval request timed out."""
+    task_safe = _strip_backticks(_truncate(task_text, 100))
+    _send(f"⏱ *Approval timeout*\nTask paused: `{task_safe}`")
+
+
+def notify_approval_result(task_text: str, result: str) -> None:
+    """Notify about an approval decision."""
+    icons = {"approved": "✅", "denied": "❌", "skipped": "⏭️"}
+    icon = icons.get(result, "ℹ️")
+    task_safe = _strip_backticks(_truncate(task_text, 100))
+    result_safe = _escape_markdown(result)
+    _send(f"{icon} *Approval {result_safe}*\nTask: `{task_safe}`")
+
+
 def notify_tool_progress(tool_name: str, iteration: int, max_iter: int, message: str) -> None:
     """Notify about tool progress (e.g. review loop iteration)."""
     _send(

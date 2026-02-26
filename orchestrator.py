@@ -63,6 +63,9 @@ from queue_manager import (
     append_log,
     ensure_queue_file,
     extract_cwd,
+    extract_preapproved_actions,
+    extract_profile_tag,
+    extract_shutdown_tag,
     extract_timeout,
     finalize_task_with_result,
     has_cwd_tag,
@@ -503,12 +506,14 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
     Process all open tasks in the queue once.
     Returns True if all tasks were completed, False if stopped early.
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     # Archive old memories once per cycle (silent, never blocks)
     try:
         archived = memory_module.archive_old_memories()
         if archived:
-            import logging
-            logging.getLogger(__name__).debug("Archived %d old memories", archived)
+            _log.debug("Archived %d old memories", archived)
     except Exception:
         pass
 
@@ -530,12 +535,58 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         task = queue_task.task_text
         print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
 
+        # --- Feature 6: Load execution profile ---
+        profile_name: str | None = None
+        try:
+            from profiles import load_profile, get_default_profile
+            profile_name = extract_profile_tag(task)
+            if profile_name:
+                profile = load_profile(profile_name, VAULT_PATH)
+                if profile is None:
+                    print(f"  [profile] Warnung: Profil '{profile_name}' nicht gefunden, verwende Default")
+                    profile = get_default_profile()
+                else:
+                    print(f"  [profile] {profile.name} (providers: {profile.providers})")
+            else:
+                profile = get_default_profile()
+        except Exception as e:
+            _log.warning("profile loading failed: %s", e)
+            profile = None
+
         # Extract task metadata
         cwd_tag_present = has_cwd_tag(task)
         cwd = extract_cwd(task)
-        timeout = extract_timeout(task, default=TASK_TIMEOUT_SEC)
+
+        # Profile timeout overrides task timeout
+        if profile and profile.timeout_minutes > 0:
+            timeout = profile.timeout_minutes * 60
+        else:
+            timeout = extract_timeout(task, default=TASK_TIMEOUT_SEC)
+
         tool_timeout = extract_timeout(task, default=0) or None
         tool_name = extract_tool_tag(task)
+
+        # Feature 6: denied_skills check
+        if tool_name and profile and tool_name in profile.denied_skills:
+            msg = f"Tool '{tool_name}' durch Profil '{profile.name}' gesperrt (denied_skills)"
+            print(f"  ❌ {msg}")
+            if not dry_run:
+                append_log(msg)
+                notify_error(task, "profile", msg)
+                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no):
+                    return False
+            continue
+
+        # Feature 6: allowed_skills whitelist check
+        if tool_name and profile and profile.allowed_skills and tool_name not in profile.allowed_skills:
+            msg = f"Tool '{tool_name}' nicht in allowed_skills von Profil '{profile.name}'"
+            print(f"  ❌ {msg}")
+            if not dry_run:
+                append_log(msg)
+                notify_error(task, "profile", msg)
+                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no):
+                    return False
+            continue
 
         if cwd_tag_present and cwd is None:
             msg = "Ungültiges cwd:-Tag (Verzeichnis fehlt oder ist nicht erlaubt) - Task wird nicht ausgeführt"
@@ -555,10 +606,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if tool_name:
             print(f"  [tool] {tool_name}")
 
+        # --- Feature 10: detect #shutdown tag ---
+        task_has_shutdown = extract_shutdown_tag(task)
+
         # Dry-run
         if dry_run:
             limits = get_limits()
-            provider = select_provider(task, limits)
+            provider = select_provider(task, limits, profile=profile)
             memory_context = memory_module.get_context_for_task(task, cwd=cwd)
             prompt = _build_prompt(
                 task,
@@ -568,8 +622,12 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             )
             print(f"  [DRY-RUN] Provider: {provider.name if provider else 'KEINER VERFÜGBAR'}")
             print(f"  [DRY-RUN] Tool: {tool_name or 'keins (single-shot)'}")
+            if profile_name:
+                print(f"  [DRY-RUN] Profil: {profile_name}")
             print(f"  [DRY-RUN] Memory: {len(memory_context)} Zeichen ({memory_context.count(chr(10)+chr(10))+1 if memory_context else 0} Einträge)")
             print(f"  [DRY-RUN] Prompt-Länge: {len(prompt)} Zeichen (~{len(prompt.split())} Tokens)")
+            if task_has_shutdown:
+                print(f"  [DRY-RUN] #shutdown erkannt → Shutdown nach diesem Task")
             continue
 
         # Get current limits
@@ -579,11 +637,106 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Fetch memory context once (same for all provider fallbacks)
         memory_context = memory_module.get_context_for_task(task, cwd=cwd)
 
+        # --- Feature 9: Policy check ---
+        try:
+            from policy import get_engine, TIER_DENY, TIER_APPROVE, _TIER_ORDER
+            engine = get_engine()
+            
+            # Check parent task
+            clean_task_for_policy = strip_metadata_tags(task)
+            verdict, reasons_list = engine.check_task(clean_task_for_policy)
+            reasons = set(reasons_list)
+            
+            # Check subtasks (if any)
+            if getattr(queue_task, "subtasks", None):
+                for st in queue_task.subtasks:
+                    st_verdict, st_reasons = engine.check_task(strip_metadata_tags(st))
+                    # Lower index means higher priority (DENY < APPROVE < AUTO)
+                    if _TIER_ORDER.index(st_verdict) < _TIER_ORDER.index(verdict):
+                        verdict = st_verdict
+                    for r in st_reasons:
+                        reasons.add(r)
+
+            if verdict == TIER_DENY:
+                msg = f"Task gesperrt (DENY-Policy): {'; '.join(reasons)}"
+                print(f"  ❌ {msg}")
+                append_log(msg)
+                notify_error(task, "policy", msg)
+                if not _mark_done_checked(task, "policy-denied", queue_line_no=queue_task.line_no):
+                    return False
+                continue
+
+            if verdict == TIER_APPROVE:
+                preapproved = extract_preapproved_actions(task)
+                unapproved = [r for r in reasons if r not in preapproved and not engine.is_preapproved(r)]
+                if unapproved:
+                    response = engine.request_approval(task, unapproved)
+                    if response == "denied":
+                        print("  ❌ Genehmigung abgelehnt — Task bleibt in Queue.")
+                        append_log(f"Genehmigung abgelehnt für Task: {task[:60]}")
+                        reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
+                            return False
+                        return False
+                    elif response == "timeout":
+                        print("  ⏱ Genehmigung timeout — Task bleibt in Queue.")
+                        append_log(f"Genehmigung timeout für Task: {task[:60]}")
+                        reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
+                            return False
+                        return False
+                    # "approved" or "skipped" → continue
+        except ImportError:
+            pass
+        except Exception as e:
+            _log.warning("policy check failed: %s", e)
+
+        # --- Feature 7: Parallel sub-agent spawning ---
+        if getattr(queue_task, "subtasks", None):
+            print(f"  [parallel] {len(queue_task.subtasks)} Subtask(s)")
+            try:
+                from parallel_runner import run_parallel, format_parallel_result
+                results = run_parallel(
+                    task,
+                    queue_task.subtasks,
+                    limits,
+                    memory_context=memory_context,
+                    pause_event=pause_event,
+                    profile=profile,
+                )
+                aggregated = format_parallel_result(results)
+                success_all = all(r.success for r in results)
+                provider_tag = "parallel"
+                status_str = "✅" if success_all else "⚠️"
+                print(f"  {status_str} Parallel abgeschlossen ({len(results)} Subtasks)")
+                if not _finalize_task_with_result_checked(
+                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no
+                ):
+                    return False
+                memory_module.store_result(task, aggregated, provider_tag, 0.0, cwd=cwd, success=success_all)
+                append_log(f"Parallel-Task erledigt: {task[:60]}")
+                notify_task_done(task, provider_tag, aggregated)
+            except Exception as e:
+                msg = f"Parallel-Ausführung fehlgeschlagen: {e}"
+                print(f"  ❌ {msg}")
+                append_log(msg)
+                notify_error(task, "parallel", msg)
+                if not _mark_done_checked(task, "parallel-error", queue_line_no=queue_task.line_no):
+                    return False
+
+            # Feature 10: trigger shutdown after this task if tagged
+            if task_has_shutdown:
+                from shutdown import request_shutdown
+                if request_shutdown():
+                    print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")
+                return False
+            continue
+
         # Tool-based task (iterative loop)
         if tool_name:
             tried_providers: set[str] = set()
             while True:
-                provider = select_provider(task, limits, exclude=tried_providers)
+                provider = select_provider(task, limits, exclude=tried_providers, profile=profile)
                 if provider is None:
                     earliest = _get_next_retry_sec(limits)
                     reset_dt = datetime.now() + timedelta(seconds=earliest)
@@ -623,6 +776,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     provider.set_cooldown(5 * 60)
 
                 print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
+
+            # Feature 10: trigger shutdown after tool task if tagged
+            if task_has_shutdown:
+                from shutdown import request_shutdown
+                if request_shutdown():
+                    print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")
+                return False
             continue
 
         # Safety: snapshot before execution
@@ -639,7 +799,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log("Queue-Verarbeitung pausiert")
                 return False
 
-            provider = select_provider(task, limits, exclude=tried_providers)
+            provider = select_provider(task, limits, exclude=tried_providers, profile=profile)
 
             if provider is None:
                 if not tried_providers:
@@ -712,6 +872,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             notify_error(task, provider.name, error)
             print("  Task bleibt in Queue - versuche nächsten Provider...")
 
+        # Feature 10: trigger shutdown after single-shot task if tagged
+        if task_has_shutdown:
+            from shutdown import request_shutdown
+            if request_shutdown():
+                print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")
+            return False
+
     if dry_run:
         print("\n[DRY-RUN] Keine Tasks ausgeführt.")
         return True
@@ -746,6 +913,9 @@ def run_watch(dry_run: bool = False) -> None:
 
     heartbeat = HeartbeatRunner()
 
+    def _cleanup():
+        listener.stop()
+
     try:
         while True:
             # Honour /pause command from Telegram
@@ -758,6 +928,16 @@ def run_watch(dry_run: bool = False) -> None:
 
             tasks = read_queue()
             if not tasks:
+                # Feature 10: if shutdown pending and queue drained, start countdown
+                try:
+                    from shutdown import execute_shutdown, shutdown_pending as _sp
+                    if _sp.is_set() and not pause_event.is_set():
+                        print("\n[shutdown] Queue leer + #shutdown gesetzt → Countdown startet")
+                        execute_shutdown(cleanup_cb=_cleanup)
+                        return
+                except Exception:
+                    pass
+
                 print("\nQueue leer. Warte auf neue Tasks (alle 60s prüfen)...")
                 heartbeat.run_due(read_queue)
                 time.sleep(60)
@@ -773,6 +953,16 @@ def run_watch(dry_run: bool = False) -> None:
 
             if dry_run:
                 return
+
+            # Feature 10: check shutdown after each run_once cycle
+            try:
+                from shutdown import execute_shutdown, shutdown_pending as _sp
+                if _sp.is_set() and not pause_event.is_set():
+                    print("\n[shutdown] #shutdown gesetzt → Countdown startet")
+                    execute_shutdown(cleanup_cb=_cleanup)
+                    return
+            except Exception:
+                pass
 
             if done:
                 print("\nQueue abgearbeitet. Warte auf neue Tasks...")

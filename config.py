@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 from pathlib import Path
 
 
@@ -152,6 +153,21 @@ PROMPT_CORE_TOKENS       = 200
 PROMPT_MEMORY_TOKENS     = 2_000
 PROMPT_WIKILINK_TOKENS   = 3_000
 PROMPT_SKILL_TOKENS      = 2_000
+
+# --- Profiles ---
+PROFILES_DIR = VAULT_PATH / "99_System" / "AI" / "profiles"
+
+# --- Policy ---
+POLICY_FILE = VAULT_PATH / "99_System" / "AI" / "policy.yaml"
+POLICY_APPROVAL_TIMEOUT_SEC = 600  # 10 minutes
+
+# --- Shutdown ---
+SHUTDOWN_DELAY_SEC = 60
+SHUTDOWN_COMMAND = (
+    ["shutdown", "/s", "/t", "0"]
+    if sys.platform == "win32"
+    else ["sudo", "shutdown", "-h", "now"]
+)
 
 # --- SOUL.md (Personality-as-Config) ---
 _soul_cache: dict[str, str] | None = None

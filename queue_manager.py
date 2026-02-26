@@ -49,6 +49,18 @@ PROVIDER_TAG_RE = re.compile(r"#(?:claude|gemini|codex)\b", re.IGNORECASE)
 # Matches retry comment (legacy HH:MM or absolute local timestamp)
 RETRY_TAG_RE = re.compile(r"<!-- retry: ([^>]+?) -->")
 
+# Matches #agent:<name> profile tag
+PROFILE_TAG_RE = re.compile(r"(?i)#agent:([\w-]+)")
+
+# Matches #approve:<categories> pre-approval tag  (e.g. #approve:push,publish)
+PREAPPROVE_TAG_RE = re.compile(r"(?i)#approve:([\w,:-]+)")
+
+# Matches #shutdown tag
+SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
+
+# Matches #parallel tag
+PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
+
 # Extract only the markdown body under "## Queue" (until the next H2 heading)
 QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)
 
@@ -57,6 +69,7 @@ QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILIN
 class QueueTask:
     task_text: str
     line_no: int
+    subtasks: tuple[str, ...] = ()   # populated for #parallel tasks
 
 
 def _find_heading_line(content: str, heading: str, prefer_last: bool = False):
@@ -393,12 +406,48 @@ def extract_timeout(task: str, default: int = 0) -> int:
     return val * {"s": 1, "m": 60, "h": 3600}[unit]
 
 
+def extract_profile_tag(task: str) -> str | None:
+    """Extract #agent:<name> profile tag from task text.
+
+    If multiple #agent: tags are present, the first wins and a warning is logged.
+    """
+    matches = PROFILE_TAG_RE.findall(task)
+    if len(matches) > 1:
+        import logging
+        logging.getLogger(__name__).warning(
+            "queue_manager: multiple #agent: tags found ('%s') — using first: '%s'",
+            "', '".join(matches),
+            matches[0],
+        )
+    return matches[0] if matches else None
+
+
+def extract_preapproved_actions(task: str) -> set[str]:
+    """Parse '#approve:push,publish' → {'push', 'publish'}."""
+    result: set[str] = set()
+    for m in PREAPPROVE_TAG_RE.finditer(task):
+        for part in m.group(1).split(","):
+            part = part.strip(": ").lower()
+            if part:
+                result.add(part)
+    return result
+
+
+def extract_shutdown_tag(task: str) -> bool:
+    """Return True if #shutdown tag is present in the task text."""
+    return bool(SHUTDOWN_TAG_RE.search(task))
+
+
 def strip_metadata_tags(task: str) -> str:
     """Remove routing/metadata tags before sending the task text to a provider."""
     task = CWD_RE.sub("", task)
     task = TIMEOUT_RE.sub("", task)
     task = TOOL_TAG_RE.sub("", task)
     task = PROVIDER_TAG_RE.sub("", task)
+    task = PROFILE_TAG_RE.sub("", task)
+    task = PREAPPROVE_TAG_RE.sub("", task)
+    task = SHUTDOWN_TAG_RE.sub("", task)
+    task = PARALLEL_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 
@@ -532,8 +581,11 @@ def read_queue_items() -> list[QueueTask]:
 
     in_queue = False
     items: list[QueueTask] = []
+    all_lines = content.splitlines()
 
-    for line_no, line in enumerate(content.splitlines(), start=1):
+    for line_idx, line in enumerate(all_lines):
+        line_no = line_idx + 1  # 1-based
+
         if line.startswith("## "):
             in_queue = line.strip() == "## Queue"
             continue
@@ -548,7 +600,26 @@ def read_queue_items() -> list[QueueTask]:
         if retry_match and not _retry_is_due(retry_match.group(1)):
             continue
 
-        items.append(QueueTask(task_text=m.group(1).strip(), line_no=line_no))
+        task_text = m.group(1).strip()
+
+        # Collect indented subtask lines for #parallel tasks
+        subtask_lines: tuple[str, ...] = ()
+        if PARALLEL_TAG_RE.search(task_text):
+            collected: list[str] = []
+            j = line_idx + 1
+            while j < len(all_lines):
+                raw = all_lines[j].rstrip()
+                if raw.startswith("  -") or raw.startswith("\t-"):
+                    # Strip leading whitespace then leading dash, then whitespace
+                    subtask_text = raw.lstrip().lstrip("-").strip()
+                    if subtask_text:
+                        collected.append(subtask_text)
+                    j += 1
+                else:
+                    break
+            subtask_lines = tuple(collected)
+
+        items.append(QueueTask(task_text=task_text, line_no=line_no, subtasks=subtask_lines))
 
     return items
 

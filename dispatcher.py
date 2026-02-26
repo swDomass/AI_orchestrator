@@ -44,10 +44,16 @@ def _limits_ok(name: str, limits: AllLimits) -> bool:
     return getattr(limits, name).available
 
 
-def select_provider(task: str, limits: AllLimits, exclude: set[str] | None = None) -> BaseProvider | None:
+def select_provider(
+    task: str,
+    limits: AllLimits,
+    exclude: set[str] | None = None,
+    profile=None,  # ProfileConfig | None
+) -> BaseProvider | None:
     """
     Returns the best available provider for this task, or None if all are blocked.
     If the task contains a #provider tag, that provider is tried first.
+    If a profile is given, its provider order overrides the default priority.
     """
     # Check for explicit provider tag
     task_lower = task.lower()
@@ -56,15 +62,24 @@ def select_provider(task: str, limits: AllLimits, exclude: set[str] | None = Non
         None
     )
 
-    order = _PRIORITY[:]
+    # Profile provider order overrides _PRIORITY
+    if profile and getattr(profile, "providers", None):
+        base_order = [p for p in profile.providers if p in _providers]
+    else:
+        base_order = _PRIORITY[:]
+
     if forced:
-        # Move forced provider to front
-        order = [forced.name] + [n for n in order if n != forced.name]
+        # Move forced provider to front within the allowed order
+        order = [forced.name] + [n for n in base_order if n != forced.name]
+    else:
+        order = base_order
 
     excluded = exclude or set()
 
     for name in order:
         if name in excluded:
+            continue
+        if name not in _providers:
             continue
         provider = _providers[name]
         if provider.is_cooling_down():

@@ -20,17 +20,17 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 2 | `--doctor` / onboarding command | DONE |
 | 3 | Memory system with temporal decay | DONE |
 | 4 | Heartbeat / proactive scheduled tasks | DONE |
-| 10 | `#shutdown` — graceful OS shutdown via Telegram or queue tag | planned |
+| 10 | `#shutdown` — graceful OS shutdown via Telegram or queue tag | DONE |
 
 ## Tier 2 — Strong Value, Moderate Effort
 
 | # | Feature | Status |
 |---|---------|--------|
 | 5 | Selective skill/prompt injection | DONE |
-| 6 | Execution profiles (`#agent:work`, `#agent:personal`) | planned |
-| 7 | Parallel sub-agent spawning | planned |
-| 8 | SOUL.md / personality-as-config | planned |
-| 9 | Execution policy + approval layer | planned |
+| 6 | Execution profiles (`#agent:work`, `#agent:personal`) | DONE |
+| 7 | Parallel sub-agent spawning | DONE |
+| 8 | SOUL.md / personality-as-config | DONE |
+| 9 | Execution policy + approval layer | DONE |
 
 ## Tier 3 — Nice to Have, After Core Is Solid
 

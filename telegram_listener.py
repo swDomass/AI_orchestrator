@@ -5,11 +5,16 @@ Runs as a daemon thread during --watch mode. Uses long-polling (getUpdates)
 to receive messages — no webhooks, no extra dependencies.
 
 Supported commands:
-  /help    — list all commands
-  /status  — queue size + per-provider limit summary
-  /limits  — detailed per-provider limits (same as --check-limits output)
-  /pause   — pause orchestrator task processing
-  /resume  — resume orchestrator task processing
+  /help              — list all commands
+  /status            — queue size + per-provider limit summary
+  /limits            — detailed per-provider limits
+  /pause             — pause orchestrator task processing
+  /resume            — resume orchestrator task processing
+  /approve [cat]     — approve pending approval request
+  /approve-all <cat> — session-wide preapproval for category
+  /deny              — deny pending approval request
+  /skip              — skip risky action, continue task
+  /cancel-shutdown   — cancel pending shutdown countdown
 
 Any other text is forwarded to the best available AI provider and the
 response is sent back to the same chat.
@@ -204,7 +209,22 @@ class TelegramListener:
         if not text:
             return
 
+        # Cancel any pending shutdown on ANY incoming message
+        try:
+            from shutdown import cancel_shutdown, shutdown_pending as _sp
+            if _sp.is_set():
+                cancel_shutdown()
+        except Exception:
+            pass
+
         parsed_command = _parse_command(text)
+
+        # Detect #shutdown in plain text (not a command)
+        if not parsed_command and "#shutdown" in text.lower():
+            self._handle_shutdown_request()
+            # Still process as chat if the message also contains other text
+            # (but not as AI chat — shutdown is the action)
+            return
 
         # Commands (rate-limited)
         if parsed_command:
@@ -229,6 +249,16 @@ class TelegramListener:
                 self._cmd_pause()
             elif command == "/resume":
                 self._cmd_resume()
+            elif command == "/approve":
+                self._cmd_approve(command_args)
+            elif command == "/approve-all":
+                self._cmd_approve_all(command_args)
+            elif command == "/deny":
+                self._cmd_deny()
+            elif command == "/skip":
+                self._cmd_skip()
+            elif command == "/cancel-shutdown":
+                self._cmd_cancel_shutdown()
             return
 
         # AI chat (rate-limited, spawned in worker thread)
@@ -246,12 +276,18 @@ class TelegramListener:
         send_message(
             "🤖 *AI Orchestrator – Befehle*\n\n"
             "/task \\<beschreibung\\> — Task zur Queue hinzufügen\n"
-            "/status — Queue-Größe + Provider-Übersicht\n"
-            "/limits — Detaillierte Provider-Limits\n"
-            "/pause  — Task-Verarbeitung pausieren\n"
-            "/resume — Task-Verarbeitung fortsetzen\n"
+            "/status — Queue\\-Größe \\+ Provider\\-Übersicht\n"
+            "/limits — Detaillierte Provider\\-Limits\n"
+            "/pause  — Task\\-Verarbeitung pausieren\n"
+            "/resume — Task\\-Verarbeitung fortsetzen\n"
+            "/approve \\[kategorie\\] — Ausstehende Aktion genehmigen\n"
+            "/approve\\-all \\<kategorie\\> — Session\\-Freigabe für Kategorie\n"
+            "/deny  — Ausstehende Aktion ablehnen\n"
+            "/skip  — Aktion überspringen, Task fortsetzen\n"
+            "/cancel\\-shutdown — Geplanten Shutdown abbrechen\n"
             "/help   — Diese Hilfe\n\n"
-            "Beliebiger Text → sofortige KI-Antwort"
+            "\\#shutdown in Text → Shutdown einplanen\n"
+            "Beliebiger Text → sofortige KI\\-Antwort"
         )
 
     def _cmd_status(self) -> None:
@@ -295,6 +331,91 @@ class TelegramListener:
         self._pause_event.clear()
         send_message("▶️ Orchestrator *läuft wieder*.")
         logger.info("Orchestrator durch Telegram fortgesetzt.")
+
+    def _cmd_approve(self, category: str) -> None:
+        try:
+            from policy import get_engine
+            engine = get_engine()
+            if not engine.has_pending_approval():
+                send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
+                return
+            cat = category.strip()
+            if cat:
+                engine.add_preapproval(cat)
+            engine._respond("approved")
+            send_message("✅ Genehmigt.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_approve_all(self, category: str) -> None:
+        cat = category.strip()
+        if not cat:
+            send_message("ℹ️ Verwendung: `/approve-all <kategorie>`  (z.B. `push`)")
+            return
+        try:
+            from policy import get_engine
+            engine = get_engine()
+            engine.add_preapproval(cat)
+            send_message(f"✅ Session\\-Freigabe für *{_escape_telegram_markdown(cat)}* gesetzt.")
+            # Also respond to any pending approval
+            if engine.has_pending_approval():
+                engine._respond("approved")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_deny(self) -> None:
+        try:
+            from policy import get_engine
+            engine = get_engine()
+            if not engine.has_pending_approval():
+                send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
+                return
+            engine._respond("denied")
+            send_message("❌ Abgelehnt. Task bleibt in Queue.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_skip(self) -> None:
+        try:
+            from policy import get_engine
+            engine = get_engine()
+            if not engine.has_pending_approval():
+                send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
+                return
+            engine._respond("skipped")
+            send_message("⏭️ Übersprungen. Task wird fortgesetzt.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_cancel_shutdown(self) -> None:
+        try:
+            from shutdown import cancel_shutdown, shutdown_pending as _sp
+            if not _sp.is_set():
+                send_message("ℹ️ Kein Shutdown ausstehend.")
+                return
+            cancel_shutdown()
+            send_message("✋ Shutdown abgebrochen.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _handle_shutdown_request(self) -> None:
+        """Handle #shutdown in plain text message."""
+        try:
+            from shutdown import execute_shutdown, request_shutdown
+            from queue_manager import read_queue
+
+            if not request_shutdown():
+                send_message("ℹ️ Shutdown bereits ausstehend.")
+                return
+
+            send_message("⏾ Shutdown geplant nach aktuellem Task.")
+
+            # If idle (queue empty), start countdown immediately in background
+            if not read_queue():
+                t = threading.Thread(target=execute_shutdown, daemon=True)
+                t.start()
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 
     def _cmd_add_task(self, task_text: str) -> None:
         task_text = task_text.strip()

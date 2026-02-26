@@ -271,6 +271,111 @@ def check_heartbeat_file() -> CheckResult:
         return CheckResult(WARN, "HEARTBEAT.md", f"check failed: {e}")
 
 
+def check_profiles() -> CheckResult:
+    """Scan PROFILES_DIR, report count and any invalid YAML."""
+    try:
+        from config import PROFILES_DIR, VAULT_PATH
+        if not VAULT_PATH.is_dir():
+            return CheckResult(WARN, "Profiles dir", "vault not accessible — skipped")
+
+        if not PROFILES_DIR.exists():
+            def _fix():
+                PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+                print(f"    Created profiles directory at {PROFILES_DIR}")
+
+            return CheckResult(
+                WARN, "Profiles dir",
+                f"not found: {PROFILES_DIR}",
+                fix_hint="Will be created automatically on first profile use",
+                fix_fn=_fix,
+            )
+
+        yaml_files = list(PROFILES_DIR.glob("*.yaml"))
+        if not yaml_files:
+            return CheckResult(WARN, "Profiles dir", f"no profiles found in {PROFILES_DIR}")
+
+        # Validate each YAML
+        invalid = []
+        for f in yaml_files:
+            try:
+                import yaml
+                with open(f, encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh)
+                if not isinstance(data, dict):
+                    invalid.append(f.name)
+            except Exception:
+                invalid.append(f.name)
+
+        if invalid:
+            return CheckResult(
+                WARN, "Profiles dir",
+                f"{len(yaml_files)} profiles, {len(invalid)} invalid: {', '.join(invalid)}"
+            )
+
+        return CheckResult(PASS, "Profiles dir", f"{len(yaml_files)} profile(s) found")
+    except Exception as e:
+        return CheckResult(WARN, "Profiles dir", f"check failed: {e}")
+
+
+def check_policy_file() -> CheckResult:
+    """Check that policy.yaml exists and is valid YAML."""
+    try:
+        from config import POLICY_FILE, VAULT_PATH
+        if not VAULT_PATH.is_dir():
+            return CheckResult(WARN, "Policy file", "vault not accessible — skipped")
+
+        if not POLICY_FILE.exists():
+            def _fix():
+                POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                POLICY_FILE.write_text(
+                    "# AI Orchestrator — Policy\n\n"
+                    "auto:\n"
+                    "  - \"git add\"\n"
+                    "  - \"git commit\"\n"
+                    "  - \"pytest\"\n"
+                    "  - \"npm install\"\n"
+                    "  - \"pip install\"\n\n"
+                    "approve:\n"
+                    "  - pattern: \"git push\"\n"
+                    "    message: \"git push to remote\"\n"
+                    "  - pattern: \"npm publish\"\n"
+                    "    message: \"npm publish package\"\n\n"
+                    "deny:\n"
+                    "  - \"git push --force.*(main|master)\"\n"
+                    "  - \"rm -rf /\"\n"
+                    "  - \"DROP (TABLE|DATABASE)\"\n"
+                    "  - \"format [A-Z]:\"\n"
+                    "  - \"mkfs\"\n",
+                    encoding="utf-8",
+                )
+                print(f"    Created policy.yaml at {POLICY_FILE}")
+
+            return CheckResult(
+                WARN, "Policy file",
+                f"not found: {POLICY_FILE}",
+                fix_hint="Create policy.yaml in vault 99_System/AI/",
+                fix_fn=_fix,
+            )
+
+        try:
+            import yaml
+            with open(POLICY_FILE, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                return CheckResult(FAIL, "Policy file", "invalid YAML (not a mapping)")
+            auto_count = len(data.get("auto", []))
+            approve_count = len(data.get("approve", []))
+            deny_count = len(data.get("deny", []))
+            return CheckResult(
+                PASS, "Policy file",
+                f"{auto_count} auto, {approve_count} approve, {deny_count} deny rules"
+            )
+        except Exception as e:
+            return CheckResult(FAIL, "Policy file", f"invalid YAML: {e}")
+    except Exception as e:
+        return CheckResult(WARN, "Policy file", f"check failed: {e}")
+
+
 def check_skills() -> CheckResult:
     try:
         from skills.discovery import discover_skills
@@ -327,6 +432,8 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_skills(),
         check_memory_dir(),
         check_heartbeat_file(),
+        check_profiles(),
+        check_policy_file(),
     ]
 
     any_fail = False

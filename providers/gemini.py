@@ -22,10 +22,11 @@ class GeminiProvider(BaseProvider):
             result = subprocess.run(
                 [
                     _GEMINI_CMD,
-                    "--prompt", task,
+                    "--prompt", "",
                     "--yolo",
                     "--output-format", "text",
                 ],
+                input=task,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

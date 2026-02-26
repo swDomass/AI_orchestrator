@@ -1,6 +1,7 @@
 """
 Wrapper around `npx cclimits --json`.
 Parses usage limits for Claude, Gemini (all 3 tiers), and Codex.
+Auto-refreshes expired OAuth tokens before querying.
 """
 
 import json
@@ -13,6 +14,8 @@ from config import MIN_CAPACITY_PERCENT
 # On Windows, npm-installed CLIs are .cmd files
 _CMD_SUFFIX = ".cmd" if sys.platform == "win32" else ""
 NPX_CMD = f"npx{_CMD_SUFFIX}"
+_CLAUDE_CMD = "claude.exe" if sys.platform == "win32" else "claude"
+_GEMINI_CMD = f"gemini{_CMD_SUFFIX}"
 
 
 @dataclass
@@ -62,7 +65,7 @@ def _parse_percent(pct_str: str) -> float:
 
 def _parse_claude(data: dict) -> ProviderLimits:
     if data.get("status") != "ok":
-        return ProviderLimits(error=data.get("error", "unknown"))
+        return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
 
     windows = []
     for key in ("five_hour", "seven_day"):
@@ -85,7 +88,7 @@ def _parse_claude(data: dict) -> ProviderLimits:
 
 def _parse_gemini(data: dict) -> ProviderLimits:
     if data.get("status") != "ok":
-        return ProviderLimits(error=data.get("error", "unknown"))
+        return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
 
     # All three tiers: 3-Flash, Flash, Pro (let Gemini CLI decide which to use)
     models = data.get("models", {})
@@ -114,7 +117,7 @@ def _parse_gemini(data: dict) -> ProviderLimits:
 
 def _parse_codex(data: dict) -> ProviderLimits:
     if data.get("status") != "ok":
-        return ProviderLimits(error=data.get("error", "unknown"))
+        return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
 
     windows = []
     for key in ("primary_window", "secondary_window"):
@@ -135,8 +138,8 @@ def _parse_codex(data: dict) -> ProviderLimits:
     )
 
 
-def get_limits() -> AllLimits:
-    """Run npx cclimits --json and return parsed limits for all providers."""
+def _run_cclimits() -> dict | None:
+    """Run npx cclimits --json and return parsed dict, or None on failure."""
     try:
         result = subprocess.run(
             [NPX_CMD, "cclimits", "--json"],
@@ -146,19 +149,64 @@ def get_limits() -> AllLimits:
             errors="replace",
             timeout=30,
         )
-        raw = json.loads(result.stdout)
-    except subprocess.TimeoutExpired:
+        return json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        return None
+
+
+def _needs_token_refresh(data: dict, provider: str) -> bool:
+    """Check if a provider's cclimits data indicates an expired token."""
+    pdata = data.get(provider, {})
+    if pdata.get("status") == "ok":
+        return False
+    token_status = pdata.get("token_status", "")
+    error = pdata.get("error", "")
+    return "expired" in token_status.lower() or "expired" in error.lower()
+
+
+def _refresh_token(provider: str) -> bool:
+    """Start the CLI briefly to refresh its OAuth token. Returns True on success."""
+    try:
+        if provider == "claude":
+            # auth status triggers OAuth refresh without an API call
+            subprocess.run(
+                [_CLAUDE_CMD, "auth", "status"],
+                capture_output=True, text=True, timeout=15,
+            )
+        elif provider == "gemini":
+            # No auth-only command available; minimal prompt to trigger refresh
+            subprocess.run(
+                [_GEMINI_CMD, "--prompt", ".", "--output-format", "text"],
+                capture_output=True, text=True, timeout=30,
+            )
+        else:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def get_limits() -> AllLimits:
+    """Run npx cclimits --json and return parsed limits for all providers.
+    Auto-refreshes expired OAuth tokens for Claude/Gemini and retries."""
+    raw = _run_cclimits()
+    if raw is None:
         return AllLimits(
             claude=ProviderLimits(error="cclimits timeout"),
             gemini=ProviderLimits(error="cclimits timeout"),
             codex=ProviderLimits(error="cclimits timeout"),
         )
-    except (json.JSONDecodeError, Exception) as e:
-        return AllLimits(
-            claude=ProviderLimits(error=str(e)),
-            gemini=ProviderLimits(error=str(e)),
-            codex=ProviderLimits(error=str(e)),
-        )
+
+    # Auto-refresh expired tokens and re-query
+    refreshed = False
+    for provider in ("claude", "gemini"):
+        if _needs_token_refresh(raw, provider):
+            print(f"  [{provider}] Token expired → refreshing...")
+            if _refresh_token(provider):
+                refreshed = True
+
+    if refreshed:
+        raw = _run_cclimits() or raw
 
     return AllLimits(
         claude=_parse_claude(raw.get("claude", {"status": "missing"})),

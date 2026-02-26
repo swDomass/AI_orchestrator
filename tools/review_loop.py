@@ -23,7 +23,10 @@ ALT_FINDING_RE = re.compile(
     r"^\s*(?:[-*]|\d+[.)])\s*(?:`|\*\*)?\[?(P[1-3])\]?(?:`|\*\*)?(?:\s*[:\-]\s*|\s+)(.+)$",
     re.IGNORECASE,
 )
-NO_FINDINGS_RE = re.compile(r"^\s*`?No P1/P2/P3 findings\.`?\s*$", re.IGNORECASE)
+NO_FINDINGS_RE = re.compile(
+    r"^\s*`?No P1(?:\s*[/,]\s*P2)(?:\s*[/,]\s*P3) findings\.`?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _parse_findings(text: str) -> list[str]:
@@ -84,6 +87,7 @@ class ReviewLoopTool(BaseTool):
         task: str,
         provider: BaseProvider,
         cwd: str | None = None,
+        timeout: int | None = None,
     ) -> ToolResult:
         print(f"  [review-loop] Starte iterativen Review/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
@@ -92,6 +96,9 @@ class ReviewLoopTool(BaseTool):
         seen_signatures: set[tuple[str, ...]] = set()
         all_outputs: list[str] = []
 
+        review_timeout = timeout or TOOL_REVIEW_TIMEOUT_SEC
+        fix_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
+
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: REVIEW ===")
 
@@ -99,7 +106,7 @@ class ReviewLoopTool(BaseTool):
             review_result = provider.run(
                 review_prompt,
                 cwd=cwd,
-                timeout=TOOL_REVIEW_TIMEOUT_SEC,
+                timeout=review_timeout,
             )
 
             if not review_result.success:
@@ -111,6 +118,8 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    error_code=review_result.error,
+                    retryable=True,
                 )
 
             all_outputs.append(f"--- Review {iteration} ---\n{review_result.output}")
@@ -175,7 +184,7 @@ class ReviewLoopTool(BaseTool):
             fix_result = provider.run(
                 fix_prompt,
                 cwd=cwd,
-                timeout=TOOL_FIX_TIMEOUT_SEC,
+                timeout=fix_timeout,
             )
 
             if not fix_result.success:
@@ -187,6 +196,8 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    error_code=fix_result.error,
+                    retryable=True,
                 )
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")

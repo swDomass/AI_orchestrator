@@ -6,6 +6,7 @@ Usage in queue:
     - [ ] pytest tests/ bis alles grün #tool:test-loop cwd:/d/programmieren/projekt
 """
 
+import re
 import time
 
 from config import SAFETY_RULES, TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC
@@ -39,7 +40,7 @@ Test failures:
 {failures}
 """
 
-# Patterns that indicate failure (checked first — takes priority over pass patterns)
+# Patterns that indicate failure when no explicit green summary is detected
 FAIL_PATTERNS = [
     "FAILED",
     "failed",
@@ -48,10 +49,10 @@ FAIL_PATTERNS = [
     "FAILURES",
 ]
 
-# Regex patterns for pass detection to avoid substring false positives
-# e.g. "OK" matching inside "token", "passed" is safe since "failed" is checked first
-import re
+# Regex patterns for pass/fail detection to avoid substring false positives
 _PYTEST_PASSED_RE = re.compile(r"\d+\s+passed")
+_PYTEST_NONZERO_FAILED_RE = re.compile(r"\b[1-9]\d*\s+failed\b", re.IGNORECASE)
+_PYTEST_NONZERO_ERRORS_RE = re.compile(r"\b[1-9]\d*\s+errors?\b", re.IGNORECASE)
 _UNITTEST_OK_RE = re.compile(r"^OK\b", re.MULTILINE)
 
 
@@ -65,15 +66,16 @@ def _tests_passed(output: str) -> bool:
     if any(p in lower for p in ("no tests ran", "collected 0 items", "ran 0 tests")):
         return False
 
-    has_fail = any(p.lower() in lower for p in FAIL_PATTERNS)
-    if has_fail:
-        return False
-
-    # Use regex to avoid false positives (e.g. "OK" matching inside "token")
     if _PYTEST_PASSED_RE.search(output):
+        if _PYTEST_NONZERO_FAILED_RE.search(output) or _PYTEST_NONZERO_ERRORS_RE.search(output):
+            return False
         return True
     if _UNITTEST_OK_RE.search(output):
         return True
+
+    has_fail = any(p.lower() in lower for p in FAIL_PATTERNS)
+    if has_fail:
+        return False
 
     return False
 
@@ -87,6 +89,7 @@ class TestLoopTool(BaseTool):
         task: str,
         provider: BaseProvider,
         cwd: str | None = None,
+        timeout: int | None = None,
     ) -> ToolResult:
         print(f"  [test-loop] Starte iterativen Test/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
@@ -94,13 +97,15 @@ class TestLoopTool(BaseTool):
         all_outputs: list[str] = []
         last_failures: str = ""
 
+        step_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
+
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [test-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: TESTS ===")
 
             test_result = provider.run(
                 test_prompt,
                 cwd=cwd,
-                timeout=TOOL_FIX_TIMEOUT_SEC,
+                timeout=step_timeout,
             )
 
             if not test_result.success:
@@ -108,7 +113,8 @@ class TestLoopTool(BaseTool):
                 print(f"  [test-loop] {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
-                                  iterations=iteration, error=msg)
+                                  iterations=iteration, error=msg,
+                                  error_code=test_result.error, retryable=True)
 
             all_outputs.append(f"--- Test Run {iteration} ---\n{test_result.output}")
 
@@ -135,14 +141,15 @@ class TestLoopTool(BaseTool):
                                  "Fixing test failures...")
 
             fix_prompt = _FIX_PROMPT.format(iteration=iteration, failures=test_result.output)
-            fix_result = provider.run(fix_prompt, cwd=cwd, timeout=TOOL_FIX_TIMEOUT_SEC)
+            fix_result = provider.run(fix_prompt, cwd=cwd, timeout=step_timeout)
 
             if not fix_result.success:
                 msg = f"Fix fehlgeschlagen: {fix_result.error}"
                 print(f"  [test-loop] {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
-                                  iterations=iteration, error=msg)
+                                  iterations=iteration, error=msg,
+                                  error_code=fix_result.error, retryable=True)
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
             time.sleep(2)

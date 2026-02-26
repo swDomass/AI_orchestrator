@@ -20,7 +20,9 @@ Task format in agent-queue.md:
 """
 
 import argparse
+from dataclasses import dataclass
 import os
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -37,9 +39,9 @@ from config import (
     GIT_AUTO_STASH,
     MAX_RETRIES_PER_PROVIDER,
     SLEEP_POLL_INTERVAL,
-    SYSTEM_PROMPTS,
     TASK_TIMEOUT_SEC,
     TRACK_FILE_CHANGES,
+    get_system_prompt,
 )
 from dispatcher import select_provider, earliest_cooldown_reset
 from limits import get_limits, AllLimits
@@ -51,16 +53,20 @@ from notifier import (
     start_session,
 )
 from providers.base import RunResult
+from skills import load_skill, check_requirements
+from config import VAULT_PATH
 from queue_manager import (
     append_log,
-    append_result,
     ensure_queue_file,
     extract_cwd,
     extract_timeout,
+    finalize_task_with_result,
+    has_cwd_tag,
     inject_file_context,
     mark_done,
     mark_retry,
     read_queue,
+    read_queue_items,
     strip_metadata_tags,
 )
 from telegram_listener import TelegramListener
@@ -96,15 +102,18 @@ def _get_next_retry_sec(limits: AllLimits) -> int:
 
 
 def _snapshot_dir(cwd: str) -> dict[str, tuple[float, int]]:
-    """Walk top-level files (1 level deep) and record {filename: (mtime, size)}."""
+    """Recursively snapshot files as {relative_path: (mtime, size)}."""
     snapshot: dict[str, tuple[float, int]] = {}
     try:
-        for entry in os.scandir(cwd):
-            try:
-                stat = entry.stat()
-                snapshot[entry.name] = (stat.st_mtime, stat.st_size)
-            except OSError:
-                pass
+        for root, _dirs, files in os.walk(cwd):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    stat = os.stat(path)
+                    rel = os.path.relpath(path, cwd)
+                    snapshot[rel] = (stat.st_mtime, stat.st_size)
+                except OSError:
+                    pass
     except OSError:
         pass
     return snapshot
@@ -184,17 +193,30 @@ def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
 
 
 def _git_diff_summary(cwd: str) -> str:
-    """Get git diff --stat summary for the working directory."""
+    """Get a git change summary including untracked files."""
+    parts: list[str] = []
     try:
-        result = subprocess.run(
+        tracked = subprocess.run(
             ["git", "diff", "HEAD", "--stat"],
             cwd=cwd, capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+        if tracked.returncode == 0 and tracked.stdout.strip():
+            parts.append(tracked.stdout.strip())
+
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+        if untracked.returncode == 0 and untracked.stdout.strip():
+            files = [line.strip() for line in untracked.stdout.splitlines() if line.strip()]
+            if files:
+                preview = ", ".join(files[:10])
+                if len(files) > 10:
+                    preview += f", ... (+{len(files) - 10} mehr)"
+                parts.append(f"Untracked ({len(files)}): {preview}")
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return ""
+    return "\n".join(parts)
 
 
 def _get_change_summary(cwd: str | None, snap_before: dict | None, is_git: bool = False) -> str:
@@ -220,7 +242,7 @@ def _build_prompt(task: str, provider_name: str) -> str:
     clean_task = strip_metadata_tags(task)
     clean = inject_file_context(clean_task)
 
-    system = SYSTEM_PROMPTS.get(provider_name, "")
+    system = get_system_prompt(provider_name)
     if system:
         return f"{system}\n\n{clean}"
     return clean
@@ -264,14 +286,90 @@ def _run_with_retry(
     return result, True
 
 
-def _execute_tool_task(task: str, tool_name: str, provider, cwd: str | None) -> bool:
-    """Execute a tool-based task (iterative loop). Returns True on success."""
+@dataclass
+class ToolTaskExecutionOutcome:
+    success: bool
+    finalized: bool
+    retryable: bool = False
+    error: str = ""
+    error_code: str = ""
+
+
+
+def _mark_done_checked(task: str, provider: str, *, queue_line_no: int | None = None) -> bool:
+    """Mark task done and return False if queue mutation failed."""
+    if mark_done(task, provider, line_no=queue_line_no):
+        return True
+    msg = "Queue-Update fehlgeschlagen: Task konnte nicht als erledigt markiert werden"
+    print(f"  ❌ {msg}")
+    append_log(msg)
+    notify_error(task, provider, msg)
+    return False
+
+
+def _finalize_task_with_result_checked(
+    task: str,
+    result: str,
+    provider: str,
+    *,
+    queue_line_no: int | None = None,
+) -> bool:
+    """Atomically persist result + done status and return False on queue mutation failure."""
+    if finalize_task_with_result(task, result, provider, line_no=queue_line_no):
+        return True
+    msg = "Queue-Update fehlgeschlagen: Ergebnis+Status konnten nicht atomar persistiert werden"
+    print(f"  ❌ {msg}")
+    append_log(msg)
+    notify_error(task, provider, msg)
+    return False
+
+
+def _mark_retry_checked(
+    task: str,
+    retry_at: str,
+    provider: str = "queue",
+    *,
+    queue_line_no: int | None = None,
+) -> bool:
+    """Mark task for retry and return False if queue mutation failed."""
+    if mark_retry(task, retry_at, line_no=queue_line_no):
+        return True
+    msg = f"Queue-Update fehlgeschlagen: Task konnte nicht für Retry ({retry_at}) markiert werden"
+    print(f"  ❌ {msg}")
+    append_log(msg)
+    notify_error(task, provider, msg)
+    return False
+
+
+def _execute_tool_task(
+    task: str,
+    tool_name: str,
+    provider,
+    cwd: str | None,
+    timeout: int | None = None,
+    queue_line_no: int | None = None,
+) -> ToolTaskExecutionOutcome:
+    """Execute a tool-based task and report whether the queue item was finalized."""
     tool = get_tool(tool_name)
     if not tool:
+        msg = f"Tool nicht gefunden: {tool_name}"
         print(f"  ❌ Unbekanntes Tool: {tool_name}")
         append_log(f"Unbekanntes Tool: {tool_name}")
-        notify_error(task, provider.name, f"Tool nicht gefunden: {tool_name}")
-        return False
+        notify_error(task, provider.name if provider else "unknown", msg)
+        finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+        return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
+
+    # Gating check: verify skill requirements are met
+    skill = load_skill(tool_name, cwd=Path(cwd) if cwd else None, vault_path=VAULT_PATH)
+    if skill:
+        available, reasons = check_requirements(skill)
+        if not available:
+            msg = f"Skill '{tool_name}' Anforderungen nicht erfüllt: {'; '.join(reasons)}"
+            print(f"  ❌ {msg}")
+            append_log(msg)
+            notify_error(task, provider.name, msg)
+            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+            return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
 
     # Safety: snapshot before execution
     is_git = bool(cwd) and _is_git_repo(cwd)
@@ -281,7 +379,7 @@ def _execute_tool_task(task: str, tool_name: str, provider, cwd: str | None) -> 
 
     print(f"  → Tool: {tool.name} ({tool.description})")
     clean_task = strip_metadata_tags(task)
-    tool_result = tool.run(clean_task, provider, cwd=cwd)
+    tool_result = tool.run(clean_task, provider, cwd=cwd, timeout=timeout)
 
     # Safety: build change summary
     change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
@@ -292,19 +390,53 @@ def _execute_tool_task(task: str, tool_name: str, provider, cwd: str | None) -> 
 
     if tool_result.success:
         print(f"  ✅ Tool erledigt ({tool_result.iterations} Iteration(en))")
-        mark_done(task, provider_tool)
-        append_result(task, tool_result.output, provider_tool)
+        if not _finalize_task_with_result_checked(
+            task,
+            tool_result.output,
+            provider_tool,
+            queue_line_no=queue_line_no,
+        ):
+            return ToolTaskExecutionOutcome(
+                success=False,
+                finalized=False,
+                error="queue_update_failed",
+            )
         append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
         notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
-        return True
+        return ToolTaskExecutionOutcome(success=True, finalized=True)
     else:
         print(f"  ⚠️ Tool beendet: {tool_result.error}")
-        append_result(task, tool_result.output, provider_tool)
+        if tool_result.retryable:
+            append_log(f"Tool {tool.name} transienter Fehler via {provider.name}: {tool_result.error}")
+            notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
+            return ToolTaskExecutionOutcome(
+                success=False,
+                finalized=False,
+                retryable=True,
+                error=tool_result.error,
+                error_code=tool_result.error_code or tool_result.error,
+            )
+
+        if not _finalize_task_with_result_checked(
+            task,
+            tool_result.output,
+            provider_tool,
+            queue_line_no=queue_line_no,
+        ):
+            return ToolTaskExecutionOutcome(
+                success=False,
+                finalized=False,
+                error="queue_update_failed",
+                error_code=tool_result.error_code,
+            )
         append_log(f"Tool {tool.name} Fehler: {tool_result.error}")
         notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
-        # Mark done even on failure (to prevent infinite retries of broken tools)
-        mark_done(task, provider_tool)
-        return False
+        return ToolTaskExecutionOutcome(
+            success=False,
+            finalized=True,
+            error=tool_result.error,
+            error_code=tool_result.error_code,
+        )
 
 
 def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) -> bool:
@@ -312,27 +444,41 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
     Process all open tasks in the queue once.
     Returns True if all tasks were completed, False if stopped early.
     """
-    tasks = read_queue()
-    if not tasks:
+    task_items = read_queue_items()
+    if not task_items:
         print("Queue leer - nichts zu tun.")
         return True
 
     print(f"\n{'='*60}")
-    print(f"Queue: {len(tasks)} offene Task(s)")
+    print(f"Queue: {len(task_items)} offene Task(s)")
     print(f"{'='*60}")
 
-    for i, task in enumerate(tasks, 1):
+    for i, queue_task in enumerate(task_items, 1):
         if pause_event and pause_event.is_set():
             print("\n[pause] Queue-Verarbeitung pausiert.")
             append_log("Queue-Verarbeitung pausiert")
             return False
 
-        print(f"\n[{i}/{len(tasks)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
+        task = queue_task.task_text
+        print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
 
         # Extract task metadata
+        cwd_tag_present = has_cwd_tag(task)
         cwd = extract_cwd(task)
         timeout = extract_timeout(task, default=TASK_TIMEOUT_SEC)
+        tool_timeout = extract_timeout(task, default=0) or None
         tool_name = extract_tool_tag(task)
+
+        if cwd_tag_present and cwd is None:
+            msg = "Ungültiges cwd:-Tag (Verzeichnis fehlt oder ist nicht erlaubt) - Task wird nicht ausgeführt"
+            print(f"  ❌ {msg}")
+            if dry_run:
+                continue
+            append_log(msg)
+            notify_error(task, "queue", msg)
+            if not _mark_done_checked(task, "invalid-cwd", queue_line_no=queue_task.line_no):
+                return False
+            continue
 
         if cwd:
             print(f"  [cwd] {cwd}")
@@ -357,18 +503,47 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
         # Tool-based task (iterative loop)
         if tool_name:
-            provider = select_provider(task, limits)
-            if provider is None:
-                earliest = _get_next_retry_sec(limits)
-                reset_at = (datetime.now() + timedelta(seconds=earliest)).strftime("%H:%M")
-                msg = f"Alle Provider voll/unreachable → Task wartet bis ~{reset_at}"
-                print(f"  {msg}")
-                append_log(msg)
-                mark_retry(task, reset_at)
-                notify_providers_exhausted(fmt_time(earliest))
-                return False
-            print(f"  → Provider: {provider.name}")
-            _execute_tool_task(task, tool_name, provider, cwd)
+            tried_providers: set[str] = set()
+            while True:
+                provider = select_provider(task, limits, exclude=tried_providers)
+                if provider is None:
+                    earliest = _get_next_retry_sec(limits)
+                    reset_dt = datetime.now() + timedelta(seconds=earliest)
+                    reset_at_display = reset_dt.strftime("%H:%M")
+                    reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                    msg = f"Alle Provider voll/unreachable → Task wartet bis ~{reset_at_display}"
+                    print(f"  {msg}")
+                    append_log(msg)
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                        return False
+                    notify_providers_exhausted(fmt_time(earliest))
+                    return False
+
+                print(f"  → Provider: {provider.name}")
+                outcome = _execute_tool_task(
+                    task,
+                    tool_name,
+                    provider,
+                    cwd,
+                    timeout=tool_timeout,
+                    queue_line_no=queue_task.line_no,
+                )
+
+                if outcome.success or outcome.finalized:
+                    break
+
+                if not outcome.retryable:
+                    print("  ❌ Tool-Task nicht finalisiert (Queue-Update-Fehler). Task bleibt offen.")
+                    append_log("Tool-Task nicht finalisiert wegen Queue-Update-Fehler")
+                    return False
+
+                tried_providers.add(provider.name)
+                if outcome.error_code == "unreachable":
+                    provider.set_cooldown()
+                elif outcome.error_code not in ("rate_limit", ""):
+                    provider.set_cooldown(5 * 60)
+
+                print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
             continue
 
         # Safety: snapshot before execution
@@ -390,11 +565,14 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if provider is None:
                 if not tried_providers:
                     earliest = _get_next_retry_sec(limits)
-                    reset_at = (datetime.now() + timedelta(seconds=earliest)).strftime("%H:%M")
-                    msg = f"Alle Provider voll/unreachable → Task wartet bis ~{reset_at}"
+                    reset_dt = datetime.now() + timedelta(seconds=earliest)
+                    reset_at_display = reset_dt.strftime("%H:%M")
+                    reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                    msg = f"Alle Provider voll/unreachable → Task wartet bis ~{reset_at_display}"
                     print(f"  {msg}")
                     append_log(msg)
-                    mark_retry(task, reset_at)
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                        return False
                     notify_providers_exhausted(fmt_time(earliest))
                     return False
 
@@ -418,8 +596,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
                 if change_summary:
                     print(f"  [safety] Änderungen:\n{change_summary}")
-                mark_done(task, provider.name)
-                append_result(task, result.output, provider.name)
+                if not _finalize_task_with_result_checked(
+                    task,
+                    result.output,
+                    provider.name,
+                    queue_line_no=queue_task.line_no,
+                ):
+                    return False
                 append_log(f"Task erledigt via {provider.name}: {task[:60]}")
                 notify_task_done(task, provider.name, result.output, change_summary=change_summary)
                 break
@@ -463,6 +646,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
 def run_watch(dry_run: bool = False) -> None:
     """Continuously process queue, sleeping when all providers are exhausted."""
+    from doctor import run_startup_checks
+    if not run_startup_checks():
+        print("CRITICAL: Startup checks failed. Run --doctor to see details.")
+        sys.exit(1)
+
     print("Orchestrator gestartet (--watch Modus). Ctrl+C zum Beenden.")
     append_log("Orchestrator gestartet (watch)")
     start_session()
@@ -540,7 +728,17 @@ def main() -> None:
                         help="Validiert Tasks ohne auszuführen")
     parser.add_argument("--list-tools", action="store_true",
                         help="Zeigt verfügbare Tools")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Validiert das gesamte Setup")
+    parser.add_argument("--fix", action="store_true",
+                        help="Auto-fixe Probleme (mit --doctor)")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Nicht-interaktiver Fix (mit --doctor --fix)")
     args = parser.parse_args()
+
+    if args.doctor:
+        from doctor import run_doctor
+        sys.exit(0 if run_doctor(fix=args.fix, yes=args.yes) else 1)
 
     ensure_queue_file()
 

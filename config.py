@@ -1,5 +1,14 @@
 import os
+import re
 from pathlib import Path
+
+
+def _normalize_dotenv_value(value: str) -> str:
+    """Strip surrounding quotes from .env values (supports trailing comments)."""
+    m = re.match(r'^(["\'])(.*)\1(?:\s+#.*)?$', value)
+    if m:
+        return m.group(2)
+    return value
 
 
 def _load_dotenv() -> None:
@@ -16,7 +25,7 @@ def _load_dotenv() -> None:
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
-            value = value.strip()
+            value = _normalize_dotenv_value(value.strip())
             # Only set if not already defined (real env vars take precedence)
             if key not in os.environ:
                 os.environ[key] = value
@@ -124,3 +133,72 @@ TOOL_FIX_TIMEOUT_SEC = 40 * 60     # 40 min per fix
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3
+
+# --- SOUL.md (Personality-as-Config) ---
+_soul_cache: dict[str, str] | None = None
+_soul_mtime: float = 0.0
+
+
+def _parse_soul_sections(content: str) -> dict[str, str]:
+    """Parse SOUL.md into sections keyed by 'base' and provider names."""
+    sections: dict[str, str] = {}
+
+    # Split by ### <ProviderName> headings
+    parts = re.split(r"^###\s+(\w+)\s*$", content, flags=re.MULTILINE)
+
+    # parts[0] is everything before the first ### heading
+    # Followed by alternating: heading, content, heading, content, ...
+    base_text = parts[0]
+
+    # Extract ## Base section from the preamble
+    base_match = re.search(r"^##\s+Base\s*\n(.*?)(?=^##|\Z)", base_text, re.MULTILINE | re.DOTALL)
+    if base_match:
+        sections["base"] = base_match.group(1).strip()
+    else:
+        sections["base"] = base_text.strip()
+
+    # Parse provider-specific sections
+    # re.split with a capturing group produces [before, g1, c1, g2, c2, ...].
+    # Step by 2 starting at index 1 to visit all (heading, content) pairs.
+    for i in range(1, len(parts), 2):
+        provider_name = parts[i].strip().lower()
+        provider_content = parts[i + 1].strip()
+        # Strip HTML comments
+        provider_content = re.sub(r"<!--.*?-->", "", provider_content, flags=re.DOTALL).strip()
+        if provider_content:
+            sections[provider_name] = provider_content
+
+    return sections
+
+
+def load_soul() -> dict[str, str]:
+    """Load SOUL.md from vault. Returns {'base': ..., 'claude': ..., ...}.
+    Falls back to empty dict (use hardcoded SYSTEM_PROMPTS) if file missing."""
+    global _soul_cache, _soul_mtime
+
+    soul_file = VAULT_PATH / "99_System" / "AI" / "SOUL.md"
+    if not soul_file.exists():
+        return {}
+
+    try:
+        mtime = soul_file.stat().st_mtime
+        if _soul_cache is not None and mtime == _soul_mtime:
+            return _soul_cache
+
+        content = soul_file.read_text(encoding="utf-8")
+        sections = _parse_soul_sections(content)
+        _soul_cache = sections
+        _soul_mtime = mtime
+        return sections
+    except Exception:
+        return {}
+
+
+def get_system_prompt(provider_name: str) -> str:
+    """Get assembled system prompt for provider. Falls back to hardcoded SYSTEM_PROMPTS."""
+    soul = load_soul()
+    if not soul:
+        return SYSTEM_PROMPTS.get(provider_name, "")
+    base = soul.get("base", "")
+    override = soul.get(provider_name.lower(), "")
+    return f"{base}\n\n{override}".strip() if override else base

@@ -1,0 +1,22 @@
+import os
+
+import config
+
+
+def test_load_dotenv_strips_surrounding_quotes(monkeypatch, tmp_path):
+    env_dir = tmp_path / "cfg"
+    env_dir.mkdir()
+    (env_dir / ".env").write_text(
+        'ORCH_VAULT_PATH="D:\\path with spaces"\n'
+        "ORCH_QUEUE_FILE='D:\\queue\\agent-queue.md'\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("ORCH_VAULT_PATH", raising=False)
+    monkeypatch.delenv("ORCH_QUEUE_FILE", raising=False)
+    monkeypatch.setattr(config, "__file__", str(env_dir / "config.py"))
+
+    config._load_dotenv()
+
+    assert os.environ["ORCH_VAULT_PATH"] == r"D:\path with spaces"
+    assert os.environ["ORCH_QUEUE_FILE"] == r"D:\queue\agent-queue.md"

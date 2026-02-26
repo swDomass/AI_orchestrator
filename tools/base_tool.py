@@ -16,6 +16,8 @@ class ToolResult:
     output: str = ""
     iterations: int = 0
     error: str = ""
+    error_code: str = ""
+    retryable: bool = False
 
 
 class BaseTool(ABC):
@@ -28,6 +30,7 @@ class BaseTool(ABC):
         task: str,
         provider: BaseProvider,
         cwd: str | None = None,
+        timeout: int | None = None,
     ) -> ToolResult:
         """Execute the tool workflow. Returns a ToolResult."""
         ...

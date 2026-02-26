@@ -165,7 +165,10 @@ class TelegramListener:
                 offset = update["update_id"] + 1
                 msg = update.get("message")
                 if msg:
-                    self._handle_message(msg)
+                    try:
+                        self._handle_message(msg)
+                    except Exception as e:
+                        logger.error("Unhandled error while processing Telegram message: %s", e, exc_info=True)
 
     def _sync_to_latest_offset(self) -> int | None:
         """Drop pending backlog once on startup so only new commands are processed."""
@@ -263,7 +266,8 @@ class TelegramListener:
                 reset = f" (reset ~{_fmt_time(lim.resets_in_sec)})" if lim.resets_in_sec else ""
                 lines.append(f"  {name}: {status}{reset}")
             else:
-                lines.append(f"  {name}: ❌ {lim.error or 'nicht verfügbar'}")
+                err = _escape_telegram_markdown(lim.error or "nicht verfügbar")
+                lines.append(f"  {name}: ❌ {err}")
 
         paused = " ⏸️ PAUSIERT" if self._pause_event.is_set() else ""
         lines.append(f"\nOrchestrator: {'läuft' + paused}")
@@ -278,7 +282,8 @@ class TelegramListener:
                 reset = f", reset in {_fmt_time(lim.resets_in_sec)}" if lim.resets_in_sec else ""
                 lines.append(f"  {name}: {lim.remaining_pct:.1f}% remaining{reset}")
             else:
-                lines.append(f"  {name}: ❌ {lim.error or 'nicht verfügbar'}")
+                err = _escape_telegram_markdown(lim.error or "nicht verfügbar")
+                lines.append(f"  {name}: ❌ {err}")
         send_message("\n".join(lines))
 
     def _cmd_pause(self) -> None:
@@ -306,7 +311,10 @@ class TelegramListener:
         if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in task_text):
             send_message("❌ Task enthält ungültige Zeichen.")
             return
-        append_task(task_text)
+        if not append_task(task_text):
+            send_message("❌ Task konnte nicht zur Queue hinzugefügt werden (Schreibfehler).")
+            logger.error("Task konnte nicht gespeichert werden: %s", task_text[:60])
+            return
         safe = task_text[:100].replace("`", "'")
         send_message(f"✅ Task zur Queue hinzugefügt:\n`{safe}`")
         logger.info("Task hinzugefügt: %s", task_text[:60])
@@ -351,39 +359,25 @@ class TelegramListener:
                 logger.info("Versuche Provider: %s", provider.name)
                 send_message(f"⏳ Frage {provider.name}...")
 
-                # Run provider in a thread so we can send a "thinking" notification
-                result_holder: list = []
-                error_holder: list = []
+                # Send a delayed "thinking" notification without offloading provider.run
+                # to another worker thread. This keeps the semaphore tied to actual work
+                # and avoids orphaned provider worker threads on timeout/hangs.
+                provider_done = threading.Event()
 
-                def _run_provider():
-                    try:
-                        result_holder.append(provider.run(text, timeout=TELEGRAM_CHAT_TIMEOUT_SEC))
-                    except Exception as exc:
-                        error_holder.append(exc)
-
-                worker = threading.Thread(target=_run_provider, daemon=True)
-                worker.start()
-
-                # Phase 1: wait THINKING_SEC, send notification if still running
-                worker.join(timeout=TELEGRAM_CHAT_THINKING_SEC)
-                if worker.is_alive():
-                    logger.info("%s denkt noch nach (>%ds)", provider.name, TELEGRAM_CHAT_THINKING_SEC)
+                def _send_thinking_if_pending() -> None:
+                    if provider_done.is_set():
+                        return
+                    logger.info("%s denkt noch nach (>%ss)", provider.name, TELEGRAM_CHAT_THINKING_SEC)
                     send_message(f"⏳ {provider.name} denkt noch nach...")
-                    # Phase 2: wait for remaining time
-                    remaining = TELEGRAM_CHAT_TIMEOUT_SEC - TELEGRAM_CHAT_THINKING_SEC
-                    worker.join(timeout=max(0, remaining))
 
-                if worker.is_alive():
-                    logger.warning("%s Timeout nach %ds", provider.name, TELEGRAM_CHAT_TIMEOUT_SEC)
-                    # Thread is stuck — we can't kill it, but we move on to next provider
-                    err = _escape_telegram_markdown("Timeout")
-                    send_message(f"⚠️ {provider.name} fehlgeschlagen: {err} – versuche anderen Provider...")
-                    continue
-
-                if error_holder:
-                    raise error_holder[0]
-
-                result = result_holder[0]
+                thinking_timer = threading.Timer(max(0, TELEGRAM_CHAT_THINKING_SEC), _send_thinking_if_pending)
+                thinking_timer.daemon = True
+                thinking_timer.start()
+                try:
+                    result = provider.run(text, timeout=TELEGRAM_CHAT_TIMEOUT_SEC)
+                finally:
+                    provider_done.set()
+                    thinking_timer.cancel()
 
                 if result.success:
                     logger.info("Antwort von %s erhalten (%d Zeichen)", provider.name, len(result.output))
@@ -394,8 +388,14 @@ class TelegramListener:
                     send_message(f"{header}{reply}")
                     return
                 else:
-                    logger.warning("%s fehlgeschlagen: %s", provider.name, result.error)
-                    err = _escape_telegram_markdown(str(result.error))
+                    error = str(result.error)
+                    if error == "unreachable":
+                        provider.set_cooldown()
+                    elif error != "rate_limit":
+                        provider.set_cooldown(5 * 60)
+
+                    logger.warning("%s fehlgeschlagen: %s", provider.name, error)
+                    err = _escape_telegram_markdown(error)
                     send_message(f"⚠️ {provider.name} fehlgeschlagen: {err} – versuche anderen Provider...")
         except Exception as e:
             logger.error("Interner Fehler bei Chat-Verarbeitung: %s", e, exc_info=True)

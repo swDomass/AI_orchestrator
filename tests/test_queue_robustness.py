@@ -86,3 +86,30 @@ def test_retry_is_not_due_across_midnight():
     assert queue_manager._retry_is_due("23:45", now=now) is True
     assert queue_manager._retry_is_due("00:15", now=now) is False
 
+
+def test_retry_is_due_with_absolute_timestamp_across_day_boundary():
+    now = queue_manager.datetime(2026, 2, 25, 3, 0)
+
+    assert queue_manager._retry_is_due("2026-02-24 14:00", now=now) is True
+    assert queue_manager._retry_is_due("2026-02-25 14:00", now=now) is False
+
+
+def test_read_queue_retry_filtering_with_absolute_retry_markers(mock_queue_file):
+    from datetime import datetime, timedelta
+
+    now = datetime.now().replace(second=0, microsecond=0)
+    future_time = (now + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+    past_time = (now - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+
+    content = f"""
+## Queue
+- [ ] Task Future <!-- retry: {future_time} -->
+- [ ] Task Past <!-- retry: {past_time} -->
+"""
+    mock_queue_file.write_text(content, encoding="utf-8")
+
+    tasks = read_queue()
+
+    assert "Task Past" in tasks
+    assert "Task Future" not in tasks
+

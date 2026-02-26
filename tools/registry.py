@@ -27,7 +27,7 @@ def get_tool(name: str) -> BaseTool | None:
 
 
 def list_tools() -> dict[str, str]:
-    """Return dict of tool_name → description."""
+    """Return executable #tool handlers (matches get_tool/_execute_tool_task behavior)."""
     return {name: tool.description for name, tool in _TOOLS.items()}
 
 

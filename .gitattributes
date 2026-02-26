@@ -1,0 +1,9 @@
+# Normalize all text files to LF in the repository
+* text=auto eol=lf
+
+# Explicitly binary files — no line-ending conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.pdf binary

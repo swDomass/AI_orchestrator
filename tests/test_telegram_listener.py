@@ -108,6 +108,7 @@ def test_help_reply_mentions_all_commands(mock_send):
 @patch("telegram_listener.send_message")
 @patch("telegram_listener.append_task")
 def test_task_adds_single_line_task_to_queue(mock_append_task, mock_send):
+    mock_append_task.return_value = True
     listener, _ = _make_listener()
     listener._handle_message(_msg("/task Fixe den Bug im Parser"))
 
@@ -126,6 +127,18 @@ def test_task_rejects_multiline_payload(mock_append_task, mock_send):
     mock_append_task.assert_not_called()
     sent_texts = [c[0][0] for c in mock_send.call_args_list]
     assert any("einzeilig" in t for t in sent_texts)
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.append_task", return_value=False)
+def test_task_reports_queue_write_failure(_mock_append_task, mock_send):
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/task Persistiere diesen Task"))
+
+    sent_texts = [c[0][0] for c in mock_send.call_args_list]
+    assert any("konnte nicht" in t.lower() for t in sent_texts)
+    assert not any(t.startswith("✅ Task zur Queue hinzugefügt") for t in sent_texts)
 
 
 @patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
@@ -374,6 +387,43 @@ def test_chat_provider_run_failure_sends_error_reply(mock_select, mock_limits, m
 @patch("telegram_listener.send_message")
 @patch("telegram_listener.get_limits")
 @patch("telegram_listener.select_provider")
+def test_chat_unreachable_failure_sets_provider_cooldown_before_retry(mock_select, mock_limits, mock_send):
+    failing = _fake_provider(name="claude", success=False, output="unreachable")
+    succeeding = _fake_provider(name="gemini", output="ok")
+    mock_select.side_effect = [failing, succeeding]
+    mock_limits.return_value = _fake_limits()
+
+    listener, _ = _make_listener()
+    listener._handle_chat("test")
+
+    failing.set_cooldown.assert_called_once_with()
+    succeeding.set_cooldown.assert_not_called()
+    texts = [c[0][0] for c in mock_send.call_args_list]
+    assert any("fehlgeschlagen" in t for t in texts)
+    assert any("gemini" in t for t in texts)
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.get_limits")
+@patch("telegram_listener.select_provider")
+def test_chat_generic_failure_sets_short_provider_cooldown_before_retry(mock_select, mock_limits, mock_send):
+    failing = _fake_provider(name="claude", success=False, output="boom")
+    succeeding = _fake_provider(name="codex", output="ok")
+    mock_select.side_effect = [failing, succeeding]
+    mock_limits.return_value = _fake_limits()
+
+    listener, _ = _make_listener()
+    listener._handle_chat("test")
+
+    failing.set_cooldown.assert_called_once_with(5 * 60)
+    succeeding.set_cooldown.assert_not_called()
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.get_limits")
+@patch("telegram_listener.select_provider")
 def test_chat_defensive_guard_stops_repeated_provider_selection(mock_select, mock_limits, mock_send):
     """
     If select_provider ignores the exclude set and returns the same provider again,
@@ -406,6 +456,43 @@ def test_chat_exception_in_provider_sends_error_reply(mock_select, mock_limits, 
 
     last_text = mock_send.call_args[0][0]
     assert "❌" in last_text
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.get_limits")
+@patch("telegram_listener.select_provider")
+def test_chat_timeout_does_not_bypass_semaphore_with_blocked_provider(mock_select, mock_limits, mock_send):
+    provider = MagicMock()
+    provider.name = "claude"
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_run(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=1)
+        return RunResult(success=True, output="fertig", error="")
+
+    provider.run.side_effect = _blocking_run
+    mock_select.return_value = provider
+    mock_limits.return_value = _fake_limits()
+
+    with (
+        patch("telegram_listener.TELEGRAM_CHAT_THINKING_SEC", 0),
+        patch("telegram_listener.TELEGRAM_CHAT_TIMEOUT_SEC", 0.01),
+    ):
+        listener, _ = _make_listener()
+        t = threading.Thread(target=listener._handle_chat, args=("erste",), daemon=True)
+        t.start()
+        assert started.wait(timeout=0.2), "provider.run wurde nicht gestartet"
+        time.sleep(0.03)  # > patched timeout; old fallback logic would have released the semaphore
+
+        listener._handle_chat("zweite")
+        release.set()
+        t.join(timeout=1)
+
+    texts = [c[0][0] for c in mock_send.call_args_list]
+    assert any("warten" in t.lower() or "läuft" in t.lower() for t in texts), texts
 
 
 # ---------------------------------------------------------------------------
@@ -541,3 +628,26 @@ def test_start_is_noop_when_telegram_disabled():
     listener, _ = _make_listener()
     listener.start()
     assert not listener._thread.is_alive()
+
+
+def test_poll_loop_survives_unhandled_message_exception():
+    listener, _ = _make_listener()
+    calls = {"count": 0}
+
+    def fake_api_get(_method, _params):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"ok": True, "result": [{"update_id": 1, "message": _msg("/help")}]}
+        listener._stop_event.set()
+        return {"ok": True, "result": []}
+
+    with (
+        patch.object(listener, "_sync_to_latest_offset", return_value=0),
+        patch.object(listener, "_handle_message", side_effect=RuntimeError("boom")),
+        patch("telegram_listener._api_get", side_effect=fake_api_get),
+        patch("telegram_listener.logger") as mock_logger,
+    ):
+        listener._poll_loop()
+
+    assert calls["count"] >= 2
+    mock_logger.error.assert_called()

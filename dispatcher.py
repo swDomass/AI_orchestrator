@@ -11,6 +11,8 @@ A provider is skipped if:
   - It is in cooldown (unreachable / error within last 30 min)
 """
 
+import re
+
 from limits import AllLimits
 from providers.base import BaseProvider
 from providers import ClaudeProvider, GeminiProvider, CodexProvider
@@ -20,6 +22,11 @@ _TAG_MAP = {
     "#claude": "claude",
     "#gemini": "gemini",
     "#codex": "codex",
+}
+
+_TAG_RE_BY_PROVIDER = {
+    tag: re.compile(rf"(?<!\S){re.escape(tag)}(?![\w-])")
+    for tag in _TAG_MAP
 }
 
 # Singleton provider instances (carry cooldown state across calls)
@@ -43,8 +50,9 @@ def select_provider(task: str, limits: AllLimits, exclude: set[str] | None = Non
     If the task contains a #provider tag, that provider is tried first.
     """
     # Check for explicit provider tag
+    task_lower = task.lower()
     forced = next(
-        (_providers[v] for tag, v in _TAG_MAP.items() if tag in task.lower()),
+        (_providers[v] for tag, v in _TAG_MAP.items() if _TAG_RE_BY_PROVIDER[tag].search(task_lower)),
         None
     )
 
@@ -84,4 +92,3 @@ def earliest_cooldown_reset() -> int | None:
     if not times:
         return None
     return min(times)
-

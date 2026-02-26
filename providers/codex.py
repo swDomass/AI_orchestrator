@@ -9,7 +9,7 @@ import sys
 from providers.base import BaseProvider, RunResult
 from config import TASK_TIMEOUT_SEC
 
-_CODEX_CMD = "codex.cmd" if sys.platform == "win32" else "codex"
+_CODEX_CMD = "codex"
 
 
 class CodexProvider(BaseProvider):
@@ -32,6 +32,7 @@ class CodexProvider(BaseProvider):
                 errors="replace",
                 timeout=timeout,
                 cwd=cwd,
+                shell=sys.platform == "win32",
             )
 
             output = (result.stdout or "").strip()

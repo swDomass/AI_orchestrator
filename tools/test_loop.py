@@ -9,13 +9,12 @@ Usage in queue:
 import re
 import time
 
-from config import SAFETY_RULES, TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC
+from config import get_system_prompt, TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
 from tools.base_tool import BaseTool, ToolResult
 
-_TEST_PROMPT = SAFETY_RULES + """
-
+_TEST_PROMPT_BODY = """
 Run the test suite in the current working directory.
 
 Instructions:
@@ -26,8 +25,7 @@ Instructions:
 - If tests fail, list each failure with file path and error message
 """
 
-_FIX_PROMPT = SAFETY_RULES + """
-
+_FIX_PROMPT_BODY = """
 Fix the failing tests from iteration {iteration}.
 
 Instructions:
@@ -39,6 +37,7 @@ Instructions:
 Test failures:
 {failures}
 """
+
 
 # Patterns that indicate failure when no explicit green summary is detected
 FAIL_PATTERNS = [
@@ -90,10 +89,16 @@ class TestLoopTool(BaseTool):
         provider: BaseProvider,
         cwd: str | None = None,
         timeout: int | None = None,
+        memory_context: str = "",
     ) -> ToolResult:
         print(f"  [test-loop] Starte iterativen Test/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
-        test_prompt = f"{task}\n\n{_TEST_PROMPT}"
+        # Build prompts using system-wide personality + memory context
+        system_prompt = get_system_prompt(provider.name)
+        if memory_context:
+            system_prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
+
+        test_prompt = f"{system_prompt}\n\n{task}\n\n{_TEST_PROMPT_BODY}"
         all_outputs: list[str] = []
         last_failures: str = ""
 
@@ -140,7 +145,7 @@ class TestLoopTool(BaseTool):
             notify_tool_progress(self.name, iteration, TOOL_MAX_ITERATIONS,
                                  "Fixing test failures...")
 
-            fix_prompt = _FIX_PROMPT.format(iteration=iteration, failures=test_result.output)
+            fix_prompt = f"{system_prompt}\n\n" + _FIX_PROMPT_BODY.format(iteration=iteration, failures=test_result.output)
             fix_result = provider.run(fix_prompt, cwd=cwd, timeout=step_timeout)
 
             if not fix_result.success:

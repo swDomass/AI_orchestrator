@@ -10,7 +10,7 @@ import sys
 from providers.base import BaseProvider, RunResult
 from config import TASK_TIMEOUT_SEC
 
-_GEMINI_CMD = "gemini.cmd" if sys.platform == "win32" else "gemini"
+_GEMINI_CMD = "gemini"
 
 
 class GeminiProvider(BaseProvider):
@@ -33,6 +33,7 @@ class GeminiProvider(BaseProvider):
                 errors="replace",
                 timeout=timeout,
                 cwd=cwd,
+                shell=sys.platform == "win32",
             )
 
             output = (result.stdout or "").strip()

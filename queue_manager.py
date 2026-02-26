@@ -405,10 +405,49 @@ def strip_metadata_tags(task: str) -> str:
 
 # --- Context injection ---
 
-def inject_file_context(task: str) -> str:
+def _extract_relevant_section(content: str, task_keywords: set[str], context_lines: int = 50) -> str:
+    """Find the section in content most relevant to task_keywords and return it ± context_lines.
+
+    Falls back to the full content if no keyword match is found.
+    """
+    if not task_keywords:
+        return content
+
+    lines = content.splitlines()
+    best_idx = -1
+    best_score = 0
+
+    for i, line in enumerate(lines):
+        line_tokens = set(re.findall(r"[a-zA-ZäöüÄÖÜß0-9]{3,}", line.lower()))
+        score = len(task_keywords & line_tokens)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx < 0 or best_score == 0:
+        return content
+
+    start = max(0, best_idx - context_lines)
+    end = min(len(lines), best_idx + context_lines + 1)
+    excerpt = "\n".join(lines[start:end])
+
+    prefix = "...\n" if start > 0 else ""
+    suffix = "\n..." if end < len(lines) else ""
+    return prefix + excerpt + suffix
+
+
+def inject_file_context(task: str, max_chars: int = 0) -> str:
     """
     Finds [[wikilinks]] and file paths in the task text,
     reads the referenced vault files, and appends their content to the prompt.
+
+    Args:
+        task: The task text containing wikilinks/file refs.
+        max_chars: Budget cap for total injected content (0 = unlimited).
+                   If > 0 and content exceeds budget, smart section extraction
+                   is applied first, then hard truncation as fallback.
+                   Total injected chars across all wikilinks is capped.
+
     Respects MAX_CONTEXT_FILE_SIZE.
     """
     refs: list[str] = []
@@ -421,8 +460,25 @@ def inject_file_context(task: str) -> str:
     if not refs:
         return task
 
+    # Compute task keywords for smart section extraction
+    task_keywords: set[str] = set()
+    if max_chars > 0:
+        task_keywords = set(re.findall(r"[a-zA-ZäöüÄÖÜß0-9]{3,}", task.lower()))
+        _stopwords = {"the", "and", "for", "with", "from", "that", "this",
+                      "und", "die", "der", "das", "ein", "eine", "ist"}
+        task_keywords -= _stopwords
+
+    # Per-file budget: split max_chars evenly across refs (if budget set)
+    per_file_chars = (max_chars // len(refs)) if (max_chars > 0 and refs) else 0
+    total_injected = 0
+
     context_blocks = []
     for ref in refs:
+        # Check overall budget remaining
+        if max_chars > 0 and total_injected >= max_chars:
+            print(f"  [context] Budget erschöpft, überspringe: {ref}")
+            break
+
         path = _resolve_note(ref)
         if not path:
             print(f"  [context] Datei nicht gefunden: {ref}")
@@ -443,10 +499,22 @@ def inject_file_context(task: str) -> str:
             print(f"  [context] Datei konnte nicht gelesen werden ({path}): {e}")
             continue
 
-        context_blocks.append(
-            f"--- Inhalt von '{path.name}' ---\n{content}\n--- Ende ---"
-        )
-        print(f"  [context] Datei eingelesen: {path.name}")
+        # Apply budget truncation
+        remaining_budget = max_chars - total_injected if max_chars > 0 else 0
+        file_budget = min(per_file_chars, remaining_budget) if max_chars > 0 else 0
+
+        if file_budget > 0 and len(content) > file_budget:
+            # Smart: find the most relevant section first
+            content = _extract_relevant_section(content, task_keywords)
+            if len(content) > file_budget:
+                content = content[:file_budget] + "\n...[truncated]"
+            print(f"  [context] Datei eingelesen (gekürzt): {path.name}")
+        else:
+            print(f"  [context] Datei eingelesen: {path.name}")
+
+        block = f"--- Inhalt von '{path.name}' ---\n{content}\n--- Ende ---"
+        context_blocks.append(block)
+        total_injected += len(block)
 
     if not context_blocks:
         return task

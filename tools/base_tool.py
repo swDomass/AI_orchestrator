@@ -31,6 +31,7 @@ class BaseTool(ABC):
         provider: BaseProvider,
         cwd: str | None = None,
         timeout: int | None = None,
+        memory_context: str = "",
     ) -> ToolResult:
         """Execute the tool workflow. Returns a ToolResult."""
         ...

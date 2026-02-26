@@ -134,6 +134,25 @@ LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3
 
+# --- Memory System ---
+MEMORY_HALF_LIFE_DAYS    = 30
+MEMORY_MAX_AGE_DAYS      = 180
+MEMORY_TOP_K             = 5
+MEMORY_SUMMARY_MAX_CHARS = 700   # first 500 + "...\n" + last 200
+
+# --- Heartbeat ---
+HEARTBEAT_FILE           = VAULT_PATH / "99_System" / "AI" / "HEARTBEAT.md"
+HEARTBEAT_DISK_WARN_PCT  = 10    # warn if free < 10%
+HEARTBEAT_GIT_STALE_DAYS = 7
+HEARTBEAT_QUEUE_IDLE_HOURS = 2
+
+# --- Prompt Budget (token ≈ word heuristic) ---
+PROMPT_BUDGET_TOKENS     = 8_000
+PROMPT_CORE_TOKENS       = 200
+PROMPT_MEMORY_TOKENS     = 2_000
+PROMPT_WIKILINK_TOKENS   = 3_000
+PROMPT_SKILL_TOKENS      = 2_000
+
 # --- SOUL.md (Personality-as-Config) ---
 _soul_cache: dict[str, str] | None = None
 _soul_mtime: float = 0.0

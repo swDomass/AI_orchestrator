@@ -11,7 +11,7 @@ Usage in queue:
 import re
 import time
 
-from config import SAFETY_RULES, TOOL_MAX_ITERATIONS, TOOL_REVIEW_TIMEOUT_SEC, TOOL_FIX_TIMEOUT_SEC
+from config import get_system_prompt, TOOL_MAX_ITERATIONS, TOOL_REVIEW_TIMEOUT_SEC, TOOL_FIX_TIMEOUT_SEC
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
 from tools.base_tool import BaseTool, ToolResult
@@ -48,8 +48,7 @@ def _is_no_findings_output(text: str) -> bool:
     return any(NO_FINDINGS_RE.match(line.strip()) for line in text.splitlines())
 
 
-_REVIEW_PROMPT = f"""{SAFETY_RULES}
-
+_REVIEW_PROMPT_BODY = """
 Perform a code review of the current working directory.
 
 Rules:
@@ -63,8 +62,7 @@ Output format (strict):
 - If no findings: output exactly: `No P1/P2/P3 findings.`
 """
 
-_FIX_PROMPT = SAFETY_RULES + """
-
+_FIX_PROMPT_BODY = """
 You are fixing issues found by a code review (iteration {iteration}).
 
 Task:
@@ -88,11 +86,16 @@ class ReviewLoopTool(BaseTool):
         provider: BaseProvider,
         cwd: str | None = None,
         timeout: int | None = None,
+        memory_context: str = "",
     ) -> ToolResult:
         print(f"  [review-loop] Starte iterativen Review/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
-        # Combine user task with review prompt
-        review_prompt = f"{task}\n\n{_REVIEW_PROMPT}"
+        # Build prompts using system-wide personality + memory context
+        system_prompt = get_system_prompt(provider.name)
+        if memory_context:
+            system_prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
+
+        review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
         seen_signatures: set[tuple[str, ...]] = set()
         all_outputs: list[str] = []
 
@@ -179,7 +182,7 @@ class ReviewLoopTool(BaseTool):
             )
 
             findings_text = "\n".join(findings)
-            fix_prompt = _FIX_PROMPT.format(iteration=iteration, findings=findings_text)
+            fix_prompt = f"{system_prompt}\n\n" + _FIX_PROMPT_BODY.format(iteration=iteration, findings=findings_text)
 
             fix_result = provider.run(
                 fix_prompt,

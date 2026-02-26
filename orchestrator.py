@@ -38,6 +38,9 @@ from logging_setup import setup_logging
 from config import (
     GIT_AUTO_STASH,
     MAX_RETRIES_PER_PROVIDER,
+    PROMPT_MEMORY_TOKENS,
+    PROMPT_SKILL_TOKENS,
+    PROMPT_WIKILINK_TOKENS,
     SLEEP_POLL_INTERVAL,
     TASK_TIMEOUT_SEC,
     TRACK_FILE_CHANGES,
@@ -55,6 +58,7 @@ from notifier import (
 from providers.base import RunResult
 from skills import load_skill, check_requirements
 from config import VAULT_PATH
+import memory as memory_module
 from queue_manager import (
     append_log,
     ensure_queue_file,
@@ -236,16 +240,61 @@ def _get_change_summary(cwd: str | None, snap_before: dict | None, is_git: bool 
     return ""
 
 
-def _build_prompt(task: str, provider_name: str) -> str:
-    """Build final prompt: system prompt + file context + task (without metadata tags)."""
+def _truncate_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to approximately max_tokens words."""
+    words = text.split()
+    if len(words) <= max_tokens:
+        return text
+    return " ".join(words[:max_tokens]) + "\n...[truncated]"
+
+
+def _build_prompt(
+    task: str,
+    provider_name: str,
+    skill_name: str | None = None,
+    memory_context: str = "",
+) -> str:
+    """Build final prompt with selective injection and token budget management.
+
+    Components (in order):
+    1. Core system prompt (SOUL.md base + provider override) — always included
+    2. Skill body — only when skill_name is provided
+    3. Relevant past context (memory) — budget-capped
+    4. File/wikilink context + task text — budget-capped
+    """
+    from skills import load_skill
+
     # Strip routing tags only from the queue task text, not from injected file contents.
     clean_task = strip_metadata_tags(task)
-    clean = inject_file_context(clean_task)
 
-    system = get_system_prompt(provider_name)
-    if system:
-        return f"{system}\n\n{clean}"
-    return clean
+    # 1. Core prompt (always)
+    core = get_system_prompt(provider_name)
+
+    # 2. Skill body (only when #tool: present)
+    skill_prompt = ""
+    if skill_name:
+        skill = load_skill(skill_name, vault_path=VAULT_PATH)
+        if skill and skill.prompt:
+            skill_prompt = _truncate_tokens(skill.prompt, PROMPT_SKILL_TOKENS)
+
+    # 3. Memory context (pre-filtered by get_context_for_task)
+    mem_block = _truncate_tokens(memory_context, PROMPT_MEMORY_TOKENS) if memory_context else ""
+
+    # 4. Wikilink / file context (budget-capped); ~5 chars per token
+    max_wiki_chars = PROMPT_WIKILINK_TOKENS * 5
+    wiki_ctx = inject_file_context(clean_task, max_chars=max_wiki_chars)
+
+    # Assemble
+    parts: list[str] = []
+    if core:
+        parts.append(core)
+    if skill_prompt:
+        parts.append(f"## Skill: {skill_name}\n{skill_prompt}")
+    if mem_block:
+        parts.append(f"## Relevanter vergangener Kontext\n{mem_block}")
+    parts.append(wiki_ctx)
+
+    return "\n\n".join(p for p in parts if p)
 
 
 def _run_with_retry(
@@ -348,6 +397,7 @@ def _execute_tool_task(
     cwd: str | None,
     timeout: int | None = None,
     queue_line_no: int | None = None,
+    memory_context: str = "",
 ) -> ToolTaskExecutionOutcome:
     """Execute a tool-based task and report whether the queue item was finalized."""
     tool = get_tool(tool_name)
@@ -379,7 +429,9 @@ def _execute_tool_task(
 
     print(f"  → Tool: {tool.name} ({tool.description})")
     clean_task = strip_metadata_tags(task)
-    tool_result = tool.run(clean_task, provider, cwd=cwd, timeout=timeout)
+    _tool_start = time.time()
+    tool_result = tool.run(clean_task, provider, cwd=cwd, timeout=timeout, memory_context=memory_context)
+    _tool_duration = time.time() - _tool_start
 
     # Safety: build change summary
     change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
@@ -401,6 +453,9 @@ def _execute_tool_task(
                 finalized=False,
                 error="queue_update_failed",
             )
+        memory_module.store_result(
+            task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True
+        )
         append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
         notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
         return ToolTaskExecutionOutcome(success=True, finalized=True)
@@ -429,6 +484,10 @@ def _execute_tool_task(
                 error="queue_update_failed",
                 error_code=tool_result.error_code,
             )
+        memory_module.store_result(
+            task, tool_result.output or tool_result.error, provider_tool,
+            _tool_duration, cwd=cwd, success=False,
+        )
         append_log(f"Tool {tool.name} Fehler: {tool_result.error}")
         notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
         return ToolTaskExecutionOutcome(
@@ -444,6 +503,15 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
     Process all open tasks in the queue once.
     Returns True if all tasks were completed, False if stopped early.
     """
+    # Archive old memories once per cycle (silent, never blocks)
+    try:
+        archived = memory_module.archive_old_memories()
+        if archived:
+            import logging
+            logging.getLogger(__name__).debug("Archived %d old memories", archived)
+    except Exception:
+        pass
+
     task_items = read_queue_items()
     if not task_items:
         print("Queue leer - nichts zu tun.")
@@ -491,15 +559,25 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if dry_run:
             limits = get_limits()
             provider = select_provider(task, limits)
-            prompt = _build_prompt(task, provider.name if provider else "claude")
+            memory_context = memory_module.get_context_for_task(task, cwd=cwd)
+            prompt = _build_prompt(
+                task,
+                provider.name if provider else "claude",
+                skill_name=tool_name,
+                memory_context=memory_context,
+            )
             print(f"  [DRY-RUN] Provider: {provider.name if provider else 'KEINER VERFÜGBAR'}")
             print(f"  [DRY-RUN] Tool: {tool_name or 'keins (single-shot)'}")
-            print(f"  [DRY-RUN] Prompt-Länge: {len(prompt)} Zeichen")
+            print(f"  [DRY-RUN] Memory: {len(memory_context)} Zeichen ({memory_context.count(chr(10)+chr(10))+1 if memory_context else 0} Einträge)")
+            print(f"  [DRY-RUN] Prompt-Länge: {len(prompt)} Zeichen (~{len(prompt.split())} Tokens)")
             continue
 
         # Get current limits
         print("  Prüfe Usage-Limits (cclimits)...")
         limits = get_limits()
+
+        # Fetch memory context once (same for all provider fallbacks)
+        memory_context = memory_module.get_context_for_task(task, cwd=cwd)
 
         # Tool-based task (iterative loop)
         if tool_name:
@@ -527,6 +605,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     cwd,
                     timeout=tool_timeout,
                     queue_line_no=queue_task.line_no,
+                    memory_context=memory_context,
                 )
 
                 if outcome.success or outcome.finalized:
@@ -581,7 +660,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 break
 
             print(f"  → Provider: {provider.name}")
-            prompt = _build_prompt(task, provider.name)
+            prompt = _build_prompt(task, provider.name, memory_context=memory_context)
+            start_time = time.time()
             result, _exhausted = _run_with_retry(
                 provider, task, prompt, cwd, timeout, pause_event=pause_event
             )
@@ -592,6 +672,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 return False
 
             if result.success:
+                duration = time.time() - start_time
                 print(f"  ✅ Erledigt ({len(result.output)} Zeichen Output)")
                 change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
                 if change_summary:
@@ -603,6 +684,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     queue_line_no=queue_task.line_no,
                 ):
                     return False
+                memory_module.store_result(
+                    task, result.output, provider.name, duration, cwd=cwd, success=True
+                )
                 append_log(f"Task erledigt via {provider.name}: {task[:60]}")
                 notify_task_done(task, provider.name, result.output, change_summary=change_summary)
                 break
@@ -647,6 +731,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 def run_watch(dry_run: bool = False) -> None:
     """Continuously process queue, sleeping when all providers are exhausted."""
     from doctor import run_startup_checks
+    from heartbeat import HeartbeatRunner
     if not run_startup_checks():
         print("CRITICAL: Startup checks failed. Run --doctor to see details.")
         sys.exit(1)
@@ -658,6 +743,8 @@ def run_watch(dry_run: bool = False) -> None:
     pause_event = threading.Event()
     listener = TelegramListener(pause_event)
     listener.start()
+
+    heartbeat = HeartbeatRunner()
 
     try:
         while True:
@@ -672,10 +759,14 @@ def run_watch(dry_run: bool = False) -> None:
             tasks = read_queue()
             if not tasks:
                 print("\nQueue leer. Warte auf neue Tasks (alle 60s prüfen)...")
+                heartbeat.run_due(read_queue)
                 time.sleep(60)
                 continue
 
             done = run_once(dry_run=dry_run, pause_event=pause_event)
+
+            # Run heartbeat checks after each queue cycle
+            heartbeat.run_due(read_queue)
 
             if pause_event.is_set():
                 continue

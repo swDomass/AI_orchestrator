@@ -60,7 +60,11 @@ def _check_cli(label: str, cmd: str, install_hint: str = "") -> CheckResult:
     if found:
         # Try to get version
         try:
-            r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                [cmd, "--version"],
+                capture_output=True, text=True, timeout=5,
+                shell=os.name == "nt",
+            )
             version = (r.stdout or r.stderr).strip().splitlines()[0][:60]
         except Exception:
             version = found
@@ -101,6 +105,7 @@ def check_cclimits() -> CheckResult:
         r = subprocess.run(
             ["npx", "cclimits", "--json"],
             capture_output=True, text=True, timeout=15,
+            shell=os.name == "nt",
         )
         if r.returncode == 0:
             return CheckResult(PASS, "cclimits", "npx cclimits --json succeeded")
@@ -203,6 +208,69 @@ def check_env_file() -> CheckResult:
     return CheckResult(PASS, ".env file", str(env_file))
 
 
+def check_memory_dir() -> CheckResult:
+    """Check that the memory directory is accessible and writable."""
+    try:
+        from config import VAULT_PATH
+        memory_root = VAULT_PATH / "99_System" / "AI" / "memory"
+
+        if not VAULT_PATH.is_dir():
+            return CheckResult(WARN, "Memory dir", "vault not accessible — skipped")
+
+        if not memory_root.exists():
+            def _fix():
+                (memory_root / "task_results").mkdir(parents=True, exist_ok=True)
+                (memory_root / "archive").mkdir(parents=True, exist_ok=True)
+                print(f"    Created memory directory at {memory_root}")
+
+            return CheckResult(
+                WARN, "Memory dir",
+                f"not found: {memory_root}",
+                fix_hint="Will be created automatically on first task completion",
+                fix_fn=_fix,
+            )
+
+        task_results = memory_root / "task_results"
+        count = len(list(task_results.glob("*.md"))) if task_results.exists() else 0
+        return CheckResult(PASS, "Memory dir", f"{memory_root.name} ({count} stored results)")
+    except Exception as e:
+        return CheckResult(WARN, "Memory dir", f"check failed: {e}")
+
+
+def check_heartbeat_file() -> CheckResult:
+    """Check that HEARTBEAT.md exists and is parseable."""
+    try:
+        from config import HEARTBEAT_FILE
+        if not HEARTBEAT_FILE.exists():
+            def _fix():
+                HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+                HEARTBEAT_FILE.write_text(
+                    "# Heartbeat Checks\n\n"
+                    "## Every 30 minutes\n"
+                    "- [ ] Check if queue has been empty for >2 hours → notify via Telegram\n\n"
+                    "## Every 2 hours\n"
+                    "- [ ] Check disk space on project drives\n\n"
+                    "## Daily (first run after 08:00)\n"
+                    "- [ ] Summarize yesterday's completed tasks → post to Telegram\n",
+                    encoding="utf-8",
+                )
+                print(f"    Created HEARTBEAT.md at {HEARTBEAT_FILE}")
+
+            return CheckResult(
+                WARN, "HEARTBEAT.md",
+                f"not found: {HEARTBEAT_FILE}",
+                fix_hint="Create HEARTBEAT.md in vault 99_System/AI/",
+                fix_fn=_fix,
+            )
+
+        from heartbeat import _parse_heartbeat_md
+        content = HEARTBEAT_FILE.read_text(encoding="utf-8")
+        items = _parse_heartbeat_md(content)
+        return CheckResult(PASS, "HEARTBEAT.md", f"{len(items)} check(s) configured")
+    except Exception as e:
+        return CheckResult(WARN, "HEARTBEAT.md", f"check failed: {e}")
+
+
 def check_skills() -> CheckResult:
     try:
         from skills.discovery import discover_skills
@@ -257,6 +325,8 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_telegram_bot(),
         check_env_file(),
         check_skills(),
+        check_memory_dir(),
+        check_heartbeat_file(),
     ]
 
     any_fail = False

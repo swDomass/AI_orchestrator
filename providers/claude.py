@@ -9,7 +9,7 @@ import sys
 from providers.base import BaseProvider, RunResult
 from config import TASK_TIMEOUT_SEC
 
-_CLAUDE_CMD = "claude.exe" if sys.platform == "win32" else "claude"
+_CLAUDE_CMD = "claude"
 
 
 class ClaudeProvider(BaseProvider):
@@ -32,6 +32,7 @@ class ClaudeProvider(BaseProvider):
                 errors="replace",
                 timeout=timeout,
                 cwd=cwd,
+                shell=sys.platform == "win32",
             )
 
             output = (result.stdout or "").strip()

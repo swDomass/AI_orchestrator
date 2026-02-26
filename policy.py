@@ -28,6 +28,12 @@ TIER_APPROVE = "approve"
 TIER_DENY = "deny"
 
 _TIER_ORDER = [TIER_DENY, TIER_APPROVE, TIER_AUTO]
+_PREAPPROVAL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*", re.IGNORECASE)
+_PREAPPROVAL_STOPWORDS = {
+    "the", "and", "for", "with", "from", "this", "that",
+    "und", "die", "der", "das", "mit", "von", "auf",
+    "to", "into", "onto", "remote", "package", "command", "action",
+}
 
 
 @dataclass
@@ -66,6 +72,40 @@ def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
     return rules
 
 
+def _freeze_policy_data(data):
+    """Convert policy dict/list structures into a hashable, content-based cache key."""
+    if isinstance(data, dict):
+        return tuple(sorted((str(k), _freeze_policy_data(v)) for k, v in data.items()))
+    if isinstance(data, list):
+        return tuple(_freeze_policy_data(v) for v in data)
+    if isinstance(data, tuple):
+        return tuple(_freeze_policy_data(v) for v in data)
+    if isinstance(data, (str, int, float, bool, type(None))):
+        return data
+    return repr(data)
+
+
+def _preapproval_tokens(text: str) -> set[str]:
+    """Extract normalized category tokens from a reason/message string."""
+    tokens = {
+        t.lower()
+        for t in _PREAPPROVAL_TOKEN_RE.findall(str(text))
+        if len(t) >= 3
+    }
+    return {t for t in tokens if t not in _PREAPPROVAL_STOPWORDS}
+
+
+def reason_matches_preapproval(reason: str, category: str) -> bool:
+    """Return True if a user preapproval category matches a policy reason string."""
+    reason_norm = str(reason).strip().lower()
+    cat_norm = str(category).strip().lower()
+    if not reason_norm or not cat_norm:
+        return False
+    if reason_norm == cat_norm:
+        return True
+    return cat_norm in _preapproval_tokens(reason_norm)
+
+
 class PolicyEngine:
     """Load policy.yaml, classify tasks, manage approval flow."""
 
@@ -75,8 +115,8 @@ class PolicyEngine:
         self._mtime: float = 0.0
         self._lock = threading.Lock()
 
-        # Cache for parsed profile rules: {id(profile_dict): (timestamp, [PolicyRule])}
-        self._profile_cache: dict[int, tuple[float, list[PolicyRule]]] = {}
+        # Cache for parsed profile rules keyed by content (not object id).
+        self._profile_cache: dict[tuple, list[PolicyRule]] = {}
 
         # Session-wide preapprovals (category → approved for this process lifetime)
         self._preapprovals: set[str] = set()
@@ -151,17 +191,17 @@ class PolicyEngine:
         self._reload_if_changed()
 
         if profile_rules:
-            dict_id = id(profile_rules)
+            cache_key = _freeze_policy_data(profile_rules)
             with self._lock:
-                p_rules = self._profile_cache.get(dict_id)
-            
+                p_rules = self._profile_cache.get(cache_key)
+
             if p_rules is None:
                 p_rules = _parse_rules_from_dict(profile_rules)
                 with self._lock:
                     # Clear cache occasionally to prevent memory leak (crude)
                     if len(self._profile_cache) > 50:
                         self._profile_cache.clear()
-                    self._profile_cache[dict_id] = p_rules
+                    self._profile_cache[cache_key] = p_rules
 
             p_tier, p_msgs, p_matched = self._classify(task_text, p_rules)
             if p_matched:
@@ -177,10 +217,21 @@ class PolicyEngine:
     # ------------------------------------------------------------------
 
     def is_preapproved(self, category: str) -> bool:
-        return category.lower() in self._preapprovals
+        category_norm = str(category).strip().lower()
+        if not category_norm:
+            return False
+        with self._lock:
+            preapprovals = set(self._preapprovals)
+        if category_norm in preapprovals:
+            return True
+        return any(reason_matches_preapproval(category_norm, p) for p in preapprovals)
 
     def add_preapproval(self, category: str) -> None:
-        self._preapprovals.add(category.lower())
+        category_norm = str(category).strip().lower()
+        if not category_norm:
+            return
+        with self._lock:
+            self._preapprovals.add(category_norm)
         logger.info("policy: session preapproval added: %s", category)
 
     # ------------------------------------------------------------------

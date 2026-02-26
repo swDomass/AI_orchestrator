@@ -101,3 +101,19 @@ policy:
     }
     assert cfg.name == "work"
     assert cfg.providers == ["claude", "gemini"]
+
+
+def test_profile_policy_cache_updates_when_same_dict_is_mutated(tmp_path):
+    """Mutating the same profile_rules dict must not return a stale cached verdict."""
+    engine = _make_engine(tmp_path, "")
+    profile_rules = {"deny": ["git push"]}
+
+    tier, _ = engine.check_task("git push origin main", profile_rules=profile_rules)
+    assert tier == TIER_DENY
+
+    profile_rules.clear()
+    profile_rules["auto"] = ["git push"]
+
+    tier, msgs = engine.check_task("git push origin main", profile_rules=profile_rules)
+    assert tier == TIER_AUTO
+    assert msgs == ["git push"]

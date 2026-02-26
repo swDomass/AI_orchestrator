@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from policy import PolicyEngine, TIER_AUTO, TIER_APPROVE, TIER_DENY, PolicyRule
+from policy import PolicyEngine, TIER_AUTO, TIER_APPROVE, TIER_DENY, PolicyRule, reason_matches_preapproval
 
 def test_policy_rule_exact_match():
     rule = PolicyRule(pattern="git commit", message="git commit matched", tier=TIER_AUTO)
@@ -51,6 +51,13 @@ def test_preapprovals():
     engine.add_preapproval("push")
     assert engine.is_preapproved("push") is True
     assert engine.is_preapproved("PUSH") is True # Case insensitive
+    assert engine.is_preapproved("git push to remote") is True
+
+
+def test_reason_matches_preapproval_category_tokens():
+    assert reason_matches_preapproval("git push to remote", "push") is True
+    assert reason_matches_preapproval("npm publish package", "publish") is True
+    assert reason_matches_preapproval("git push to remote", "publish") is False
 
 def test_policy_engine_multi_match(tmp_path):
     policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"

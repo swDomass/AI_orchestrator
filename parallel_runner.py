@@ -13,7 +13,7 @@ Different CWD groups run in parallel threads.
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from limits import AllLimits
 
@@ -145,6 +145,12 @@ def _run_single_subtask(
     )
 
 
+def _group_join_timeout_sec(group: list[tuple[int, SubTask]]) -> int:
+    """Join timeout for one CWD group (runs sequentially within a single thread)."""
+    total = sum(max(0, st.timeout) for _, st in group)
+    return total + 120  # extra buffer for provider/tool overhead
+
+
 def run_parallel(
     parent_task: str,
     subtask_texts: tuple[str, ...],
@@ -162,6 +168,18 @@ def run_parallel(
         return []
 
     subtasks = [_parse_subtask(t) for t in subtask_texts]
+    try:
+        from queue_manager import extract_cwd, has_cwd_tag
+        parent_cwd = extract_cwd(parent_task)
+        if parent_cwd:
+            subtasks = [
+                replace(st, cwd=parent_cwd)
+                if st.cwd is None and not has_cwd_tag(st.text)
+                else st
+                for st in subtasks
+            ]
+    except Exception:
+        pass
 
     # Group by CWD (None = parent CWD group)
     cwd_groups: dict[str | None, list[tuple[int, SubTask]]] = {}
@@ -171,6 +189,7 @@ def run_parallel(
 
     all_results: list[SubTaskResult | None] = [None] * len(subtasks)
     threads: list[threading.Thread] = []
+    thread_timeouts: dict[threading.Thread, int] = {}
     lock = threading.Lock()
 
     def _run_group(group: list[tuple[int, SubTask]]) -> None:
@@ -187,13 +206,11 @@ def run_parallel(
             name=f"parallel-{_cwd or 'default'}",
         )
         threads.append(t)
+        thread_timeouts[t] = _group_join_timeout_sec(group)
         t.start()
 
-    # Compute a generous join timeout: max subtask timeout + buffer
-    max_subtask_timeout = max(st.timeout for st in subtasks) if subtasks else 600
-    join_timeout = max_subtask_timeout + 120  # extra 2 min buffer
-
     for t in threads:
+        join_timeout = thread_timeouts.get(t, 720)
         t.join(timeout=join_timeout)
         if t.is_alive():
             logger.warning("parallel: thread %s still alive after %ds timeout", t.name, join_timeout)

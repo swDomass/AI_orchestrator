@@ -383,7 +383,7 @@ class TelegramListener:
                 send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
                 return
             engine._respond("skipped")
-            send_message("⏭️ Übersprungen. Task wird fortgesetzt.")
+            send_message("⏭️ Übersprungen. Riskante Aktion blockiert; Task bleibt in Queue.")
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 

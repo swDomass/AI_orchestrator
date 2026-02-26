@@ -652,7 +652,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
         # --- Feature 9: Policy check ---
         try:
-            from policy import get_engine, TIER_DENY, TIER_APPROVE, _TIER_ORDER
+            from policy import get_engine, TIER_DENY, TIER_APPROVE, _TIER_ORDER, reason_matches_preapproval
             engine = get_engine()
 
             # Build profile policy once; used for both parent task and subtasks
@@ -690,7 +690,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
             if verdict == TIER_APPROVE:
                 preapproved = extract_preapproved_actions(task)
-                unapproved = [r for r in reasons if r not in preapproved and not engine.is_preapproved(r)]
+                unapproved = [
+                    r for r in reasons
+                    if not any(reason_matches_preapproval(r, cat) for cat in preapproved)
+                    and not engine.is_preapproved(r)
+                ]
                 if unapproved:
                     response = engine.request_approval(task, unapproved)
                     if response == "denied":
@@ -707,7 +711,14 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
                             return False
                         return False
-                    # "approved" or "skipped" → continue
+                    elif response == "skipped":
+                        print("  ⏭ Genehmigung übersprungen — riskante Aktion blockiert, Task bleibt in Queue.")
+                        append_log(f"Genehmigung übersprungen für Task: {task[:60]}")
+                        reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
+                            return False
+                        return False
+                    # "approved" → continue
         except ImportError:
             pass
         except Exception as e:

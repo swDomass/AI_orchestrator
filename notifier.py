@@ -208,7 +208,7 @@ def notify_approval_required(task_text: str, reasons: list[str], timeout_sec: in
         f"/approve — allow this action\n"
         f"/approve\\-all \\<category\\> — allow all in session\n"
         f"/deny — block, pause task\n"
-        f"/skip — skip action, continue task"
+        f"/skip — skip for now, task retries later"
     )
 
 

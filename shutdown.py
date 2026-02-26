@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 # Module-level state (volatile, session-only — no file persistence)
 shutdown_pending = threading.Event()
 shutdown_cancel = threading.Event()
+_countdown_running = threading.Event()
+_countdown_lock = threading.Lock()
 
 
 def request_shutdown() -> bool:
@@ -70,40 +72,50 @@ def execute_shutdown(
     )
     from queue_manager import append_log
 
-    shutdown_cancel.clear()
-    notify_shutdown_pending(delay_sec)
-    logger.info("shutdown: countdown started (%ds)", delay_sec)
-
-    elapsed = 0
-    while elapsed < delay_sec:
-        chunk = min(5, delay_sec - elapsed)
-        cancelled = shutdown_cancel.wait(timeout=chunk)
-
-        if cancelled or check_queue_abort():
-            shutdown_cancel.clear()
-            shutdown_pending.clear()
-            notify_shutdown_cancelled()
-            logger.info("shutdown: countdown cancelled")
+    with _countdown_lock:
+        if _countdown_running.is_set():
+            logger.info("shutdown: countdown already running; ignoring duplicate request")
             return
+        _countdown_running.set()
 
-        elapsed += chunk
+    try:
+        shutdown_cancel.clear()
+        notify_shutdown_pending(delay_sec)
+        logger.info("shutdown: countdown started (%ds)", delay_sec)
 
-    # Execute — cleanup before OS kills us (Telegram first, logs last)
-    logger.info("shutdown: executing OS shutdown command")
-    notify_shutdown_executing()
+        elapsed = 0
+        while elapsed < delay_sec:
+            chunk = min(5, delay_sec - elapsed)
+            cancelled = shutdown_cancel.wait(timeout=chunk)
 
-    if cleanup_cb:
+            if cancelled or check_queue_abort():
+                shutdown_cancel.clear()
+                shutdown_pending.clear()
+                notify_shutdown_cancelled()
+                logger.info("shutdown: countdown cancelled")
+                return
+
+            elapsed += chunk
+
+        # Execute — cleanup before OS kills us (Telegram first, logs last)
+        logger.info("shutdown: executing OS shutdown command")
+        notify_shutdown_executing()
+        shutdown_pending.clear()
+
+        if cleanup_cb:
+            try:
+                cleanup_cb()
+            except Exception as e:
+                logger.warning("shutdown: cleanup_cb error: %s", e)
+
         try:
-            cleanup_cb()
+            append_log("Shutdown initiated by #shutdown.")
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(SHUTDOWN_COMMAND, check=False)
         except Exception as e:
-            logger.warning("shutdown: cleanup_cb error: %s", e)
-
-    try:
-        append_log("Shutdown initiated by #shutdown.")
-    except Exception:
-        pass
-
-    try:
-        subprocess.run(SHUTDOWN_COMMAND, check=False)
-    except Exception as e:
-        logger.error("shutdown: OS shutdown command failed: %s", e)
+            logger.error("shutdown: OS shutdown command failed: %s", e)
+    finally:
+        _countdown_running.clear()

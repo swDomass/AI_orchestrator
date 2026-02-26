@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import orchestrator
+import policy as policy_module
 from tools.base_tool import ToolResult
 
 
@@ -214,3 +215,74 @@ def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
     )
     notify_error.assert_called_once()
     select_provider.assert_not_called()
+
+
+def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
+    queue_item = SimpleNamespace(task_text="Risky task", line_no=11)
+    mark_retry = Mock(return_value=True)
+    select_provider = Mock(side_effect=AssertionError("provider must not be selected after /skip"))
+
+    class FakeEngine:
+        def check_task(self, _task_text, profile_rules=None):
+            return policy_module.TIER_APPROVE, ["git push to remote"]
+
+        def is_preapproved(self, _category):
+            return False
+
+        def request_approval(self, _task_text, _reasons):
+            return "skipped"
+
+    monkeypatch.setattr(policy_module, "get_engine", lambda: FakeEngine())
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [queue_item])
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [queue_item.task_text])
+    monkeypatch.setattr(orchestrator, "has_cwd_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
+    monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry)
+    monkeypatch.setattr(orchestrator, "select_provider", select_provider)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
+
+    result = orchestrator.run_once()
+
+    assert result is False
+    mark_retry.assert_called_once()
+    select_provider.assert_not_called()
+
+
+def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
+    queue_item = SimpleNamespace(task_text="Deploy release #approve:push", line_no=12)
+    mark_retry = Mock(return_value=True)
+    engine = Mock()
+    engine.check_task.return_value = (policy_module.TIER_APPROVE, ["git push to remote"])
+    engine.is_preapproved.return_value = False
+    engine.request_approval = Mock(side_effect=AssertionError("approval prompt should be skipped"))
+
+    monkeypatch.setattr(policy_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [queue_item])
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [queue_item.task_text])
+    monkeypatch.setattr(orchestrator, "has_cwd_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1)
+    monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
+    monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
+
+    result = orchestrator.run_once()
+
+    assert result is False
+    engine.request_approval.assert_not_called()
+    mark_retry.assert_called_once()

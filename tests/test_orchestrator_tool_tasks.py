@@ -286,3 +286,43 @@ def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
     assert result is False
     engine.request_approval.assert_not_called()
     mark_retry.assert_called_once()
+
+
+def test_run_once_parallel_exception_marks_retry_instead_of_done(monkeypatch):
+    queue_item = SimpleNamespace(task_text="Parent task #parallel", line_no=21, subtasks=("sub a",))
+    mark_retry = Mock(return_value=True)
+    mark_done = Mock(return_value=True)
+
+    class FakeEngine:
+        def check_task(self, _task_text, profile_rules=None):
+            return policy_module.TIER_AUTO, []
+
+        def is_preapproved(self, _category):
+            return False
+
+    monkeypatch.setattr(policy_module, "get_engine", lambda: FakeEngine())
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [queue_item])
+    monkeypatch.setattr(orchestrator, "has_cwd_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry)
+    monkeypatch.setattr(orchestrator, "mark_done", mark_done)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
+    monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_args, **_kwargs: "")
+
+    import parallel_runner as parallel_runner_module
+    monkeypatch.setattr(parallel_runner_module, "run_parallel", Mock(side_effect=RuntimeError("boom")))
+
+    result = orchestrator.run_once()
+
+    assert result is False
+    mark_retry.assert_called_once()
+    mark_done.assert_not_called()

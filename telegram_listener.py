@@ -22,6 +22,7 @@ response is sent back to the same chat.
 
 import json
 import logging
+import re
 import threading
 import urllib.parse
 import urllib.request
@@ -43,6 +44,7 @@ from queue_manager import append_task, read_queue
 logger = logging.getLogger("telegram-listener")
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+_SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
 
 
 def _fmt_time(seconds: int) -> str:
@@ -220,7 +222,7 @@ class TelegramListener:
         parsed_command = _parse_command(text)
 
         # Detect #shutdown in plain text (not a command)
-        if not parsed_command and "#shutdown" in text.lower():
+        if not parsed_command and _SHUTDOWN_TAG_RE.search(text):
             self._handle_shutdown_request()
             # Still process as chat if the message also contains other text
             # (but not as AI chat — shutdown is the action)

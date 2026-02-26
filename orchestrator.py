@@ -348,6 +348,7 @@ class ToolTaskExecutionOutcome:
     retryable: bool = False
     error: str = ""
     error_code: str = ""
+    output: str = ""
 
 
 
@@ -466,13 +467,18 @@ def _execute_tool_task(
                     success=False,
                     finalized=False,
                     error="queue_update_failed",
+                    output=tool_result.output,
                 )
             memory_module.store_result(
                 task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True
             )
             append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
             notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
-        return ToolTaskExecutionOutcome(success=True, finalized=not skip_queue)
+        return ToolTaskExecutionOutcome(
+            success=True,
+            finalized=not skip_queue,
+            output=tool_result.output,
+        )
     else:
         print(f"  ⚠️ Tool beendet: {tool_result.error}")
         if tool_result.retryable:
@@ -485,6 +491,7 @@ def _execute_tool_task(
                 retryable=True,
                 error=tool_result.error,
                 error_code=tool_result.error_code or tool_result.error,
+                output=tool_result.output,
             )
 
         if not skip_queue:
@@ -499,6 +506,7 @@ def _execute_tool_task(
                     finalized=False,
                     error="queue_update_failed",
                     error_code=tool_result.error_code,
+                    output=tool_result.output,
                 )
             memory_module.store_result(
                 task, tool_result.output or tool_result.error, provider_tool,
@@ -511,6 +519,7 @@ def _execute_tool_task(
             finalized=not skip_queue,
             error=tool_result.error,
             error_code=tool_result.error_code,
+            output=tool_result.output,
         )
 
 
@@ -754,8 +763,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  ❌ {msg}")
                 append_log(msg)
                 notify_error(task, "parallel", msg)
-                if not _mark_done_checked(task, "parallel-error", queue_line_no=queue_task.line_no):
+                retry_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+                if not _mark_retry_checked(task, retry_at, "parallel", queue_line_no=queue_task.line_no):
                     return False
+                print(f"  [parallel] Task bleibt in Queue (Retry um ~{retry_at[-5:]})")
+                return False
 
             # Feature 10: trigger shutdown after this task if tagged
             if task_has_shutdown:

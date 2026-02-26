@@ -24,7 +24,7 @@ ALT_FINDING_RE = re.compile(
     re.IGNORECASE,
 )
 NO_FINDINGS_RE = re.compile(
-    r"^\s*`?No P1(?:\s*[/,]\s*P2)(?:\s*[/,]\s*P3) findings\.`?\s*$",
+    r"^\s*(?:`|\*\*)?\s*No\s+P1(?:\s*(?:/|,|and|or)\s*P2)(?:\s*(?:/|,|and|or)\s*P3)\s+findings(?:\s+found)?\.?\s*(?:`|\*\*)?\s*$",
     re.IGNORECASE,
 )
 

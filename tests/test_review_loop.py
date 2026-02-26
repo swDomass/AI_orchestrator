@@ -7,3 +7,11 @@ def test_no_findings_sentinel_accepts_slash_format():
 
 def test_no_findings_sentinel_accepts_comma_format():
     assert _is_no_findings_output("No P1, P2, P3 findings.") is True
+
+
+def test_no_findings_sentinel_accepts_bold_wrapped_and_no_period():
+    assert _is_no_findings_output("**No P1/P2/P3 findings**") is True
+
+
+def test_no_findings_sentinel_accepts_found_suffix_and_or_separator():
+    assert _is_no_findings_output("No P1, P2 or P3 findings found.") is True

@@ -1,6 +1,7 @@
 import pytest
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 import queue_manager
 import parallel_runner as parallel_runner_module
 from parallel_runner import _parse_subtask, SubTask, run_parallel, format_parallel_result, SubTaskResult
@@ -145,3 +146,89 @@ def test_run_parallel_inherits_parent_cwd_for_subtasks_without_cwd(tmp_path, mon
 
     assert len(seen_cwds) == 2
     assert all(Path(c).resolve() == parent_dir.resolve() for c in seen_cwds)
+
+
+def test_run_parallel_continues_group_after_subtask_exception(monkeypatch):
+    parsed = {
+        "a": SubTask(text="a", provider_forced=None, cwd="C:/proj", tool_name=None, timeout=5),
+        "b": SubTask(text="b", provider_forced=None, cwd="C:/proj", tool_name=None, timeout=5),
+    }
+    monkeypatch.setattr(parallel_runner_module, "_parse_subtask", lambda text: parsed[text])
+
+    calls = []
+
+    def fake_run_single(subtask, idx, limits, memory_context, pause_event, profile=None):
+        calls.append((idx, subtask.text))
+        if subtask.text == "a":
+            raise RuntimeError("boom")
+        return SubTaskResult(text=subtask.text, provider_name="mock", success=True, output="ok")
+
+    monkeypatch.setattr(parallel_runner_module, "_run_single_subtask", fake_run_single)
+
+    class FakeThread:
+        def __init__(self, target, args, daemon, name):
+            self._target = target
+            self._args = args
+            self.name = name
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            self._target(*self._args)
+            self._alive = False
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return self._alive
+
+    monkeypatch.setattr(parallel_runner_module.threading, "Thread", FakeThread)
+
+    results = run_parallel("parent", ("a", "b"), AllLimits())
+
+    assert calls == [(0, "a"), (1, "b")]
+    assert len(results) == 2
+    assert results[0].success is False
+    assert results[0].provider_name == "internal"
+    assert "subtask_crash" in results[0].error
+    assert results[1].success is True
+    assert results[1].output == "ok"
+
+
+def test_run_single_subtask_tool_success_preserves_tool_output(monkeypatch):
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="codex")
+    subtask = SubTask(
+        text="Run tool #tool:review-loop",
+        provider_forced=None,
+        cwd=None,
+        tool_name="review-loop",
+        timeout=30,
+    )
+
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(
+        orchestrator,
+        "_execute_tool_task",
+        lambda *_args, **_kwargs: orchestrator.ToolTaskExecutionOutcome(
+            success=True,
+            finalized=False,
+            output="fixed 2 issues",
+        ),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask,
+        idx=0,
+        limits=AllLimits(),
+        memory_context="",
+        pause_event=None,
+    )
+
+    assert result.success is True
+    assert result.provider_name == "codex+review-loop"
+    assert result.output == "fixed 2 issues"

@@ -126,7 +126,7 @@ def _run_single_subtask(
             text=subtask.text,
             provider_name=f"{provider.name}+{subtask.tool_name}",
             success=outcome.success,
-            output=outcome.error if not outcome.success else "done",
+            output=(outcome.output or "done") if outcome.success else "",
             error=outcome.error if not outcome.success else "",
         )
 
@@ -178,8 +178,8 @@ def run_parallel(
                 else st
                 for st in subtasks
             ]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("parallel: parent cwd inheritance skipped: %s", e)
 
     # Group by CWD (None = parent CWD group)
     cwd_groups: dict[str | None, list[tuple[int, SubTask]]] = {}
@@ -194,7 +194,17 @@ def run_parallel(
 
     def _run_group(group: list[tuple[int, SubTask]]) -> None:
         for idx, st in group:
-            result = _run_single_subtask(st, idx, limits, memory_context, pause_event, profile=profile)
+            try:
+                result = _run_single_subtask(st, idx, limits, memory_context, pause_event, profile=profile)
+            except Exception as e:
+                logger.exception("parallel: subtask %d crashed", idx)
+                result = SubTaskResult(
+                    text=st.text,
+                    provider_name="internal",
+                    success=False,
+                    output="",
+                    error=f"subtask_crash: {e}",
+                )
             with lock:
                 all_results[idx] = result
 

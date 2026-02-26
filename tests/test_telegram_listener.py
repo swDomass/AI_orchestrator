@@ -619,6 +619,50 @@ def test_plain_text_routes_to_ai_and_replies(mock_select, mock_limits, mock_send
     assert any("stimmt" in t for t in texts)
 
 
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_plain_text_shutdown_tag_triggers_shutdown_handler_not_chat(_mock_send):
+    listener, _ = _make_listener()
+    listener._handle_shutdown_request = MagicMock()
+    listener._handle_chat = MagicMock()
+
+    listener._handle_message(_msg("Bitte später #shutdown"))
+
+    listener._handle_shutdown_request.assert_called_once()
+    listener._handle_chat.assert_not_called()
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_plain_text_shutdown_substring_does_not_trigger_shutdown_handler(_mock_send):
+    listener, _ = _make_listener()
+    listener._handle_shutdown_request = MagicMock()
+    listener._handle_chat = MagicMock()
+
+    class FakeThread:
+        def __init__(self, target, args, daemon=True):
+            self._target = target
+            self._args = args
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            self._target(*self._args)
+            self._alive = False
+
+        def is_alive(self):
+            return self._alive
+
+        def join(self, timeout=None):
+            return None
+
+    with patch("telegram_listener.threading.Thread", FakeThread):
+        listener._handle_message(_msg("Was bedeutet #shutdown-now in diesem Kontext?"))
+
+    listener._handle_shutdown_request.assert_not_called()
+    listener._handle_chat.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # start() behaviour when Telegram is disabled
 # ---------------------------------------------------------------------------

@@ -312,6 +312,9 @@ def _run_with_retry(
     Run task on provider with retries. Returns (result, exhausted).
     exhausted=True means all retries failed.
     """
+    if MAX_RETRIES_PER_PROVIDER <= 0:
+        return RunResult(success=False, error="no retries configured"), True
+
     for attempt in range(MAX_RETRIES_PER_PROVIDER):
         if pause_event and pause_event.is_set():
             return RunResult(success=False, error="paused"), False
@@ -401,15 +404,19 @@ def _execute_tool_task(
     timeout: int | None = None,
     queue_line_no: int | None = None,
     memory_context: str = "",
+    skip_queue: bool = False,
 ) -> ToolTaskExecutionOutcome:
     """Execute a tool-based task and report whether the queue item was finalized."""
     tool = get_tool(tool_name)
     if not tool:
         msg = f"Tool nicht gefunden: {tool_name}"
         print(f"  ❌ Unbekanntes Tool: {tool_name}")
-        append_log(f"Unbekanntes Tool: {tool_name}")
-        notify_error(task, provider.name if provider else "unknown", msg)
-        finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+        if not skip_queue:
+            append_log(f"Unbekanntes Tool: {tool_name}")
+            notify_error(task, provider.name if provider else "unknown", msg)
+            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+        else:
+            finalized = False
         return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
 
     # Gating check: verify skill requirements are met
@@ -419,9 +426,12 @@ def _execute_tool_task(
         if not available:
             msg = f"Skill '{tool_name}' Anforderungen nicht erfüllt: {'; '.join(reasons)}"
             print(f"  ❌ {msg}")
-            append_log(msg)
-            notify_error(task, provider.name, msg)
-            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+            if not skip_queue:
+                append_log(msg)
+                notify_error(task, provider.name, msg)
+                finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+            else:
+                finalized = False
             return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
 
     # Safety: snapshot before execution
@@ -445,28 +455,30 @@ def _execute_tool_task(
 
     if tool_result.success:
         print(f"  ✅ Tool erledigt ({tool_result.iterations} Iteration(en))")
-        if not _finalize_task_with_result_checked(
-            task,
-            tool_result.output,
-            provider_tool,
-            queue_line_no=queue_line_no,
-        ):
-            return ToolTaskExecutionOutcome(
-                success=False,
-                finalized=False,
-                error="queue_update_failed",
+        if not skip_queue:
+            if not _finalize_task_with_result_checked(
+                task,
+                tool_result.output,
+                provider_tool,
+                queue_line_no=queue_line_no,
+            ):
+                return ToolTaskExecutionOutcome(
+                    success=False,
+                    finalized=False,
+                    error="queue_update_failed",
+                )
+            memory_module.store_result(
+                task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True
             )
-        memory_module.store_result(
-            task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True
-        )
-        append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
-        notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
-        return ToolTaskExecutionOutcome(success=True, finalized=True)
+            append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
+            notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
+        return ToolTaskExecutionOutcome(success=True, finalized=not skip_queue)
     else:
         print(f"  ⚠️ Tool beendet: {tool_result.error}")
         if tool_result.retryable:
-            append_log(f"Tool {tool.name} transienter Fehler via {provider.name}: {tool_result.error}")
-            notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
+            if not skip_queue:
+                append_log(f"Tool {tool.name} transienter Fehler via {provider.name}: {tool_result.error}")
+                notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
             return ToolTaskExecutionOutcome(
                 success=False,
                 finalized=False,
@@ -475,27 +487,28 @@ def _execute_tool_task(
                 error_code=tool_result.error_code or tool_result.error,
             )
 
-        if not _finalize_task_with_result_checked(
-            task,
-            tool_result.output,
-            provider_tool,
-            queue_line_no=queue_line_no,
-        ):
-            return ToolTaskExecutionOutcome(
-                success=False,
-                finalized=False,
-                error="queue_update_failed",
-                error_code=tool_result.error_code,
+        if not skip_queue:
+            if not _finalize_task_with_result_checked(
+                task,
+                tool_result.output,
+                provider_tool,
+                queue_line_no=queue_line_no,
+            ):
+                return ToolTaskExecutionOutcome(
+                    success=False,
+                    finalized=False,
+                    error="queue_update_failed",
+                    error_code=tool_result.error_code,
+                )
+            memory_module.store_result(
+                task, tool_result.output or tool_result.error, provider_tool,
+                _tool_duration, cwd=cwd, success=False,
             )
-        memory_module.store_result(
-            task, tool_result.output or tool_result.error, provider_tool,
-            _tool_duration, cwd=cwd, success=False,
-        )
-        append_log(f"Tool {tool.name} Fehler: {tool_result.error}")
-        notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
+            append_log(f"Tool {tool.name} Fehler: {tool_result.error}")
+            notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
         return ToolTaskExecutionOutcome(
             success=False,
-            finalized=True,
+            finalized=not skip_queue,
             error=tool_result.error,
             error_code=tool_result.error_code,
         )

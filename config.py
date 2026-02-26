@@ -170,6 +170,8 @@ SHUTDOWN_COMMAND = (
 )
 
 # --- SOUL.md (Personality-as-Config) ---
+import threading as _threading
+_soul_lock = _threading.Lock()
 _soul_cache: dict[str, str] | None = None
 _soul_mtime: float = 0.0
 
@@ -217,13 +219,15 @@ def load_soul() -> dict[str, str]:
 
     try:
         mtime = soul_file.stat().st_mtime
-        if _soul_cache is not None and mtime == _soul_mtime:
-            return _soul_cache
+        with _soul_lock:
+            if _soul_cache is not None and mtime == _soul_mtime:
+                return _soul_cache
 
         content = soul_file.read_text(encoding="utf-8")
         sections = _parse_soul_sections(content)
-        _soul_cache = sections
-        _soul_mtime = mtime
+        with _soul_lock:
+            _soul_cache = sections
+            _soul_mtime = mtime
         return sections
     except Exception:
         return {}

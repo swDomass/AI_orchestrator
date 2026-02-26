@@ -3,6 +3,7 @@ Telegram notification support for the AI Orchestrator.
 Sends messages on task completion, errors, provider exhaustion, and queue summary.
 """
 
+import threading
 import urllib.request
 import urllib.parse
 import json
@@ -27,6 +28,7 @@ _stats = {
     "providers_used": {},
     "started_at": None,
 }
+_stats_lock = threading.Lock()
 
 
 def _escape_markdown(text: str) -> str:
@@ -82,10 +84,11 @@ def _truncate(text: str, max_len: int = 300) -> str:
 
 def start_session() -> None:
     """Mark the start of an orchestrator session."""
-    _stats["started_at"] = datetime.now()
-    _stats["tasks_done"] = 0
-    _stats["tasks_failed"] = 0
-    _stats["providers_used"] = {}
+    with _stats_lock:
+        _stats["started_at"] = datetime.now()
+        _stats["tasks_done"] = 0
+        _stats["tasks_failed"] = 0
+        _stats["providers_used"] = {}
 
 
 def notify_task_done(task: str, provider: str, output: str, change_summary: str | None = None) -> None:
@@ -93,8 +96,9 @@ def notify_task_done(task: str, provider: str, output: str, change_summary: str 
     if not NOTIFY_ON_TASK_DONE:
         return
 
-    _stats["tasks_done"] += 1
-    _stats["providers_used"][provider] = _stats["providers_used"].get(provider, 0) + 1
+    with _stats_lock:
+        _stats["tasks_done"] += 1
+        _stats["providers_used"][provider] = _stats["providers_used"].get(provider, 0) + 1
 
     provider_safe = _escape_markdown(provider)
     task_safe = _strip_backticks(_truncate(task, 100))
@@ -116,7 +120,8 @@ def notify_error(task: str, provider: str, error: str) -> None:
     if not NOTIFY_ON_ERROR:
         return
 
-    _stats["tasks_failed"] += 1
+    with _stats_lock:
+        _stats["tasks_failed"] += 1
 
     provider_safe = _escape_markdown(provider)
     task_safe = _strip_backticks(_truncate(task, 100))
@@ -146,7 +151,12 @@ def notify_queue_complete(remaining: int = 0) -> None:
     if not NOTIFY_ON_QUEUE_COMPLETE:
         return
 
-    started = _stats["started_at"]
+    with _stats_lock:
+        started = _stats["started_at"]
+        tasks_done = _stats["tasks_done"]
+        tasks_failed = _stats["tasks_failed"]
+        providers_used = dict(_stats["providers_used"])
+
     duration = ""
     if started:
         elapsed = datetime.now() - started
@@ -154,7 +164,7 @@ def notify_queue_complete(remaining: int = 0) -> None:
         duration = f"\nDauer: {mins} Min"
 
     providers_str = ", ".join(
-        f"{name}: {count}" for name, count in _stats["providers_used"].items()
+        f"{name}: {count}" for name, count in providers_used.items()
     ) or "keine"
     providers_safe = _escape_markdown(providers_str)
 
@@ -163,8 +173,8 @@ def notify_queue_complete(remaining: int = 0) -> None:
     _send(
         f"📊 *Orchestrator Zusammenfassung*\n\n"
         f"{status}\n"
-        f"Erledigt: {_stats['tasks_done']}\n"
-        f"Fehler: {_stats['tasks_failed']}\n"
+        f"Erledigt: {tasks_done}\n"
+        f"Fehler: {tasks_failed}\n"
         f"Provider: {providers_safe}{duration}"
     )
 

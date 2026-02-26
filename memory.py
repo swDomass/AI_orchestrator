@@ -84,11 +84,12 @@ def _make_filename(task: str, provider: str) -> str:
 
 
 def _truncate_summary(text: str) -> str:
-    """Truncate to MEMORY_SUMMARY_MAX_CHARS (first 500 + last 200)."""
-    first = MEMORY_SUMMARY_MAX_CHARS - 200
+    """Truncate to MEMORY_SUMMARY_MAX_CHARS (first N + last 200)."""
     if len(text) <= MEMORY_SUMMARY_MAX_CHARS:
         return text
-    return text[:first] + "\n...\n" + text[-200:]
+    tail = min(200, MEMORY_SUMMARY_MAX_CHARS // 3)
+    first = max(0, MEMORY_SUMMARY_MAX_CHARS - tail)
+    return text[:first] + "\n...\n" + text[-tail:]
 
 
 def _tokenize(text: str) -> set[str]:
@@ -343,8 +344,10 @@ def archive_old_memories() -> int:
                 ts = mem["timestamp"] if mem else datetime.fromtimestamp(path.stat().st_mtime)
                 if ts < cutoff:
                     dest = _ARCHIVE_DIR / path.name
-                    if dest.exists():
-                        dest = _ARCHIVE_DIR / f"{path.stem}_dup.md"
+                    counter = 1
+                    while dest.exists():
+                        dest = _ARCHIVE_DIR / f"{path.stem}_{counter}.md"
+                        counter += 1
                     shutil.move(str(path), str(dest))
                     archived += 1
                     logger.debug("Archived memory: %s", path.name)

@@ -115,8 +115,9 @@ def _run_single_subtask(
             provider,
             subtask.cwd,
             timeout=subtask.timeout,
-            queue_line_no=None,   # don't modify queue — parent handles finalization
+            queue_line_no=None,
             memory_context=memory_context,
+            skip_queue=True,      # parent handles finalization
         )
         return SubTaskResult(
             text=subtask.text,

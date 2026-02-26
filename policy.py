@@ -103,11 +103,10 @@ class PolicyEngine:
             if mtime == self._mtime:
                 return
             self._mtime = mtime
+            self._load_rules_locked(path)
 
-        self._load_rules(path)
-
-    def _load_rules(self, path: Path) -> None:
-        """Parse policy.yaml into PolicyRule list."""
+    def _load_rules_locked(self, path: Path) -> None:
+        """Parse policy.yaml into PolicyRule list. Caller must hold self._lock."""
         try:
             import yaml
             with open(path, encoding="utf-8") as f:
@@ -119,12 +118,8 @@ class PolicyEngine:
         if not isinstance(data, dict):
             return
 
-        rules = _parse_rules_from_dict(data)
-
-        with self._lock:
-            self._rules = rules
-
-        logger.debug("policy: loaded %d rules from %s", len(rules), path)
+        self._rules = _parse_rules_from_dict(data)
+        logger.debug("policy: loaded %d rules from %s", len(self._rules), path)
 
     # ------------------------------------------------------------------
     # Classification

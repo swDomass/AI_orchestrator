@@ -216,6 +216,8 @@ Befehle:
 - `/limits` -> detaillierte Limits
 - `/pause` / `/resume`
 - `/approve`, `/approve-all <cat>`, `/deny`, `/skip`
+- `/pick N` -> Usage-Vorschlag auswählen (1-3)
+- `/decline` -> Vorschläge ablehnen
 - `/cancel-shutdown`
 - `/help`
 
@@ -230,9 +232,108 @@ Plain-Text:
   - speichert Task-Ergebnisse und liefert relevanten Kontext für ähnliche Aufgaben
 - **Heartbeat (`heartbeat.py`)**
   - proaktive Checks (z. B. Queue-Idle, Disk-Space, Git-Staleness)
+- **Usage Suggester (`usage_suggester.py`)**
+  - erkennt wenn Claude-Limits bald zurückgesetzt werden und noch >30% Kapazität übrig ist
+  - schlägt proaktiv 2-3 Tasks via Telegram vor (Skills, Git-Changes, fehlgeschlagene Retries, Vault-Tasks)
+  - Auswahl per `/pick N` oder `/decline`
+  - Details und Beispiele: siehe [Usage Suggester](#usage-suggester) weiter unten
 - **SOUL.md**
   - zentrale Prompt-/Persönlichkeitsdefinition im Vault
   - provider-spezifische Abschnitte möglich (`### Claude`, `### Gemini`, `### Codex`)
+
+## Usage Suggester
+
+Im `--watch` Modus prüft der Usage Suggester alle 5 Minuten, ob Claude-Kapazität ungenutzt verfallen würde. Wenn das Limit bald zurückgesetzt wird (< 15 Min) und noch ausreichend Kapazität übrig ist (> 30%), werden proaktiv 2–3 sinnvolle Tasks per Telegram vorgeschlagen.
+
+### Wann feuert der Suggester?
+
+Alle Bedingungen müssen gleichzeitig erfüllt sein:
+
+- Queue ist **leer** (keine wartenden Tasks)
+- Claude-Remaining **> 30%**
+- Reset in **< 15 Minuten**
+- Kein ausstehender Policy-Approval
+- Letzte Vorschläge liegen mindestens **20 Minuten** zurück (Cooldown)
+
+### Vorschlag-Strategien
+
+Der Suggester sammelt Kandidaten aus vier Quellen und wählt die 3 besten nach Score:
+
+| Strategie | Quelle | Score | Beispiel |
+|---|---|---|---|
+| **Vault Skills** | Skills aus `99_System/AI/Skills/` die nicht kürzlich (< 7 Tage) liefen | 1.0 (3.0 montags, 2.5 am Monatsanfang) | `Skill: vault-gardener` |
+| **Git Changes** | Repos in `ALLOWED_CWD_ROOTS` mit uncommitted Changes | 0.8 – 1.3 (je nach Anzahl Änderungen) | `Git: my-project (12 Änderungen)` |
+| **Failed Retries** | Fehlgeschlagene Tasks der letzten 3 Tage aus Memory | 0.6 | `Retry: Fix parser bug in…` |
+| **Vault Tasks** | Offene Tasks aus dem Obsidian-Vault (Tasks-Plugin), per LLM auf Autonomie-Eignung bewertet | 0.5 – 2.5 (Heuristik × 0.3 + LLM-Score × 0.7) | `Vault: Datenmodell für Lastkollektiv…` |
+
+**Vault Tasks im Detail:**
+
+Die Vault-Task-Strategie scannt `01_Tasks/01_Tasks_Lake.md`, `01_Tasks/02_recTasks.md` und `01_Tasks/01_Projekte/**/*.md` nach offenen `- [ ]` Tasks mit Tasks-Plugin-Metadaten. Harte Filter entfernen physische/manuelle Tasks (`#Rolle/haus`, `#Rolle/Fam` etc.), blockierte (`#wait`), wiederkehrende (`🔁`) und zu lange (`#Dauer/proj`, `#Dauer/d`) Tasks. Die verbleibenden Kandidaten werden nach Urgency, Priorität, Fälligkeit und Dauer heuristisch vorbewertet. Die Top-10 werden per LLM-Call auf Autonomie-Eignung (0–10) bewertet. Falls kein Provider verfügbar ist, wird nur die Heuristik verwendet.
+
+### Telegram-Nachricht (Beispiel)
+
+So sieht eine typische Vorschlag-Nachricht aus:
+
+```text
+💡 Freie Kapazität verfügbar
+
+Claude: 45% übrig, Reset in ~12 Min
+
+Vorschläge:
+  1. Skill: vault-gardener
+  2. Git: AI_orchestrator (3 Änderungen)
+  3. Retry: Fix Unicode-Bug in parser
+
+/pick 1-3 — Auswahl treffen
+/decline — Nichts davon
+```
+
+### Vorschläge beantworten
+
+| Befehl | Wirkung |
+|---|---|
+| `/pick 1` | Wählt Vorschlag 1 — der Task wird automatisch zur Queue hinzugefügt und vom Orchestrator ausgeführt |
+| `/pick 2` | Wählt Vorschlag 2 |
+| `/decline` | Lehnt alle Vorschläge ab — der Suggester wartet mindestens 20 Min bis zum nächsten Versuch |
+| *(keine Antwort)* | Nach 5 Minuten Timeout wird automatisch abgebrochen |
+
+Nach `/pick N` bestätigt der Bot:
+
+```text
+👍 Vorschlag 1 angenommen…
+✅ Task zur Queue hinzugefügt:
+`Führe den Skill 'vault-gardener' aus: Bereinigt …`
+```
+
+### Welche Tasks eignen sich als Vorschläge?
+
+Gute Kandidaten sind **wartungsarme, risikoarme** Aufgaben, die der Orchestrator selbständig durchführen kann:
+
+**Ideal:**
+- Vault-Skills (vault-gardener, smart-search, etc.) — brauchen keine manuelle Eingabe
+- Code-Reviews für Repos mit Änderungen — der Orchestrator committet nicht ohne Freigabe
+- Retry fehlgeschlagener Tasks — oft hilft ein frischer Versuch bei temporären Fehlern
+
+**Weniger geeignet:**
+- Tasks die manuelle Entscheidungen erfordern
+- Destruktive Operationen (werden ohnehin durch Policy/Guardrails gefiltert)
+- Tasks mit langer Laufzeit (> 10 Min) — die Kapazität könnte mitten im Task resetten
+
+### Konfiguration
+
+Die Schwellenwerte sind in `config.py` einstellbar:
+
+| Konstante | Default | Beschreibung |
+|---|---|---|
+| `USAGE_SUGGEST_MIN_REMAINING_PCT` | `30` | Mindest-Remaining in % damit Vorschläge kommen |
+| `USAGE_SUGGEST_RESET_WINDOW_SEC` | `900` (15 Min) | Reset muss innerhalb dieses Fensters liegen |
+| `USAGE_SUGGEST_TIMEOUT_SEC` | `300` (5 Min) | Wartezeit auf Antwort per Telegram |
+| `USAGE_SUGGEST_SKILL_COOLDOWN_DAYS` | `7` | Skills die innerhalb dieses Zeitraums liefen werden nicht vorgeschlagen |
+| `USAGE_SUGGEST_RETRY_WINDOW_DAYS` | `3` | Nur fehlgeschlagene Tasks der letzten N Tage |
+| `USAGE_SUGGEST_LLM_TIMEOUT_SEC` | `60` | Timeout für den LLM-Autonomie-Assessment-Call |
+| `USAGE_SUGGEST_VAULT_TASK_DIRS` | `[01_Tasks/...]` | Vault-Pfade für Task-Scanning (relativ zum Vault) |
+
+Heartbeat-Intervall wird über `HEARTBEAT.md` im Vault gesteuert (Standard: alle 5 Minuten).
 
 ## Sicherheit / Guardrails
 
@@ -272,6 +373,7 @@ orchestrator.py
   -> profiles.py            (#agent Profile)
   -> memory.py              (Kontextspeicher)
   -> heartbeat.py           (Watch-Modus Checks)
+  -> usage_suggester.py     (Proaktive Task-Vorschläge bei freier Kapazität)
   -> telegram_listener.py   (Telegram Commands + Chat)
   -> notifier.py            (Telegram Notifications)
   -> shutdown.py            (Shutdown Countdown / Cancel)

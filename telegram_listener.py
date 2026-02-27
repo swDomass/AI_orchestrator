@@ -14,6 +14,8 @@ Supported commands:
   /approve-all <cat> — session-wide preapproval for category
   /deny              — deny pending approval request
   /skip              — skip risky action, continue task
+  /pick N            — pick usage suggestion (1-3)
+  /decline           — dismiss usage suggestions
   /cancel-shutdown   — cancel pending shutdown countdown
 
 Any other text is forwarded to the best available AI provider and the
@@ -259,6 +261,10 @@ class TelegramListener:
                 self._cmd_deny()
             elif command == "/skip":
                 self._cmd_skip()
+            elif command == "/pick":
+                self._cmd_pick(command_args)
+            elif command == "/decline":
+                self._cmd_decline()
             elif command == "/cancel-shutdown":
                 self._cmd_cancel_shutdown()
             return
@@ -286,6 +292,8 @@ class TelegramListener:
             "/approve\\-all \\<kategorie\\> — Session\\-Freigabe für Kategorie\n"
             "/deny  — Ausstehende Aktion ablehnen\n"
             "/skip  — Aktion überspringen, Task fortsetzen\n"
+            "/pick N — Vorschlag N auswählen \\(1\\-3\\)\n"
+            "/decline — Vorschläge ablehnen\n"
             "/cancel\\-shutdown — Geplanten Shutdown abbrechen\n"
             "/help   — Diese Hilfe\n\n"
             "\\#shutdown in Text → Shutdown einplanen\n"
@@ -397,6 +405,43 @@ class TelegramListener:
                 return
             cancel_shutdown()
             send_message("✋ Shutdown abgebrochen.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_pick(self, args: str) -> None:
+        try:
+            from usage_suggester import get_suggester
+            suggester = get_suggester()
+            pending_count = suggester.pending_suggestion_count()
+            if pending_count == 0:
+                send_message("ℹ️ Keine ausstehenden Vorschläge.")
+                return
+            n = args.strip()
+            if not n or not n.isdigit():
+                send_message(f"ℹ️ Verwendung: `/pick N` mit `N = 1..{pending_count}`")
+                return
+            pick = int(n)
+            if pick < 1 or pick > pending_count:
+                send_message(f"ℹ️ Ungültige Auswahl. Erlaubt ist `1..{pending_count}`.")
+                return
+            if suggester.respond(str(pick)):
+                send_message(f"👍 Vorschlag {pick} angenommen…")
+            else:
+                send_message("ℹ️ Vorschlag ist nicht mehr aktiv.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_decline(self) -> None:
+        try:
+            from usage_suggester import get_suggester
+            suggester = get_suggester()
+            if not suggester.has_pending_suggestion():
+                send_message("ℹ️ Keine ausstehenden Vorschläge.")
+                return
+            if suggester.respond("decline"):
+                send_message("👍 Vorschläge abgelehnt.")
+            else:
+                send_message("ℹ️ Vorschlag ist nicht mehr aktiv.")
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 

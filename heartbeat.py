@@ -19,12 +19,14 @@ Built-in handlers matched by case-insensitive substring in item label:
     "check-limits" → _check_limits
     "summarize"    → _check_task_summary
     "stale branch" → _check_stale_branches
+    "usage-suggest" → _check_usage_suggest
 """
 
 import logging
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -57,6 +59,7 @@ class HeartbeatItem:
 # ── Module-level state for queue-idle tracking ─────────────────────────────
 
 _queue_empty_since: Optional[datetime] = None
+_usage_suggest_thread: Optional[threading.Thread] = None
 
 
 # ── Built-in handlers ─────────────────────────────────────────────────────────
@@ -192,6 +195,36 @@ def _check_task_summary(dispatcher: Optional[object] = None) -> Optional[str]:
         return None
 
 
+def _check_usage_suggest(queue_read_fn: Callable) -> Optional[str]:
+    """Check if Claude limits are about to reset with unused capacity and suggest tasks."""
+    global _usage_suggest_thread
+    try:
+        from usage_suggester import get_suggester
+
+        # Run asynchronously so heartbeat never blocks the main watch loop.
+        if _usage_suggest_thread and _usage_suggest_thread.is_alive():
+            return None
+
+        def _worker() -> None:
+            try:
+                result = get_suggester().check_and_suggest(queue_read_fn)
+                if result:
+                    logger.info("usage-suggest result: %s", result)
+            except Exception as e:
+                logger.debug("usage-suggest worker failed: %s", e)
+
+        _usage_suggest_thread = threading.Thread(
+            target=_worker,
+            name="usage-suggest",
+            daemon=True,
+        )
+        _usage_suggest_thread.start()
+        return None
+    except Exception as e:
+        logger.debug("usage-suggest failed: %s", e)
+        return None
+
+
 def _check_stale_branches() -> Optional[str]:
     """Warn about branches with last commit >HEARTBEAT_GIT_STALE_DAYS days old."""
     results: list[str] = []
@@ -247,6 +280,7 @@ HANDLER_KEYS: list[tuple[str, str]] = [
     ("check-limits",  "_check_limits"),
     ("summarize",     "_check_task_summary"),
     ("stale branch",  "_check_stale_branches"),
+    ("usage-suggest", "_check_usage_suggest"),
 ]
 
 
@@ -437,6 +471,8 @@ class HeartbeatRunner:
             return _check_task_summary(dispatcher)
         elif key == "_check_stale_branches":
             return _check_stale_branches()
+        elif key == "_check_usage_suggest":
+            return _check_usage_suggest(queue_read_fn)
         else:
             logger.debug("No handler for heartbeat item: %s", item.label)
             return None

@@ -227,6 +227,31 @@ def notify_approval_result(task_text: str, result: str) -> None:
     _send(f"{icon} *Approval {result_safe}*\nTask: `{task_safe}`")
 
 
+def notify_usage_suggestions(suggestions: list, remaining_pct: float, resets_in_sec: int) -> None:
+    """Send usage suggestions with /pick and /decline options."""
+    if not suggestions:
+        return
+    mins = resets_in_sec // 60
+    max_pick = len(suggestions)
+    lines = [
+        "💡 *Freie Kapazität verfügbar*",
+        "",
+        f"Claude: {remaining_pct:.0f}% übrig, Reset in ~{mins} Min",
+        "",
+        "Vorschläge:",
+    ]
+    for s in suggestions:
+        label_safe = _escape_markdown(s.label)
+        lines.append(f"  {s.rank}. {label_safe}")
+
+    lines.append("")
+    pick_hint = "/pick 1" if max_pick == 1 else f"/pick 1-{max_pick}"
+    lines.append(f"{pick_hint} — Auswahl treffen")
+    lines.append("/decline — Nichts davon")
+
+    _send("\n".join(lines))
+
+
 def notify_tool_progress(tool_name: str, iteration: int, max_iter: int, message: str) -> None:
     """Notify about tool progress (e.g. review loop iteration)."""
     _send(

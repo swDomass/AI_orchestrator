@@ -152,6 +152,54 @@ def test_task_prefix_command_does_not_match_other_commands(mock_append_task, moc
     mock_send.assert_not_called()
 
 
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("usage_suggester.get_suggester")
+def test_pick_sends_confirmation_on_success(mock_get_suggester, mock_send):
+    suggester = MagicMock()
+    suggester.pending_suggestion_count.return_value = 2
+    suggester.respond.return_value = True
+    mock_get_suggester.return_value = suggester
+
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/pick 1"))
+
+    sent_texts = [c[0][0] for c in mock_send.call_args_list]
+    assert any("angenommen" in t for t in sent_texts)
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("usage_suggester.get_suggester")
+def test_pick_reports_when_suggestion_is_no_longer_active(mock_get_suggester, mock_send):
+    suggester = MagicMock()
+    suggester.pending_suggestion_count.return_value = 2
+    suggester.respond.return_value = False
+    mock_get_suggester.return_value = suggester
+
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/pick 1"))
+
+    sent_texts = [c[0][0] for c in mock_send.call_args_list]
+    assert any("nicht mehr aktiv" in t for t in sent_texts)
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("usage_suggester.get_suggester")
+def test_decline_reports_when_suggestion_is_no_longer_active(mock_get_suggester, mock_send):
+    suggester = MagicMock()
+    suggester.has_pending_suggestion.return_value = True
+    suggester.respond.return_value = False
+    mock_get_suggester.return_value = suggester
+
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/decline"))
+
+    sent_texts = [c[0][0] for c in mock_send.call_args_list]
+    assert any("nicht mehr aktiv" in t for t in sent_texts)
+
+
 # ---------------------------------------------------------------------------
 # /status
 # ---------------------------------------------------------------------------

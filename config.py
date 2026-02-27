@@ -161,6 +161,19 @@ PROFILES_DIR = VAULT_PATH / "99_System" / "AI" / "profiles"
 POLICY_FILE = VAULT_PATH / "99_System" / "AI" / "policy.yaml"
 POLICY_APPROVAL_TIMEOUT_SEC = 600  # 10 minutes
 
+# --- Usage Suggester ---
+USAGE_SUGGEST_MIN_REMAINING_PCT   = 30
+USAGE_SUGGEST_RESET_WINDOW_SEC    = 15 * 60
+USAGE_SUGGEST_TIMEOUT_SEC         = 5 * 60
+USAGE_SUGGEST_SKILL_COOLDOWN_DAYS = 7
+USAGE_SUGGEST_RETRY_WINDOW_DAYS   = 3
+USAGE_SUGGEST_LLM_TIMEOUT_SEC    = 60
+USAGE_SUGGEST_VAULT_TASK_DIRS     = [
+    "01_Tasks/01_Tasks_Lake.md",
+    "01_Tasks/02_recTasks.md",
+    "01_Tasks/01_Projekte",
+]
+
 # --- Shutdown ---
 SHUTDOWN_DELAY_SEC = 60
 SHUTDOWN_COMMAND = (

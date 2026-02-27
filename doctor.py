@@ -62,7 +62,7 @@ def _check_cli(label: str, cmd: str, install_hint: str = "") -> CheckResult:
         try:
             r = subprocess.run(
                 f"{cmd} --version",
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
                 shell=True,
             )
             version = (r.stdout or r.stderr).strip().splitlines()[0][:60]
@@ -104,7 +104,7 @@ def check_cclimits() -> CheckResult:
     try:
         r = subprocess.run(
             ["npx", "cclimits", "--json"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             shell=os.name == "nt",
         )
         if r.returncode == 0:

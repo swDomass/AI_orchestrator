@@ -155,7 +155,7 @@ def _is_git_repo(cwd: str) -> bool:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         return result.returncode == 0 and result.stdout.strip() == "true"
     except (OSError, subprocess.TimeoutExpired):
@@ -178,7 +178,7 @@ def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
     try:
         create = subprocess.run(
             ["git", "stash", "create", msg],
-            cwd=cwd, capture_output=True, text=True, timeout=30,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
         if create.returncode != 0:
             return None
@@ -189,7 +189,7 @@ def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
 
         store = subprocess.run(
             ["git", "stash", "store", "-m", msg, stash_commit],
-            cwd=cwd, capture_output=True, text=True, timeout=30,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
         if store.returncode == 0:
             print(f"  [safety] Git Snapshot gespeichert (nicht-destruktiv): {msg}")
@@ -205,14 +205,14 @@ def _git_diff_summary(cwd: str) -> str:
     try:
         tracked = subprocess.run(
             ["git", "diff", "HEAD", "--stat"],
-            cwd=cwd, capture_output=True, text=True, timeout=10,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         if tracked.returncode == 0 and tracked.stdout.strip():
             parts.append(tracked.stdout.strip())
 
         untracked = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
-            cwd=cwd, capture_output=True, text=True, timeout=10,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         if untracked.returncode == 0 and untracked.stdout.strip():
             files = [line.strip() for line in untracked.stdout.splitlines() if line.strip()]

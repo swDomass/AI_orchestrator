@@ -102,6 +102,8 @@ def _check_git_status() -> Optional[str]:
                 cwd=str(root),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -205,6 +207,8 @@ def _check_stale_branches() -> Optional[str]:
                 cwd=str(root),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             if r.returncode != 0 or not r.stdout.strip():

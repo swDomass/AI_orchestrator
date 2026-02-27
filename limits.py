@@ -171,13 +171,13 @@ def _refresh_token(provider: str) -> bool:
             # auth status triggers OAuth refresh without an API call
             subprocess.run(
                 [_CLAUDE_CMD, "auth", "status"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
         elif provider == "gemini":
             # No auth-only command available; minimal prompt to trigger refresh
             subprocess.run(
                 [_GEMINI_CMD, "--prompt", ".", "--output-format", "text"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
             )
         else:
             return False

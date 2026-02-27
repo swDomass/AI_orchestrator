@@ -117,9 +117,9 @@ def execute_shutdown(
         try:
             if sys.platform == "win32":
                 cmd = " ".join(SHUTDOWN_COMMAND) if isinstance(SHUTDOWN_COMMAND, list) else SHUTDOWN_COMMAND
-                result = subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True)
+                result = subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
             else:
-                result = subprocess.run(SHUTDOWN_COMMAND, check=False, capture_output=True, text=True)
+                result = subprocess.run(SHUTDOWN_COMMAND, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 logger.error("shutdown: command returned %d — stderr: %s", result.returncode, result.stderr.strip())
         except Exception as e:

@@ -985,9 +985,9 @@ def run_watch(dry_run: bool = False) -> None:
                 except Exception:
                     pass
 
-                print("\nQueue leer. Warte auf neue Tasks (alle 60s prüfen)...")
+                print("\nQueue leer. Warte auf neue Tasks (alle 5min prüfen)...")
                 heartbeat.run_due(read_queue)
-                time.sleep(60)
+                time.sleep(SLEEP_POLL_INTERVAL)
                 continue
 
             done = run_once(dry_run=dry_run, pause_event=pause_event)

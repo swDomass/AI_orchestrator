@@ -31,6 +31,7 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 7 | Parallel sub-agent spawning | DONE |
 | 8 | SOUL.md / personality-as-config | DONE |
 | 9 | Execution policy + approval layer | DONE |
+| 10b | Usage Suggester (proactive task suggestions) | DONE |
 
 ## Tier 3 — Nice to Have, After Core Is Solid
 

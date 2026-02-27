@@ -403,8 +403,7 @@ class TelegramListener:
     def _handle_shutdown_request(self) -> None:
         """Handle #shutdown in plain text message."""
         try:
-            from shutdown import execute_shutdown, request_shutdown
-            from queue_manager import read_queue
+            from shutdown import request_shutdown
 
             if not request_shutdown():
                 send_message("ℹ️ Shutdown bereits ausstehend.")
@@ -412,10 +411,8 @@ class TelegramListener:
 
             send_message("⏾ Shutdown geplant nach aktuellem Task.")
 
-            # If idle (queue empty), start countdown immediately in background
-            if not read_queue():
-                t = threading.Thread(target=execute_shutdown, daemon=True)
-                t.start()
+            # Don't start countdown here — let the main orchestrator loop handle it.
+            # Starting on a daemon thread would get killed when main() exits.
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 

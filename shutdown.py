@@ -14,6 +14,7 @@ State machine:
 
 import logging
 import subprocess
+import sys
 import threading
 from typing import Callable
 
@@ -114,7 +115,13 @@ def execute_shutdown(
             pass
 
         try:
-            subprocess.run(SHUTDOWN_COMMAND, check=False)
+            if sys.platform == "win32":
+                cmd = " ".join(SHUTDOWN_COMMAND) if isinstance(SHUTDOWN_COMMAND, list) else SHUTDOWN_COMMAND
+                result = subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True)
+            else:
+                result = subprocess.run(SHUTDOWN_COMMAND, check=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error("shutdown: command returned %d — stderr: %s", result.returncode, result.stderr.strip())
         except Exception as e:
             logger.error("shutdown: OS shutdown command failed: %s", e)
     finally:

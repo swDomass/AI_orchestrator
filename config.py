@@ -59,7 +59,7 @@ PROVIDER_COOLDOWN_SEC = 30 * 60  # 30 minutes
 MIN_CAPACITY_PERCENT = 5
 
 # How long to wait between cclimits polls when sleeping (seconds)
-SLEEP_POLL_INTERVAL = 60
+SLEEP_POLL_INTERVAL = 5 * 60
 
 # Timeout for a single CLI task call (seconds)
 TASK_TIMEOUT_SEC = 5 * 60  # 5 minutes

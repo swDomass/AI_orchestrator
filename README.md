@@ -103,6 +103,7 @@ Der Orchestrator ergänzt automatisch:
 | Feature | Syntax | Beispiel |
 |---|---|---|
 | Provider erzwingen | `#claude`, `#gemini`, `#codex` | `- [ ] Task #codex` |
+| Claude-Modell wählen | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
 | Tool ausführen | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
 | Working Directory | `cwd:<pfad>` | `cwd:D:\projects\repo` |
 | Working Directory mit Leerzeichen | `cwd:"<pfad mit spaces>"` | `cwd:"D:\My Projects\App"` |
@@ -226,20 +227,37 @@ Plain-Text:
 - beliebiger Text -> AI-Chat (Antwort via best available provider)
 - `#shutdown` als eigenständiges Tag im Text -> Shutdown planen
 
+Rate-Limits (Telegram-seitig, gegen Spam):
+
+| Kategorie | Limit |
+|---|---|
+| Commands | 20/min |
+| AI-Chats | 5/min |
+| Task-Adds | 10/min |
+
+Max. Task-Länge via `/task`: 500 Zeichen (konfigurierbar via `TELEGRAM_MAX_TASK_LENGTH`).
+
 ## Memory, Heartbeat, SOUL.md
 
 - **Memory (`memory.py`)**
-  - speichert Task-Ergebnisse und liefert relevanten Kontext für ähnliche Aufgaben
+  - speichert Task-Ergebnisse als Markdown mit YAML-Frontmatter in `99_System/AI/memory/task_results/`
+  - TF-IDF Keyword-Matching + Temporal Decay (Halbwertszeit: 30 Tage)
+  - Top-K relevante Erinnerungen (Standard: 5) werden in den Prompt injiziert (max. 2000 Tokens)
+  - Automatische Archivierung nach 180 Tagen in `memory/archive/`
 - **Heartbeat (`heartbeat.py`)**
-  - proaktive Checks (z. B. Queue-Idle, Disk-Space, Git-Staleness)
+  - proaktive Checks im `--watch` Modus, konfiguriert über `99_System/AI/HEARTBEAT.md`
+  - 7 Built-in Handler: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `summarize`, `stale-branch`, `usage-suggest`
+  - Mtime-cached Config — Änderungen an HEARTBEAT.md werden automatisch übernommen
 - **Usage Suggester (`usage_suggester.py`)**
   - erkennt wenn Claude-Limits bald zurückgesetzt werden und noch >30% Kapazität übrig ist
   - schlägt proaktiv 2-3 Tasks via Telegram vor (Skills, Git-Changes, fehlgeschlagene Retries, Vault-Tasks)
   - Auswahl per `/pick N` oder `/decline`
   - Details und Beispiele: siehe [Usage Suggester](#usage-suggester) weiter unten
 - **SOUL.md**
-  - zentrale Prompt-/Persönlichkeitsdefinition im Vault
-  - provider-spezifische Abschnitte möglich (`### Claude`, `### Gemini`, `### Codex`)
+  - zentrale Prompt-/Persönlichkeitsdefinition im Vault (`99_System/AI/SOUL.md`)
+  - provider-spezifische Abschnitte möglich (`### claude`, `### gemini`, `### codex`)
+  - Mtime-cached — Änderungen wirken ab dem nächsten Task (kein Neustart nötig)
+  - Enthält: Safety Rules, Projektkontext-Anweisungen, Qualitätsregeln, Error Handling, Vault-Konventionen
 
 ## Usage Suggester
 
@@ -345,18 +363,48 @@ Neben der Policy gibt es zusätzliche Guardrails im Systemprompt und in der Lauf
 - `cwd:`-Validierung (inkl. `ALLOWED_CWD_ROOTS`, falls gesetzt)
 - Dateiänderungs-Snapshot + Änderungszusammenfassung nach Tasks
 
+## Prompt-Aufbau (Token-Budget)
+
+Der Orchestrator baut den Prompt aus mehreren Quellen zusammen, jede mit eigenem Token-Budget:
+
+| Komponente | Budget | Quelle |
+|---|---|---|
+| Core (Task + Safety) | ~200 Tokens | `config.py` / `SOUL.md` |
+| Memory-Kontext | ~2000 Tokens | `memory.py` — relevante vergangene Tasks |
+| Wikilink-Kontext | ~3000 Tokens | `queue_manager.py` — `[[verlinkte Dateien]]` |
+| Skill-Prompt | ~2000 Tokens | `SKILL.md` Body (nur bei `#tool:` Tag) |
+| **Gesamt** | **~8000 Tokens** | |
+
+Wikilinks und Memory werden intelligent gekürzt: relevante Abschnitte werden per Keyword-Matching extrahiert, nicht einfach abgeschnitten.
+
+## Logging
+
+- Log-Datei: `logs/orchestrator.log`
+- Rotating File Handler: 5 MB pro Datei, 3 Backups
+- Console-Output parallel zum File-Logging
+- Konfiguration in `logging_setup.py`
+
+## Encoding
+
+- Dateien werden als UTF-8 gelesen
+- Fallback auf Windows-1252 (`cp1252`) bei `UnicodeDecodeError`
+- Alle `subprocess`-Aufrufe verwenden explizit `encoding="utf-8"`
+
 ## Doctor (`--doctor`)
 
-`python orchestrator.py --doctor` prüft u. a.:
+`python orchestrator.py --doctor` führt 15+ Checks durch:
 
 - Provider-CLIs (`claude`, `gemini`, `codex`)
 - `node`, `git`, `npx cclimits`
-- Vault-/Queue-Pfade
-- Telegram Bot-Konfiguration
-- `.env`
-- Skills + Gating
-- Memory-/Heartbeat-Dateien
-- Profiles / Policy-Dateien
+- Vault-Pfad + Queue-Datei
+- Telegram Bot-Konfiguration (`getMe` API-Call)
+- `.env` (vorhanden + erforderliche Keys)
+- Skills Discovery + Requirements-Gating
+- Memory-Verzeichnis (`99_System/AI/memory/`)
+- Heartbeat-Datei (`99_System/AI/HEARTBEAT.md`)
+- Profiles-Verzeichnis + Validierung
+- Policy-Datei (`99_System/AI/policy.yaml`)
+- Provider-Limits (via `cclimits`)
 
 Mit `--fix` (optional `--yes`) werden einfache Probleme automatisch erstellt/repariert, z. B. Queue-Datei oder Verzeichnisse.
 
@@ -377,6 +425,10 @@ orchestrator.py
   -> telegram_listener.py   (Telegram Commands + Chat)
   -> notifier.py            (Telegram Notifications)
   -> shutdown.py            (Shutdown Countdown / Cancel)
+  -> limits.py              (cclimits Wrapper / Provider-Kapazität)
+  -> logging_setup.py       (Rotating File Logger)
+  -> doctor.py              (Setup-Validierung / --doctor)
+  -> config.py              (Konstanten, .env, SOUL.md Loader)
 ```
 
 ## Troubleshooting

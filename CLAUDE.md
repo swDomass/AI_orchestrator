@@ -39,14 +39,18 @@ python orchestrator.py --list-tools   # show available #tool: handlers
 
 Key components:
 - **`orchestrator.py`**: Main loop (`run_once`/`run_watch`), prompt building (`_build_prompt`), file change tracking via before/after snapshots
-- **`dispatcher.py`**: Provider selection with fallback chain (Claude → Gemini → Codex), cooldown management
-- **`queue_manager.py`**: Obsidian MD queue parsing with sidecar `.lock` file locking (msvcrt on Windows, fcntl on Unix). Regex-based metadata extraction (`cwd:`, `#tool:`, `#agent:`, `#parallel`, etc.)
+- **`dispatcher.py`**: Provider selection with fallback chain (Claude → Gemini → Codex), cooldown management, Claude model aliases (`#claude_haiku`, `#claude_sonnet`, `#claude_opus`)
+- **`queue_manager.py`**: Obsidian MD queue parsing with sidecar `.lock` file locking (msvcrt on Windows, fcntl on Unix). Regex-based metadata extraction (`cwd:`, `#tool:`, `#agent:`, `#parallel`, `#claude_*`, etc.). UTF-8 with cp1252 fallback. Smart wikilink/file context injection with TF-IDF section extraction.
 - **`providers/base.py`**: `BaseProvider` ABC with per-provider `_lock` for cooldown state and `threading.local()` for per-thread forced model
 - **`policy.py`**: `PolicyEngine` singleton — AUTO/APPROVE/DENY classification from vault YAML, blocks on `threading.Event` for Telegram approval
 - **`usage_suggester.py`**: `UsageSuggester` singleton — proactive task suggestions when provider capacity is underutilized. Same threading pattern as PolicyEngine
-- **`memory.py`**: TF-IDF + temporal decay search over past task results stored in vault
-- **`heartbeat.py`**: Scheduled health checks with mtime-reloading config from vault `HEARTBEAT.md`
-- **`config.py`**: Centralized constants, `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader
+- **`memory.py`**: TF-IDF + temporal decay search over past task results stored in vault. Auto-archival after 180 days.
+- **`heartbeat.py`**: Scheduled health checks with mtime-reloading config from vault `HEARTBEAT.md`. 7 built-in handlers: queue-idle, git-status, disk-space, check-limits, summarize, stale-branch, usage-suggest
+- **`config.py`**: Centralized constants (~56), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases
+- **`limits.py`**: `cclimits` wrapper for provider capacity checks, OAuth refresh handling
+- **`logging_setup.py`**: Rotating file logger (5MB, 3 backups) + console output
+- **`doctor.py`**: 15+ setup validation checks, `--fix`/`--yes` auto-repair mode
+- **`shutdown.py`**: Shutdown state machine with countdown, cancellation via Telegram or new queue tasks
 
 ## Key Patterns
 

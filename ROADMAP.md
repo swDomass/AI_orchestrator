@@ -42,6 +42,7 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 12 | Optional Docker sandbox | backlog |
 | 13 | Dashboard / web UI | backlog |
 | 14 | Plugin system (runtime-loadable handlers) | backlog |
+| 15 | Obsidian CLI integration (search, tasks, backlinks) | backlog |
 
 ## Tier 4 — Overkill for Now
 

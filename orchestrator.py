@@ -36,6 +36,7 @@ from datetime import datetime, timedelta
 from logging_setup import setup_logging
 
 from config import (
+    CLAUDE_MODEL_ALIASES,
     GIT_AUTO_STASH,
     MAX_RETRIES_PER_PROVIDER,
     PROMPT_MEMORY_TOKENS,
@@ -63,6 +64,7 @@ from queue_manager import (
     append_log,
     ensure_queue_file,
     extract_cwd,
+    extract_model_tag,
     extract_preapproved_actions,
     extract_profile_tag,
     extract_shutdown_tag,
@@ -588,6 +590,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         tool_timeout = extract_timeout(task, default=0) or None
         tool_name = extract_tool_tag(task)
 
+        model_tag = extract_model_tag(task)
+        model_id = CLAUDE_MODEL_ALIASES.get(model_tag) if model_tag else None
+        if model_tag and model_id is None:
+            _log.warning("Unknown model tag #%s — ignored, using default model", model_tag)
+
         # Feature 6: denied_skills check
         if tool_name and profile and tool_name in profile.denied_skills:
             msg = f"Tool '{tool_name}' durch Profil '{profile.name}' gesperrt (denied_skills)"
@@ -627,6 +634,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             print(f"  [timeout] {fmt_time(timeout)}")
         if tool_name:
             print(f"  [tool] {tool_name}")
+        if model_id:
+            print(f"  [model] #{model_tag} → {model_id}")
 
         # --- Feature 10: detect #shutdown tag ---
         task_has_shutdown = extract_shutdown_tag(task)
@@ -796,15 +805,23 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     return False
 
                 print(f"  → Provider: {provider.name}")
-                outcome = _execute_tool_task(
-                    task,
-                    tool_name,
-                    provider,
-                    cwd,
-                    timeout=tool_timeout,
-                    queue_line_no=queue_task.line_no,
-                    memory_context=memory_context,
-                )
+                previous_forced_model = None
+                if provider.name == "claude":
+                    previous_forced_model = getattr(provider, "_forced_model", None)
+                    setattr(provider, "_forced_model", model_id)
+                try:
+                    outcome = _execute_tool_task(
+                        task,
+                        tool_name,
+                        provider,
+                        cwd,
+                        timeout=tool_timeout,
+                        queue_line_no=queue_task.line_no,
+                        memory_context=memory_context,
+                    )
+                finally:
+                    if provider.name == "claude":
+                        setattr(provider, "_forced_model", previous_forced_model)
 
                 if outcome.success or outcome.finalized:
                     break
@@ -866,11 +883,19 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 break
 
             print(f"  → Provider: {provider.name}")
-            prompt = _build_prompt(task, provider.name, memory_context=memory_context)
-            start_time = time.time()
-            result, _exhausted = _run_with_retry(
-                provider, task, prompt, cwd, timeout, pause_event=pause_event
-            )
+            previous_forced_model = None
+            if provider.name == "claude":
+                previous_forced_model = getattr(provider, "_forced_model", None)
+                setattr(provider, "_forced_model", model_id)
+            try:
+                prompt = _build_prompt(task, provider.name, memory_context=memory_context)
+                start_time = time.time()
+                result, _exhausted = _run_with_retry(
+                    provider, task, prompt, cwd, timeout, pause_event=pause_event
+                )
+            finally:
+                if provider.name == "claude":
+                    setattr(provider, "_forced_model", previous_forced_model)
 
             if result.error == "paused":
                 print("\n[pause] Queue-Verarbeitung pausiert.")

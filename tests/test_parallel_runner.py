@@ -16,13 +16,14 @@ def test_parse_subtask(tmp_path, monkeypatch):
     d.mkdir()
     cwd_str = str(d.resolve())
     
-    text = f"Review project X #claude #tool:review-loop cwd:{cwd_str} #timeout:300s"
+    text = f"Review project X #claude_haiku #tool:review-loop cwd:{cwd_str} #timeout:300s"
     st = _parse_subtask(text)
     assert st.text == text
     assert st.provider_forced == "claude"
     assert st.tool_name == "review-loop"
     assert Path(st.cwd).resolve() == d.resolve()
     assert st.timeout == 300
+    assert st.forced_model == "claude-haiku-4-5-20251001"
 
 def test_parse_subtask_defaults():
     text = "Review project X"
@@ -148,6 +149,60 @@ def test_run_parallel_inherits_parent_cwd_for_subtasks_without_cwd(tmp_path, mon
     assert all(Path(c).resolve() == parent_dir.resolve() for c in seen_cwds)
 
 
+def test_run_parallel_inherits_parent_forced_model_for_subtasks_without_model(monkeypatch):
+    monkeypatch.setattr(queue_manager, "ALLOWED_CWD_ROOTS", [])
+
+    monkeypatch.setattr(
+        parallel_runner_module,
+        "_parse_subtask",
+        lambda text: SubTask(
+            text=text,
+            provider_forced=None,
+            cwd=None,
+            tool_name=None,
+            timeout=5,
+        ),
+    )
+
+    seen_models = []
+    monkeypatch.setattr(
+        parallel_runner_module,
+        "_run_single_subtask",
+        lambda subtask, idx, limits, memory_context, pause_event, profile=None: (
+            seen_models.append(subtask.forced_model),
+            SubTaskResult(text=subtask.text, provider_name="mock", success=True, output="ok")
+        )[1],
+    )
+
+    class FakeThread:
+        def __init__(self, target, args, daemon, name):
+            self._target = target
+            self._args = args
+            self.name = name
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            self._target(*self._args)
+            self._alive = False
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return self._alive
+
+    monkeypatch.setattr(parallel_runner_module.threading, "Thread", FakeThread)
+
+    run_parallel(
+        "Parent task #parallel #claude_haiku",
+        ("subtask a", "subtask b"),
+        AllLimits(),
+    )
+
+    assert seen_models == ["claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"]
+
+
 def test_run_parallel_continues_group_after_subtask_exception(monkeypatch):
     parsed = {
         "a": SubTask(text="a", provider_forced=None, cwd="C:/proj", tool_name=None, timeout=5),
@@ -194,6 +249,54 @@ def test_run_parallel_continues_group_after_subtask_exception(monkeypatch):
     assert "subtask_crash" in results[0].error
     assert results[1].success is True
     assert results[1].output == "ok"
+
+
+def test_run_single_subtask_applies_forced_claude_model(monkeypatch):
+    import dispatcher
+    import orchestrator
+
+    class DummyProvider:
+        name = "claude"
+
+        def __init__(self):
+            self._forced_model = None
+
+    provider = DummyProvider()
+    subtask = SubTask(
+        text="Do the thing",
+        provider_forced="claude",
+        cwd=None,
+        tool_name=None,
+        timeout=30,
+        forced_model="claude-haiku-4-5-20251001",
+    )
+
+    seen_models = []
+
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *_args, **_kwargs: "prompt")
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_with_retry",
+        lambda provider, *_args, **_kwargs: (
+            seen_models.append(provider._forced_model),
+            (SimpleNamespace(success=True, output="ok", error=""), 0.0)
+        )[1],
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask,
+        idx=0,
+        limits=AllLimits(),
+        memory_context="",
+        pause_event=None,
+    )
+
+    assert seen_models == ["claude-haiku-4-5-20251001"]
+    assert provider._forced_model is None
+    assert result.success is True
+    assert result.provider_name == "claude"
 
 
 def test_run_single_subtask_tool_success_preserves_tool_output(monkeypatch):

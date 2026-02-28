@@ -1,6 +1,6 @@
 """Claude Code CLI provider.
 
-Runs claude with full tool access (Read, Write, Edit, Bash) in non-interactive mode.
+Runs claude with full tool access (Read, Write, Edit, Bash, Glob, Grep) in non-interactive mode.
 Uses Anthropic subscription auth - no API key needed.
 """
 
@@ -16,15 +16,22 @@ class ClaudeProvider(BaseProvider):
     name = "claude"
 
     def run(self, task: str, cwd: str | None = None, timeout: int = TASK_TIMEOUT_SEC) -> RunResult:
-        print(f"  [claude] Führe Task aus...")
+        model_label = self._forced_model
+        if model_label:
+            print(f"  [claude → {model_label}] Führe Task aus...")
+        else:
+            print(f"  [claude] Führe Task aus...")
+        cmd = [
+            _CLAUDE_CMD,
+            "--print",
+            "--dangerously-skip-permissions",
+            "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
+        ]
+        if self._forced_model:
+            cmd.extend(["--model", self._forced_model])
         try:
             result = subprocess.run(
-                [
-                    _CLAUDE_CMD,
-                    "--print",
-                    "--dangerously-skip-permissions",
-                    "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
-                ],
+                cmd,
                 input=task,
                 capture_output=True,
                 text=True,

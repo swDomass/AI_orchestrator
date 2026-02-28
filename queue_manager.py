@@ -61,6 +61,9 @@ SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
 # Matches #parallel tag
 PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
 
+# Matches Claude model selection tags: #claude_haiku, #claude_sonnet, #claude_opus
+MODEL_TAG_RE = re.compile(r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus))(?![\w-])")
+
 # Extract only the markdown body under "## Queue" (until the next H2 heading)
 QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)
 
@@ -443,6 +446,15 @@ def extract_shutdown_tag(task: str) -> bool:
     return bool(SHUTDOWN_TAG_RE.search(task))
 
 
+def extract_model_tag(task: str) -> str | None:
+    """Extract Claude model tag (#claude_haiku, #claude_sonnet, #claude_opus).
+
+    Returns the alias key (e.g. 'claude_haiku') or None.
+    """
+    m = MODEL_TAG_RE.search(task)
+    return m.group(1).lower() if m else None
+
+
 def strip_metadata_tags(task: str) -> str:
     """Remove routing/metadata tags before sending the task text to a provider."""
     task = CWD_RE.sub("", task)
@@ -453,6 +465,7 @@ def strip_metadata_tags(task: str) -> str:
     task = PREAPPROVE_TAG_RE.sub("", task)
     task = SHUTDOWN_TAG_RE.sub("", task)
     task = PARALLEL_TAG_RE.sub("", task)
+    task = MODEL_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 

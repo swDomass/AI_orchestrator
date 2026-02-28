@@ -44,6 +44,14 @@ def test_has_cwd_tag_ignores_plain_prose():
     assert queue_manager.extract_cwd(task) is None
 
 
+def test_extract_model_tag_accepts_trailing_punctuation():
+    assert queue_manager.extract_model_tag("Fix bug #claude_haiku.") == "claude_haiku"
+
+
+def test_extract_model_tag_rejects_suffix_word_characters():
+    assert queue_manager.extract_model_tag("Fix bug #claude_haiku_extra") is None
+
+
 def test_extract_cwd_stops_before_non_metadata_hashtag(tmp_path, monkeypatch):
     project_dir = tmp_path / "project"
     project_dir.mkdir()

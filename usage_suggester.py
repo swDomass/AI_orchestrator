@@ -30,6 +30,7 @@ from typing import Callable, Optional
 
 from config import (
     ALLOWED_CWD_ROOTS,
+    USAGE_SUGGEST_CLAUDE_MODEL,
     USAGE_SUGGEST_LLM_TIMEOUT_SEC,
     USAGE_SUGGEST_MIN_REMAINING_PCT,
     USAGE_SUGGEST_RESET_WINDOW_SEC,
@@ -589,7 +590,15 @@ class UsageSuggester:
                 logger.debug("usage-suggest: no provider for autonomy assessment")
                 return {}
 
-            result = provider.run(prompt, cwd=None, timeout=USAGE_SUGGEST_LLM_TIMEOUT_SEC)
+            previous_forced_model = None
+            if provider.name == "claude":
+                previous_forced_model = provider._forced_model
+                provider._forced_model = USAGE_SUGGEST_CLAUDE_MODEL
+            try:
+                result = provider.run(prompt, cwd=None, timeout=USAGE_SUGGEST_LLM_TIMEOUT_SEC)
+            finally:
+                if provider.name == "claude":
+                    provider._forced_model = previous_forced_model
             if not result.success or not result.output:
                 return {}
 

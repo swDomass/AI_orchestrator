@@ -174,6 +174,16 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
     "01_Tasks/01_Projekte",
 ]
 
+# --- Claude Model Selection ---
+# Maps task tag aliases to full Claude CLI model IDs.
+CLAUDE_MODEL_ALIASES: dict[str, str] = {
+    "claude_haiku": "claude-haiku-4-5-20251001",
+    "claude_sonnet": "claude-sonnet-4-6",
+    "claude_opus":   "claude-opus-4-6",
+}
+# Model used by the usage suggester for LLM autonomy assessment (cheap + fast)
+USAGE_SUGGEST_CLAUDE_MODEL = CLAUDE_MODEL_ALIASES["claude_haiku"]
+
 # --- Shutdown ---
 SHUTDOWN_DELAY_SEC = 60
 SHUTDOWN_COMMAND = (

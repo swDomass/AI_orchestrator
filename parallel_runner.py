@@ -27,6 +27,7 @@ class SubTask:
     cwd: str | None
     tool_name: str | None
     timeout: int
+    forced_model: str | None = None
 
 
 @dataclass
@@ -40,8 +41,8 @@ class SubTaskResult:
 
 def _parse_subtask(text: str) -> SubTask:
     """Extract metadata from a subtask line."""
-    from queue_manager import extract_cwd, extract_timeout
-    from config import TASK_TIMEOUT_SEC
+    from queue_manager import extract_cwd, extract_timeout, extract_model_tag
+    from config import TASK_TIMEOUT_SEC, CLAUDE_MODEL_ALIASES
 
     # Detect forced provider from #claude / #gemini / #codex tags
     from dispatcher import _TAG_MAP, _TAG_RE_BY_PROVIDER
@@ -58,6 +59,8 @@ def _parse_subtask(text: str) -> SubTask:
     tool_name = extract_tool_tag(text)
     cwd = extract_cwd(text)
     timeout = extract_timeout(text, default=TASK_TIMEOUT_SEC)
+    model_tag = extract_model_tag(text)
+    forced_model = CLAUDE_MODEL_ALIASES.get(model_tag) if model_tag else None
 
     return SubTask(
         text=text,
@@ -65,6 +68,7 @@ def _parse_subtask(text: str) -> SubTask:
         cwd=cwd,
         tool_name=tool_name,
         timeout=timeout,
+        forced_model=forced_model,
     )
 
 
@@ -108,41 +112,49 @@ def _run_single_subtask(
         )
 
     logger.debug("parallel: subtask %d → provider %s, tool %s", idx, provider.name, subtask.tool_name)
+    previous_forced_model = None
+    if provider.name == "claude":
+        previous_forced_model = getattr(provider, "_forced_model", None)
+        setattr(provider, "_forced_model", subtask.forced_model)
 
-    # Tool-based subtask
-    if subtask.tool_name:
-        from orchestrator import ToolTaskExecutionOutcome
-        outcome = _execute_tool_task(
-            subtask.text,
-            subtask.tool_name,
-            provider,
-            subtask.cwd,
-            timeout=subtask.timeout,
-            queue_line_no=None,
-            memory_context=memory_context,
-            skip_queue=True,      # parent handles finalization
+    try:
+        # Tool-based subtask
+        if subtask.tool_name:
+            from orchestrator import ToolTaskExecutionOutcome
+            outcome = _execute_tool_task(
+                subtask.text,
+                subtask.tool_name,
+                provider,
+                subtask.cwd,
+                timeout=subtask.timeout,
+                queue_line_no=None,
+                memory_context=memory_context,
+                skip_queue=True,      # parent handles finalization
+            )
+            return SubTaskResult(
+                text=subtask.text,
+                provider_name=f"{provider.name}+{subtask.tool_name}",
+                success=outcome.success,
+                output=(outcome.output or "done") if outcome.success else "",
+                error=outcome.error if not outcome.success else "",
+            )
+
+        # Plain single-shot subtask
+        prompt = _build_prompt(subtask.text, provider.name, memory_context=memory_context)
+        result, _ = _run_with_retry(
+            provider, subtask.text, prompt, subtask.cwd, subtask.timeout,
+            pause_event=pause_event,
         )
         return SubTaskResult(
             text=subtask.text,
-            provider_name=f"{provider.name}+{subtask.tool_name}",
-            success=outcome.success,
-            output=(outcome.output or "done") if outcome.success else "",
-            error=outcome.error if not outcome.success else "",
+            provider_name=provider.name,
+            success=result.success,
+            output=result.output if result.success else "",
+            error=result.error if not result.success else "",
         )
-
-    # Plain single-shot subtask
-    prompt = _build_prompt(subtask.text, provider.name, memory_context=memory_context)
-    result, _ = _run_with_retry(
-        provider, subtask.text, prompt, subtask.cwd, subtask.timeout,
-        pause_event=pause_event,
-    )
-    return SubTaskResult(
-        text=subtask.text,
-        provider_name=provider.name,
-        success=result.success,
-        output=result.output if result.success else "",
-        error=result.error if not result.success else "",
-    )
+    finally:
+        if provider.name == "claude":
+            setattr(provider, "_forced_model", previous_forced_model)
 
 
 def _group_join_timeout_sec(group: list[tuple[int, SubTask]]) -> int:
@@ -169,8 +181,11 @@ def run_parallel(
 
     subtasks = [_parse_subtask(t) for t in subtask_texts]
     try:
-        from queue_manager import extract_cwd, has_cwd_tag
+        from queue_manager import extract_cwd, has_cwd_tag, extract_model_tag
+        from config import CLAUDE_MODEL_ALIASES
         parent_cwd = extract_cwd(parent_task)
+        parent_model_tag = extract_model_tag(parent_task)
+        parent_forced_model = CLAUDE_MODEL_ALIASES.get(parent_model_tag) if parent_model_tag else None
         if parent_cwd:
             subtasks = [
                 replace(st, cwd=parent_cwd)
@@ -178,8 +193,15 @@ def run_parallel(
                 else st
                 for st in subtasks
             ]
+        if parent_forced_model:
+            subtasks = [
+                replace(st, forced_model=parent_forced_model)
+                if st.forced_model is None
+                else st
+                for st in subtasks
+            ]
     except Exception as e:
-        logger.warning("parallel: parent cwd inheritance skipped: %s", e)
+        logger.warning("parallel: parent metadata inheritance skipped: %s", e)
 
     # Group by CWD (None = parent CWD group)
     cwd_groups: dict[str | None, list[tuple[int, SubTask]]] = {}

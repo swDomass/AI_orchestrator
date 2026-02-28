@@ -21,6 +21,16 @@ class BaseProvider(ABC):
     def __init__(self) -> None:
         self._cooldown_until: float = 0.0
         self._lock = threading.Lock()
+        # Per-thread runtime context (providers are shared singleton instances).
+        self._thread_ctx = threading.local()
+
+    @property
+    def _forced_model(self) -> str | None:
+        return getattr(self._thread_ctx, "forced_model", None)
+
+    @_forced_model.setter
+    def _forced_model(self, value: str | None) -> None:
+        self._thread_ctx.forced_model = value
 
     def is_cooling_down(self) -> bool:
         with self._lock:

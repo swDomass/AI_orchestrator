@@ -17,11 +17,15 @@ from limits import AllLimits
 from providers.base import BaseProvider
 from providers import ClaudeProvider, GeminiProvider, CodexProvider
 
-# Tag in task text to force a specific provider
+# Tag in task text to force a specific provider.
+# Model-specific tags (#claude_haiku etc.) also select Claude as provider.
 _TAG_MAP = {
-    "#claude": "claude",
-    "#gemini": "gemini",
-    "#codex": "codex",
+    "#claude":        "claude",
+    "#claude_haiku":  "claude",
+    "#claude_sonnet": "claude",
+    "#claude_opus":   "claude",
+    "#gemini":        "gemini",
+    "#codex":         "codex",
 }
 
 _TAG_RE_BY_PROVIDER = {

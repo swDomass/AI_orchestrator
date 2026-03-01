@@ -184,8 +184,14 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
 # Model used by the usage suggester for LLM autonomy assessment (cheap + fast)
 USAGE_SUGGEST_CLAUDE_MODEL = CLAUDE_MODEL_ALIASES["claude_haiku"]
 
+# --- Startup ---
+STARTUP_DELAY_SEC = 5 * 60  # 5 minutes: wait for tokens to renew
+
 # --- Shutdown ---
 SHUTDOWN_DELAY_SEC = 60
+
+# --- Dashboard ---
+DASHBOARD_PORT = 8411
 SHUTDOWN_COMMAND = (
     ["shutdown", "/s", "/t", "0"]
     if sys.platform == "win32"

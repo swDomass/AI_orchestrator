@@ -9,7 +9,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~190 tests, ~2s)
+# Run all tests (~207 tests, ~2s)
 python -m pytest tests/ -q
 
 # Run a single test file
@@ -31,6 +31,7 @@ python orchestrator.py --watch        # continuous mode with heartbeat
 python orchestrator.py --dry-run      # parse queue without executing
 python orchestrator.py --check-limits # show provider capacity
 python orchestrator.py --list-tools   # show available #tool: handlers
+python orchestrator.py --dashboard    # launch analytics web dashboard
 ```
 
 ## Architecture
@@ -46,7 +47,9 @@ Key components:
 - **`usage_suggester.py`**: `UsageSuggester` singleton — proactive task suggestions when provider capacity is underutilized. Same threading pattern as PolicyEngine
 - **`memory.py`**: TF-IDF + temporal decay search over past task results stored in vault. Auto-archival after 180 days.
 - **`heartbeat.py`**: Scheduled health checks with mtime-reloading config from vault `HEARTBEAT.md`. 7 built-in handlers: queue-idle, git-status, disk-space, check-limits, summarize, stale-branch, usage-suggest
-- **`config.py`**: Centralized constants (~56), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases
+- **`analytics.py`**: Parses task results, log files, queue events into `TaskRecord`/`LimitSnapshot`/`QueueEvent` dataclasses. Aggregation functions + `get_dashboard_data()` with 30s TTL cache
+- **`dashboard.py`**: Standalone HTTP server (port 8411) serving Chart.js dashboard. `GET /` HTML, `GET /api/data` JSON. Auto-refresh 60s. Also launchable via `--dashboard` flag
+- **`config.py`**: Centralized constants (~58), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases
 - **`limits.py`**: `cclimits` wrapper for provider capacity checks, OAuth refresh handling
 - **`logging_setup.py`**: Rotating file logger (5MB, 3 backups) + console output
 - **`doctor.py`**: 15+ setup validation checks, `--fix`/`--yes` auto-repair mode

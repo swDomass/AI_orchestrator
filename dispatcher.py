@@ -48,16 +48,25 @@ def _limits_ok(name: str, limits: AllLimits) -> bool:
     return getattr(limits, name).available
 
 
+def has_explicit_provider_tag(task: str) -> bool:
+    """Return True if the task text contains an explicit provider/model tag."""
+    task_lower = task.lower()
+    return any(_TAG_RE_BY_PROVIDER[tag].search(task_lower) for tag in _TAG_MAP)
+
+
 def select_provider(
     task: str,
     limits: AllLimits,
     exclude: set[str] | None = None,
     profile=None,  # ProfileConfig | None
     force_name: str | None = None,
+    strict: bool = False,
 ) -> BaseProvider | None:
     """
     Returns the best available provider for this task, or None if all are blocked.
     If 'force_name' is given or the task contains a #provider tag, that provider is tried first.
+    If strict=True and a provider is forced (via tag or force_name), ONLY that provider is
+    considered — no fallback to other providers.
     If a profile is given, its provider order overrides the default priority.
     """
     # Check for explicit provider tag
@@ -78,8 +87,12 @@ def select_provider(
         base_order = _PRIORITY[:]
 
     if forced:
-        # Move forced provider to front within the allowed order
-        order = [forced.name] + [n for n in base_order if n != forced.name]
+        if strict:
+            # Strict mode: only try the forced provider, no fallback
+            order = [forced.name]
+        else:
+            # Move forced provider to front within the allowed order
+            order = [forced.name] + [n for n in base_order if n != forced.name]
     else:
         order = base_order
 

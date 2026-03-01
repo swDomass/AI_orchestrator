@@ -5,7 +5,7 @@ Inspired by codex_p1_review_loop.py but works with any provider (Claude, Gemini,
 
 Usage in queue:
     - [ ] Review und fixe Bugs in main.py #tool:review-loop cwd:/d/programmieren/projekt
-    - [ ] Full code review #tool:review-loop #codex cwd:/d/programmieren/projekt
+    - [ ] Review uncommitted changes #tool:review-loop #codex cwd:/d/programmieren/projekt
 """
 
 import re
@@ -49,17 +49,19 @@ def _is_no_findings_output(text: str) -> bool:
 
 
 _REVIEW_PROMPT_BODY = """
-Perform a code review of the current working directory.
+Perform a code review of UNCOMMITTED changes in the current git working tree.
 
 Rules:
-- Review all code files, focus on correctness, bugs, security, crashes.
+- Review only files affected by uncommitted changes (tracked and untracked).
+- If needed, inspect changes via git commands (`git diff`, `git status --porcelain`, `git ls-files --others --exclude-standard`).
+- Focus on correctness, bugs, security, and crashes.
 - Include file paths and line numbers.
 - Do NOT modify any files.
 
 Output format (strict):
 - One bullet per finding: `- [P1] ...`, `- [P2] ...`, `- [P3] ...`
 - P1 = critical/crash, P2 = significant bug, P3 = minor issue
-- If no findings: output exactly: `No P1/P2/P3 findings.`
+- If no findings (or no uncommitted changes): output exactly: `No P1/P2/P3 findings.`
 """
 
 _FIX_PROMPT_BODY = """
@@ -78,7 +80,7 @@ Review findings:
 
 class ReviewLoopTool(BaseTool):
     name = "review-loop"
-    description = "Iterative Review > Fix > Re-Review bis keine P1/P2/P3 Findings mehr"
+    description = "Review/Fix-Loop auf uncommitted Changes (max 10, P3-only x3 = Exit)"
 
     def run(
         self,
@@ -98,6 +100,7 @@ class ReviewLoopTool(BaseTool):
         review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
         seen_signatures: set[tuple[str, ...]] = set()
         all_outputs: list[str] = []
+        consecutive_p3_only = 0
 
         review_timeout = timeout or TOOL_REVIEW_TIMEOUT_SEC
         fix_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
@@ -160,9 +163,27 @@ class ReviewLoopTool(BaseTool):
                     iterations=iteration,
                 )
 
+            p3_only = bool(findings) and all(f.upper().startswith("- [P3] ") for f in findings)
+            if p3_only:
+                consecutive_p3_only += 1
+                if consecutive_p3_only >= 3:
+                    msg = (
+                        "Nur P3-Findings in 3 Iterationen in Folge. "
+                        "Loop beendet (P3-Exit-Regel)."
+                    )
+                    print(f"  [review-loop] ✅ {msg}")
+                    notify_tool_done(self.name, iteration, True, msg)
+                    return ToolResult(
+                        success=True,
+                        output="\n\n".join(all_outputs),
+                        iterations=iteration,
+                    )
+            else:
+                consecutive_p3_only = 0
+
             # Check for repeated findings (infinite loop detection)
             signature = tuple(sorted(findings))
-            if signature in seen_signatures:
+            if not p3_only and signature in seen_signatures:
                 msg = f"Findings wiederholen sich nach {iteration} Iterationen. Loop beendet."
                 print(f"  [review-loop] ⚠️ {msg}")
                 notify_tool_done(self.name, iteration, False, msg)

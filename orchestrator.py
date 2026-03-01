@@ -43,11 +43,12 @@ from config import (
     PROMPT_SKILL_TOKENS,
     PROMPT_WIKILINK_TOKENS,
     SLEEP_POLL_INTERVAL,
+    STARTUP_DELAY_SEC,
     TASK_TIMEOUT_SEC,
     TRACK_FILE_CHANGES,
     get_system_prompt,
 )
-from dispatcher import select_provider, earliest_cooldown_reset
+from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag
 from limits import get_limits, AllLimits
 from notifier import (
     notify_error,
@@ -595,6 +596,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if model_tag and model_id is None:
             _log.warning("Unknown model tag #%s — ignored, using default model", model_tag)
 
+        # Strict mode: when provider/model is explicitly specified, no fallback
+        provider_is_forced = has_explicit_provider_tag(task)
+
         # Feature 6: denied_skills check
         if tool_name and profile and tool_name in profile.denied_skills:
             msg = f"Tool '{tool_name}' durch Profil '{profile.name}' gesperrt (denied_skills)"
@@ -643,7 +647,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Dry-run
         if dry_run:
             limits = get_limits()
-            provider = select_provider(task, limits, profile=profile)
+            provider = select_provider(task, limits, profile=profile, strict=provider_is_forced)
             memory_context = memory_module.get_context_for_task(task, cwd=cwd)
             prompt = _build_prompt(
                 task,
@@ -790,7 +794,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if tool_name:
             tried_providers: set[str] = set()
             while True:
-                provider = select_provider(task, limits, exclude=tried_providers, profile=profile)
+                provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced)
                 if provider is None:
                     earliest = _get_next_retry_sec(limits)
                     reset_dt = datetime.now() + timedelta(seconds=earliest)
@@ -837,6 +841,18 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 elif outcome.error_code not in ("rate_limit", ""):
                     provider.set_cooldown(5 * 60)
 
+                if provider_is_forced:
+                    # Strict mode: no fallback, retry later
+                    earliest = _get_next_retry_sec(limits)
+                    reset_dt = datetime.now() + timedelta(seconds=earliest)
+                    reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                    msg = f"Provider {provider.name} erzwungen aber nicht verfügbar → Retry um ~{reset_dt.strftime('%H:%M')}"
+                    print(f"  {msg}")
+                    append_log(msg)
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                        return False
+                    break
+
                 print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
 
             # Feature 10: trigger shutdown after tool task if tagged
@@ -862,7 +878,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log("Queue-Verarbeitung pausiert")
                 return False
 
-            provider = select_provider(task, limits, exclude=tried_providers, profile=profile)
+            provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced)
 
             if provider is None:
                 if not tried_providers:
@@ -942,6 +958,19 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 provider.set_cooldown(5 * 60)
 
             notify_error(task, provider.name, error)
+
+            if provider_is_forced:
+                # Strict mode: no fallback, retry later
+                earliest = _get_next_retry_sec(limits)
+                reset_dt = datetime.now() + timedelta(seconds=earliest)
+                reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                msg = f"Provider {provider.name} erzwungen aber nicht verfügbar → Retry um ~{reset_dt.strftime('%H:%M')}"
+                print(f"  {msg}")
+                append_log(msg)
+                if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                    return False
+                break
+
             print("  Task bleibt in Queue - versuche nächsten Provider...")
 
         # Feature 10: trigger shutdown after single-shot task if tagged
@@ -978,6 +1007,19 @@ def run_watch(dry_run: bool = False) -> None:
     print("Orchestrator gestartet (--watch Modus). Ctrl+C zum Beenden.")
     append_log("Orchestrator gestartet (watch)")
     start_session()
+
+    # Startup delay: wait for provider tokens to renew
+    if STARTUP_DELAY_SEC > 0:
+        print(f"\n[startup] Warte {fmt_time(STARTUP_DELAY_SEC)} vor Queue-Verarbeitung (Token-Erneuerung)...")
+        append_log(f"Startup-Delay: {fmt_time(STARTUP_DELAY_SEC)}")
+        slept = 0
+        while slept < STARTUP_DELAY_SEC:
+            time.sleep(min(10, STARTUP_DELAY_SEC - slept))
+            slept += min(10, STARTUP_DELAY_SEC - slept)
+            remaining = STARTUP_DELAY_SEC - slept
+            if remaining > 0:
+                print(f"  [startup] noch {fmt_time(int(remaining))}...", end="\r")
+        print(f"[startup] Delay abgeschlossen, starte Queue-Verarbeitung.")
 
     pause_event = threading.Event()
     listener = TelegramListener(pause_event)
@@ -1081,6 +1123,8 @@ def main() -> None:
                         help="Validiert Tasks ohne auszuführen")
     parser.add_argument("--list-tools", action="store_true",
                         help="Zeigt verfügbare Tools")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Startet das Analytics-Dashboard im Browser")
     parser.add_argument("--doctor", action="store_true",
                         help="Validiert das gesamte Setup")
     parser.add_argument("--fix", action="store_true",
@@ -1092,6 +1136,11 @@ def main() -> None:
     if args.doctor:
         from doctor import run_doctor
         sys.exit(0 if run_doctor(fix=args.fix, yes=args.yes) else 1)
+
+    if args.dashboard:
+        from dashboard import start_server
+        start_server()
+        return
 
     ensure_queue_file()
 

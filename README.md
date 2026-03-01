@@ -82,6 +82,7 @@ python orchestrator.py --list-tools    # Verfügbare #tool Handler anzeigen
 python orchestrator.py --doctor        # Setup validieren
 python orchestrator.py --doctor --fix  # Auto-Fixes anbieten/anwenden
 python orchestrator.py --doctor --fix --yes
+python orchestrator.py --dashboard     # Analytics-Dashboard im Browser
 ```
 
 ## Queue-Datei (Syntax)
@@ -353,6 +354,42 @@ Die Schwellenwerte sind in `config.py` einstellbar:
 
 Heartbeat-Intervall wird über `HEARTBEAT.md` im Vault gesteuert (Standard: alle 5 Minuten).
 
+## Analytics Dashboard
+
+Der Orchestrator enthält ein eingebautes Web-Dashboard zur Visualisierung aller gesammelten Daten.
+
+```bash
+# Dashboard starten (öffnet Browser automatisch)
+python orchestrator.py --dashboard
+
+# Oder standalone mit Optionen
+python dashboard.py
+python dashboard.py --port 9000
+python dashboard.py --no-open
+```
+
+**Dashboard-Sektionen:**
+
+- **Übersichtskarten**: Gesamt-Tasks, Erfolgsrate, Ø Dauer, aktive Provider
+- **Tasks/Tag** (30 Tage): Balkenchart der täglichen Task-Abarbeitung
+- **Provider-Verteilung**: Donut-Chart der Nutzung pro Provider
+- **Provider-Kapazität** (48 h): Timeline-Chart der Limits aus Heartbeat-Logs
+- **Letzte Events**: Error-Lines aus Logs + Queue-Events (merge)
+- **Session-Stats**: Live-Daten der aktuellen Orchestrator-Sitzung (nur bei `--watch`)
+
+**Datenquellen:**
+
+| Quelle | Dateien | Was wird geparst |
+|---|---|---|
+| Task Results | `memory/task_results/*.md` + `archive/*.md` | YAML-Frontmatter (Task, Provider, Dauer, Erfolg) |
+| Logs | `logs/orchestrator.log*` | Heartbeat check-limits Einträge + ERROR-Zeilen |
+| Queue Log | `agent-queue.md` | HTML-Kommentare (`<!-- YYYY-MM-DD HH:MM \| msg -->`) |
+| Session | `notifier._stats` (RAM) | Tasks done/failed, Provider-Nutzung, Startzeit |
+
+Der API-Endpunkt `GET /api/data` (JSON) wird alle 60s vom Dashboard abgefragt und intern 30s gecacht.
+
+**Standard-Port**: `8411` (konfigurierbar via `DASHBOARD_PORT` in `config.py` oder `--port`).
+
 ## Sicherheit / Guardrails
 
 Neben der Policy gibt es zusätzliche Guardrails im Systemprompt und in der Laufzeit:
@@ -422,6 +459,8 @@ orchestrator.py
   -> memory.py              (Kontextspeicher)
   -> heartbeat.py           (Watch-Modus Checks)
   -> usage_suggester.py     (Proaktive Task-Vorschläge bei freier Kapazität)
+  -> analytics.py           (Daten-Parsing + Aggregation für Dashboard)
+  -> dashboard.py           (HTTP-Server + Chart.js Web-Dashboard)
   -> telegram_listener.py   (Telegram Commands + Chat)
   -> notifier.py            (Telegram Notifications)
   -> shutdown.py            (Shutdown Countdown / Cancel)

@@ -1,0 +1,229 @@
+"""Tests for analytics.py — parsing, aggregation, and caching."""
+
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _mock_dotenv():
+    with patch("config._load_dotenv"):
+        yield
+
+
+@pytest.fixture()
+def task_results_dir(tmp_path):
+    d = tmp_path / "task_results"
+    d.mkdir()
+    return d
+
+
+@pytest.fixture()
+def archive_dir(tmp_path):
+    d = tmp_path / "archive"
+    d.mkdir()
+    return d
+
+
+def _write_task_file(directory, name, task="Test task", provider="claude",
+                     duration=10.0, success=True, ts=None):
+    ts = ts or datetime.now().isoformat(timespec="seconds")
+    content = (
+        f"---\n"
+        f'task: "{task}"\n'
+        f"provider: {provider}\n"
+        f"cwd: /d/test\n"
+        f"duration_sec: {duration}\n"
+        f"timestamp: {ts}\n"
+        f"success: {str(success).lower()}\n"
+        f"---\n\n"
+        f"Result summary."
+    )
+    (directory / name).write_text(content, encoding="utf-8")
+
+
+# ── Parsing tests ────────────────────────────────────────────────────────────
+
+class TestParseTaskFile:
+    def test_valid_file(self, tmp_path):
+        from analytics import _parse_task_file
+        _write_task_file(tmp_path, "t.md", task="Fix bug", provider="gemini",
+                         duration=42.5, ts="2026-02-28T10:00:00")
+        rec = _parse_task_file(tmp_path / "t.md")
+        assert rec is not None
+        assert rec.task == "Fix bug"
+        assert rec.provider == "gemini"
+        assert rec.duration_sec == 42.5
+        assert rec.success is True
+
+    def test_missing_file(self, tmp_path):
+        from analytics import _parse_task_file
+        assert _parse_task_file(tmp_path / "nope.md") is None
+
+    def test_no_frontmatter(self, tmp_path):
+        from analytics import _parse_task_file
+        (tmp_path / "bad.md").write_text("Just text", encoding="utf-8")
+        assert _parse_task_file(tmp_path / "bad.md") is None
+
+    def test_failed_task(self, tmp_path):
+        from analytics import _parse_task_file
+        _write_task_file(tmp_path, "f.md", success=False)
+        rec = _parse_task_file(tmp_path / "f.md")
+        assert rec is not None
+        assert rec.success is False
+
+
+class TestParseMemoryFiles:
+    def test_combines_both_dirs(self, task_results_dir, archive_dir):
+        from analytics import _parse_memory_files
+        _write_task_file(task_results_dir, "a.md", task="A")
+        _write_task_file(archive_dir, "b.md", task="B")
+        records = _parse_memory_files(task_results_dir, archive_dir)
+        assert len(records) == 2
+        sources = {r.source for r in records}
+        assert sources == {"task_results", "archive"}
+
+    def test_empty_dirs(self, tmp_path):
+        from analytics import _parse_memory_files
+        records = _parse_memory_files(tmp_path / "nope", tmp_path / "nope2")
+        assert records == []
+
+
+class TestParseLogLimits:
+    def test_single_line(self, tmp_path):
+        from analytics import _parse_log_limits
+        log = tmp_path / "test.log"
+        log.write_text(
+            "2026-02-28 10:00:00,000 [heartbeat] INFO "
+            "Heartbeat [Run check-limits and log to memory]: "
+            "claude: 85% remaining\n",
+            encoding="utf-8",
+        )
+        snaps = _parse_log_limits(log)
+        assert len(snaps) == 1
+        assert snaps[0].provider == "claude"
+        assert snaps[0].remaining_pct == 85.0
+        assert snaps[0].available is True
+
+    def test_multiline_block(self, tmp_path):
+        from analytics import _parse_log_limits
+        log = tmp_path / "test.log"
+        log.write_text(
+            "2026-02-28 10:00:00,000 [heartbeat] INFO "
+            "Heartbeat [Run check-limits and log to memory]: "
+            "claude: 50% remaining\n"
+            "gemini: 100% remaining\n"
+            "codex: ❌ expired\n",
+            encoding="utf-8",
+        )
+        snaps = _parse_log_limits(log)
+        assert len(snaps) == 3
+        providers = {s.provider: s for s in snaps}
+        assert providers["claude"].remaining_pct == 50.0
+        assert providers["gemini"].remaining_pct == 100.0
+        assert providers["codex"].available is False
+
+    def test_missing_file(self, tmp_path):
+        from analytics import _parse_log_limits
+        assert _parse_log_limits(tmp_path / "nope.log") == []
+
+
+class TestParseQueueLog:
+    def test_parses_comments(self, tmp_path):
+        from analytics import _parse_queue_log
+        qf = tmp_path / "queue.md"
+        qf.write_text(
+            "# Queue\n"
+            "<!-- 2026-03-01 08:31 | Alle Tasks erledigt. -->\n"
+            "<!-- 2026-03-01 08:19 | Orchestrator gestartet (watch) -->\n"
+            "- [ ] Some task\n",
+            encoding="utf-8",
+        )
+        events = _parse_queue_log(qf)
+        assert len(events) == 2
+        assert events[0].message == "Alle Tasks erledigt."  # most recent first
+
+
+# ── Aggregation tests ────────────────────────────────────────────────────────
+
+class TestAggregation:
+    def _make_records(self, n=5, days_back=3):
+        from analytics import TaskRecord
+        records = []
+        for i in range(n):
+            records.append(TaskRecord(
+                task=f"Task {i}",
+                provider="claude" if i % 2 == 0 else "gemini",
+                cwd="/d/test",
+                duration_sec=10.0 + i,
+                timestamp=datetime.now() - timedelta(days=i % days_back),
+                success=i != 2,  # one failure
+                source="task_results",
+            ))
+        return records
+
+    def test_tasks_per_day_zero_filled(self):
+        from analytics import _tasks_per_day
+        labels, values = _tasks_per_day([], days=7)
+        assert len(labels) == 7
+        assert all(v == 0 for v in values)
+
+    def test_success_rate(self):
+        from analytics import _success_rate
+        recs = self._make_records(5)
+        rate = _success_rate(recs)
+        assert rate == 80.0  # 4/5
+
+    def test_success_rate_empty(self):
+        from analytics import _success_rate
+        assert _success_rate([]) == 0.0
+
+    def test_provider_distribution(self):
+        from analytics import _provider_distribution, TaskRecord
+        recs = [
+            TaskRecord("t", "claude+review-loop", "", 1, datetime.now(), True, "x"),
+            TaskRecord("t", "claude", "", 1, datetime.now(), True, "x"),
+            TaskRecord("t", "gemini", "", 1, datetime.now(), True, "x"),
+        ]
+        labels, values = _provider_distribution(recs)
+        assert "claude" in labels
+        idx = labels.index("claude")
+        assert values[idx] == 2  # normalized: claude+review-loop → claude
+
+    def test_avg_duration_only_success(self):
+        from analytics import _avg_duration, TaskRecord
+        recs = [
+            TaskRecord("t", "c", "", 100, datetime.now(), True, "x"),
+            TaskRecord("t", "c", "", 200, datetime.now(), True, "x"),
+            TaskRecord("t", "c", "", 999, datetime.now(), False, "x"),  # ignored
+        ]
+        assert _avg_duration(recs) == 150.0
+
+    def test_limits_timeline_filters_old(self):
+        from analytics import _limits_timeline, LimitSnapshot
+        old = datetime.now() - timedelta(hours=100)
+        recent = datetime.now() - timedelta(hours=1)
+        snaps = [
+            LimitSnapshot(old, "claude", 50, True),
+            LimitSnapshot(recent, "claude", 80, True),
+        ]
+        tl = _limits_timeline(snaps, hours=48)
+        assert len(tl.get("claude", [])) == 1
+
+
+class TestCache:
+    def test_cache_returns_same_object(self, tmp_path):
+        from analytics import get_dashboard_data, _cache
+        # Reset cache
+        _cache["data"] = None
+        _cache["ts"] = 0.0
+        with patch("analytics.VAULT_PATH", tmp_path), \
+             patch("analytics.LOG_FILE", tmp_path / "logs" / "orchestrator.log"), \
+             patch("analytics.QUEUE_FILE", tmp_path / "queue.md"):
+            (tmp_path / "logs").mkdir(exist_ok=True)
+            d1 = get_dashboard_data()
+            d2 = get_dashboard_data()
+            assert d1 is d2  # same cached object

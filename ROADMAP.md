@@ -40,7 +40,7 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 10 | Tool policy layering (global > profile > task) | backlog |
 | 11 | Session management (context per task) | backlog |
 | 12 | Optional Docker sandbox | backlog |
-| 13 | Dashboard / web UI | backlog |
+| 13 | Dashboard / web UI | DONE |
 | 14 | Plugin system (runtime-loadable handlers) | backlog |
 | 15 | Obsidian CLI integration (search, tasks, backlinks) | backlog |
 

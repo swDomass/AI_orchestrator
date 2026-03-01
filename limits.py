@@ -165,23 +165,44 @@ def _needs_token_refresh(data: dict, provider: str) -> bool:
 
 
 def _refresh_token(provider: str) -> bool:
-    """Start the CLI briefly to refresh its OAuth token. Returns True on success."""
+    """Start the CLI briefly to refresh its OAuth token. Returns True on success.
+
+    For Claude, tries multiple strategies in order:
+    1. ``claude auth status`` — lightweight auth check
+    2. Minimal ``claude --print`` request
+    """
     try:
         if provider == "claude":
-            # auth status triggers OAuth refresh without an API call
-            subprocess.run(
+            # Strategy 1: auth status triggers OAuth refresh without an API call
+            r = subprocess.run(
                 [_CLAUDE_CMD, "auth", "status"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
+            if r.returncode == 0:
+                return True
+
+            # Strategy 2: open claude CLI briefly to trigger OAuth flow
+            print("  [claude] auth status fehlgeschlagen → starte claude CLI kurz...")
+            r2 = subprocess.run(
+                [_CLAUDE_CMD, "--print", "--model", "claude-haiku-4-5-20251001", "-p", "ping"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                shell=sys.platform == "win32",
+            )
+            if r2.returncode == 0:
+                return True
+
+            return False
+
         elif provider == "gemini":
             # No auth-only command available; minimal prompt to trigger refresh
-            subprocess.run(
+            r = subprocess.run(
                 [_GEMINI_CMD, "--prompt", ".", "--output-format", "text"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
             )
+            return r.returncode == 0
         else:
             return False
-        return True
     except Exception:
         return False
 

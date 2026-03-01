@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from config import MIN_CAPACITY_PERCENT
 
@@ -195,12 +196,23 @@ def _refresh_token(provider: str) -> bool:
             return False
 
         elif provider == "gemini":
-            # No auth-only command available; minimal prompt to trigger refresh
+            # No auth-only command available; use a short non-interactive request
+            # (same pattern as provider runner) to force OAuth refresh if needed.
             r = subprocess.run(
-                [_GEMINI_CMD, "--prompt", ".", "--output-format", "text"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+                [_GEMINI_CMD, "--prompt", "", "--yolo", "--output-format", "text"],
+                input="ping",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=45,
             )
-            return r.returncode == 0
+            if r.returncode == 0:
+                return True
+
+            # Some CLI versions can still refresh credentials before exiting non-zero.
+            combined = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
+            return "loaded cached credentials" in combined
         else:
             return False
     except Exception:
@@ -219,15 +231,22 @@ def get_limits() -> AllLimits:
         )
 
     # Auto-refresh expired tokens and re-query
-    refreshed = False
+    refresh_attempted = False
     for provider in ("claude", "gemini"):
         if _needs_token_refresh(raw, provider):
             print(f"  [{provider}] Token expired → refreshing...")
-            if _refresh_token(provider):
-                refreshed = True
+            _refresh_token(provider)
+            refresh_attempted = True
 
-    if refreshed:
-        raw = _run_cclimits() or raw
+    if refresh_attempted:
+        # Re-query regardless of refresh return code: token state can flip asynchronously.
+        for _ in range(3):
+            fresh = _run_cclimits()
+            if fresh is not None:
+                raw = fresh
+                if not any(_needs_token_refresh(raw, p) for p in ("claude", "gemini")):
+                    break
+            time.sleep(2)
 
     return AllLimits(
         claude=_parse_claude(raw.get("claude", {"status": "missing"})),

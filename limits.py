@@ -169,21 +169,24 @@ def _refresh_token(provider: str) -> bool:
     """Start the CLI briefly to refresh its OAuth token. Returns True on success.
 
     For Claude, tries multiple strategies in order:
-    1. ``claude auth status`` — lightweight auth check
-    2. Minimal ``claude --print`` request
+    1. ``claude auth status`` — check if token is actually valid (not just readable)
+    2. Minimal ``claude --print`` request to force OAuth refresh
     """
     try:
         if provider == "claude":
-            # Strategy 1: auth status triggers OAuth refresh without an API call
+            # Strategy 1: check auth status output — only trust if NOT expired
             r = subprocess.run(
                 [_CLAUDE_CMD, "auth", "status"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
-            if r.returncode == 0:
+            combined_out = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
+            if r.returncode == 0 and "expired" not in combined_out:
+                # Token is genuinely valid, no refresh needed
                 return True
+            print(f"  [claude] auth status: token ist expired (rc={r.returncode})")
 
-            # Strategy 2: open claude CLI briefly to trigger OAuth flow
-            print("  [claude] auth status fehlgeschlagen → starte claude CLI kurz...")
+            # Strategy 2: actual API call forces OAuth token refresh
+            print("  [claude] Versuche Token-Refresh via claude --print ...")
             r2 = subprocess.run(
                 [_CLAUDE_CMD, "--print", "--model", "claude-haiku-4-5-20251001", "-p", "ping"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -193,6 +196,10 @@ def _refresh_token(provider: str) -> bool:
             if r2.returncode == 0:
                 return True
 
+            # Strategy 2 failed — maybe token needs interactive re-auth
+            stderr2 = (r2.stderr or "").strip()
+            print(f"  [claude] Token-Refresh fehlgeschlagen (rc={r2.returncode}): {stderr2[:200]}")
+            print("  [claude] ⚠ Manuelles 'claude' in der CLI nötig um Token zu erneuern!")
             return False
 
         elif provider == "gemini":
@@ -234,12 +241,14 @@ def get_limits() -> AllLimits:
     refresh_attempted = False
     for provider in ("claude", "gemini"):
         if _needs_token_refresh(raw, provider):
-            print(f"  [{provider}] Token expired → refreshing...")
-            _refresh_token(provider)
             refresh_attempted = True
+            print(f"  [{provider}] Token expired → refreshing...")
+            if not _refresh_token(provider):
+                print(f"  [{provider}] Token-Refresh fehlgeschlagen — Provider wird als unavailable gemeldet")
 
     if refresh_attempted:
-        # Re-query regardless of refresh return code: token state can flip asynchronously.
+        # Re-query after any refresh attempt.
+        # Some CLIs refresh OAuth asynchronously and may still return non-zero once.
         for _ in range(3):
             fresh = _run_cclimits()
             if fresh is not None:

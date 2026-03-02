@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Obsidian-Projektdoku
+
+`literal:/path/to/your/obsidian_vault\01_Tasks\01_Projekte\03_Unternehmung-Invest\AI-System-Intelligence-Orchestrator.md`
+
 ## Project
 
 Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Codex CLI. Tasks come from an Obsidian vault Markdown queue (`99_System/AI/agent-queue.md`). Pure Python stdlib + pyyaml, Windows-first.

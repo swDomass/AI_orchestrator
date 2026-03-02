@@ -23,8 +23,14 @@ OPEN_TASK_RE = re.compile(r"^- \[ \] (.+?)(?:\s*<!--.*?-->)?\s*$", re.MULTILINE)
 # Matches Obsidian wikilinks: [[Note Name]] or [[path/to/Note]]
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]")
 
-# Matches explicit file paths ending in .md (including Windows drive paths like C:\...)
-FILEPATH_RE = re.compile(r"(?:^|\s)((?:[A-Za-z]:)?[\w/\\.-]+\.md)")
+# Matches explicit file paths ending in .md (including Windows drive paths like C:\...).
+# Two variants:
+#   - Quoted:   "My File.md" or 'My File.md'  (allows spaces, use for multi-word names)
+#   - Unquoted: simple-path.md                (no spaces, word-boundary safe)
+FILEPATH_RE = re.compile(
+    r"""(["'])((?:[A-Za-z]:)?[\w/\\ .-]+?\.md)\1"""   # quoted path (group 2), backreference ensures matching quotes
+    r"""|(?:^|\s)((?:[A-Za-z]:)?[\w/\\.-]+\.md)"""    # unquoted path (group 3)
+)
 
 # Matches cwd: tag in task text, including paths with spaces until the next hashtag token or EOL.
 # To reduce false positives in normal prose, valid cwd metadata requires the path to start
@@ -34,7 +40,7 @@ FILEPATH_RE = re.compile(r"(?:^|\s)((?:[A-Za-z]:)?[\w/\\.-]+\.md)")
 #   cwd:C:\Program Files\My App #tool:test-loop
 #   cwd:"C:\Program Files\My App" #timeout:10m
 CWD_RE = re.compile(
-    r'(?i)(?:^|\s)cwd:(?:"([^"]+)"|(\S(?:.*?\S)?))(?=(?:\s+#\S+)|\s*$)',
+    r'(?i)(?:^|\s)cwd:\s*(?:"([^"]+)"|(\S(?:.*?\S)?))(?=(?:\s+#\S+)|\s*$)',
 )
 
 # Matches #timeout: tag in task text
@@ -349,10 +355,14 @@ def _resolve_note(ref: str) -> Path | None:
     candidate = VAULT_PATH / ref
     if candidate.exists() and _is_within_vault(candidate):
         return candidate
-    candidate = VAULT_PATH / (ref + ".md")
+    _ref_with_md = ref if ref.endswith(".md") else ref + ".md"
+    candidate = VAULT_PATH / _ref_with_md
     if candidate.exists() and _is_within_vault(candidate):
         return candidate
-    for match in VAULT_PATH.rglob(f"{Path(ref).name}.md"):
+    _name = Path(ref).name
+    if not _name.endswith(".md"):
+        _name += ".md"
+    for match in VAULT_PATH.rglob(_name):
         if _is_within_vault(match):
             return match
     return None
@@ -373,6 +383,11 @@ def extract_cwd(task: str) -> str | None:
         return None
 
     cwd = (match.group(1) or match.group(2) or "").strip()
+
+    # Convert Git Bash / MSYS paths (/d/foo/bar) to Windows paths (D:\foo\bar)
+    if sys.platform == "win32" and re.match(r"^/([a-zA-Z])/", cwd):
+        cwd = cwd[1].upper() + ":" + cwd[2:].replace("/", "\\")
+
     cwd_path = Path(cwd)
 
     if not cwd_path.is_dir():
@@ -519,7 +534,8 @@ def inject_file_context(task: str, max_chars: int = 0) -> str:
     """
     refs: list[str] = []
     refs += [m.group(1) for m in WIKILINK_RE.finditer(task)]
-    refs += [m.group(1).strip() for m in FILEPATH_RE.finditer(task)]
+    # FILEPATH_RE: group(2) = quoted path (spaces ok), group(3) = unquoted path
+    refs += [(m.group(2) or m.group(3)).strip() for m in FILEPATH_RE.finditer(task)]
 
     # Preserve order while avoiding duplicated file reads/context blocks.
     refs = list(dict.fromkeys(refs))

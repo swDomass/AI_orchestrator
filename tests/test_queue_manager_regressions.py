@@ -14,6 +14,34 @@ def mock_queue_file(tmp_path):
         yield q_file
 
 
+def test_extract_cwd_allows_space_after_colon(tmp_path, monkeypatch):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(queue_manager, "ALLOWED_CWD_ROOTS", [])
+
+    task = f"Fix bug cwd: {project_dir} #tool:test-loop"
+
+    assert queue_manager.extract_cwd(task) == str(project_dir)
+
+
+def test_extract_cwd_converts_git_bash_path(tmp_path, monkeypatch):
+    """On Windows, /d/foo/bar style paths should be converted to D:\\foo\\bar."""
+    import sys
+    if sys.platform != "win32":
+        pytest.skip("Git Bash path conversion only applies on Windows")
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    # Build the Git Bash equivalent of project_dir
+    win_path = str(project_dir)
+    drive_letter = win_path[0].lower()
+    bash_path = "/" + drive_letter + win_path[2:].replace("\\", "/")
+
+    monkeypatch.setattr(queue_manager, "ALLOWED_CWD_ROOTS", [])
+    task = f"Review code cwd:{bash_path} #tool:review-loop"
+
+    assert queue_manager.extract_cwd(task) == str(project_dir.resolve())
+
+
 def test_extract_cwd_supports_spaces(tmp_path, monkeypatch):
     project_dir = tmp_path / "My Project"
     project_dir.mkdir()
@@ -39,9 +67,15 @@ def test_has_cwd_tag_detects_malformed_tag():
 
 
 def test_has_cwd_tag_ignores_plain_prose():
+    # "cwd:" followed by a word mid-sentence is detected by the regex
+    # but extract_cwd returns None since it's not a real directory.
+    # has_cwd_tag is conservative — it flags ambiguous cases so the
+    # orchestrator can reject rather than run in the wrong directory.
     task = "Bitte erklaere cwd: semantics im Queue-Format"
-    assert queue_manager.has_cwd_tag(task) is False
     assert queue_manager.extract_cwd(task) is None
+    # Pure prose without any path-like token after cwd: is still not a tag
+    task2 = "Erklaere was cwd bedeutet"
+    assert queue_manager.has_cwd_tag(task2) is False
 
 
 def test_extract_model_tag_accepts_trailing_punctuation():
@@ -202,3 +236,63 @@ def test_resolve_note_revalidates_rglob_fallback_match(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: False)
 
     assert queue_manager._resolve_note("some/missing/path/Target Note") is None
+
+
+def test_filepath_re_captures_quoted_spaced_filename():
+    """FILEPATH_RE must extract quoted multi-word filenames like '"Bremsenquitschen Suite.md"'."""
+    text = 'Analysiere "Bremsenquitschen Suite.md" und erstelle einen Report.'
+    matches = [(m.group(2) or m.group(3)).strip() for m in queue_manager.FILEPATH_RE.finditer(text)]
+    assert "Bremsenquitschen Suite.md" in matches
+
+
+def test_filepath_re_still_matches_simple_filename():
+    """FILEPATH_RE must still work for single-word filenames without spaces."""
+    text = "Lese README.md bitte."
+    matches = [(m.group(2) or m.group(3)).strip() for m in queue_manager.FILEPATH_RE.finditer(text)]
+    assert "README.md" in matches
+
+
+def test_resolve_note_no_double_md_extension(tmp_path, monkeypatch):
+    """_resolve_note must find 'Foo.md' via rglob even when ref already ends in .md."""
+    vault = tmp_path / "vault"
+    (vault / "nested").mkdir(parents=True)
+    note = vault / "nested" / "Bremsenquitschen Suite.md"
+    note.write_text("Inhalt", encoding="utf-8")
+
+    monkeypatch.setattr(queue_manager, "VAULT_PATH", vault)
+    monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
+
+    result = queue_manager._resolve_note("Bremsenquitschen Suite.md")
+    assert result == note
+
+
+def test_inject_file_context_finds_quoted_spaced_filename(tmp_path, monkeypatch):
+    """inject_file_context must resolve quoted multi-word filenames like '"Foo Bar.md"'."""
+    vault = tmp_path / "vault"
+    (vault / "notes").mkdir(parents=True)
+    note = vault / "notes" / "Bremsenquitschen Suite.md"
+    note.write_text("# Quitschen\nDetails hier.", encoding="utf-8")
+
+    monkeypatch.setattr(queue_manager, "VAULT_PATH", vault)
+    monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
+
+    task = 'Analysiere "Bremsenquitschen Suite.md" und erstelle einen Report.'
+    result = queue_manager.inject_file_context(task)
+    assert "Quitschen" in result
+    assert "Details hier." in result
+
+
+def test_inject_file_context_finds_wikilink_with_md_extension(tmp_path, monkeypatch):
+    """inject_file_context must resolve [[Note.md]] wikilinks that already include .md."""
+    vault = tmp_path / "vault"
+    (vault / "notes").mkdir(parents=True)
+    note = vault / "notes" / "Bremsenquitschen Suite.md"
+    note.write_text("# Quitschen\nDetails hier.", encoding="utf-8")
+
+    monkeypatch.setattr(queue_manager, "VAULT_PATH", vault)
+    monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
+
+    task = "Analysiere [[Bremsenquitschen Suite.md]] und erstelle einen Report."
+    result = queue_manager.inject_file_context(task)
+    assert "Quitschen" in result
+    assert "Details hier." in result

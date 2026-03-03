@@ -143,6 +143,7 @@ MEMORY_SUMMARY_MAX_CHARS = 700   # first 500 + "...\n" + last 200
 
 # --- Heartbeat ---
 HEARTBEAT_FILE           = VAULT_PATH / "99_System" / "AI" / "HEARTBEAT.md"
+CAPACITY_LOG_FILE        = VAULT_PATH / "99_System" / "AI" / "capacity-log.md"
 HEARTBEAT_DISK_WARN_PCT  = 10    # warn if free < 10%
 HEARTBEAT_GIT_STALE_DAYS = 7
 HEARTBEAT_QUEUE_IDLE_HOURS = 2
@@ -168,6 +169,7 @@ USAGE_SUGGEST_TIMEOUT_SEC         = 5 * 60
 USAGE_SUGGEST_SKILL_COOLDOWN_DAYS = 7
 USAGE_SUGGEST_RETRY_WINDOW_DAYS   = 3
 USAGE_SUGGEST_LLM_TIMEOUT_SEC    = 3 * 60
+USAGE_SUGGEST_MAX_PACE_FACTOR     = 2.0  # Suppress suggestions if daily usage > 2× target
 USAGE_SUGGEST_VAULT_TASK_DIRS     = [
     "01_Tasks/01_Tasks_Lake.md",
     "01_Tasks/02_recTasks.md",

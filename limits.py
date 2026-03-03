@@ -20,11 +20,19 @@ _GEMINI_CMD = f"gemini{_CMD_SUFFIX}"
 
 
 @dataclass
+class WindowData:
+    """Per-window usage data (e.g. five_hour, seven_day, 24h tier)."""
+    remaining_pct: float = 0.0
+    resets_in_sec: int = 0
+
+
+@dataclass
 class ProviderLimits:
     available: bool = False       # Has any usable capacity
     remaining_pct: float = 0.0   # Lowest remaining % across all tiers
     resets_in_sec: int = 0        # Seconds until earliest reset
     error: str = ""               # Error message if unavailable
+    windows: "dict[str, WindowData]" = field(default_factory=dict)
 
 
 @dataclass
@@ -68,22 +76,27 @@ def _parse_claude(data: dict) -> ProviderLimits:
     if data.get("status") != "ok":
         return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
 
-    windows = []
+    window_tuples = []
+    window_data: dict[str, WindowData] = {}
     for key in ("five_hour", "seven_day"):
         w = data.get(key, {})
         if "remaining" in w:
-            windows.append((_parse_percent(w["remaining"]), _parse_resets_in(w.get("resets_in", ""))))
+            pct = _parse_percent(w["remaining"])
+            sec = _parse_resets_in(w.get("resets_in", ""))
+            window_tuples.append((pct, sec))
+            window_data[key] = WindowData(remaining_pct=pct, resets_in_sec=sec)
 
-    if not windows:
+    if not window_tuples:
         return ProviderLimits(error="no window data")
 
-    remaining = min(r for r, _ in windows)
-    resets_in = min(t for _, t in windows if t > 0) if any(t > 0 for _, t in windows) else 0
+    remaining = min(r for r, _ in window_tuples)
+    resets_in = min(t for _, t in window_tuples if t > 0) if any(t > 0 for _, t in window_tuples) else 0
 
     return ProviderLimits(
         available=remaining >= MIN_CAPACITY_PERCENT,
         remaining_pct=remaining,
         resets_in_sec=resets_in,
+        windows=window_data,
     )
 
 
@@ -98,12 +111,15 @@ def _parse_gemini(data: dict) -> ProviderLimits:
 
     tier_remaining = []
     tier_resets = []
-    for model_data in models.values():
+    window_data: dict[str, WindowData] = {}
+    for model_name, model_data in models.items():
         r = _parse_percent(model_data.get("remaining", "0%"))
         t = _parse_resets_in(model_data.get("resets_in", ""))
         tier_remaining.append(r)
         if t > 0:
             tier_resets.append(t)
+        safe_key = re.sub(r"[^a-z0-9_]", "_", model_name.lower())
+        window_data[safe_key] = WindowData(remaining_pct=r, resets_in_sec=t)
 
     # Available if ANY tier has capacity (Gemini CLI picks internally)
     max_remaining = max(tier_remaining) if tier_remaining else 0
@@ -113,6 +129,7 @@ def _parse_gemini(data: dict) -> ProviderLimits:
         available=max_remaining >= MIN_CAPACITY_PERCENT,
         remaining_pct=max_remaining,
         resets_in_sec=min_reset,
+        windows=window_data,
     )
 
 
@@ -120,22 +137,27 @@ def _parse_codex(data: dict) -> ProviderLimits:
     if data.get("status") != "ok":
         return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
 
-    windows = []
+    window_tuples = []
+    window_data: dict[str, WindowData] = {}
     for key in ("primary_window", "secondary_window"):
         w = data.get(key, {})
         if "remaining" in w:
-            windows.append((_parse_percent(w["remaining"]), _parse_resets_in(w.get("resets_in", ""))))
+            pct = _parse_percent(w["remaining"])
+            sec = _parse_resets_in(w.get("resets_in", ""))
+            window_tuples.append((pct, sec))
+            window_data[key] = WindowData(remaining_pct=pct, resets_in_sec=sec)
 
-    if not windows:
+    if not window_tuples:
         return ProviderLimits(error="no window data")
 
-    remaining = min(r for r, _ in windows)
-    resets_in = min(t for _, t in windows if t > 0) if any(t > 0 for _, t in windows) else 0
+    remaining = min(r for r, _ in window_tuples)
+    resets_in = min(t for _, t in window_tuples if t > 0) if any(t > 0 for _, t in window_tuples) else 0
 
     return ProviderLimits(
         available=remaining >= MIN_CAPACITY_PERCENT,
         remaining_pct=remaining,
         resets_in_sec=resets_in,
+        windows=window_data,
     )
 
 

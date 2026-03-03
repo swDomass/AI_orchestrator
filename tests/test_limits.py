@@ -156,3 +156,58 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
 
     assert calls["n"] >= 2
     assert got.gemini.available is True
+
+
+# ── WindowData population tests ───────────────────────────────────────────────
+
+def test_parse_claude_windows_populated():
+    """_parse_claude with five_hour + seven_day → windows has both entries."""
+    data = {
+        "status": "ok",
+        "five_hour": {"remaining": "80%", "resets_in": "2h 30m"},
+        "seven_day": {"remaining": "60%", "resets_in": "3d 2h"},
+    }
+    result = limits._parse_claude(data)
+    assert "five_hour" in result.windows
+    assert "seven_day" in result.windows
+    assert abs(result.windows["five_hour"].remaining_pct - 80.0) < 0.1
+    assert abs(result.windows["five_hour"].resets_in_sec - 9000) < 60
+    assert abs(result.windows["seven_day"].remaining_pct - 60.0) < 0.1
+
+
+def test_parse_claude_windows_empty_when_no_window_data():
+    """_parse_claude with status=ok but no window keys → error, windows is empty."""
+    data = {"status": "ok"}
+    result = limits._parse_claude(data)
+    assert result.error == "no window data"
+    assert result.windows == {}
+
+
+def test_parse_codex_windows_populated():
+    """_parse_codex → windows populated with primary_window and secondary_window."""
+    data = {
+        "status": "ok",
+        "primary_window": {"remaining": "70%", "resets_in": "1h"},
+        "secondary_window": {"remaining": "90%", "resets_in": "4h"},
+    }
+    result = limits._parse_codex(data)
+    assert "primary_window" in result.windows
+    assert "secondary_window" in result.windows
+    assert abs(result.windows["primary_window"].remaining_pct - 70.0) < 0.1
+    assert abs(result.windows["secondary_window"].remaining_pct - 90.0) < 0.1
+
+
+def test_parse_gemini_windows_populated():
+    """_parse_gemini → windows populated per model with safe key names."""
+    data = {
+        "status": "ok",
+        "models": {
+            "gemini-2.5-pro": {"remaining": "95%", "resets_in": "30m"},
+            "gemini-2.0-flash": {"remaining": "80%", "resets_in": "1h"},
+        },
+    }
+    result = limits._parse_gemini(data)
+    # Keys are sanitized: "gemini-2.5-pro" → "gemini_2_5_pro"
+    assert "gemini_2_5_pro" in result.windows
+    assert "gemini_2_0_flash" in result.windows
+    assert abs(result.windows["gemini_2_5_pro"].remaining_pct - 95.0) < 0.1

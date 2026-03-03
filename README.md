@@ -373,7 +373,7 @@ python dashboard.py --no-open
 - **Übersichtskarten**: Gesamt-Tasks, Erfolgsrate, Ø Dauer, aktive Provider
 - **Tasks/Tag** (30 Tage): Balkenchart der täglichen Task-Abarbeitung
 - **Provider-Verteilung**: Donut-Chart der Nutzung pro Provider
-- **Provider-Kapazität** (48 h): Timeline-Chart der Limits aus Heartbeat-Logs
+- **Provider-Kapazität** (48 h / 7 Tage / 30 Tage): Drei Timeline-Charts für `Claude 5h + Codex (1)`, `Gemini-Modelle`, `Claude 7d + Codex (2)`
 - **Letzte Events**: Error-Lines aus Logs + Queue-Events (merge)
 - **Session-Stats**: Live-Daten der aktuellen Orchestrator-Sitzung (nur bei `--watch`)
 

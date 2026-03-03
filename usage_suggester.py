@@ -23,15 +23,17 @@ import logging
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from config import (
     ALLOWED_CWD_ROOTS,
     USAGE_SUGGEST_CLAUDE_MODEL,
     USAGE_SUGGEST_LLM_TIMEOUT_SEC,
+    USAGE_SUGGEST_MAX_PACE_FACTOR,
     USAGE_SUGGEST_MIN_REMAINING_PCT,
     USAGE_SUGGEST_RESET_WINDOW_SEC,
     USAGE_SUGGEST_TIMEOUT_SEC,
@@ -64,6 +66,7 @@ class UsageSuggester:
         self._suggestion_response: str = ""
         self._last_triggered: Optional[datetime] = None
         self._pending_suggestions: list[Suggestion] = []
+        self._limits_cache: tuple[float, Any] = (0.0, None)  # (monotonic_ts, AllLimits)
 
     # ------------------------------------------------------------------
     # Public: called from heartbeat handler
@@ -106,10 +109,22 @@ class UsageSuggester:
         if resets_in_sec > USAGE_SUGGEST_RESET_WINDOW_SEC:
             return None
 
+        # Guard: 7-day pace too high
+        seven_day_pace = self._get_seven_day_pace()
+        if seven_day_pace is not None:
+            from usage_budget import should_suppress_suggestions
+            if should_suppress_suggestions(seven_day_pace, USAGE_SUGGEST_MAX_PACE_FACTOR):
+                logger.info(
+                    "usage-suggest: 7-day pace %.1fx > %.1fx limit, suppressing",
+                    seven_day_pace["pace_factor"],
+                    USAGE_SUGGEST_MAX_PACE_FACTOR,
+                )
+                return None
+
         # Gather suggestions
         suggestions = self._gather_suggestions()
         if not suggestions:
-            logger.debug("usage-suggest: no suggestions found")
+            logger.info("usage-suggest: no suggestions found")
             return None
 
         event = threading.Event()
@@ -124,7 +139,7 @@ class UsageSuggester:
         try:
             # Send via Telegram
             from notifier import notify_usage_suggestions
-            notify_usage_suggestions(suggestions, remaining_pct, resets_in_sec)
+            notify_usage_suggestions(suggestions, remaining_pct, resets_in_sec, pace_info=seven_day_pace)
 
             # Block waiting for response
             responded = event.wait(timeout=USAGE_SUGGEST_TIMEOUT_SEC)
@@ -204,21 +219,55 @@ class UsageSuggester:
     # Limits check
     # ------------------------------------------------------------------
 
-    def _get_claude_limits(self) -> tuple[Optional[float], int]:
-        """Query Claude limits via the public get_limits() API.
+    def _get_limits_cached(self) -> Any:
+        """Return AllLimits, caching the result for 30 seconds."""
+        ts, cached = self._limits_cache
+        if cached is not None and (time.monotonic() - ts) < 30:
+            return cached
+        try:
+            from limits import get_limits
+            result = get_limits()
+            self._limits_cache = (time.monotonic(), result)
+            return result
+        except Exception as e:
+            logger.debug("usage-suggest: limits fetch failed: %s", e)
+            return None
 
+    def _get_claude_limits(self) -> tuple[Optional[float], int]:
+        """Query Claude limits via the cached API.
+
+        Returns five_hour window data if available, else top-level aggregate.
         Returns (remaining_pct, resets_in_sec) or (None, 0) on failure.
         """
         try:
-            from limits import get_limits
-            all_limits = get_limits()
-            claude = all_limits.claude
-            if claude.error or not claude.available:
+            all_limits = self._get_limits_cached()
+            if all_limits is None:
                 return None, 0
+            claude = all_limits.claude
+            if not claude.available:
+                return None, 0
+            five_h = claude.windows.get("five_hour")
+            if five_h is not None:
+                return five_h.remaining_pct, five_h.resets_in_sec
             return claude.remaining_pct, claude.resets_in_sec
         except Exception as e:
             logger.debug("usage-suggest: limits check failed: %s", e)
             return None, 0
+
+    def _get_seven_day_pace(self) -> Optional[dict]:
+        """Return pace info for Claude's 7-day window, or None if unavailable."""
+        try:
+            all_limits = self._get_limits_cached()
+            if all_limits is None:
+                return None
+            seven_d = all_limits.claude.windows.get("seven_day")
+            if seven_d is None:
+                return None
+            from usage_budget import compute_window_pace
+            return compute_window_pace(seven_d.remaining_pct, seven_d.resets_in_sec, window_days=7)
+        except Exception as e:
+            logger.debug("usage-suggest: seven-day pace check failed: %s", e)
+            return None
 
     # ------------------------------------------------------------------
     # Suggestion gathering

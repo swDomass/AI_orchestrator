@@ -34,10 +34,12 @@ from typing import Callable, Optional
 
 from config import (
     ALLOWED_CWD_ROOTS,
+    CAPACITY_LOG_FILE,
     HEARTBEAT_DISK_WARN_PCT,
     HEARTBEAT_FILE,
     HEARTBEAT_GIT_STALE_DAYS,
     HEARTBEAT_QUEUE_IDLE_HOURS,
+    MIN_CAPACITY_PERCENT,
     VAULT_PATH,
 )
 
@@ -153,8 +155,52 @@ def _check_disk_space() -> Optional[str]:
     return "\n".join(warnings) if warnings else None
 
 
+def _append_capacity_log(limits) -> None:
+    """Append one line per provider/window to the persistent capacity log in the vault."""
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines: list[str] = []
+        for name in ("claude", "gemini", "codex"):
+            lim = getattr(limits, name, None)
+            if lim is None:
+                continue
+            avail = "true" if lim.available else "false"
+            if name == "gemini" and lim.windows:
+                # Skip vertex duplicates; prefer gemini_2 (current gen), fallback to all
+                non_vertex = {k: v for k, v in lim.windows.items() if "vertex" not in k}
+                selected = non_vertex if non_vertex else lim.windows
+                for wname, wdata in selected.items():
+                    pct = f"{wdata.remaining_pct:.1f}"
+                    w_avail = "true" if wdata.remaining_pct >= MIN_CAPACITY_PERCENT else "false"
+                    lines.append(f"{ts} | {name}_{wname} | {pct} | {w_avail}")
+            elif lim.windows:
+                for wname, wdata in lim.windows.items():
+                    pct = f"{wdata.remaining_pct:.1f}"
+                    w_avail = "true" if wdata.remaining_pct >= MIN_CAPACITY_PERCENT else "false"
+                    lines.append(f"{ts} | {name}_{wname} | {pct} | {w_avail}")
+            else:
+                pct = f"{lim.remaining_pct:.1f}" if lim.available else "-1.0"
+                lines.append(f"{ts} | {name} | {pct} | {avail}")
+
+        if not lines:
+            return
+
+        if not CAPACITY_LOG_FILE.exists():
+            CAPACITY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CAPACITY_LOG_FILE.write_text(
+                "# AI Provider Capacity Log\n"
+                "<!-- appended by orchestrator heartbeat -->\n\n",
+                encoding="utf-8",
+            )
+
+        with CAPACITY_LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.debug("capacity log append failed: %s", e)
+
+
 def _check_limits(get_limits_fn: Callable) -> Optional[str]:
-    """Call get_limits() and return a formatted summary."""
+    """Call get_limits() and return a formatted summary with per-window detail."""
     try:
         limits = get_limits_fn()
         parts: list[str] = []
@@ -164,10 +210,34 @@ def _check_limits(get_limits_fn: Callable) -> Optional[str]:
                 parts.append(f"{name}: {lim.remaining_pct:.0f}% remaining")
             else:
                 parts.append(f"{name}: ❌ {lim.error or 'unavailable'}")
+            for wname, wdata in sorted(lim.windows.items()):
+                reset_min = wdata.resets_in_sec // 60
+                parts.append(
+                    f"  {wname}: {wdata.remaining_pct:.0f}% remaining, "
+                    f"reset in {reset_min}m"
+                )
+            if name == "claude" and "seven_day" in lim.windows:
+                try:
+                    from usage_budget import compute_window_pace, format_pace_status
+                    w = lim.windows["seven_day"]
+                    pace = compute_window_pace(w.remaining_pct, w.resets_in_sec, 7)
+                    parts.append(f"  {format_pace_status(pace)}")
+                except Exception:
+                    pass
+        _append_capacity_log(limits)
         return "\n".join(parts) if parts else None
     except Exception as e:
         logger.debug("check-limits failed: %s", e)
         return None
+
+
+def _log_capacity() -> None:
+    """Silently append a capacity snapshot to the persistent log. No Telegram output."""
+    try:
+        from limits import get_limits
+        _append_capacity_log(get_limits())
+    except Exception as e:
+        logger.debug("log-capacity failed: %s", e)
 
 
 def _check_task_summary(dispatcher: Optional[object] = None) -> Optional[str]:
@@ -278,6 +348,7 @@ HANDLER_KEYS: list[tuple[str, str]] = [
     ("git status",    "_check_git_status"),
     ("disk space",    "_check_disk_space"),
     ("check-limits",  "_check_limits"),
+    ("log-capacity",  "_log_capacity"),
     ("summarize",     "_check_task_summary"),
     ("stale branch",  "_check_stale_branches"),
     ("usage-suggest", "_check_usage_suggest"),
@@ -436,7 +507,7 @@ class HeartbeatRunner:
                 item.last_run_date = now.date()
 
                 if result:
-                    logger.info("Heartbeat [%s]: %s", item.label, result[:100])
+                    logger.info("Heartbeat [%s]: %s", item.label, result[:1000])
                     msg = f"🫀 Heartbeat — {item.label}\n\n{result}"
                     if send_message:
                         try:
@@ -467,6 +538,9 @@ class HeartbeatRunner:
                 return _check_limits(get_limits)
             except ImportError:
                 return None
+        elif key == "_log_capacity":
+            _log_capacity()
+            return None
         elif key == "_check_task_summary":
             return _check_task_summary(dispatcher)
         elif key == "_check_stale_branches":

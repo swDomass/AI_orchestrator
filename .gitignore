@@ -11,6 +11,7 @@ build/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
@@ -21,6 +22,8 @@ Thumbs.db
 # Pytest
 .pytest_cache/
 pytest-cache-files-*/
+.pytest_tmp*/
+pytesttmp/
 
 # Logs
 logs/

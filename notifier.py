@@ -227,7 +227,13 @@ def notify_approval_result(task_text: str, result: str) -> None:
     _send(f"{icon} *Approval {result_safe}*\nTask: `{task_safe}`")
 
 
-def notify_usage_suggestions(suggestions: list, remaining_pct: float, resets_in_sec: int) -> None:
+def notify_usage_suggestions(
+    suggestions: list,
+    remaining_pct: float,
+    resets_in_sec: int,
+    *,
+    pace_info: "dict | None" = None,
+) -> None:
     """Send usage suggestions with /pick and /decline options."""
     if not suggestions:
         return
@@ -237,6 +243,11 @@ def notify_usage_suggestions(suggestions: list, remaining_pct: float, resets_in_
         "💡 *Freie Kapazität verfügbar*",
         "",
         f"Claude: {remaining_pct:.0f}% übrig, Reset in ~{mins} Min",
+    ]
+    if pace_info:
+        from usage_budget import format_pace_status
+        lines.append(_escape_markdown(format_pace_status(pace_info)))
+    lines += [
         "",
         "Vorschläge:",
     ]
@@ -268,3 +279,13 @@ def notify_tool_done(tool_name: str, iterations: int, success: bool, summary: st
         f"Iterationen: {iterations}\n\n"
         f"{_escape_markdown(_truncate(summary))}"
     )
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        msg = " ".join(sys.argv[1:])
+        if _send(msg):
+            print(f"  [telegram] Nachricht gesendet: {msg}")
+        else:
+            print("  [telegram] Fehler beim Senden (Check .env / TELEGRAM_ENABLED)")

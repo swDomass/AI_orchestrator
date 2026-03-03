@@ -95,14 +95,12 @@ class TestParseMemoryFiles:
 class TestParseLogLimits:
     def test_single_line(self, tmp_path):
         from analytics import _parse_log_limits
-        log = tmp_path / "test.log"
-        log.write_text(
+        text = (
             "2026-02-28 10:00:00,000 [heartbeat] INFO "
             "Heartbeat [Run check-limits and log to memory]: "
-            "claude: 85% remaining\n",
-            encoding="utf-8",
+            "claude: 85% remaining\n"
         )
-        snaps = _parse_log_limits(log)
+        snaps = _parse_log_limits(text)
         assert len(snaps) == 1
         assert snaps[0].provider == "claude"
         assert snaps[0].remaining_pct == 85.0
@@ -110,25 +108,23 @@ class TestParseLogLimits:
 
     def test_multiline_block(self, tmp_path):
         from analytics import _parse_log_limits
-        log = tmp_path / "test.log"
-        log.write_text(
+        text = (
             "2026-02-28 10:00:00,000 [heartbeat] INFO "
             "Heartbeat [Run check-limits and log to memory]: "
             "claude: 50% remaining\n"
             "gemini: 100% remaining\n"
-            "codex: ❌ expired\n",
-            encoding="utf-8",
+            "codex: ❌ expired\n"
         )
-        snaps = _parse_log_limits(log)
+        snaps = _parse_log_limits(text)
         assert len(snaps) == 3
         providers = {s.provider: s for s in snaps}
         assert providers["claude"].remaining_pct == 50.0
         assert providers["gemini"].remaining_pct == 100.0
         assert providers["codex"].available is False
 
-    def test_missing_file(self, tmp_path):
+    def test_empty_text(self):
         from analytics import _parse_log_limits
-        assert _parse_log_limits(tmp_path / "nope.log") == []
+        assert _parse_log_limits("") == []
 
 
 class TestParseQueueLog:
@@ -214,6 +210,93 @@ class TestAggregation:
         assert len(tl.get("claude", [])) == 1
 
 
+class TestParseLogSuggestEvents:
+    def _get_log_text(self, msg, logger_name="usage_suggester", level="INFO"):
+        return f"2026-03-03 10:00:00,000 [{logger_name}] {level} {msg}\n"
+
+    def test_picked_event(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: picked #2 – Fix tests")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "picked"
+        assert "picked" in events[0].detail
+
+    def test_declined_event(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: user declined")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "declined"
+
+    def test_timeout_event(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: timeout — no response after 300s")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "timeout"
+
+    def test_suppressed_event(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: 7-day pace below threshold")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "suppressed"
+
+    def test_no_suggestions_event(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: no suggestions found")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "no_suggestions"
+
+    def test_result_event(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: result: task queued")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "result"
+
+    def test_unknown_falls_back_to_info(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: some unknown message")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "info"
+
+    def test_heartbeat_logger_also_matched(self):
+        from analytics import _parse_log_suggest_events
+        text = self._get_log_text("usage-suggest: timeout", logger_name="heartbeat")
+        events = _parse_log_suggest_events(text)
+        assert len(events) == 1
+        assert events[0].event_type == "timeout"
+
+    def test_empty_text(self):
+        from analytics import _parse_log_suggest_events
+        assert _parse_log_suggest_events("") == []
+
+    def test_suggest_events_in_recent_events(self, tmp_path):
+        """suggest events appear in recent_events with type='suggest' from get_dashboard_data()."""
+        from analytics import get_dashboard_data, _cache
+        _cache["data"] = None
+        _cache["ts"] = 0.0
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "orchestrator.log").write_text(
+            "2026-03-03 10:00:00,000 [usage_suggester] INFO usage-suggest: user declined\n",
+            encoding="utf-8",
+        )
+        with patch("analytics.VAULT_PATH", tmp_path), \
+             patch("analytics.LOG_FILE", log_dir / "orchestrator.log"), \
+             patch("analytics.QUEUE_FILE", tmp_path / "queue.md"), \
+             patch("analytics.CAPACITY_LOG_FILE", tmp_path / "capacity-log.md"):
+            d = get_dashboard_data()
+        suggest_items = [e for e in d["recent_events"] if e["type"] == "suggest"]
+        assert len(suggest_items) == 1
+        assert "declined" in suggest_items[0]["msg"]
+        assert d["usage_suggest_today"] >= 1
+
+
 class TestCache:
     def test_cache_returns_same_object(self, tmp_path):
         from analytics import get_dashboard_data, _cache
@@ -222,7 +305,8 @@ class TestCache:
         _cache["ts"] = 0.0
         with patch("analytics.VAULT_PATH", tmp_path), \
              patch("analytics.LOG_FILE", tmp_path / "logs" / "orchestrator.log"), \
-             patch("analytics.QUEUE_FILE", tmp_path / "queue.md"):
+             patch("analytics.QUEUE_FILE", tmp_path / "queue.md"), \
+             patch("analytics.CAPACITY_LOG_FILE", tmp_path / "capacity-log.md"):
             (tmp_path / "logs").mkdir(exist_ok=True)
             d1 = get_dashboard_data()
             d2 = get_dashboard_data()

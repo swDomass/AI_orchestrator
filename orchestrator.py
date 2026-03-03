@@ -1158,6 +1158,13 @@ def main() -> None:
             status = f"{lim.remaining_pct:.1f}% remaining" if lim.available else f"❌ {lim.error}"
             reset = f", reset in {fmt_time(lim.resets_in_sec)}" if lim.resets_in_sec else ""
             print(f"  {name:8}: {status}{reset}")
+            for wname, wdata in sorted(lim.windows.items()):
+                print(f"    {wname:20}: {wdata.remaining_pct:.1f}% remaining, reset in {fmt_time(wdata.resets_in_sec)}")
+            if name == "claude" and "seven_day" in lim.windows:
+                from usage_budget import compute_window_pace, format_pace_status
+                w = lim.windows["seven_day"]
+                pace = compute_window_pace(w.remaining_pct, w.resets_in_sec, 7)
+                print(f"    {format_pace_status(pace)}")
         return
 
     if args.dry_run:

@@ -76,8 +76,9 @@ class TestCheckAndSuggest:
     @patch("queue_manager.append_task", return_value=True)
     @patch("notifier.send_message")
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
     @patch.object(us.UsageSuggester, "_gather_suggestions")
-    def test_pick_adds_task(self, mock_gather, _lim, _send, _append, _notify):
+    def test_pick_adds_task(self, mock_gather, _pace, _lim, _send, _append, _notify):
         suggestions = [
             us.Suggestion(rank=1, label="Skill: foo", task_text="run foo", source="skill", score=2.0),
         ]
@@ -100,15 +101,16 @@ class TestCheckAndSuggest:
     @patch("queue_manager.append_task", return_value=True)
     @patch("notifier.send_message")
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
     @patch.object(us.UsageSuggester, "_gather_suggestions")
-    def test_pick_immediately_after_notify(self, mock_gather, _lim, _send, _append):
+    def test_pick_immediately_after_notify(self, mock_gather, _pace, _lim, _send, _append):
         suggestions = [
             us.Suggestion(rank=1, label="Skill: foo", task_text="run foo", source="skill", score=2.0),
         ]
         mock_gather.return_value = suggestions
         suggester = _make_suggester()
 
-        with patch("notifier.notify_usage_suggestions", side_effect=lambda *_: suggester.respond("1")):
+        with patch("notifier.notify_usage_suggestions", side_effect=lambda *_, **__: suggester.respond("1")):
             result = suggester.check_and_suggest(lambda: [])
 
         assert result == "picked: Skill: foo"
@@ -116,8 +118,9 @@ class TestCheckAndSuggest:
     @patch("queue_manager.append_task", return_value=True)
     @patch("notifier.send_message")
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
     @patch.object(us.UsageSuggester, "_gather_suggestions")
-    def test_pick_processed_when_wait_reports_timeout_but_response_exists(self, mock_gather, _lim, _send, _append):
+    def test_pick_processed_when_wait_reports_timeout_but_response_exists(self, mock_gather, _pace, _lim, _send, _append):
         suggestions = [
             us.Suggestion(rank=1, label="Skill: foo", task_text="run foo", source="skill", score=2.0),
         ]
@@ -125,7 +128,7 @@ class TestCheckAndSuggest:
         suggester = _make_suggester()
 
         with (
-            patch("notifier.notify_usage_suggestions", side_effect=lambda *_: suggester.respond("1")),
+            patch("notifier.notify_usage_suggestions", side_effect=lambda *_, **__: suggester.respond("1")),
             patch.object(threading.Event, "wait", return_value=False),
         ):
             result = suggester.check_and_suggest(lambda: [])
@@ -134,8 +137,9 @@ class TestCheckAndSuggest:
 
     @patch("notifier.notify_usage_suggestions")
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
     @patch.object(us.UsageSuggester, "_gather_suggestions")
-    def test_decline(self, mock_gather, _lim, _notify):
+    def test_decline(self, mock_gather, _pace, _lim, _notify):
         suggestions = [
             us.Suggestion(rank=1, label="Skill: foo", task_text="run foo", source="skill", score=2.0),
         ]
@@ -153,6 +157,60 @@ class TestCheckAndSuggest:
 
         result = suggester.check_and_suggest(lambda: [])
         assert result == "declined"
+
+
+class TestSevenDayPaceGuard:
+    """Tests for the 7-day pace guard in check_and_suggest."""
+
+    @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(
+        us.UsageSuggester,
+        "_get_seven_day_pace",
+        return_value={"pace_factor": 2.5, "days_remaining": 3.0, "status": "critical"},
+    )
+    def test_suppressed_when_seven_day_over_pace(self, _pace, _lim):
+        """pace_factor=2.5 with 3 days remaining → suppressed."""
+        suggester = _make_suggester()
+        result = suggester.check_and_suggest(lambda: [])
+        assert result is None
+
+    @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(
+        us.UsageSuggester,
+        "_get_seven_day_pace",
+        return_value={"pace_factor": 3.0, "days_remaining": 0.1, "status": "critical"},
+    )
+    @patch.object(us.UsageSuggester, "_gather_suggestions", return_value=[])
+    def test_not_suppressed_at_end_of_window(self, _gather, _pace, _lim):
+        """pace_factor=3.0 but only 0.1 days remaining → proceeds (no suggestions though)."""
+        suggester = _make_suggester()
+        result = suggester.check_and_suggest(lambda: [])
+        # Not suppressed by pace guard, but no suggestions → None
+        assert result is None
+        # Verify _gather_suggestions was called (pace guard didn't stop it)
+        _gather.assert_called_once()
+
+    @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(
+        us.UsageSuggester,
+        "_get_seven_day_pace",
+        return_value={"pace_factor": 1.1, "days_remaining": 3.0, "status": "ok"},
+    )
+    @patch.object(us.UsageSuggester, "_gather_suggestions", return_value=[])
+    def test_not_suppressed_when_pace_ok(self, _gather, _pace, _lim):
+        """pace_factor=1.1 (below 2.0 limit) → proceeds normally."""
+        suggester = _make_suggester()
+        result = suggester.check_and_suggest(lambda: [])
+        _gather.assert_called_once()
+
+    @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
+    @patch.object(us.UsageSuggester, "_gather_suggestions", return_value=[])
+    def test_not_suppressed_when_no_seven_day_data(self, _gather, _pace, _lim):
+        """_get_seven_day_pace returns None → no suppression."""
+        suggester = _make_suggester()
+        result = suggester.check_and_suggest(lambda: [])
+        _gather.assert_called_once()
 
 
 class TestRespond:

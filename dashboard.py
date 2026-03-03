@@ -35,6 +35,8 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Orchestrator Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2/dist/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
   :root {
     --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
@@ -73,7 +75,19 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   .chart-box canvas { width: 100% !important; }
   .timeline-box {
     background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem;
+  }
+  .timeline-section {
+    background: var(--surface); border: 1px solid var(--border);
     border-radius: 10px; padding: 1rem; margin-bottom: 1.5rem;
+  }
+  .timeline-head {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 1rem; margin-bottom: 0.8rem; flex-wrap: wrap;
+  }
+  .timeline-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1rem;
   }
   .timeline-box h3 { font-size: 0.9rem; margin-bottom: 0.8rem; color: var(--muted); }
   .events-box {
@@ -86,6 +100,11 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   th { color: var(--muted); font-weight: 500; }
   .tag-error { color: var(--red); }
   .tag-queue { color: var(--accent); }
+  .tag-suggest { color: var(--yellow); }
+  .time-btns { display: flex; gap: 0.5rem; margin-bottom: 0.8rem; }
+  .time-btn { background: var(--surface); border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 0.3rem 0.8rem; cursor: pointer; font-size: 0.8rem; }
+  .time-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .zoom-reset { background: none; border: none; color: var(--muted); font-size: 0.75rem; cursor: pointer; padding: 0.2rem 0; text-decoration: underline; display: block; margin-top: 0.4rem; }
   .session-box {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 10px; padding: 1rem;
@@ -94,7 +113,10 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.8rem; }
   .session-grid .item { font-size: 0.85rem; }
   .session-grid .item span { color: var(--accent); font-weight: 600; }
-  @media (max-width: 700px) { .charts { grid-template-columns: 1fr; } }
+  @media (max-width: 700px) {
+    .charts { grid-template-columns: 1fr; }
+    .timeline-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -109,12 +131,19 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   <div class="card"><div class="value" id="success-rate">—</div><div class="label">Erfolgsrate</div></div>
   <div class="card"><div class="value" id="avg-dur">—</div><div class="label">Ø Dauer (s)</div></div>
   <div class="card"><div class="value" id="providers">—</div><div class="label">Aktive Provider</div></div>
+  <div class="card"><div class="value" id="suggest-today">—</div><div class="label">Vorschläge heute</div></div>
 </div>
 
 <div class="charts">
   <div class="chart-box">
-    <h3>Tasks / Tag (30 Tage)</h3>
+    <h3>Tasks / Tag</h3>
+    <div class="time-btns">
+      <button class="time-btn" data-days="7" onclick="setRange(7)">7 Tage</button>
+      <button class="time-btn active" data-days="30" onclick="setRange(30)">30 Tage</button>
+      <button class="time-btn" data-days="90" onclick="setRange(90)">90 Tage</button>
+    </div>
     <canvas id="tpd-chart" height="180"></canvas>
+    <button class="zoom-reset" id="tpd-reset">Zoom zurücksetzen</button>
   </div>
   <div class="chart-box">
     <h3>Provider-Verteilung</h3>
@@ -122,9 +151,32 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div class="timeline-box">
-  <h3>Provider-Kapazität (48 h)</h3>
-  <canvas id="limit-chart" height="140"></canvas>
+<div class="timeline-section">
+  <div class="timeline-head">
+    <h3>Provider-Kapazität</h3>
+    <div class="time-btns">
+      <button class="time-btn" data-hours="48" onclick="setLimitRange(48)">48 h</button>
+      <button class="time-btn active" data-hours="168" onclick="setLimitRange(168)">7 Tage</button>
+      <button class="time-btn" data-hours="720" onclick="setLimitRange(720)">30 Tage</button>
+    </div>
+  </div>
+  <div class="timeline-grid">
+    <div class="timeline-box">
+      <h3>5h + 24h (Claude 5h, Codex (1))</h3>
+      <canvas id="limit-chart-short" height="140"></canvas>
+      <button class="zoom-reset" id="lim-short-reset">Zoom zurücksetzen</button>
+    </div>
+    <div class="timeline-box">
+      <h3>Gemini Modelle</h3>
+      <canvas id="limit-chart-gemini" height="140"></canvas>
+      <button class="zoom-reset" id="lim-gemini-reset">Zoom zurücksetzen</button>
+    </div>
+    <div class="timeline-box">
+      <h3>7d (Claude 7d, Codex (2))</h3>
+      <canvas id="limit-chart-long" height="140"></canvas>
+      <button class="zoom-reset" id="lim-long-reset">Zoom zurücksetzen</button>
+    </div>
+  </div>
 </div>
 
 <div class="events-box">
@@ -141,6 +193,32 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
+function providerColor(name) {
+  if (name === 'claude_seven_day') return '#b0a8ff';
+  if (name.startsWith('claude')) return '#6c63ff';
+  if (name.includes('secondary')) return '#81c784';
+  if (name.startsWith('codex')) return '#4caf50';
+  if (name.startsWith('gemini_gemini_1')) return '#ffda6a';
+  if (name.startsWith('gemini')) return '#ffc107';
+  return '#888';
+}
+function providerLabel(name) {
+  const known = {
+    claude: 'Claude', claude_five_hour: 'Claude 5h', claude_seven_day: 'Claude 7d',
+    gemini: 'Gemini', codex: 'Codex',
+    codex_primary_window: 'Codex (1)', codex_secondary_window: 'Codex (2)',
+  };
+  if (known[name]) return known[name];
+  // gemini model windows: gemini_gemini_2_5_flash_ → "Gemini 2.5 Flash"
+  if (name.startsWith('gemini_gemini_')) {
+    const parts = name.replace(/^gemini_gemini_/, '').replace(/_+$/, '').split('_');
+    const ver = [], words = [];
+    for (const p of parts) (/^\d+$/.test(p) ? ver : words).push(p);
+    return 'Gemini ' + ver.join('.') + (words.length ? ' ' + words.map(w => w[0].toUpperCase() + w.slice(1)).join(' ') : '');
+  }
+  return name.replace(/_/g, ' ');
+}
+// kept for doughnut chart colours
 const COLORS = {
   claude: '#6c63ff', gemini: '#ffc107', codex: '#4caf50',
 };
@@ -152,15 +230,112 @@ const chartOpts = {
     y: { ticks: { color: '#666' }, grid: { color: '#2a2d3a' }, beginAtZero: true },
   },
 };
+const zoomPlugin = {
+  zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
+  pan:  { enabled: true, mode: 'x' },
+};
 
-let tpdChart, pdChart, limitChart;
+let tpdChart, pdChart, limitShortChart, limitGeminiChart, limitLongChart;
+let _allTpd = { labels: [], values: [] };
+let _activeRange = 30;
+let _allLimits = {};
+let _activeLimitRange = 168;
+
+function safeResetZoom(chart) {
+  if (chart && typeof chart.resetZoom === 'function') chart.resetZoom();
+}
+
+function setRange(days) {
+  _activeRange = days;
+  document.querySelectorAll('.time-btn[data-days]').forEach(b =>
+    b.classList.toggle('active', +b.dataset.days === days));
+  applyRange();
+}
+
+function setLimitRange(hours) {
+  _activeLimitRange = hours;
+  document.querySelectorAll('.time-btn[data-hours]').forEach(b =>
+    b.classList.toggle('active', +b.dataset.hours === hours));
+  applyLimitRange();
+}
+
+function tsKey(ts) {
+  // "2026-03-03T14:00:38" → "2026-03-03T14:00" (sortable key)
+  return ts.slice(0, 16);
+}
+
+function providerInLimitGroup(provider, group) {
+  if (group === 'short') return provider === 'claude_five_hour' || provider === 'codex_primary_window';
+  if (group === 'gemini') return provider === 'gemini' || provider.startsWith('gemini_');
+  if (group === 'long') return provider === 'claude_seven_day' || provider === 'codex_secondary_window';
+  return false;
+}
+
+function buildLimitChartData(group) {
+  const cutoff = new Date(Date.now() - _activeLimitRange * 3600 * 1000);
+
+  // 1. Collect all unique sorted labels across every provider
+  const labelSet = new Set();
+  const provFiltered = {};
+  for (const [prov, pts] of Object.entries(_allLimits)) {
+    if (!providerInLimitGroup(prov, group)) continue;
+    const filtered = pts.filter(p => new Date(p.ts) >= cutoff);
+    if (!filtered.length) continue;
+    provFiltered[prov] = filtered;
+    for (const p of filtered) labelSet.add(tsKey(p.ts));
+  }
+  const labels = Array.from(labelSet).sort();
+
+  // 2. Each dataset uses {x, y} so Chart.js places points at their actual label
+  const datasets = [];
+  for (const [prov, pts] of Object.entries(provFiltered)) {
+    datasets.push({
+      label: providerLabel(prov),
+      data: pts.map(p => ({ x: tsKey(p.ts), y: p.pct })),
+      borderColor: providerColor(prov),
+      backgroundColor: 'transparent',
+      tension: 0.3,
+      pointRadius: 2,
+    });
+  }
+
+  return { labels, datasets };
+}
+
+function updateLimitChart(chart, group) {
+  if (!chart) return;
+  const d = buildLimitChartData(group);
+  chart.data.labels = d.labels;
+  chart.data.datasets = d.datasets;
+  safeResetZoom(chart);
+  chart.update();
+}
+
+function applyLimitRange() {
+  updateLimitChart(limitShortChart, 'short');
+  updateLimitChart(limitGeminiChart, 'gemini');
+  updateLimitChart(limitLongChart, 'long');
+}
+
+function applyRange() {
+  const n = _activeRange;
+  const labels = _allTpd.labels.slice(-n).map(l => l.slice(5));
+  const values = _allTpd.values.slice(-n);
+  tpdChart.data.labels = labels;
+  tpdChart.data.datasets[0].data = values;
+  safeResetZoom(tpdChart);
+  tpdChart.update();
+}
 
 function initCharts() {
   const tpdCtx = document.getElementById('tpd-chart').getContext('2d');
   tpdChart = new Chart(tpdCtx, {
     type: 'bar',
     data: { labels: [], datasets: [{ label: 'Tasks', data: [], backgroundColor: '#6c63ff88', borderColor: '#6c63ff', borderWidth: 1 }] },
-    options: { ...chartOpts, plugins: { legend: { display: false } } },
+    options: {
+      ...chartOpts,
+      plugins: { legend: { display: false }, zoom: zoomPlugin },
+    },
   });
 
   const pdCtx = document.getElementById('pd-chart').getContext('2d');
@@ -170,19 +345,41 @@ function initCharts() {
     options: { responsive: true, plugins: { legend: { labels: { color: '#888' }, position: 'bottom' } } },
   });
 
-  const limCtx = document.getElementById('limit-chart').getContext('2d');
-  limitChart = new Chart(limCtx, {
-    type: 'line',
-    data: { datasets: [] },
-    options: {
-      ...chartOpts,
-      scales: {
-        ...chartOpts.scales,
-        x: { ...chartOpts.scales.x, type: 'category' },
-        y: { ...chartOpts.scales.y, min: 0, max: 100, title: { display: true, text: '%', color: '#888' } },
+  function createLimitChart(canvasId) {
+    const limCtx = document.getElementById(canvasId).getContext('2d');
+    return new Chart(limCtx, {
+      type: 'line',
+      data: { datasets: [] },
+      options: {
+        ...chartOpts,
+        plugins: { legend: { labels: { color: '#888' } }, zoom: zoomPlugin },
+        scales: {
+          ...chartOpts.scales,
+          x: {
+            ...chartOpts.scales.x,
+            type: 'category',
+            ticks: {
+              ...chartOpts.scales.x.ticks,
+              callback: function(value) {
+                const raw = this.getLabelForValue(value);
+                return raw && raw.length >= 16 ? (raw.slice(5, 10) + ' ' + raw.slice(11, 16)) : raw;
+              },
+            },
+          },
+          y: { ...chartOpts.scales.y, min: 0, max: 100, title: { display: true, text: '%', color: '#888' } },
+        },
       },
-    },
-  });
+    });
+  }
+
+  limitShortChart = createLimitChart('limit-chart-short');
+  limitGeminiChart = createLimitChart('limit-chart-gemini');
+  limitLongChart = createLimitChart('limit-chart-long');
+
+  document.getElementById('tpd-reset').onclick = () => safeResetZoom(tpdChart);
+  document.getElementById('lim-short-reset').onclick = () => safeResetZoom(limitShortChart);
+  document.getElementById('lim-gemini-reset').onclick = () => safeResetZoom(limitGeminiChart);
+  document.getElementById('lim-long-reset').onclick = () => safeResetZoom(limitLongChart);
 }
 
 function update(d) {
@@ -191,45 +388,28 @@ function update(d) {
   document.getElementById('success-rate').textContent = d.success_rate + '%';
   document.getElementById('avg-dur').textContent = d.avg_duration_sec;
   document.getElementById('providers').textContent = (d.active_providers || []).length;
+  document.getElementById('suggest-today').textContent = d.usage_suggest_today ?? '—';
 
-  // Tasks per day
-  tpdChart.data.labels = (d.tasks_per_day.labels || []).map(l => l.slice(5));
-  tpdChart.data.datasets[0].data = d.tasks_per_day.values || [];
-  tpdChart.update();
+  // Tasks per day — store full 90-day data, then apply active range
+  _allTpd = d.tasks_per_day || { labels: [], values: [] };
+  applyRange();
 
   // Provider dist
   pdChart.data.labels = d.provider_distribution.labels || [];
   pdChart.data.datasets[0].data = d.provider_distribution.values || [];
   pdChart.update();
 
-  // Limits timeline
-  const lt = d.limits_timeline || {};
-  const datasets = [];
-  for (const [prov, pts] of Object.entries(lt)) {
-    datasets.push({
-      label: prov,
-      data: pts.map(p => p.pct),
-      borderColor: COLORS[prov] || '#888',
-      backgroundColor: 'transparent',
-      tension: 0.3,
-      pointRadius: 2,
-    });
-  }
-  // Use longest provider's timestamps as labels
-  let maxLabels = [];
-  for (const [, pts] of Object.entries(lt)) {
-    if (pts.length > maxLabels.length) maxLabels = pts.map(p => p.ts.slice(5, 16));
-  }
-  limitChart.data.labels = maxLabels;
-  limitChart.data.datasets = datasets;
-  limitChart.update();
+  // Limits timeline — store full history and apply active range to all three charts
+  _allLimits = d.limits_timeline || {};
+  applyLimitRange();
 
   // Events
+  const typeClass = { error: 'tag-error', queue: 'tag-queue', suggest: 'tag-suggest' };
   const tbody = document.getElementById('events-body');
   tbody.innerHTML = '';
   for (const ev of (d.recent_events || [])) {
     const tr = document.createElement('tr');
-    const cls = ev.type === 'error' ? 'tag-error' : 'tag-queue';
+    const cls = typeClass[ev.type] || 'tag-queue';
     tr.innerHTML = '<td>' + ev.ts.slice(0, 16).replace('T', ' ') + '</td>'
       + '<td class="' + cls + '">' + ev.type + '</td>'
       + '<td>' + ev.msg.replace(/</g, '&lt;') + '</td>';

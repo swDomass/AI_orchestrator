@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from config import LOG_FILE, QUEUE_FILE, VAULT_PATH
+from config import CAPACITY_LOG_FILE, LOG_FILE, QUEUE_FILE, VAULT_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,13 @@ class LimitSnapshot:
 class QueueEvent:
     timestamp: datetime
     message: str
+
+
+@dataclass(frozen=True)
+class UsageSuggestEvent:
+    timestamp: datetime
+    event_type: str   # "picked" | "declined" | "timeout" | "suppressed" | "no_suggestions" | "result" | "info"
+    detail: str       # raw message tail
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -119,8 +126,8 @@ def _parse_memory_files(
 # Log line pattern:
 #   2026-02-27 09:17:25,762 [heartbeat] INFO Heartbeat [Run check-limits ...]: claude: 71% remaining
 _LIMIT_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[heartbeat\] INFO "
-    r"Heartbeat \[Run check-limits.*?\]: (.+)",
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(?:usage_suggester|heartbeat)\] INFO "
+    r"Heartbeat \[(?:Run )?check-limits.*?\]: (.+)",
     re.MULTILINE,
 )
 # Individual provider entry inside a check-limits block
@@ -128,19 +135,15 @@ _PROVIDER_LINE_RE = re.compile(
     r"(\w+):\s+(?:(\d+(?:\.\d+)?)%\s+remaining|❌\s*(.*))"
 )
 
+_SUGGEST_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(?:usage_suggester|heartbeat)\] (?:INFO|WARNING) "
+    r"(usage-suggest: .+)$",
+    re.MULTILINE,
+)
 
-def _parse_log_limits(log_path: Path) -> list[LimitSnapshot]:
-    """Parse heartbeat check-limits entries from a single log file.
 
-    Handles multi-line log blocks where provider entries follow the timestamp line.
-    """
-    if not log_path.is_file():
-        return []
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-
+def _parse_log_limits(text: str) -> list[LimitSnapshot]:
+    """Parse heartbeat check-limits entries from log text."""
     snapshots: list[LimitSnapshot] = []
 
     # Split into blocks: each check-limits log entry can span multiple lines
@@ -170,40 +173,103 @@ def _parse_log_limits(log_path: Path) -> list[LimitSnapshot]:
 
             for pm in _PROVIDER_LINE_RE.finditer(block):
                 provider = pm.group(1).lower()
-                if pm.group(2) is not None:
-                    pct = float(pm.group(2))
+                pct_str = pm.group(2)
+                if pct_str is not None:
+                    pct = float(pct_str)
                     snapshots.append(LimitSnapshot(ts, provider, pct, True))
                 else:
                     snapshots.append(LimitSnapshot(ts, provider, -1.0, False))
-
             i = j
         else:
             i += 1
-
     return snapshots
 
 
-def _parse_all_logs(log_dir: Path) -> tuple[list[LimitSnapshot], list[str]]:
-    """Parse all rotated log files. Returns (snapshots, error_lines)."""
+def _parse_log_suggest_events(text: str) -> list[UsageSuggestEvent]:
+    """Parse usage-suggest log entries from log text."""
+    _type_map = (
+        ("usage-suggest: picked #", "picked"),
+        ("usage-suggest: user declined", "declined"),
+        ("usage-suggest: timeout", "timeout"),
+        ("usage-suggest: 7-day pace", "suppressed"),
+        ("usage-suggest: no suggestions found", "no_suggestions"),
+        ("usage-suggest: result:", "result"),
+    )
+
+    events: list[UsageSuggestEvent] = []
+    for m in _SUGGEST_RE.finditer(text):
+        ts_str, detail = m.group(1), m.group(2)
+        try:
+            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        event_type = "info"
+        for prefix, etype in _type_map:
+            if detail.startswith(prefix):
+                event_type = etype
+                break
+        events.append(UsageSuggestEvent(ts, event_type, detail))
+    return events
+
+
+def _parse_all_logs(log_dir: Path) -> tuple[list[LimitSnapshot], list[str], list[UsageSuggestEvent]]:
+    """Parse all rotated log files. Returns (snapshots, error_lines, suggest_events)."""
     all_snapshots: list[LimitSnapshot] = []
     error_lines: list[str] = []
+    all_suggest: list[UsageSuggestEvent] = []
 
     if not log_dir.is_dir():
-        return all_snapshots, error_lines
+        return all_snapshots, error_lines, all_suggest
 
     log_files = sorted(log_dir.glob("orchestrator.log*"))
     for lf in log_files:
-        all_snapshots.extend(_parse_log_limits(lf))
-        # Collect ERROR lines
         try:
-            for line in lf.read_text(encoding="utf-8", errors="replace").splitlines():
-                if " ERROR " in line:
-                    error_lines.append(line.strip())
+            text = lf.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            pass
+            continue
+
+        all_snapshots.extend(_parse_log_limits(text))
+        all_suggest.extend(_parse_log_suggest_events(text))
+
+        # Collect ERROR lines
+        for line in text.splitlines():
+            if " ERROR " in line:
+                error_lines.append(line.strip())
 
     all_snapshots.sort(key=lambda s: s.timestamp)
-    return all_snapshots, error_lines
+    all_suggest.sort(key=lambda e: e.timestamp)
+    return all_snapshots, error_lines, all_suggest
+
+
+_CAP_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*(\w+)\s*\|\s*([-\d.]+)\s*\|\s*(true|false)\s*$"
+)
+
+
+def _parse_capacity_log(path: Path) -> list[LimitSnapshot]:
+    """Parse the persistent capacity log (one provider entry per line)."""
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    snapshots: list[LimitSnapshot] = []
+    for line in text.splitlines():
+        m = _CAP_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        provider = m.group(2).lower()
+        pct = float(m.group(3))
+        available = m.group(4) == "true"
+        snapshots.append(LimitSnapshot(ts, provider, pct, available))
+    snapshots.sort(key=lambda s: s.timestamp)
+    return snapshots
 
 
 _QUEUE_EVENT_RE = re.compile(
@@ -252,7 +318,7 @@ def _parse_session_stats() -> dict:
 
 # ── Aggregation ──────────────────────────────────────────────────────────────
 
-def _tasks_per_day(records: list[TaskRecord], days: int = 30) -> tuple[list[str], list[int]]:
+def _tasks_per_day(records: list[TaskRecord], days: int = 90) -> tuple[list[str], list[int]]:
     """Aggregate task counts per day for the last N days (zero-filled)."""
     today = datetime.now().date()
     counts: dict[str, int] = {}
@@ -299,7 +365,7 @@ def _avg_duration(records: list[TaskRecord]) -> float:
 
 def _limits_timeline(
     snapshots: list[LimitSnapshot],
-    hours: int = 48,
+    hours: int = 7 * 24,
 ) -> dict[str, list[dict]]:
     """Per-provider timeline of capacity snapshots within the last N hours."""
     cutoff = datetime.now() - timedelta(hours=hours)
@@ -316,9 +382,10 @@ def _limits_timeline(
 def _recent_events(
     error_lines: list[str],
     queue_events: list[QueueEvent],
+    suggest_events: list[UsageSuggestEvent] | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    """Merge error lines and queue events into a unified recent-events list."""
+    """Merge error lines, queue events, and suggest events into a unified recent-events list."""
     items: list[dict] = []
 
     # Parse timestamp from error lines: "2026-02-28 07:54:23,645 ..."
@@ -336,6 +403,9 @@ def _recent_events(
 
     for ev in queue_events:
         items.append({"ts": ev.timestamp.isoformat(), "type": "queue", "msg": ev.message[:200]})
+
+    for ev in (suggest_events or []):
+        items.append({"ts": ev.timestamp.isoformat(), "type": "suggest", "msg": ev.detail[:200]})
 
     # Sort by timestamp descending
     items.sort(key=lambda x: x["ts"], reverse=True)
@@ -365,13 +435,24 @@ def get_dashboard_data() -> dict:
 
     # Parse
     records = _parse_memory_files(task_results_dir, archive_dir)
-    snapshots, error_lines = _parse_all_logs(log_dir)
+    snapshots, error_lines, suggest_events = _parse_all_logs(log_dir)
+    # Merge persistent capacity log (deduplicates by keeping both; later sort handles order)
+    persistent_snaps = _parse_capacity_log(CAPACITY_LOG_FILE)
+    if persistent_snaps:
+        seen = {(s.timestamp, s.provider) for s in snapshots}
+        for s in persistent_snaps:
+            if (s.timestamp, s.provider) not in seen:
+                snapshots.append(s)
+        snapshots.sort(key=lambda s: s.timestamp)
     queue_events = _parse_queue_log(QUEUE_FILE)
     session = _parse_session_stats()
 
     # Aggregate
     tpd_labels, tpd_values = _tasks_per_day(records)
     pd_labels, pd_values = _provider_distribution(records)
+
+    cutoff_24h = datetime.now() - timedelta(hours=24)
+    suggest_today = sum(1 for e in suggest_events if e.timestamp >= cutoff_24h)
 
     data = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -381,8 +462,9 @@ def get_dashboard_data() -> dict:
         "active_providers": pd_labels[:5],
         "tasks_per_day": {"labels": tpd_labels, "values": tpd_values},
         "provider_distribution": {"labels": pd_labels, "values": pd_values},
-        "limits_timeline": _limits_timeline(snapshots),
-        "recent_events": _recent_events(error_lines, queue_events),
+        "limits_timeline": _limits_timeline(snapshots, hours=90 * 24),
+        "recent_events": _recent_events(error_lines, queue_events, suggest_events),
+        "usage_suggest_today": suggest_today,
         "session": session,
     }
 

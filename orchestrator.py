@@ -647,7 +647,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Dry-run
         if dry_run:
             limits = get_limits()
-            provider = select_provider(task, limits, profile=profile, strict=provider_is_forced)
+            provider = select_provider(task, limits, profile=profile, strict=provider_is_forced, tool_name=tool_name)
             memory_context = memory_module.get_context_for_task(task, cwd=cwd)
             prompt = _build_prompt(
                 task,
@@ -794,7 +794,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if tool_name:
             tried_providers: set[str] = set()
             while True:
-                provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced)
+                provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
                 if provider is None:
                     earliest = _get_next_retry_sec(limits)
                     reset_dt = datetime.now() + timedelta(seconds=earliest)
@@ -878,7 +878,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log("Queue-Verarbeitung pausiert")
                 return False
 
-            provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced)
+            provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
 
             if provider is None:
                 if not tried_providers:

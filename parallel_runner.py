@@ -100,7 +100,7 @@ def _run_single_subtask(
     exclude: set[str] = set()
     provider = select_provider(
         subtask.text, limits, exclude=exclude, profile=profile,
-        force_name=subtask.provider_forced
+        force_name=subtask.provider_forced, tool_name=subtask.tool_name
     )
     if provider is None:
         return SubTaskResult(

@@ -502,7 +502,7 @@ class TelegramListener:
             tried_providers: set[str] = set()
 
             while True:
-                provider = select_provider(text, limits, exclude=tried_providers)
+                provider = select_provider(text, limits, exclude=tried_providers, tool_name=None)
 
                 if provider is None:
                     if not tried_providers:

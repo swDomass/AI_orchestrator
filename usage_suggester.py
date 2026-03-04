@@ -634,7 +634,7 @@ class UsageSuggester:
             from dispatcher import select_provider
 
             limits = get_limits()
-            provider = select_provider("", limits)
+            provider = select_provider("", limits, tool_name=None)
             if provider is None:
                 logger.debug("usage-suggest: no provider for autonomy assessment")
                 return {}

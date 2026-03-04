@@ -112,6 +112,7 @@ class PolicyEngine:
     def __init__(self, vault_path: Path) -> None:
         self._vault_path = vault_path
         self._rules: list[PolicyRule] = []
+        self._tool_providers: dict[str, list[str]] = {}
         self._mtime: float = 0.0
         self._lock = threading.Lock()
 
@@ -162,11 +163,34 @@ class PolicyEngine:
             return
 
         self._rules = _parse_rules_from_dict(data)
-        logger.debug("policy: loaded %d rules from %s", len(self._rules), path)
+        self._tool_providers = data.get("tool_providers") or {}
+        logger.debug("policy: loaded %d rules and %d tool policies from %s", 
+                     len(self._rules), len(self._tool_providers), path)
 
     # ------------------------------------------------------------------
     # Classification
     # ------------------------------------------------------------------
+
+    def get_allowed_providers(self, tool_name: str | None = None) -> list[str] | None:
+        """Return the list of allowed providers for a tool, or None if no restriction.
+
+        Resolution order:
+        1. Specific tool entry in tool_providers (e.g. 'review-loop')
+        2. 'default' entry in tool_providers
+        3. None (all providers allowed)
+        """
+        self._reload_if_changed()
+        with self._lock:
+            if not self._tool_providers:
+                return None
+
+            if tool_name and tool_name in self._tool_providers:
+                return list(self._tool_providers[tool_name])
+
+            if "default" in self._tool_providers:
+                return list(self._tool_providers["default"])
+
+        return None
 
     def _classify(self, task_text: str, rules: list[PolicyRule]) -> tuple[str, list[str], bool]:
         """Returns (tier, messages, had_any_match)."""

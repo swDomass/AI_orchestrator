@@ -1,18 +1,18 @@
-# AI Orchestrator — Feature Roadmap
+﻿# AI Orchestrator ÔÇö Feature Roadmap
 
 Inspired by patterns from OpenClaw and our own ideas.
 Prioritized by usefulness, effort, and synergy with existing infrastructure
 (Obsidian vault, Telegram, 3 CLI providers, queue system).
 
-**Guiding principle — Human-in-the-Loop**:
+**Guiding principle ÔÇö Human-in-the-Loop**:
 Maximum autonomy for routine work (file edits, git commits, tests, tool loops).
 Telegram-based approval ONLY for irreversible/dangerous actions (push, publish,
-delete outside CWD, CI changes). No approval fatigue — blanket session approvals,
+delete outside CWD, CI changes). No approval fatigue ÔÇö blanket session approvals,
 per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 
 ---
 
-## Tier 1 — High Impact, Builds on What We Have
+## Tier 1 ÔÇö High Impact, Builds on What We Have
 
 | # | Feature | Status |
 |---|---------|--------|
@@ -20,9 +20,9 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 2 | `--doctor` / onboarding command | DONE |
 | 3 | Memory system with temporal decay | DONE |
 | 4 | Heartbeat / proactive scheduled tasks | DONE |
-| 10 | `#shutdown` — graceful OS shutdown via Telegram or queue tag | DONE |
+| 10 | `#shutdown` ÔÇö graceful OS shutdown via Telegram or queue tag | DONE |
 
-## Tier 2 — Strong Value, Moderate Effort
+## Tier 2 ÔÇö Strong Value, Moderate Effort
 
 | # | Feature | Status |
 |---|---------|--------|
@@ -33,18 +33,19 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 9 | Execution policy + approval layer | DONE |
 | 10b | Usage Suggester (proactive task suggestions) | DONE |
 
-## Tier 3 — Nice to Have, After Core Is Solid
+## Tier 3 ÔÇö Nice to Have, After Core Is Solid
 
 | # | Feature | Status |
 |---|---------|--------|
-| 10 | Tool policy layering (global > profile > task) | backlog |
+| 10 | Tool policy layering (global > profile > task) | DONE |
 | 11 | Session management (context per task) | backlog |
 | 12 | Optional Docker sandbox | backlog |
 | 13 | Dashboard / web UI | DONE |
 | 14 | Plugin system (runtime-loadable handlers) | backlog |
 | 15 | Obsidian CLI integration (search, tasks, backlinks) | backlog |
+| 16 | Usage Budgeting & Pace Analysis (7d rolling) | DONE |
 
-## Tier 4 — Overkill for Now
+## Tier 4 ÔÇö Overkill for Now
 
 | # | Feature | Status |
 |---|---------|--------|
@@ -57,15 +58,15 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 ## Recommended Build Order
 
 ```
-Phase 1 (foundations)     → Skills, --doctor, SOUL.md
-Phase 2 (intelligence)    → Memory, Heartbeat, Selective injection
-Phase 3 (power features)  → Profiles, Parallel spawning, Policy layer
-Phase 4 (hardening)       → Docker sandbox, Tool policy, Dashboard
+Phase 1 (foundations)     ÔåÆ Skills, --doctor, SOUL.md
+Phase 2 (intelligence)    ÔåÆ Memory, Heartbeat, Selective injection
+Phase 3 (power features)  ÔåÆ Profiles, Parallel spawning, Policy layer
+Phase 4 (hardening)       ÔåÆ Docker sandbox, Tool policy, Dashboard
 ```
 
 ---
 
-## Detailed Plans — Tier 1 & Tier 2
+## Detailed Plans ÔÇö Tier 1 & Tier 2
 
 ### 1. Skills System + Auto-Discovery + Gating
 
@@ -88,7 +89,7 @@ Skill resolution order (highest priority wins):
 ```
 
 **YAML parsing**: Use `pyyaml` (`pip install pyyaml`). Acceptable exception to the
-no-external-deps rule — YAML is used across Skills, Profiles, and Policy configs.
+no-external-deps rule ÔÇö YAML is used across Skills, Profiles, and Policy configs.
 Add to `requirements.txt`.
 
 **SKILL.md format** (YAML frontmatter + Markdown body):
@@ -102,7 +103,7 @@ requires:
   bins: []              # e.g. ["pytest", "docker"]
   env: []               # e.g. ["OPENAI_API_KEY"]
   os: []                # e.g. ["win32", "linux"]
-  providers: []         # e.g. ["claude"] — only run on these (task waits for reset)
+  providers: []         # e.g. ["claude"] ÔÇö only run on these (task waits for reset)
 tags: ["review", "quality"]
 config:
   max_iterations: 10
@@ -123,7 +124,7 @@ You are performing an iterative code review...
 **Implementation steps**:
 
 1. Create `skills/discovery.py`:
-   - `discover_skills(cwd, vault_path)` → scans all 4 locations
+   - `discover_skills(cwd, vault_path)` ÔåÆ scans all 4 locations
    - Returns `dict[str, SkillConfig]` with precedence applied
    - Parses YAML frontmatter from each `SKILL.md`
    - **Shadowing warning**: when a higher-priority location overrides a
@@ -131,26 +132,26 @@ You are performing an iterative code review...
      "Skill 'review-loop' in repo-local shadows vault version")
 
 2. Create `skills/gating.py`:
-   - `check_requirements(skill)` → validates bins (shutil.which),
+   - `check_requirements(skill)` ÔåÆ validates bins (shutil.which),
      env vars (os.environ), OS (sys.platform), provider availability
    - Returns `(available: bool, reasons: list[str])`
    - **Provider-locked skills** (`requires.providers`): if the required provider
-     is rate-limited, the task waits for that provider to reset — no fallback
+     is rate-limited, the task waits for that provider to reset ÔÇö no fallback
      to other providers. Uses existing `mark_retry(task, reset_at)` mechanism.
 
 3. Create `skills/loader.py`:
-   - `load_skill(name)` → returns skill config + prompt content
+   - `load_skill(name)` ÔåÆ returns skill config + prompt content
    - Caches loaded skills per session
 
 4. Migrate existing tools:
-   - Convert `tools/review_loop.py` → `skills/review-loop/SKILL.md`
-   - Convert `tools/test_loop.py` → `skills/test-loop/SKILL.md`
+   - Convert `tools/review_loop.py` ÔåÆ `skills/review-loop/SKILL.md`
+   - Convert `tools/test_loop.py` ÔåÆ `skills/test-loop/SKILL.md`
    - Keep Python implementation files alongside SKILL.md for complex logic
    - Update `tools/registry.py` to delegate to `skills/discovery.py`
 
 5. Update `queue_manager.py`:
    - `#tool:<name>` tag resolution goes through skill discovery
-   - Unknown skill names → `mark_done` with failure reason, notify via Telegram.
+   - Unknown skill names ÔåÆ `mark_done` with failure reason, notify via Telegram.
      Task is removed from queue (marked failed) so it doesn't block other tasks.
 
 **Files to create**: `skills/__init__.py`, `skills/discovery.py`,
@@ -161,7 +162,7 @@ You are performing an iterative code review...
 
 ### 2. `--doctor` / Onboarding Command
 
-**Goal**: Single command to validate the entire setup — CLIs, auth, vault, Telegram,
+**Goal**: Single command to validate the entire setup ÔÇö CLIs, auth, vault, Telegram,
 skills prerequisites.
 
 **Implementation steps**:
@@ -189,7 +190,7 @@ skills prerequisites.
 
 3. Output format:
    ```
-   AI Orchestrator — Doctor
+   AI Orchestrator ÔÇö Doctor
    ========================
    [PASS] Claude CLI .......... claude 1.x at /usr/bin/claude
    [PASS] Gemini CLI .......... gemini 0.x at /usr/bin/gemini
@@ -203,15 +204,15 @@ skills prerequisites.
 4. Add `--doctor` flag to `orchestrator.py` argparse
 5. Also run a subset of checks on `--watch` startup:
    - **Critical checks** (vault path, queue file, at least 1 provider): if any
-     FAIL → refuse to start, print error, exit with non-zero code + Telegram warning
+     FAIL ÔåÆ refuse to start, print error, exit with non-zero code + Telegram warning
    - **Non-critical checks** (Telegram, git, skills): WARN only, continue startup
 
 6. **Auto-fix mode** (`--doctor --fix`):
    - For each FAIL, offer a fix action if possible:
-     - Missing CLI → suggest install command (e.g. `npm install -g @anthropic/claude-code`)
-     - Missing `.env` → create template with placeholder keys
-     - Missing queue file → `ensure_queue_file()` (already exists)
-     - Missing vault dirs → `os.makedirs()`
+     - Missing CLI ÔåÆ suggest install command (e.g. `npm install -g @anthropic/claude-code`)
+     - Missing `.env` ÔåÆ create template with placeholder keys
+     - Missing queue file ÔåÆ `ensure_queue_file()` (already exists)
+     - Missing vault dirs ÔåÆ `os.makedirs()`
    - Interactive: print the fix command, ask `Apply? [y/N]`, execute on confirmation
    - Non-interactive (`--doctor --fix --yes`): apply all fixes without prompting
 
@@ -222,7 +223,7 @@ skills prerequisites.
 
 ### 3. Memory System with Temporal Decay
 
-**Goal**: Persistent memory across runs — store task results, error patterns,
+**Goal**: Persistent memory across runs ÔÇö store task results, error patterns,
 and learned context. Use semantic search with temporal decay so recent
 memories rank higher.
 
@@ -232,25 +233,25 @@ memories rank higher.
 
 ```
 99_System/AI/memory/
-  ├── task_results/        # One .md per completed task
-  │   └── 2026-02-25_review-loop_projectX.md
-  ├── error_patterns/      # Recurring errors + solutions
-  │   └── rate_limit_recovery.md
-  ├── preferences/         # Learned user/project preferences
-  │   └── project_defaults.md
-  └── index.md             # Summary + links (auto-generated)
+  Ôö£ÔöÇÔöÇ task_results/        # One .md per completed task
+  Ôöé   ÔööÔöÇÔöÇ 2026-02-25_review-loop_projectX.md
+  Ôö£ÔöÇÔöÇ error_patterns/      # Recurring errors + solutions
+  Ôöé   ÔööÔöÇÔöÇ rate_limit_recovery.md
+  Ôö£ÔöÇÔöÇ preferences/         # Learned user/project preferences
+  Ôöé   ÔööÔöÇÔöÇ project_defaults.md
+  ÔööÔöÇÔöÇ index.md             # Summary + links (auto-generated)
 ```
 
 **Implementation steps**:
 
 1. Create `memory.py` module:
-   - `store_result(task, result, provider, duration, cwd)` → writes MD file
+   - `store_result(task, result, provider, duration, cwd)` ÔåÆ writes MD file
      - **Truncated summary only**: never store full provider output. The
-       orchestrator uses a cheap LLM (Gemini → Codex → Haiku) to summarize the
+       orchestrator uses a cheap LLM (Gemini ÔåÆ Codex ÔåÆ Haiku) to summarize the
        result into ~200-500 tokens before storing. If no LLM available, fall back
        to first 500 chars + last 200 chars of raw output.
-   - `search_memory(query, top_k=5)` → semantic search + temporal decay
-   - `get_context_for_task(task_text)` → returns relevant past results
+   - `search_memory(query, top_k=5)` ÔåÆ semantic search + temporal decay
+   - `get_context_for_task(task_text)` ÔåÆ returns relevant past results
 
 2. Temporal decay scoring:
    ```python
@@ -267,7 +268,7 @@ memories rank higher.
    - `orchestrator.py`: after task completion, call `store_result()`
    - Prompt building (`orchestrator._build_prompt`): call `get_context_for_task()`
      and inject relevant memories. **The orchestrator decides** which memories are
-     relevant (keyword matching + temporal decay scoring) — the AI provider never
+     relevant (keyword matching + temporal decay scoring) ÔÇö the AI provider never
      sees the full memory pool, only pre-selected snippets.
    - Memory injection capped at ~2000 tokens to preserve context budget
    - **Generic tasks with no keyword matches**: inject the most recent memories
@@ -278,9 +279,9 @@ memories rank higher.
    get archived to `memory/archive/`
 
 6. **Compaction triggers** (user-initiated, never automatic):
-   - `#comp_week` tag in queue or Telegram → summarize the past 7 days of
+   - `#comp_week` tag in queue or Telegram ÔåÆ summarize the past 7 days of
      task results into a single weekly summary file, delete originals
-   - `#comp_month` tag → same for the past 30 days
+   - `#comp_month` tag ÔåÆ same for the past 30 days
    - Before executing: send Telegram preview ("Compacting 42 task results
      from last week into summary. Proceed? /approve or /deny")
    - Only compact after user confirmation
@@ -305,15 +306,15 @@ proactive maintenance tasks.
 # Heartbeat Checks
 
 ## Every 30 minutes
-- [ ] Check if queue has been empty for >2 hours → notify via Telegram
-- [ ] Check git status in active project dirs → warn about uncommitted changes
+- [ ] Check if queue has been empty for >2 hours ÔåÆ notify via Telegram
+- [ ] Check git status in active project dirs ÔåÆ warn about uncommitted changes
 
 ## Every 2 hours
 - [ ] Run `--check-limits` and log to memory
 - [ ] Check disk space on project drives
 
 ## Daily (first run after 08:00)
-- [ ] Summarize yesterday's completed tasks → post to Telegram
+- [ ] Summarize yesterday's completed tasks ÔåÆ post to Telegram
 - [ ] Check for stale branches (>7 days) in project repos
 ```
 
@@ -322,22 +323,22 @@ proactive maintenance tasks.
 1. Create `heartbeat.py` module:
    - Parse `HEARTBEAT.md` for check items with frequency tags
    - `HeartbeatRunner` class with `last_run` tracking per item
-   - `should_run(item)` → checks frequency vs last execution
+   - `should_run(item)` ÔåÆ checks frequency vs last execution
 
 2. Integration with `--watch` loop:
    - After each queue poll cycle, check if any heartbeat items are due
    - Execute due items as lightweight tasks (shorter timeout, no git snapshot)
    - Log results to memory system (feature #3)
 
-3. Heartbeat items are NOT queue tasks — they run in a separate lightweight
+3. Heartbeat items are NOT queue tasks ÔÇö they run in a separate lightweight
    path, don't modify the queue file, and use Telegram for output only
 
-4. **Execution strategy — local-first**:
+4. **Execution strategy ÔÇö local-first**:
    - **Prefer local/stdlib execution** wherever possible: `subprocess` for git
      status, `shutil.disk_usage()` for disk space, file mtime checks for
      staleness, `read_queue()` for queue monitoring. No LLM needed for these.
    - **LLM fallback** only when the check requires reasoning (e.g. "summarize
-     yesterday's tasks"). Provider priority for heartbeat: Gemini → Codex →
+     yesterday's tasks"). Provider priority for heartbeat: Gemini ÔåÆ Codex ÔåÆ
      Claude with `--model haiku`. Use cheapest/fastest provider first.
    - **If all providers exhausted**: skip the LLM-dependent heartbeat item
      silently. It will be retried at the next interval. Never block the main
@@ -348,7 +349,7 @@ proactive maintenance tasks.
    yesterday's tasks") and only run local checks. No hard dependency.
 
 6. **Shutdown interaction**: If `shutdown_pending` is set and a heartbeat check is
-   due, the heartbeat still runs first — shutdown countdown is paused until the
+   due, the heartbeat still runs first ÔÇö shutdown countdown is paused until the
    heartbeat completes. Heartbeats are fast (local checks: <1s, LLM checks: <30s),
    so the delay is negligible.
 
@@ -368,7 +369,7 @@ into every task regardless of content.
 **Design**:
 
 1. Split system prompt into layers:
-   - **Core** (~200 tokens): Always injected — safety rules, CWD, identity
+   - **Core** (~200 tokens): Always injected ÔÇö safety rules, CWD, identity
    - **Skill-specific** (variable): Only when `#tool:` tag matches
    - **Context** (variable): Memory results, wikilink content
 
@@ -387,7 +388,7 @@ into every task regardless of content.
 4. If multiple skills match (future: `#tool:review-loop,test-loop`),
    budget is split proportionally
 
-5. **Aggressive token saving — truncate to useful blocks**:
+5. **Aggressive token saving ÔÇö truncate to useful blocks**:
    - All injected content (wikilinks, memory, skill prompts) is truncated to
      only the useful/relevant sections, never raw-dumped in full.
    - **Wikilink files**: extract only sections relevant to the task (heading
@@ -395,7 +396,7 @@ into every task regardless of content.
    - **Memory results**: already pre-filtered by orchestrator (see Feature #3).
    - **Skill prompts**: trim examples/steps that don't apply to the current task.
    - **Principle**: save tokens wherever possible without compromising quality.
-     A 10,000-token wikilink file should never be injected as-is — extract the
+     A 10,000-token wikilink file should never be injected as-is ÔÇö extract the
      500-1000 tokens that actually matter.
 
 **Implementation steps**:
@@ -404,7 +405,7 @@ into every task regardless of content.
 2. Update prompt assembly in `orchestrator.py`:
    - `build_prompt(task, skill, memory_context, wikilink_context)`
    - Token counting with simple `len(text.split())` heuristic
-   - Truncate ALL categories to budget — no category gets a free pass
+   - Truncate ALL categories to budget ÔÇö no category gets a free pass
    - Smart truncation: extract relevant blocks, not just `text[:limit]`
 3. Each provider's `run()` method receives the assembled prompt
 
@@ -438,7 +439,7 @@ safety_level: strict               # strict | standard | yolo
 **Implementation steps**:
 
 1. Create `profiles.py`:
-   - `load_profile(name)` → reads YAML from vault or repo (uses `pyyaml`,
+   - `load_profile(name)` ÔåÆ reads YAML from vault or repo (uses `pyyaml`,
      same dependency as Skills)
    - `ProfileConfig` dataclass with all fields + defaults
    - Default profile = current hardcoded config values
@@ -459,7 +460,7 @@ safety_level: strict               # strict | standard | yolo
 
 5. **Profile vs global policy**: Profile settings win over global `policy.yaml`.
    A profile with `safety_level: yolo` can override DENY rules from global policy.
-   This is intentional — profiles are explicit, named configurations that the user
+   This is intentional ÔÇö profiles are explicit, named configurations that the user
    creates with full awareness. The global policy is the default, profiles are
    the override.
 
@@ -489,7 +490,7 @@ simultaneously.
    - Parse into `ParallelTask` with list of `SubTask` objects
 
 2. Create `parallel_runner.py`:
-   - `run_parallel(subtasks)` → launches each in a thread
+   - `run_parallel(subtasks)` ÔåÆ launches each in a thread
    - Each thread uses `dispatcher.select_provider()` with forced provider
    - Collects `RunResult` from each, waits for all to finish
    - Aggregates results into single output
@@ -500,9 +501,9 @@ simultaneously.
    - **No simultaneous file access**: subtasks that share the same CWD
      are NOT allowed to run in parallel. The parallel runner must validate
      this at parse time:
-     - If all subtasks have distinct `cwd:` tags → run in parallel
+     - If all subtasks have distinct `cwd:` tags ÔåÆ run in parallel
      - If any two subtasks share a CWD (or have no CWD, defaulting to the
-       parent task's CWD) → run them sequentially within that CWD group,
+       parent task's CWD) ÔåÆ run them sequentially within that CWD group,
        parallel across groups
    - This prevents merge conflicts, file corruption, and race conditions
 
@@ -515,9 +516,9 @@ simultaneously.
    from all subtasks. One entry under `## Ergebnisse` with per-subtask sections:
    ```
    ### Review, test, and document project X
-   **Subtask 1** (claude, review-loop): PASS — 3 findings fixed
-   **Subtask 2** (codex, test-loop): PASS — 12/12 tests green
-   **Subtask 3** (gemini): FAIL — rate limited
+   **Subtask 1** (claude, review-loop): PASS ÔÇö 3 findings fixed
+   **Subtask 2** (codex, test-loop): PASS ÔÇö 12/12 tests green
+   **Subtask 3** (gemini): FAIL ÔÇö rate limited
    ```
 
 **Files to create**: `parallel_runner.py`
@@ -534,7 +535,7 @@ simultaneously.
 **Format**:
 
 ```markdown
-# AI Orchestrator — Soul
+# AI Orchestrator ÔÇö Soul
 
 ## Identity
 You are an autonomous task executor working inside an Obsidian vault.
@@ -566,7 +567,7 @@ You execute tasks from a queue with careful attention to safety.
 **Implementation steps**:
 
 1. Update `config.py`:
-   - `load_soul(vault_path)` → reads and parses `SOUL.md`
+   - `load_soul(vault_path)` ÔåÆ reads and parses `SOUL.md`
    - Falls back to current hardcoded `SAFETY_RULES` if file missing
    - Caches content, reloads on file change (mtime check)
 
@@ -589,10 +590,10 @@ You execute tasks from a queue with careful attention to safety.
 **Goal**: Maximum autonomy for routine work, Telegram-based approval ONLY for
 genuinely dangerous or irreversible actions. No approval fatigue.
 
-**Core philosophy — 3 tiers**:
+**Core philosophy ÔÇö 3 tiers**:
 
 ```
-AUTO (no confirmation needed — the 95% case):
+AUTO (no confirmation needed ÔÇö the 95% case):
   - Read/write/edit files in allowed CWD roots
   - git add, commit, branch, checkout, stash
   - Run tests, linters, formatters
@@ -600,7 +601,7 @@ AUTO (no confirmation needed — the 95% case):
   - Create/edit Obsidian notes
   - All tool-loop iterations (review, test)
 
-APPROVE (Telegram confirmation required — rare, irreversible):
+APPROVE (Telegram confirmation required ÔÇö rare, irreversible):
   - git push (any remote)
   - npm publish / pypi upload / docker push
   - Delete files outside task CWD
@@ -609,7 +610,7 @@ APPROVE (Telegram confirmation required — rare, irreversible):
   - Send emails / post to external APIs
   - Any command matching custom regex patterns
 
-DENY (always blocked — catastrophic):
+DENY (always blocked ÔÇö catastrophic):
   - rm -rf / or equivalent
   - git push --force to main/master
   - DROP TABLE / DROP DATABASE
@@ -627,7 +628,7 @@ DENY (always blocked — catastrophic):
    ```markdown
    - [ ] Deploy feature X #approve:push,publish cwd:/d/project
    ```
-   These are approved when the task is queued — no runtime interruption.
+   These are approved when the task is queued ÔÇö no runtime interruption.
 
 3. **Profile-level defaults**: The `work` profile might auto-approve
    `git push` but require approval for `npm publish`. The `readonly`
@@ -636,22 +637,22 @@ DENY (always blocked — catastrophic):
 4. **Smart grouping**: If a task triggers 5 file deletions, send ONE
    approval request listing all files, not 5 separate messages.
 
-5. **Approval timeout**: 10 min default → deny + pause task (not skip).
+5. **Approval timeout**: 10 min default ÔåÆ deny + pause task (not skip).
    Task stays in queue for retry after user reviews.
 
 **Telegram approval UX**:
 
 ```
-🔒 Approval required
+­ƒöÆ Approval required
 
 Task: "Deploy feature X"
 Action: git push origin feature/x
 
 Reply:
-  /approve       — allow this action
-  /approve-all push — allow all pushes this session
-  /deny          — block and pause task
-  /skip          — block this action, continue task
+  /approve       ÔÇö allow this action
+  /approve-all push ÔÇö allow all pushes this session
+  /deny          ÔÇö block and pause task
+  /skip          ÔÇö block this action, continue task
 ```
 
 **Policy config** (YAML, in vault or profile):
@@ -685,33 +686,33 @@ session_preapprovals: []  # populated at runtime via /approve-all
 
 1. Create `policy.py`:
    - `PolicyEngine` loads rules from profile + global policy.yaml
-   - Three-tier classification: `check(cmd)` → `auto | approve | deny`
+   - Three-tier classification: `check(cmd)` ÔåÆ `auto | approve | deny`
    - Pattern matching via regex, with variable extraction for messages
    - Session state: `preapprovals: set[str]` (e.g. {"push", "publish"})
 
 2. Create approval flow in `telegram_listener.py`:
    - New commands: `/approve`, `/approve-all <category>`, `/deny`, `/skip`
-   - `request_approval(action, context)` → sends message, blocks on
+   - `request_approval(action, context)` ÔåÆ sends message, blocks on
      `threading.Event` with timeout
    - Smart grouping: buffer multiple approval requests within 2s window,
      send as single message
 
 3. Queue tag parsing in `queue_manager.py`:
-   - `#approve:push,publish` → pre-approve these categories for task
+   - `#approve:push,publish` ÔåÆ pre-approve these categories for task
 
-4. Integration in `orchestrator.py` — **pre-execution is top priority**:
+4. Integration in `orchestrator.py` ÔÇö **pre-execution is top priority**:
    - **Pre-execution** (primary defense): scan task text, skill config, and
      `#approve:` tags for risky patterns BEFORE sending to any provider.
-     - DENY matches → reject task immediately, notify via Telegram, mark failed
-     - APPROVE matches without pre-approval → request Telegram confirmation,
+     - DENY matches ÔåÆ reject task immediately, notify via Telegram, mark failed
+     - APPROVE matches without pre-approval ÔåÆ request Telegram confirmation,
        block until approved/denied/timeout
-     - AUTO matches → proceed silently
+     - AUTO matches ÔåÆ proceed silently
    - **Post-execution** (audit trail): scan provider output for commands that
      were actually run. Can't undo damage, but:
      - Log all detected risky commands to audit log
      - Notify via Telegram if a DENY-tier pattern appears in output
-       (indicates the provider bypassed expectations — important to know)
-     - This is secondary effort — implement after pre-execution is solid
+       (indicates the provider bypassed expectations ÔÇö important to know)
+     - This is secondary effort ÔÇö implement after pre-execution is solid
 
 5. Logging:
    - All approval decisions logged to `memory/audit_log.md`
@@ -723,7 +724,7 @@ session_preapprovals: []  # populated at runtime via /approve-all
 
 ---
 
-### 10. `#shutdown` — Graceful OS Shutdown via Telegram or Queue Tag
+### 10. `#shutdown` ÔÇö Graceful OS Shutdown via Telegram or Queue Tag
 
 **Goal**: Allow the user to trigger a safe computer shutdown by typing `#shutdown`
 in a Telegram message or embedding it as a tag in a queue task. If the app is in
@@ -742,14 +743,14 @@ via Telegram. Any incoming reply cancels the shutdown.
 
 ```
 IDLE
-  │  user sends #shutdown (Telegram or queue tag)
-  ▼
-SHUTDOWN_PENDING  ── task in progress? wait for it to finish
-  │               ── queue empty? start countdown immediately
-  ▼
-COUNTDOWN (60s)   ── any incoming Telegram message → IDLE (cancelled)
-  │
-  ▼
+  Ôöé  user sends #shutdown (Telegram or queue tag)
+  Ôû╝
+SHUTDOWN_PENDING  ÔöÇÔöÇ task in progress? wait for it to finish
+  Ôöé               ÔöÇÔöÇ queue empty? start countdown immediately
+  Ôû╝
+COUNTDOWN (60s)   ÔöÇÔöÇ any incoming Telegram message ÔåÆ IDLE (cancelled)
+  Ôöé
+  Ôû╝
 EXECUTE OS shutdown
 ```
 
@@ -760,7 +761,7 @@ EXECUTE OS shutdown
    for the next orchestrator session. If countdown is cancelled, the watch loop resumes
    and remaining tasks are processed normally.
 
-2. **Cancellation — any reply**: During countdown, any incoming message from the
+2. **Cancellation ÔÇö any reply**: During countdown, any incoming message from the
    authorized chat (command or plain text) sets `shutdown_cancel_event`. The listener
    still processes the message normally (e.g. `/status` still shows status), but the
    countdown is also cancelled. `/cancel-shutdown` is an explicit command for this.
@@ -774,7 +775,7 @@ EXECUTE OS shutdown
    is cleared, and the orchestrator processes the new task normally.
 
 5. **Double `#shutdown` is idempotent**: If `shutdown_pending` is already set, a second
-   `#shutdown` (from any source) is silently ignored — no timer reset, no duplicate
+   `#shutdown` (from any source) is silently ignored ÔÇö no timer reset, no duplicate
    notification.
 
 6. **Task failure still triggers shutdown**: If a `#shutdown`-tagged task fails
@@ -792,7 +793,7 @@ EXECUTE OS shutdown
 9. **Telegram notification failure**: If `notify_shutdown_pending()` fails to send,
    the countdown proceeds silently. The user may not see it, but the intent was clear.
 
-10. **Volatile flag only**: `shutdown_pending` is a `threading.Event` — session-only.
+10. **Volatile flag only**: `shutdown_pending` is a `threading.Event` ÔÇö session-only.
     If the orchestrator crashes or is killed, the shutdown intent is lost. No file-based
     persistence.
 
@@ -802,27 +803,27 @@ EXECUTE OS shutdown
 12. **Cleanup before OS shutdown**: Before calling `subprocess.run(SHUTDOWN_COMMAND)`,
     run cleanup: stop TelegramListener, call `notify_queue_complete()`, flush logs,
     `append_log("Shutdown initiated.")`. The OS may kill the process mid-cleanup,
-    so order matters — Telegram notification first, log flush last.
+    so order matters ÔÇö Telegram notification first, log flush last.
 
 **Shutdown flows**:
 
 ```
-Flow A — Queue task has #shutdown:
-  1. extract_shutdown(task) → True; #shutdown stripped from prompt
+Flow A ÔÇö Queue task has #shutdown:
+  1. extract_shutdown(task) ÔåÆ True; #shutdown stripped from prompt
   2. Task runs normally
   3. After mark_done: run_once() returns early (skips remaining tasks), sets shutdown_pending
-  4. run_watch() detects shutdown_pending → calls _execute_shutdown()
+  4. run_watch() detects shutdown_pending ÔåÆ calls _execute_shutdown()
 
-Flow B — Telegram #shutdown while task is running:
+Flow B ÔÇö Telegram #shutdown while task is running:
   1. Listener detects #shutdown, sets shutdown_pending
   2. Replies: "Shutdown scheduled after current task completes."
-  3. Orchestrator checks shutdown_pending after task finishes → _execute_shutdown()
+  3. Orchestrator checks shutdown_pending after task finishes ÔåÆ _execute_shutdown()
 
-Flow C — Telegram #shutdown while standby (queue empty):
+Flow C ÔÇö Telegram #shutdown while standby (queue empty):
   1. Listener sets shutdown_pending
-  2. Spawns background thread → _execute_shutdown() (countdown starts immediately)
+  2. Spawns background thread ÔåÆ _execute_shutdown() (countdown starts immediately)
 
-Flow D — Queue drains while shutdown_pending is set:
+Flow D ÔÇö Queue drains while shutdown_pending is set:
   1. run_watch() empty-queue branch checks shutdown_pending.is_set()
   2. Calls _execute_shutdown() proactively
 ```
@@ -860,7 +861,7 @@ def execute_shutdown(delay_sec: int = SHUTDOWN_DELAY_SEC,
         shutdown_pending.clear()
         notify_shutdown_cancelled()
         return
-    # Cleanup before OS kills us — order matters (Telegram first, logs last)
+    # Cleanup before OS kills us ÔÇö order matters (Telegram first, logs last)
     notify_shutdown_executing()
     if cleanup_cb:
         cleanup_cb()                    # stop listener, flush state
@@ -890,7 +891,7 @@ Flow C cancels the shutdown within ~5s.
 # In run_watch(), before calling execute_shutdown():
 if shutdown_pending.is_set() and not pause_event.is_set():
     execute_shutdown(cleanup_cb=lambda: listener.stop())
-# If paused, shutdown waits — checked again after /resume
+# If paused, shutdown waits ÔÇö checked again after /resume
 ```
 
 **Any-reply cancellation in listener**:
@@ -916,36 +917,36 @@ SHUTDOWN_COMMAND = ["shutdown", "/s", "/t", "0"] if sys.platform == "win32" \
 
 1. **Create `shutdown.py`** (new shared module):
    - Module-level `shutdown_pending` and `shutdown_cancel` Events
-   - `request_shutdown()` — idempotent, returns False if already pending
-   - `cancel_shutdown()` — sets cancel event
-   - `execute_shutdown(delay_sec, cleanup_cb)` — countdown in 5s chunks,
+   - `request_shutdown()` ÔÇö idempotent, returns False if already pending
+   - `cancel_shutdown()` ÔÇö sets cancel event
+   - `execute_shutdown(delay_sec, cleanup_cb)` ÔÇö countdown in 5s chunks,
      checks `check_queue_abort()` each chunk, runs cleanup + OS command
-   - `check_queue_abort()` — returns True if queue has new tasks
+   - `check_queue_abort()` ÔÇö returns True if queue has new tasks
 
 2. **`config.py`**: add `SHUTDOWN_DELAY_SEC = 60` and platform-aware `SHUTDOWN_COMMAND`
 
 3. **`queue_manager.py`**:
-   - Add `extract_shutdown(task: str) -> bool` — detects `#shutdown` tag
+   - Add `extract_shutdown(task: str) -> bool` ÔÇö detects `#shutdown` tag
    - Extend `strip_metadata_tags()` to also remove `#shutdown`
 
 4. **`notifier.py`**:
-   - Add `notify_shutdown_pending(delay_sec)` — "Shutting down in {delay_sec}s. Send any message to cancel."
-   - Add `notify_shutdown_cancelled()` — "Shutdown cancelled."
-   - Add `notify_shutdown_executing()` — "Shutting down now."
+   - Add `notify_shutdown_pending(delay_sec)` ÔÇö "Shutting down in {delay_sec}s. Send any message to cancel."
+   - Add `notify_shutdown_cancelled()` ÔÇö "Shutdown cancelled."
+   - Add `notify_shutdown_executing()` ÔÇö "Shutting down now."
 
 5. **`telegram_listener.py`**:
    - Import `request_shutdown`, `cancel_shutdown`, `shutdown_pending` from `shutdown`
    - In `_handle_message`: if `shutdown_pending.is_set()`, call `cancel_shutdown()`
-   - Detect `#shutdown` in plain text → call `request_shutdown()`; if idle,
+   - Detect `#shutdown` in plain text ÔåÆ call `request_shutdown()`; if idle,
      spawn thread calling `execute_shutdown()`
    - Add `/cancel-shutdown` command (also covered by any-reply, but explicit)
 
 6. **`orchestrator.py`**:
    - Import `shutdown_pending`, `execute_shutdown`, `request_shutdown` from `shutdown`
-   - In `run_once()`: after `mark_done`/`mark_retry`, if task had `#shutdown` →
+   - In `run_once()`: after `mark_done`/`mark_retry`, if task had `#shutdown` ÔåÆ
      `request_shutdown()`, return early (skip remaining tasks)
    - In `run_watch()` after `run_once()`: if `shutdown_pending.is_set()` and
-     not `pause_event.is_set()` → `execute_shutdown(cleanup_cb=...)`
+     not `pause_event.is_set()` ÔåÆ `execute_shutdown(cleanup_cb=...)`
    - In `run_watch()` empty-queue branch: same check
    - Cleanup callback: `listener.stop()`, flush logs
 
@@ -956,13 +957,13 @@ SHUTDOWN_COMMAND = ["shutdown", "/s", "/t", "0"] if sys.platform == "win32" \
 
 **Verification**:
 
-1. Queue tag: Add `- [ ] Echo hello #shutdown` to queue → task completes → Telegram
-   countdown message → send any message → "Shutdown cancelled." → queue resumes.
-2. Telegram trigger (standby): Send `#shutdown` while queue is empty → countdown
+1. Queue tag: Add `- [ ] Echo hello #shutdown` to queue ÔåÆ task completes ÔåÆ Telegram
+   countdown message ÔåÆ send any message ÔåÆ "Shutdown cancelled." ÔåÆ queue resumes.
+2. Telegram trigger (standby): Send `#shutdown` while queue is empty ÔåÆ countdown
    starts immediately.
-3. Proactive standby: Set `shutdown_pending` before queue drains → orchestrator
+3. Proactive standby: Set `shutdown_pending` before queue drains ÔåÆ orchestrator
    triggers countdown automatically when queue empties.
-4. Task with followers: Add `#shutdown` task with tasks below it → shutdown starts
+4. Task with followers: Add `#shutdown` task with tasks below it ÔåÆ shutdown starts
    after the tagged task, remaining tasks stay in queue.
 5. Windows OS command: Confirm `shutdown /s /t 0` fires (test with a long delay first
    to verify cancellation).
@@ -971,7 +972,7 @@ SHUTDOWN_COMMAND = ["shutdown", "/s", "/t", "0"] if sys.platform == "win32" \
 
 ## References
 
-- [OpenClaw](https://github.com/openclaw/openclaw) — Architecture patterns,
+- [OpenClaw](https://github.com/openclaw/openclaw) ÔÇö Architecture patterns,
   SOUL.md, Skills, Memory, Heartbeat concepts
 - Existing vault skills: `99_System/AI/Skills/` (11 skills with SKILL.md)
 - Existing tools: `tools/registry.py`, `tools/review_loop.py`, `tools/test_loop.py`

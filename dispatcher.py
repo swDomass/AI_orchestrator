@@ -61,6 +61,7 @@ def select_provider(
     profile=None,  # ProfileConfig | None
     force_name: str | None = None,
     strict: bool = False,
+    tool_name: str | None = None,
 ) -> BaseProvider | None:
     """
     Returns the best available provider for this task, or None if all are blocked.
@@ -68,6 +69,7 @@ def select_provider(
     If strict=True and a provider is forced (via tag or force_name), ONLY that provider is
     considered — no fallback to other providers.
     If a profile is given, its provider order overrides the default priority.
+    If tool_name is given, allowed providers are filtered via PolicyEngine.
     """
     # Check for explicit provider tag
     task_lower = task.lower()
@@ -80,11 +82,23 @@ def select_provider(
             None
         )
 
+    # Tool Policy Layering: filter allowed providers for this tool
+    allowed_by_policy = None
+    try:
+        from policy import get_engine
+        allowed_by_policy = get_engine().get_allowed_providers(tool_name)
+    except Exception:
+        pass
+
     # Profile provider order overrides _PRIORITY
     if profile and getattr(profile, "providers", None):
         base_order = [p for p in profile.providers if p in _providers]
     else:
         base_order = _PRIORITY[:]
+
+    # Filter base_order by policy if applicable
+    if allowed_by_policy:
+        base_order = [p for p in base_order if p in allowed_by_policy]
 
     if forced:
         if strict:

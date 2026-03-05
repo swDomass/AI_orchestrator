@@ -1,14 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pytest
 
 import orchestrator
 import policy as policy_module
 from tools.base_tool import ToolResult
 
 
-def test_get_limits_force_refresh_uses_kwarg_when_supported(monkeypatch):
+def test_get_limits_force_refresh_passes_force_refresh(monkeypatch):
     seen = {"force_refresh": None}
 
     def fake_get_limits(force_refresh=False):
@@ -21,51 +20,6 @@ def test_get_limits_force_refresh_uses_kwarg_when_supported(monkeypatch):
 
     assert result == "fresh"
     assert seen["force_refresh"] is True
-
-
-def test_get_limits_force_refresh_falls_back_for_no_kwarg_stub(monkeypatch):
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: "legacy")
-
-    result = orchestrator._get_limits_force_refresh()
-
-    assert result == "legacy"
-
-
-def test_get_limits_force_refresh_uses_positional_for_positional_only_param(monkeypatch):
-    seen = {"force_refresh": None}
-
-    def fake_get_limits(force_refresh=False, /):
-        seen["force_refresh"] = force_refresh
-        return "fresh-positional"
-
-    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
-
-    result = orchestrator._get_limits_force_refresh()
-
-    assert result == "fresh-positional"
-    assert seen["force_refresh"] is True
-
-
-def test_get_limits_force_refresh_falls_back_when_signature_unavailable(monkeypatch):
-    def raise_no_signature(_fn):
-        raise ValueError("no signature")
-
-    monkeypatch.setattr(orchestrator.inspect, "signature", raise_no_signature)
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: "legacy-no-signature")
-
-    result = orchestrator._get_limits_force_refresh()
-
-    assert result == "legacy-no-signature"
-
-
-def test_get_limits_force_refresh_does_not_swallow_internal_type_error(monkeypatch):
-    def fake_get_limits(force_refresh=False):
-        raise TypeError("internal type failure")
-
-    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
-
-    with pytest.raises(TypeError, match="internal type failure"):
-        orchestrator._get_limits_force_refresh()
 
 
 def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):

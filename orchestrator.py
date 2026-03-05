@@ -21,7 +21,6 @@ Task format in agent-queue.md:
 
 import argparse
 from dataclasses import dataclass
-import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -126,50 +125,8 @@ def _rate_limit_cooldown_sec(limits: AllLimits, provider_name: str) -> int:
 
 
 def _get_limits_force_refresh() -> AllLimits:
-    """Get a fresh limits snapshot while staying compatible with simple stubs."""
-    sig_error: BaseException | None = None
-    try:
-        signature = inspect.signature(get_limits)
-    except (TypeError, ValueError) as exc:
-        sig_error = exc
-        signature = None
-
-    if signature is not None:
-        params = signature.parameters
-        force_refresh_param = params.get("force_refresh")
-        supports_kw = (
-            force_refresh_param is not None
-            and force_refresh_param.kind in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-        ) or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
-        if supports_kw:
-            return get_limits(force_refresh=True)
-
-        if force_refresh_param is not None:
-            # Positional-only parameter: pass as positional.
-            return get_limits(True)
-
-        if not params:
-            return get_limits()
-
-    try:
-        return get_limits(force_refresh=True)
-    except TypeError as exc:
-        msg = str(exc).lower()
-        kwarg_not_supported = "force_refresh" in msg and (
-            "unexpected keyword" in msg
-            or "positional-only" in msg
-            or "got an unexpected keyword argument" in msg
-        )
-        # Only fallback when signature introspection failed and this clearly
-        # looks like an unsupported keyword argument.
-        if sig_error is not None and kwarg_not_supported:
-            return get_limits()
-        raise
+    """Get a fresh limits snapshot, bypassing the cache."""
+    return get_limits(force_refresh=True)
 
 
 def _snapshot_dir(cwd: str) -> dict[str, tuple[float, int]]:

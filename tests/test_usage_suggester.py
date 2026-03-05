@@ -168,11 +168,13 @@ class TestSevenDayPaceGuard:
         "_get_seven_day_pace",
         return_value={"pace_factor": 2.6, "days_remaining": 3.0, "status": "critical"},
     )
-    def test_suppressed_when_seven_day_over_pace(self, _pace, _lim):
-        """pace_factor=2.6 (> max 2.5) with 3 days remaining → suppressed."""
+    @patch.object(us.UsageSuggester, "_gather_suggestions")
+    def test_suppressed_when_seven_day_over_pace(self, mock_gather, _pace, _lim):
+        """pace_factor=2.6 (> max 2.5) with 3 days remaining → suppressed before gathering."""
         suggester = _make_suggester()
         result = suggester.check_and_suggest(lambda: [])
         assert result is None
+        mock_gather.assert_not_called()
 
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
     @patch.object(

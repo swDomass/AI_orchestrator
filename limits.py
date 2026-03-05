@@ -58,7 +58,7 @@ class AllLimits:
         return min(times) if times else 3600  # default 1h fallback
 
     def any_available(self) -> bool:
-        return any([self.claude.available, self.gemini.available, self.codex.available])
+        return any((self.claude.available, self.gemini.available, self.codex.available))
 
 
 def _parse_resets_in(resets_str: str) -> int:

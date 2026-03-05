@@ -282,8 +282,9 @@ class TestParseLogSuggestEvents:
         _cache["ts"] = 0.0
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         (log_dir / "orchestrator.log").write_text(
-            "2026-03-03 10:00:00,000 [usage_suggester] INFO usage-suggest: user declined\n",
+            f"{ts_str},000 [usage_suggester] INFO usage-suggest: user declined\n",
             encoding="utf-8",
         )
         with patch("analytics.VAULT_PATH", tmp_path), \

@@ -76,9 +76,7 @@ def _freeze_policy_data(data):
     """Convert policy dict/list structures into a hashable, content-based cache key."""
     if isinstance(data, dict):
         return tuple(sorted((str(k), _freeze_policy_data(v)) for k, v in data.items()))
-    if isinstance(data, list):
-        return tuple(_freeze_policy_data(v) for v in data)
-    if isinstance(data, tuple):
+    if isinstance(data, (list, tuple)):
         return tuple(_freeze_policy_data(v) for v in data)
     if isinstance(data, (str, int, float, bool, type(None))):
         return data

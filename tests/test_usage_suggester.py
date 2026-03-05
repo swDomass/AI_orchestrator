@@ -166,10 +166,10 @@ class TestSevenDayPaceGuard:
     @patch.object(
         us.UsageSuggester,
         "_get_seven_day_pace",
-        return_value={"pace_factor": 2.5, "days_remaining": 3.0, "status": "critical"},
+        return_value={"pace_factor": 2.6, "days_remaining": 3.0, "status": "critical"},
     )
     def test_suppressed_when_seven_day_over_pace(self, _pace, _lim):
-        """pace_factor=2.5 with 3 days remaining → suppressed."""
+        """pace_factor=2.6 (> max 2.5) with 3 days remaining → suppressed."""
         suggester = _make_suggester()
         result = suggester.check_and_suggest(lambda: [])
         assert result is None

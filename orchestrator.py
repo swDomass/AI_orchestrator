@@ -349,7 +349,8 @@ def _run_with_retry(
             return result, True
 
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
-            wait = 2 ** attempt
+            # Progressive backoff: 5s, 10s, ...
+            wait = 5 * (attempt + 1)
             print(f"  Retry {attempt + 1}/{MAX_RETRIES_PER_PROVIDER} in {wait}s...")
             slept = 0
             while slept < wait:

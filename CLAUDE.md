@@ -13,7 +13,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~207 tests, ~2s)
+# Run all tests (~270 tests, ~4s)
 python -m pytest tests/ -q
 
 # Run a single test file
@@ -45,7 +45,7 @@ python orchestrator.py --dashboard    # launch analytics web dashboard
 Key components:
 - **`orchestrator.py`**: Main loop (`run_once`/`run_watch`), prompt building (`_build_prompt`), file change tracking via before/after snapshots
 - **`dispatcher.py`**: Provider selection with fallback chain (Claude → Gemini → Codex), cooldown management, Claude model aliases (`#claude_haiku`, `#claude_sonnet`, `#claude_opus`)
-- **`queue_manager.py`**: Obsidian MD queue parsing with sidecar `.lock` file locking (msvcrt on Windows, fcntl on Unix). Regex-based metadata extraction (`cwd:`, `#tool:`, `#agent:`, `#parallel`, `#claude_*`, etc.). UTF-8 with cp1252 fallback. Smart wikilink/file context injection with TF-IDF section extraction.
+- **`queue_manager.py`**: Obsidian MD queue parsing with sidecar `.lock` file locking (msvcrt on Windows, fcntl on Unix). Regex-based metadata extraction (`cwd:`, `#tool:`, `#agent:`, `#parallel`, `#claude_*`, etc.). UTF-8 with cp1252 fallback. Smart wikilink/file context injection with TF-IDF section extraction. `_parse_subtask_line()` shared helper used by both `read_queue_items()` and `_replace_open_task_line()`. Subtask-aware task matching in queue mutations (mark_done/mark_retry/finalize) prevents wrong-task collisions in parallel queues.
 - **`providers/base.py`**: `BaseProvider` ABC with per-provider `_lock` for cooldown state and `threading.local()` for per-thread forced model
 - **`policy.py`**: `PolicyEngine` singleton — AUTO/APPROVE/DENY classification from vault YAML, blocks on `threading.Event` for Telegram approval
 - **`usage_suggester.py`**: `UsageSuggester` singleton — proactive task suggestions when provider capacity is underutilized. Same threading pattern as PolicyEngine
@@ -65,6 +65,9 @@ Key components:
 - **Mtime-cached config**: Policy, profiles, SOUL.md, heartbeat all use `(mtime, content)` tuple caching for hot-reload in `--watch` mode
 - **Token-budget injection**: `_build_prompt()` truncates skill/memory/wikilink context to `PROMPT_*_TOKENS` constants before assembly
 - **Sidecar file locking**: `queue_manager.py` uses `.lock` file with platform-specific locking for multi-process safety
+- **Subtask-aware queue mutations**: `mark_done/mark_retry/finalize_task_with_result` accept `subtasks` kwarg; `_replace_open_task_line` uses it to disambiguate duplicate task texts in parallel queues. Fallback re-scan is O(N) — skips subtask block scan for non-matching task lines.
+- **`task_subtasks` in run_once**: Extracted via `getattr(queue_task, "subtasks", None)` at loop start for test-mock compatibility (some tests use bare `SimpleNamespace`).
+- **`.env` comment stripping**: `_normalize_dotenv_value()` requires whitespace before `#` for unquoted values (protects URLs/paths containing `#`); quoted values allow `#` anywhere after the closing quote.
 
 ## Testing Conventions
 

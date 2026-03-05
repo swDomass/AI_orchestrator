@@ -642,12 +642,9 @@ def read_queue_items() -> list[QueueTask]:
             collected: list[str] = []
             j = line_idx + 1
             while j < len(all_lines):
-                raw = all_lines[j].rstrip()
-                if raw.startswith("  -") or raw.startswith("\t-"):
-                    # Strip leading whitespace then leading dash, then whitespace
-                    subtask_text = raw.lstrip().lstrip("-").strip()
-                    if subtask_text:
-                        collected.append(subtask_text)
+                st = _parse_subtask_line(all_lines[j].rstrip())
+                if st is not None:
+                    collected.append(st)
                     j += 1
                 else:
                     break
@@ -663,12 +660,21 @@ def read_queue() -> list[str]:
     return [item.task_text for item in read_queue_items()]
 
 
+def _parse_subtask_line(raw: str) -> str | None:
+    """Return subtask text from an indented list line, or None if not a subtask line."""
+    if raw.startswith("  -") or raw.startswith("\t-"):
+        text = raw.lstrip().lstrip("-").strip()
+        return text if text else None
+    return None
+
+
 def _replace_open_task_line(
     content: str,
     *,
     line_no: int,
     task_text: str,
     replacement: str,
+    subtasks: tuple[str, ...] | None = None,
 ) -> str | None:
     """Replace an open queue line, tolerating line shifts caused by concurrent inserts."""
     lines = content.splitlines(keepends=True)
@@ -676,25 +682,55 @@ def _replace_open_task_line(
     idx = preferred_idx
     line_shifted = False
 
-    def _match_task_at(index: int) -> str | None:
+    def _get_task_at(index: int) -> tuple[str | None, tuple[str, ...]]:
         if index < 0 or index >= len(lines):
-            return None
+            return None, ()
         body = lines[index].rstrip("\r\n")
         m = OPEN_TASK_RE.match(body)
         if not m:
-            return None
-        return m.group(1).strip()
+            return None, ()
 
-    current_task = _match_task_at(idx)
-    if current_task != task_text:
+        found_text = m.group(1).strip()
+        found_subtasks: list[str] = []
+        # Only scan subtasks if caller provided subtasks for matching
+        if subtasks is not None:
+            j = index + 1
+            while j < len(lines):
+                st = _parse_subtask_line(lines[j].rstrip())
+                if st is not None:
+                    found_subtasks.append(st)
+                    j += 1
+                else:
+                    break
+        return found_text, tuple(found_subtasks)
+
+    current_task, current_subtasks = _get_task_at(idx)
+    is_exact_match = (current_task == task_text) and (subtasks is None or current_subtasks == subtasks)
+
+    if not is_exact_match:
         # Queue line numbers can shift while a task runs (e.g. Telegram /task prepends a new item).
         # Re-scan for the same still-open task and pick the nearest match, preferring same/later lines.
+        # Single O(N) pass: skip subtask scan for non-matching task texts.
         matches: list[int] = []
         for i, line in enumerate(lines):
             body = line.rstrip("\r\n")
             m = OPEN_TASK_RE.match(body)
-            if m and m.group(1).strip() == task_text:
+            if not m or m.group(1).strip() != task_text:
+                continue
+            if subtasks is None:
                 matches.append(i)
+            else:
+                found: list[str] = []
+                j = i + 1
+                while j < len(lines):
+                    st = _parse_subtask_line(lines[j].rstrip())
+                    if st is not None:
+                        found.append(st)
+                        j += 1
+                    else:
+                        break
+                if tuple(found) == subtasks:
+                    matches.append(i)
 
         if not matches:
             if preferred_idx < 0 or preferred_idx >= len(lines):
@@ -702,17 +738,18 @@ def _replace_open_task_line(
             elif current_task is None:
                 print(f"Warnung: Zeile {line_no} ist kein offener Queue-Task mehr.")
             else:
+                cur_info = f" with {len(current_subtasks)} subtasks" if subtasks is not None else ""
+                exp_info = f" with {len(subtasks)} subtasks" if subtasks is not None else ""
                 print(
                     f"Warnung: Queue-Zeile {line_no} enthält anderen Task "
-                    f"('{current_task}' statt '{task_text}')."
+                    f"('{current_task}'{cur_info} statt '{task_text}'{exp_info})."
                 )
             return None
 
         later_or_equal = [i for i in matches if i >= preferred_idx]
         pool = later_or_equal or matches
-        # NOTE: If the queue contains duplicate task texts, we pick the nearest
-        # match by index (preferring same-or-later lines). This means only the
-        # first occurrence is marked done; subsequent duplicates are left open.
+        # NOTE: If the queue contains duplicate task texts (and same subtasks), we pick the nearest
+        # match by index (preferring same-or-later lines).
         idx = min(pool, key=lambda i: abs(i - preferred_idx))
         line_shifted = idx != preferred_idx
 
@@ -724,7 +761,13 @@ def _replace_open_task_line(
     return "".join(lines)
 
 
-def mark_done(task_text: str, provider: str, *, line_no: int | None = None) -> bool:
+def mark_done(
+    task_text: str,
+    provider: str,
+    *,
+    line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
+) -> bool:
     """Mark a task as completed in the queue file."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     replacement = f"- [x] {task_text} ✅ {now} ({provider})"
@@ -736,6 +779,7 @@ def mark_done(task_text: str, provider: str, *, line_no: int | None = None) -> b
                 line_no=line_no,
                 task_text=task_text,
                 replacement=replacement,
+                subtasks=subtasks,
             )
             if updated is None:
                 print(
@@ -756,7 +800,13 @@ def mark_done(task_text: str, provider: str, *, line_no: int | None = None) -> b
     return _apply_update(update)
 
 
-def mark_retry(task_text: str, retry_at: str, *, line_no: int | None = None) -> bool:
+def mark_retry(
+    task_text: str,
+    retry_at: str,
+    *,
+    line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
+) -> bool:
     """Add retry annotation to a task (stays open, shows when it will retry)."""
     replacement = f"- [ ] {task_text} <!-- retry: {retry_at} -->"
 
@@ -767,6 +817,7 @@ def mark_retry(task_text: str, retry_at: str, *, line_no: int | None = None) -> 
                 line_no=line_no,
                 task_text=task_text,
                 replacement=replacement,
+                subtasks=subtasks,
             )
             if updated is None:
                 print(
@@ -785,6 +836,7 @@ def mark_retry(task_text: str, retry_at: str, *, line_no: int | None = None) -> 
         return pattern.sub(lambda _m: replacement, content, count=1)
 
     return _apply_update(update)
+
 
 
 def append_result(task_text: str, result: str, provider: str) -> bool:
@@ -817,6 +869,7 @@ def finalize_task_with_result(
     provider: str,
     *,
     line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
 ) -> bool:
     """Atomically mark a task done and append its result in one queue update."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -830,6 +883,7 @@ def finalize_task_with_result(
                 line_no=line_no,
                 task_text=task_text,
                 replacement=done_replacement,
+                subtasks=subtasks,
             )
             if updated is None:
                 print(

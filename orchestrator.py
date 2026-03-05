@@ -349,8 +349,8 @@ def _run_with_retry(
             return result, True
 
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
-            # Progressive backoff: 5s, 10s, ...
-            wait = 5 * (attempt + 1)
+            # Exponential backoff: 10s, 20s, 40s...
+            wait = 10 * (2 ** attempt)
             print(f"  Retry {attempt + 1}/{MAX_RETRIES_PER_PROVIDER} in {wait}s...")
             slept = 0
             while slept < wait:
@@ -374,9 +374,15 @@ class ToolTaskExecutionOutcome:
 
 
 
-def _mark_done_checked(task: str, provider: str, *, queue_line_no: int | None = None) -> bool:
+def _mark_done_checked(
+    task: str,
+    provider: str,
+    *,
+    queue_line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
+) -> bool:
     """Mark task done and return False if queue mutation failed."""
-    if mark_done(task, provider, line_no=queue_line_no):
+    if mark_done(task, provider, line_no=queue_line_no, subtasks=subtasks):
         return True
     msg = "Queue-Update fehlgeschlagen: Task konnte nicht als erledigt markiert werden"
     print(f"  ❌ {msg}")
@@ -391,9 +397,10 @@ def _finalize_task_with_result_checked(
     provider: str,
     *,
     queue_line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
 ) -> bool:
     """Atomically persist result + done status and return False on queue mutation failure."""
-    if finalize_task_with_result(task, result, provider, line_no=queue_line_no):
+    if finalize_task_with_result(task, result, provider, line_no=queue_line_no, subtasks=subtasks):
         return True
     msg = "Queue-Update fehlgeschlagen: Ergebnis+Status konnten nicht atomar persistiert werden"
     print(f"  ❌ {msg}")
@@ -408,9 +415,10 @@ def _mark_retry_checked(
     provider: str = "queue",
     *,
     queue_line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
 ) -> bool:
     """Mark task for retry and return False if queue mutation failed."""
-    if mark_retry(task, retry_at, line_no=queue_line_no):
+    if mark_retry(task, retry_at, line_no=queue_line_no, subtasks=subtasks):
         return True
     msg = f"Queue-Update fehlgeschlagen: Task konnte nicht für Retry ({retry_at}) markiert werden"
     print(f"  ❌ {msg}")
@@ -426,6 +434,7 @@ def _execute_tool_task(
     cwd: str | None,
     timeout: int | None = None,
     queue_line_no: int | None = None,
+    subtasks: tuple[str, ...] | None = None,
     memory_context: str = "",
     skip_queue: bool = False,
 ) -> ToolTaskExecutionOutcome:
@@ -437,7 +446,7 @@ def _execute_tool_task(
         if not skip_queue:
             append_log(f"Unbekanntes Tool: {tool_name}")
             notify_error(task, provider.name if provider else "unknown", msg)
-            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no, subtasks=subtasks)
         else:
             finalized = False
         return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
@@ -452,7 +461,7 @@ def _execute_tool_task(
             if not skip_queue:
                 append_log(msg)
                 notify_error(task, provider.name, msg)
-                finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no)
+                finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no, subtasks=subtasks)
             else:
                 finalized = False
             return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
@@ -484,6 +493,7 @@ def _execute_tool_task(
                 tool_result.output,
                 provider_tool,
                 queue_line_no=queue_line_no,
+                subtasks=subtasks,
             ):
                 return ToolTaskExecutionOutcome(
                     success=False,
@@ -522,6 +532,7 @@ def _execute_tool_task(
                 tool_result.output,
                 provider_tool,
                 queue_line_no=queue_line_no,
+                subtasks=subtasks,
             ):
                 return ToolTaskExecutionOutcome(
                     success=False,
@@ -577,6 +588,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             return False
 
         task = queue_task.task_text
+        task_subtasks: tuple[str, ...] | None = getattr(queue_task, "subtasks", None) or None
         print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
 
         # --- Feature 6: Load execution profile ---
@@ -625,7 +637,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if not dry_run:
                 append_log(msg)
                 notify_error(task, "profile", msg)
-                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no):
+                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                     return False
             continue
 
@@ -636,7 +648,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if not dry_run:
                 append_log(msg)
                 notify_error(task, "profile", msg)
-                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no):
+                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                     return False
             continue
 
@@ -647,7 +659,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 continue
             append_log(msg)
             notify_error(task, "queue", msg)
-            if not _mark_done_checked(task, "invalid-cwd", queue_line_no=queue_task.line_no):
+            if not _mark_done_checked(task, "invalid-cwd", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                 return False
             continue
 
@@ -709,7 +721,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
             # Check subtasks (if any)
             if getattr(queue_task, "subtasks", None):
-                for st in queue_task.subtasks:
+                for st in task_subtasks:
                     st_verdict, st_reasons = engine.check_task(
                         strip_metadata_tags(st),
                         profile_rules=profile_policy or None,
@@ -725,7 +737,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  ❌ {msg}")
                 append_log(msg)
                 notify_error(task, "policy", msg)
-                if not _mark_done_checked(task, "policy-denied", queue_line_no=queue_task.line_no):
+                if not _mark_done_checked(task, "policy-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                     return False
                 continue
 
@@ -742,21 +754,21 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         print("  ❌ Genehmigung abgelehnt — Task bleibt in Queue.")
                         append_log(f"Genehmigung abgelehnt für Task: {task[:60]}")
                         reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
+                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                             return False
                         return False
                     elif response == "timeout":
                         print("  ⏱ Genehmigung timeout — Task bleibt in Queue.")
                         append_log(f"Genehmigung timeout für Task: {task[:60]}")
                         reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
+                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                             return False
                         return False
                     elif response == "skipped":
                         print("  ⏭ Genehmigung übersprungen — riskante Aktion blockiert, Task bleibt in Queue.")
                         append_log(f"Genehmigung übersprungen für Task: {task[:60]}")
                         reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no):
+                        if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                             return False
                         return False
                     # "approved" → continue
@@ -767,12 +779,12 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
         # --- Feature 7: Parallel sub-agent spawning ---
         if getattr(queue_task, "subtasks", None):
-            print(f"  [parallel] {len(queue_task.subtasks)} Subtask(s)")
+            print(f"  [parallel] {len(task_subtasks)} Subtask(s)")
             try:
                 from parallel_runner import run_parallel, format_parallel_result
                 results = run_parallel(
                     task,
-                    queue_task.subtasks,
+                    task_subtasks,
                     limits,
                     memory_context=memory_context,
                     pause_event=pause_event,
@@ -784,7 +796,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 status_str = "✅" if success_all else "⚠️"
                 print(f"  {status_str} Parallel abgeschlossen ({len(results)} Subtasks)")
                 if not _finalize_task_with_result_checked(
-                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no
+                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no, subtasks=task_subtasks
                 ):
                     return False
                 memory_module.store_result(task, aggregated, provider_tag, 0.0, cwd=cwd, success=success_all)
@@ -796,7 +808,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(msg)
                 notify_error(task, "parallel", msg)
                 retry_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-                if not _mark_retry_checked(task, retry_at, "parallel", queue_line_no=queue_task.line_no):
+                if not _mark_retry_checked(task, retry_at, "parallel", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                     return False
                 print(f"  [parallel] Task bleibt in Queue (Retry um ~{retry_at[-5:]})")
                 return False
@@ -822,7 +834,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     msg = f"Alle Provider voll/unreachable → Task wartet bis ~{reset_at_display}"
                     print(f"  {msg}")
                     append_log(msg)
-                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                         return False
                     notify_providers_exhausted(fmt_time(earliest))
                     return False
@@ -840,6 +852,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         cwd,
                         timeout=tool_timeout,
                         queue_line_no=queue_task.line_no,
+                        subtasks=task_subtasks,
                         memory_context=memory_context,
                     )
                 finally:
@@ -870,7 +883,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     msg = f"Provider {provider.name} erzwungen aber nicht verfügbar → Retry um ~{reset_dt.strftime('%H:%M')}"
                     print(f"  {msg}")
                     append_log(msg)
-                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                         return False
                     break
 
@@ -910,7 +923,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     msg = f"Alle Provider voll/unreachable → Task wartet bis ~{reset_at_display}"
                     print(f"  {msg}")
                     append_log(msg)
-                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                         return False
                     notify_providers_exhausted(fmt_time(earliest))
                     return False
@@ -950,6 +963,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     result.output,
                     provider.name,
                     queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks,
                 ):
                     return False
                 memory_module.store_result(
@@ -989,7 +1003,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 msg = f"Provider {provider.name} erzwungen aber nicht verfügbar → Retry um ~{reset_dt.strftime('%H:%M')}"
                 print(f"  {msg}")
                 append_log(msg)
-                if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no):
+                if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
                     return False
                 break
 

@@ -7,11 +7,11 @@ from pathlib import Path
 def _normalize_dotenv_value(value: str) -> str:
     """Strip surrounding quotes and trailing comments from .env values."""
     # 1. Handle quoted values (supports trailing comments)
-    m = re.match(r'^(["\'])(.*)\1(?:\s+#.*)?$', value)
+    m = re.match(r'^(["\'])(.*)\1(?:\s*#.*)?$', value)
     if m:
         return m.group(2)
-    # 2. Handle unquoted values: strip trailing comments
-    # We look for the first # that is preceded by whitespace
+    # 2. Handle unquoted values: strip trailing inline comments.
+    # Require whitespace before # to avoid truncating URLs/paths (e.g. https://x.com#anchor).
     return re.split(r'\s+#', value)[0].strip()
 
 

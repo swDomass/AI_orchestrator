@@ -222,6 +222,7 @@ def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monk
         "ALL TESTS PASSED",
         "codex+test-loop",
         line_no=42,
+        subtasks=None,
     )
 
 
@@ -257,7 +258,7 @@ def test_run_once_stops_when_atomic_queue_finalization_fails(monkeypatch):
     result = orchestrator.run_once()
 
     assert result is False
-    finalize_task.assert_called_once_with("Task A", "ok", "codex", line_no=7)
+    finalize_task.assert_called_once_with("Task A", "ok", "codex", line_no=7, subtasks=None)
 
 
 def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
@@ -285,6 +286,7 @@ def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
         "Fix bug cwd:/missing/project #codex",
         "invalid-cwd",
         line_no=9,
+        subtasks=None,
     )
     notify_error.assert_called_once()
     select_provider.assert_not_called()

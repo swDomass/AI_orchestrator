@@ -464,7 +464,7 @@ orchestrator.py
   -> telegram_listener.py   (Telegram Commands + Chat)
   -> notifier.py            (Telegram Notifications)
   -> shutdown.py            (Shutdown Countdown / Cancel)
-  -> limits.py              (cclimits Wrapper / Provider-Kapazität)
+  -> limits.py              (cclimits Wrapper / Provider-Kapazität, TTL-Cache)
   -> logging_setup.py       (Rotating File Logger)
   -> doctor.py              (Setup-Validierung / --doctor)
   -> config.py              (Konstanten, .env, SOUL.md Loader)

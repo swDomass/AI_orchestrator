@@ -24,7 +24,10 @@ function Get-ProviderLines {
         [string]$Provider
     )
 
-    $rows = foreach ($line in Get-Content -LiteralPath $Path) {
+    $lines = Get-Content -LiteralPath $Path |
+        Where-Object { $_ -match "^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| " }
+
+    $rows = foreach ($line in $lines) {
         if ($line -match "^(?<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (?<key>[^|]+) \| (?<pct>-?\d+(?:\.\d+)?) \| (?<avail>true|false)$") {
             $key = $matches["key"].Trim()
             if ($key -eq $Provider -or $key.StartsWith($Provider + "_")) {

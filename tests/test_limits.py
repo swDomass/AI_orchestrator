@@ -116,6 +116,7 @@ def test_get_limits_requeries_after_successful_refresh(monkeypatch):
     monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
     monkeypatch.setattr(limits, "_refresh_token", lambda provider: True)
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(limits, "_limits_cache", None)
 
     got = limits.get_limits()
 
@@ -151,11 +152,132 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
     monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
     monkeypatch.setattr(limits, "_refresh_token", lambda provider: False)
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(limits, "_limits_cache", None)
 
     got = limits.get_limits()
 
     assert calls["n"] >= 2
     assert got.gemini.available is True
+
+
+def test_get_limits_caches_for_ttl_and_force_refresh_bypasses(monkeypatch):
+    calls = {"n": 0}
+    t = {"now": 0.0}
+
+    def fake_monotonic():
+        return t["now"]
+
+    def fake_get_limits_fresh():
+        calls["n"] += 1
+        return limits.AllLimits(
+            claude=limits.ProviderLimits(available=True, remaining_pct=float(calls["n"]), resets_in_sec=3600),
+            gemini=limits.ProviderLimits(error="missing"),
+            codex=limits.ProviderLimits(error="missing"),
+        )
+
+    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+
+    first = limits.get_limits()
+    second = limits.get_limits()
+    assert first.claude.remaining_pct == 1.0
+    assert second.claude.remaining_pct == 1.0
+    assert calls["n"] == 1
+
+    t["now"] += limits._LIMITS_CACHE_TTL_SEC + 1
+    third = limits.get_limits()
+    assert third.claude.remaining_pct == 2.0
+    assert calls["n"] == 2
+
+    forced = limits.get_limits(force_refresh=True)
+    assert forced.claude.remaining_pct == 3.0
+    assert calls["n"] == 3
+
+
+def test_get_limits_cache_expires_by_earliest_reset(monkeypatch):
+    calls = {"n": 0}
+    t = {"now": 0.0}
+
+    def fake_monotonic():
+        return t["now"]
+
+    def fake_get_limits_fresh():
+        calls["n"] += 1
+        return limits.AllLimits(
+            claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=30),
+            gemini=limits.ProviderLimits(error="missing"),
+            codex=limits.ProviderLimits(error="missing"),
+        )
+
+    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+
+    limits.get_limits()
+    t["now"] += 20
+    limits.get_limits()
+    assert calls["n"] == 1
+
+    t["now"] += 11
+    limits.get_limits()
+    assert calls["n"] == 2
+
+
+def test_get_limits_retries_timeouts_soon(monkeypatch):
+    calls = {"n": 0}
+    t = {"now": 100.0}
+
+    def fake_monotonic():
+        return t["now"]
+
+    def fake_get_limits_fresh():
+        calls["n"] += 1
+        return limits.AllLimits(
+            claude=limits.ProviderLimits(error="cclimits timeout"),
+            gemini=limits.ProviderLimits(error="cclimits timeout"),
+            codex=limits.ProviderLimits(error="cclimits timeout"),
+        )
+
+    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+
+    limits.get_limits()
+    limits.get_limits()
+    assert calls["n"] == 1
+
+    t["now"] += limits._LIMITS_ERROR_CACHE_TTL_SEC + 1
+    limits.get_limits()
+    assert calls["n"] == 2
+
+
+def test_get_limits_retries_non_resettable_error_snapshots_soon(monkeypatch):
+    calls = {"n": 0}
+    t = {"now": 10.0}
+
+    def fake_monotonic():
+        return t["now"]
+
+    def fake_get_limits_fresh():
+        calls["n"] += 1
+        return limits.AllLimits(
+            claude=limits.ProviderLimits(error="token expired"),
+            gemini=limits.ProviderLimits(error="unknown"),
+            codex=limits.ProviderLimits(error="missing"),
+        )
+
+    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+
+    limits.get_limits()
+    limits.get_limits()
+    assert calls["n"] == 1
+
+    t["now"] += limits._LIMITS_ERROR_CACHE_TTL_SEC + 1
+    limits.get_limits()
+    assert calls["n"] == 2
 
 
 # ── WindowData population tests ───────────────────────────────────────────────

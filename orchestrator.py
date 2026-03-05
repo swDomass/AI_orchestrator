@@ -21,6 +21,7 @@ Task format in agent-queue.md:
 
 import argparse
 from dataclasses import dataclass
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -109,6 +110,66 @@ def _get_next_retry_sec(limits: AllLimits) -> int:
         return int(min(limit_sec, cooldown_sec))
     
     return limit_sec
+
+
+def _rate_limit_cooldown_sec(limits: AllLimits, provider_name: str) -> int:
+    """Choose a bounded cooldown after a provider rate-limit error."""
+    lim = getattr(limits, provider_name, None)
+    if lim is None:
+        return 5 * 60
+
+    reset_sec = int(getattr(lim, "resets_in_sec", 0) or 0)
+    if reset_sec <= 0:
+        return 5 * 60
+
+    return max(60, min(reset_sec, 30 * 60))
+
+
+def _get_limits_force_refresh() -> AllLimits:
+    """Get a fresh limits snapshot while staying compatible with simple stubs."""
+    sig_error: BaseException | None = None
+    try:
+        signature = inspect.signature(get_limits)
+    except (TypeError, ValueError) as exc:
+        sig_error = exc
+        signature = None
+
+    if signature is not None:
+        params = signature.parameters
+        force_refresh_param = params.get("force_refresh")
+        supports_kw = (
+            force_refresh_param is not None
+            and force_refresh_param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        ) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if supports_kw:
+            return get_limits(force_refresh=True)
+
+        if force_refresh_param is not None:
+            # Positional-only parameter: pass as positional.
+            return get_limits(True)
+
+        if not params:
+            return get_limits()
+
+    try:
+        return get_limits(force_refresh=True)
+    except TypeError as exc:
+        msg = str(exc).lower()
+        kwarg_not_supported = "force_refresh" in msg and (
+            "unexpected keyword" in msg
+            or "positional-only" in msg
+            or "got an unexpected keyword argument" in msg
+        )
+        # Only fallback when signature introspection failed and this clearly
+        # looks like an unsupported keyword argument.
+        if sig_error is not None and kwarg_not_supported:
+            return get_limits()
+        raise
 
 
 def _snapshot_dir(cwd: str) -> dict[str, tuple[float, int]]:
@@ -838,7 +899,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 tried_providers.add(provider.name)
                 if outcome.error_code == "unreachable":
                     provider.set_cooldown()
-                elif outcome.error_code not in ("rate_limit", ""):
+                elif outcome.error_code == "rate_limit":
+                    provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
+                elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
 
                 if provider_is_forced:
@@ -948,6 +1011,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 provider_reset = fmt_time(lim.resets_in_sec) if lim.resets_in_sec else "unbekannt"
                 msg = f"{provider.name} rate-limit → reset in {provider_reset}"
                 append_log(msg)
+                provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
             elif error == "unreachable":
                 provider.set_cooldown()
                 msg = f"{provider.name} nicht erreichbar → Cooldown 30min"
@@ -1084,7 +1148,7 @@ def run_watch(dry_run: bool = False) -> None:
                 continue
 
             print("\nPrüfe Reset-Zeiten...")
-            limits = get_limits()
+            limits = _get_limits_force_refresh()
             sleep_sec = _get_next_retry_sec(limits)
             sleep_sec = min(sleep_sec, SLEEP_POLL_INTERVAL * 10)
 

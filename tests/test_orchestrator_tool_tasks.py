@@ -1,9 +1,71 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 import orchestrator
 import policy as policy_module
 from tools.base_tool import ToolResult
+
+
+def test_get_limits_force_refresh_uses_kwarg_when_supported(monkeypatch):
+    seen = {"force_refresh": None}
+
+    def fake_get_limits(force_refresh=False):
+        seen["force_refresh"] = force_refresh
+        return "fresh"
+
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+
+    result = orchestrator._get_limits_force_refresh()
+
+    assert result == "fresh"
+    assert seen["force_refresh"] is True
+
+
+def test_get_limits_force_refresh_falls_back_for_no_kwarg_stub(monkeypatch):
+    monkeypatch.setattr(orchestrator, "get_limits", lambda: "legacy")
+
+    result = orchestrator._get_limits_force_refresh()
+
+    assert result == "legacy"
+
+
+def test_get_limits_force_refresh_uses_positional_for_positional_only_param(monkeypatch):
+    seen = {"force_refresh": None}
+
+    def fake_get_limits(force_refresh=False, /):
+        seen["force_refresh"] = force_refresh
+        return "fresh-positional"
+
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+
+    result = orchestrator._get_limits_force_refresh()
+
+    assert result == "fresh-positional"
+    assert seen["force_refresh"] is True
+
+
+def test_get_limits_force_refresh_falls_back_when_signature_unavailable(monkeypatch):
+    def raise_no_signature(_fn):
+        raise ValueError("no signature")
+
+    monkeypatch.setattr(orchestrator.inspect, "signature", raise_no_signature)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda: "legacy-no-signature")
+
+    result = orchestrator._get_limits_force_refresh()
+
+    assert result == "legacy-no-signature"
+
+
+def test_get_limits_force_refresh_does_not_swallow_internal_type_error(monkeypatch):
+    def fake_get_limits(force_refresh=False):
+        raise TypeError("internal type failure")
+
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+
+    with pytest.raises(TypeError, match="internal type failure"):
+        orchestrator._get_limits_force_refresh()
 
 
 def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
@@ -103,6 +165,62 @@ def test_run_once_retries_tool_task_with_next_provider_and_passes_timeout(monkey
     assert first_call.kwargs["timeout"] == 77
     assert second_call.kwargs["timeout"] == 77
     p1.set_cooldown.assert_called_once()
+    p2.set_cooldown.assert_not_called()
+
+
+def test_run_once_sets_rate_limit_cooldown_for_tool_task(monkeypatch):
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    p2 = SimpleNamespace(name="codex", set_cooldown=Mock())
+    read_queue_calls = iter([[]])
+
+    exec_mock = Mock(side_effect=[
+        orchestrator.ToolTaskExecutionOutcome(
+            success=False,
+            finalized=False,
+            retryable=True,
+            error="rate limited",
+            error_code="rate_limit",
+        ),
+        orchestrator.ToolTaskExecutionOutcome(success=True, finalized=True),
+    ])
+
+    def fake_select_provider(_task, _limits, exclude=None, **_kwargs):
+        exclude = exclude or set()
+        if "claude" not in exclude:
+            return p1
+        if "codex" not in exclude:
+            return p2
+        return None
+
+    monkeypatch.setattr(
+        orchestrator,
+        "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: next(read_queue_calls))
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(
+        orchestrator,
+        "get_limits",
+        lambda: SimpleNamespace(
+            claude=SimpleNamespace(resets_in_sec=45),
+            codex=SimpleNamespace(resets_in_sec=0),
+            gemini=SimpleNamespace(resets_in_sec=0),
+            earliest_reset_sec=lambda: 300,
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
+
+    result = orchestrator.run_once()
+
+    assert result is True
+    p1.set_cooldown.assert_called_once_with(60)
     p2.set_cooldown.assert_not_called()
 
 

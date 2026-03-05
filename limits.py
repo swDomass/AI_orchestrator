@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from config import MIN_CAPACITY_PERCENT
@@ -17,6 +18,13 @@ _CMD_SUFFIX = ".cmd" if sys.platform == "win32" else ""
 NPX_CMD = f"npx{_CMD_SUFFIX}"
 _CLAUDE_CMD = "claude.exe" if sys.platform == "win32" else "claude"
 _GEMINI_CMD = f"gemini{_CMD_SUFFIX}"
+
+# Cache for get_limits() — avoids hammering cclimits (and Claude's API) too fast.
+# Each cclimits call makes HTTP requests; calling it while already 429'd causes more 429s.
+_LIMITS_CACHE_TTL_SEC = 120  # 2 minutes
+_LIMITS_ERROR_CACHE_TTL_SEC = 10  # retry transient failures sooner
+_limits_cache: "tuple[AllLimits, float] | None" = None
+_limits_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -248,9 +256,8 @@ def _refresh_token(provider: str) -> bool:
         return False
 
 
-def get_limits() -> AllLimits:
-    """Run npx cclimits --json and return parsed limits for all providers.
-    Auto-refreshes expired OAuth tokens for Claude/Gemini and retries."""
+def _get_limits_fresh() -> AllLimits:
+    """Actually run cclimits and parse the result (no caching)."""
     raw = _run_cclimits()
     if raw is None:
         return AllLimits(
@@ -284,3 +291,61 @@ def get_limits() -> AllLimits:
         gemini=_parse_gemini(raw.get("gemini", {"status": "missing"})),
         codex=_parse_codex(raw.get("codex", {"status": "missing"})),
     )
+
+
+def _is_timeout_snapshot(result: AllLimits) -> bool:
+    """True when cclimits failed before provider parsing (transient transport error)."""
+    providers = (result.claude, result.gemini, result.codex)
+    return all((not p.available) and p.error == "cclimits timeout" for p in providers)
+
+
+def _is_transient_error_snapshot(result: AllLimits) -> bool:
+    """True when providers are unavailable due non-resettable errors.
+
+    Example: auth glitches or malformed tool output where resets are unknown.
+    These should be retried sooner than normal steady-state snapshots.
+    """
+    providers = (result.claude, result.gemini, result.codex)
+    if result.any_available():
+        return False
+    if any((p.resets_in_sec or 0) > 0 for p in providers):
+        return False
+    return any(bool(p.error) for p in providers)
+
+
+def _cache_ttl_sec(result: AllLimits) -> int:
+    if _is_timeout_snapshot(result) or _is_transient_error_snapshot(result):
+        return _LIMITS_ERROR_CACHE_TTL_SEC
+
+    # Keep cache shorter than the next known reset to avoid sleeping until a
+    # reset and then still reading a stale pre-reset snapshot.
+    earliest_reset = result.earliest_reset_sec()
+    if 0 < earliest_reset < _LIMITS_CACHE_TTL_SEC:
+        return max(5, earliest_reset)
+
+    return _LIMITS_CACHE_TTL_SEC
+
+
+def get_limits(force_refresh: bool = False) -> AllLimits:
+    """Return cached limits (TTL=2min) to avoid hammering cclimits / Claude's API.
+
+    Pass ``force_refresh=True`` to bypass the cache (e.g. after a long sleep or
+    when the caller knows limits have changed).
+    """
+    global _limits_cache
+    now = time.monotonic()
+    if not force_refresh and _limits_cache is not None:
+        cached, ts = _limits_cache
+        if now - ts < _cache_ttl_sec(cached):
+            return cached
+
+    with _limits_cache_lock:
+        now = time.monotonic()
+        if not force_refresh and _limits_cache is not None:
+            cached, ts = _limits_cache
+            if now - ts < _cache_ttl_sec(cached):
+                return cached
+
+        result = _get_limits_fresh()
+        _limits_cache = (result, time.monotonic())
+        return result

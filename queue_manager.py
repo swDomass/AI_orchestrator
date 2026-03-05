@@ -710,7 +710,7 @@ def _replace_open_task_line(
     if not is_exact_match:
         # Queue line numbers can shift while a task runs (e.g. Telegram /task prepends a new item).
         # Re-scan for the same still-open task and pick the nearest match, preferring same/later lines.
-        # Single O(N) pass: skip subtask scan for non-matching task texts.
+        # O(N) task scan + O(S) subtask scan on matching lines only (S = subtask count).
         matches: list[int] = []
         for i, line in enumerate(lines):
             body = line.rstrip("\r\n")
@@ -836,7 +836,6 @@ def mark_retry(
         return pattern.sub(lambda _m: replacement, content, count=1)
 
     return _apply_update(update)
-
 
 
 def append_result(task_text: str, result: str, provider: str) -> bool:

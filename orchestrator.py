@@ -588,7 +588,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             return False
 
         task = queue_task.task_text
-        task_subtasks: tuple[str, ...] | None = getattr(queue_task, "subtasks", None) or None
+        task_subtasks: tuple[str, ...] | None = getattr(queue_task, "subtasks", None)  # getattr for test-mock compat
         print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
 
         # --- Feature 6: Load execution profile ---

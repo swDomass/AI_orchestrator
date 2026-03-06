@@ -105,7 +105,7 @@ def test_run_once_retries_tool_task_with_next_provider_and_passes_timeout(monkey
     assert second_call.args[2].name == "codex"
     assert first_call.kwargs["timeout"] == 77
     assert second_call.kwargs["timeout"] == 77
-    p1.set_cooldown.assert_called_once()
+    p1.set_cooldown.assert_not_called()
     p2.set_cooldown.assert_not_called()
 
 

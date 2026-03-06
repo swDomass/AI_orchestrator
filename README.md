@@ -10,7 +10,7 @@ Ziel: Routinearbeit aus einer Markdown-Queue ausführen lassen (Code, Reviews, T
 - Limit-/Kapazitätsprüfung via `npx cclimits`
 - Retry-Handling bei Rate-Limits / Provider-Ausfällen
 - Obsidian-Queue mit `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*`
-- Tool-Loops (`review-loop`, `test-loop`)
+- Tool-Loops (`dev-loop`, `review-loop`, `test-loop`)
 - Skills/`SKILL.md` Discovery + Requirements-Gating
 - Memory (TF-IDF + Temporal Decay) für wiederkehrende Tasks
 - Execution Profiles (Provider-Reihenfolge, erlaubte Skills, Timeout, Policy-Overrides)
@@ -92,6 +92,8 @@ Die Queue wird aus Markdown gelesen. Offene Aufgaben sind normale Checkbox-Zeile
 ```md
 - [ ] Fix bug in parser cwd:D:\projects\app #codex #timeout:10m
 - [ ] Review + fix repo #tool:review-loop cwd:"D:\projects\my repo" #agent:work
+- [ ] Fix login bug #tool:dev-loop cwd:D:\projects\app
+- [ ] Add CSV export to dashboard #tool:dev-loop cwd:D:\projects\app #agent:work
 ```
 
 Der Orchestrator ergänzt automatisch:
@@ -145,6 +147,10 @@ Unterstützt auch legacy `HH:MM`; Mitternacht wird berücksichtigt.
 
 Aktuell registrierte `#tool:`-Handler:
 
+- `dev-loop`
+  - Research -> Execute -> Dual-Review Loop (Code Quality + Issue Resolution)
+  - Beide Reviews müssen bestehen; kein Auto-Push
+  - Output in `{cwd}/.dev-loop/` (research.md, round-NNN.md, summary.md)
 - `review-loop`
   - Iterativer Review -> Fix -> Re-Review Loop (P1/P2/P3)
 - `test-loop`
@@ -155,6 +161,54 @@ Tool-Liste anzeigen:
 ```bash
 python orchestrator.py --list-tools
 ```
+
+## Dev-Loop (`#tool:dev-loop`)
+
+Der `dev-loop` ist ein drei-phasiger Workflow für Issues und neue Features:
+
+```
+Phase 1 — Research
+  Liest relevanten Code, versteht Problem/Feature-Anforderung,
+  erstellt einen konkreten Implementierungsplan.
+  Web-Suche nur wenn lokale Quellen nicht ausreichen.
+  → Gespeichert in {cwd}/.dev-loop/research.md
+
+Phase 2 — Execution
+  Implementiert die Lösung anhand des Research-Plans.
+  Bei Iteration > 1: beinhaltet Findings beider vorheriger Reviews.
+
+Phase 3a — Code Quality Review  (P1/P2/P3)
+  Prüft: Correctness, Clean, Secure, Performant, Maintainable,
+         Testable, Robust, Documented, Compliant.
+  P1/P2 = blockierend | P3 = non-blocking
+
+Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED)
+  Prüft nur: Löst der Code den ursprünglichen Task zu 100%?
+  Ignoriert Code-Qualität vollständig.
+
+→ Beide Reviews müssen bestehen → Loop endet, kein Auto-Push.
+→ Ergebnisse pro Iteration in {cwd}/.dev-loop/round-NNN.md
+→ Abschlussdatei: {cwd}/.dev-loop/summary.md
+```
+
+**Abbruchbedingungen:**
+
+| Bedingung | Verhalten |
+|---|---|
+| Beide Reviews bestanden | `success=True`, Telegram-Notification |
+| Quality-Findings wiederholen sich | Abbruch (Infinite-Loop-Detection) |
+| Review-Ergebnis (gesamt) wiederholt sich | Abbruch |
+| Max-Iterationen (`TOOL_MAX_ITERATIONS`) | Abbruch mit offenem Status |
+| Provider-Fehler in beliebiger Phase | `success=False`, retryable |
+
+**Konfiguration in `config.py`:**
+
+| Konstante | Default | Phase |
+|---|---|---|
+| `TOOL_DEV_RESEARCH_TIMEOUT_SEC` | 1200 (20 min) | Research |
+| `TOOL_DEV_EXEC_TIMEOUT_SEC` | 2400 (40 min) | Execution |
+| `TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC` | 1200 (20 min) | Quality Review |
+| `TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC` | 600 (10 min) | Resolution Review |
 
 ## Skills (`SKILL.md`)
 

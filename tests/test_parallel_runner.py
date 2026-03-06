@@ -32,7 +32,7 @@ def test_parse_subtask_defaults():
     assert st.provider_forced is None
     assert st.tool_name is None
     assert st.cwd is None
-    assert st.timeout == 300 # TASK_TIMEOUT_SEC default (5 min)
+    assert st.timeout == 900 # TASK_TIMEOUT_SEC default (15 min)
 
 def test_format_parallel_result():
     results = [

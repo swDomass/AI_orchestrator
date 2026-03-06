@@ -9,6 +9,7 @@ Usage in queue file:
 import re
 
 from tools.base_tool import BaseTool
+from tools.dev_loop import DevLoopTool
 from tools.review_loop import ReviewLoopTool
 from tools.test_loop import TestLoopTool
 
@@ -18,6 +19,7 @@ TOOL_TAG_RE = re.compile(r"#tool:([\w-]+)")
 _TOOLS: dict[str, BaseTool] = {
     "review-loop": ReviewLoopTool(),
     "test-loop": TestLoopTool(),
+    "dev-loop": DevLoopTool(),
 }
 
 

@@ -341,7 +341,7 @@ def _run_with_retry(
         if result.success:
             return result, False
 
-        if result.error in ("rate_limit", "unreachable"):
+        if result.error in ("rate_limit", "unreachable", "timeout"):
             return result, True
 
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
@@ -869,6 +869,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 elif outcome.error_code == "rate_limit":
                     limits = get_limits(force_refresh=True)
                     provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
+                elif outcome.error_code == "timeout":
+                    pass
                 elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
 
@@ -986,6 +988,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 provider.set_cooldown()
                 msg = f"{provider.name} nicht erreichbar → Cooldown 30min"
                 append_log(msg)
+            elif error == "timeout":
+                msg = f"{provider.name} Timeout nach {fmt_time(timeout)} — Task zu komplex; #timeout:Xm in Task hinzufügen"
+                append_log(msg)
+                print(f"  ⏱ {msg}")
+                # No cooldown: timeout is a task-complexity issue, not a provider health issue
             else:
                 msg = f"{provider.name} Fehler nach {MAX_RETRIES_PER_PROVIDER} Versuchen: {error}"
                 append_log(msg)

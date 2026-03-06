@@ -65,7 +65,7 @@ MIN_CAPACITY_PERCENT = 5
 SLEEP_POLL_INTERVAL = 5 * 60
 
 # Timeout for a single CLI task call (seconds)
-TASK_TIMEOUT_SEC = 300  # 5 minutes
+TASK_TIMEOUT_SEC = 900  # 15 minutes
 
 # Timeout for interactive Telegram chat responses (seconds)
 TELEGRAM_CHAT_TIMEOUT_SEC = 180  # 3 minutes
@@ -133,6 +133,12 @@ TOOL_MAX_ITERATIONS = 10
 TOOL_REVIEW_TIMEOUT_SEC = 1_200  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
 TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations
+
+# Dev-Loop timeouts (Research → Execute → Dual-Review)
+TOOL_DEV_RESEARCH_TIMEOUT_SEC          = 1_200  # 20 min: Research phase
+TOOL_DEV_EXEC_TIMEOUT_SEC              = 2_400  # 40 min: Execution phase
+TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC    = 1_200  # 20 min: Code Quality Review
+TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC =   600  # 10 min: Issue Resolution Review
 
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"

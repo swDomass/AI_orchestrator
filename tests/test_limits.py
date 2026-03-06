@@ -1,6 +1,8 @@
+import threading
 from types import SimpleNamespace
 
 import limits
+import pytest
 
 
 def test_refresh_token_claude_returns_true_when_auth_status_shows_valid(monkeypatch):
@@ -89,6 +91,14 @@ def test_refresh_token_gemini_accepts_cached_credentials_hint(monkeypatch):
     assert limits._refresh_token("gemini") is True
 
 
+def _reset_bg_state(monkeypatch):
+    """Helper: reset all background-thread state so each test starts clean."""
+    monkeypatch.setattr(limits, "_limits_cache", None)
+    monkeypatch.setattr(limits, "_bg_thread", None)
+    monkeypatch.setattr(limits, "_bg_wake", threading.Event())
+    monkeypatch.setattr(limits, "_cache_ready", threading.Event())
+
+
 def test_get_limits_requeries_after_successful_refresh(monkeypatch):
     """After a successful token refresh, get_limits re-queries cclimits."""
     expired = {
@@ -100,23 +110,20 @@ def test_get_limits_requeries_after_successful_refresh(monkeypatch):
         "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
         "gemini": {
             "status": "ok",
-            "models": {
-                "gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"},
-            },
+            "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}},
         },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
-
     calls = {"n": 0}
 
     def fake_run_cclimits():
         calls["n"] += 1
         return expired if calls["n"] == 1 else fresh
 
+    _reset_bg_state(monkeypatch)
     monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
     monkeypatch.setattr(limits, "_refresh_token", lambda provider: True)
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(limits, "_limits_cache", None)
 
     got = limits.get_limits()
 
@@ -136,23 +143,20 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
         "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
         "gemini": {
             "status": "ok",
-            "models": {
-                "gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"},
-            },
+            "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}},
         },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
-
     calls = {"n": 0}
 
     def fake_run_cclimits():
         calls["n"] += 1
         return expired if calls["n"] == 1 else fresh
 
+    _reset_bg_state(monkeypatch)
     monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
     monkeypatch.setattr(limits, "_refresh_token", lambda provider: False)
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(limits, "_limits_cache", None)
 
     got = limits.get_limits()
 
@@ -160,124 +164,216 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
     assert got.gemini.available is True
 
 
-def test_get_limits_caches_for_ttl_and_force_refresh_bypasses(monkeypatch):
-    calls = {"n": 0}
-    t = {"now": 0.0}
+# ── Background-thread polling interval tests ──────────────────────────────────
 
-    def fake_monotonic():
-        return t["now"]
+def test_compute_next_poll_sec_returns_available_interval():
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=50.0, resets_in_sec=3600),
+        gemini=limits.ProviderLimits(error="missing"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    assert limits._compute_next_poll_sec(result) == limits._BG_POLL_AVAILABLE_SEC
 
-    def fake_get_limits_fresh():
-        calls["n"] += 1
+
+def test_compute_next_poll_sec_returns_reset_time_when_at_limit():
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=120),
+        gemini=limits.ProviderLimits(error="missing"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    assert limits._compute_next_poll_sec(result) == 120
+
+
+def test_compute_next_poll_sec_clamps_reset_to_minimum():
+    """Reset in 5 s → clamped to 60 s minimum so we don't spin."""
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=5),
+        gemini=limits.ProviderLimits(error="missing"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    assert limits._compute_next_poll_sec(result) == 60
+
+
+def test_compute_next_poll_sec_returns_error_interval_for_timeout():
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(error="cclimits timeout"),
+        gemini=limits.ProviderLimits(error="cclimits timeout"),
+        codex=limits.ProviderLimits(error="cclimits timeout"),
+    )
+    assert limits._compute_next_poll_sec(result) == limits._BG_POLL_ERROR_SEC
+
+
+def test_compute_next_poll_sec_returns_error_interval_for_transient():
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(error="token expired"),
+        gemini=limits.ProviderLimits(error="unknown"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    assert limits._compute_next_poll_sec(result) == limits._BG_POLL_ERROR_SEC
+
+
+def test_get_limits_returns_cached_result_without_extra_call(monkeypatch):
+    """With a populated cache, get_limits() returns immediately without calling _get_limits_fresh."""
+    call_count = {"n": 0}
+
+    def fake_fresh():
+        call_count["n"] += 1
+        return limits.AllLimits(claude=limits.ProviderLimits(available=True, remaining_pct=80.0))
+
+    pre_cached = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=42.0),
+        gemini=limits.ProviderLimits(error="missing"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    cache_ready = threading.Event()
+    cache_ready.set()
+    monkeypatch.setattr(limits, "_limits_cache", (pre_cached, 0.0))
+    monkeypatch.setattr(limits, "_cache_ready", cache_ready)
+    monkeypatch.setattr(limits, "_start_bg_thread", lambda: None)  # prevent thread from overwriting cache
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_fresh)
+
+    result = limits.get_limits()
+    assert result.claude.remaining_pct == 42.0
+    assert call_count["n"] == 0
+
+
+def test_get_limits_force_refresh_calls_fresh_and_updates_cache(monkeypatch):
+    """force_refresh=True always calls _get_limits_fresh synchronously."""
+    call_count = {"n": 0}
+
+    def fake_fresh():
+        call_count["n"] += 1
         return limits.AllLimits(
-            claude=limits.ProviderLimits(available=True, remaining_pct=float(calls["n"]), resets_in_sec=3600),
+            claude=limits.ProviderLimits(available=True, remaining_pct=float(call_count["n"]) * 10),
             gemini=limits.ProviderLimits(error="missing"),
             codex=limits.ProviderLimits(error="missing"),
         )
 
-    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_fresh)
+
+    r1 = limits.get_limits(force_refresh=True)
+    r2 = limits.get_limits(force_refresh=True)
+    assert call_count["n"] == 2
+    assert r1.claude.remaining_pct == 10.0
+    assert r2.claude.remaining_pct == 20.0
+
+
+def test_get_limits_caches_unavailable_fallback_after_initial_wait_timeout(monkeypatch):
+    class FakeEvent:
+        def __init__(self):
+            self._is_set = False
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            return self._is_set
+
+        def set(self):
+            self._is_set = True
+
+    fake_ready = FakeEvent()
     monkeypatch.setattr(limits, "_limits_cache", None)
+    monkeypatch.setattr(limits, "_cache_ready", fake_ready)
+    monkeypatch.setattr(limits, "_start_bg_thread", lambda: None)
 
     first = limits.get_limits()
     second = limits.get_limits()
-    assert first.claude.remaining_pct == 1.0
-    assert second.claude.remaining_pct == 1.0
-    assert calls["n"] == 1
 
-    t["now"] += limits._LIMITS_CACHE_TTL_SEC + 1
-    third = limits.get_limits()
-    assert third.claude.remaining_pct == 2.0
-    assert calls["n"] == 2
-
-    forced = limits.get_limits(force_refresh=True)
-    assert forced.claude.remaining_pct == 3.0
-    assert calls["n"] == 3
+    assert first.claude.error == "cclimits unavailable"
+    assert second.claude.error == "cclimits unavailable"
+    assert limits._limits_cache is not None
+    assert fake_ready.wait_calls == 2
 
 
-def test_get_limits_cache_expires_by_earliest_reset(monkeypatch):
-    calls = {"n": 0}
-    t = {"now": 0.0}
+def test_get_limits_fresh_serializes_concurrent_cclimits_calls(monkeypatch):
+    call_state = {"active": 0, "calls": 0}
+    state_lock = threading.Lock()
+    first_entered = threading.Event()
+    allow_first_to_finish = threading.Event()
+    overlap_detected = threading.Event()
 
-    def fake_monotonic():
-        return t["now"]
+    def fake_run_cclimits():
+        with state_lock:
+            call_state["active"] += 1
+            call_state["calls"] += 1
+            call_no = call_state["calls"]
+            if call_state["active"] > 1:
+                overlap_detected.set()
+        try:
+            if call_no == 1:
+                first_entered.set()
+                allow_first_to_finish.wait(timeout=1)
+            return {
+                "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+                "gemini": {"status": "missing"},
+                "codex": {"status": "missing"},
+            }
+        finally:
+            with state_lock:
+                call_state["active"] -= 1
 
-    def fake_get_limits_fresh():
-        calls["n"] += 1
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())  # isolate from bg threads
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits, "_refresh_token", lambda _provider: False)
+
+    results = []
+
+    def worker():
+        results.append(limits._get_limits_fresh())
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    assert first_entered.wait(timeout=1)
+    t2.start()
+    assert not overlap_detected.wait(timeout=0.1)
+    allow_first_to_finish.set()
+    t1.join(timeout=1)
+    t2.join(timeout=1)
+
+    assert call_state["calls"] == 2
+    assert len(results) == 2
+    assert all(r.claude.available for r in results)
+
+
+def test_bg_refresh_loop_preserves_force_refresh_wakeup_until_wait(monkeypatch):
+    class FakeWakeEvent:
+        def __init__(self):
+            self.flag = False
+            self.wait_flags = []
+
+        def clear(self):
+            self.flag = False
+
+        def set(self):
+            self.flag = True
+
+        def wait(self, timeout=None):
+            self.wait_flags.append(self.flag)
+            raise RuntimeError("stop loop")
+
+    fake_wake = FakeWakeEvent()
+
+    def fake_fresh():
+        # Simulate force_refresh() waking the background thread after the loop
+        # already started its iteration but before it begins waiting.
+        fake_wake.set()
         return limits.AllLimits(
-            claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=30),
+            claude=limits.ProviderLimits(available=True, remaining_pct=75.0, resets_in_sec=300),
             gemini=limits.ProviderLimits(error="missing"),
             codex=limits.ProviderLimits(error="missing"),
         )
 
-    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
-    monkeypatch.setattr(limits, "_limits_cache", None)
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_fresh)
+    monkeypatch.setattr(limits, "_compute_next_poll_sec", lambda _result: 90)
 
-    limits.get_limits()
-    t["now"] += 20
-    limits.get_limits()
-    assert calls["n"] == 1
+    with pytest.raises(RuntimeError, match="stop loop"):
+        limits._bg_refresh_loop()
 
-    t["now"] += 11
-    limits.get_limits()
-    assert calls["n"] == 2
-
-
-def test_get_limits_retries_timeouts_soon(monkeypatch):
-    calls = {"n": 0}
-    t = {"now": 100.0}
-
-    def fake_monotonic():
-        return t["now"]
-
-    def fake_get_limits_fresh():
-        calls["n"] += 1
-        return limits.AllLimits(
-            claude=limits.ProviderLimits(error="cclimits timeout"),
-            gemini=limits.ProviderLimits(error="cclimits timeout"),
-            codex=limits.ProviderLimits(error="cclimits timeout"),
-        )
-
-    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
-    monkeypatch.setattr(limits, "_limits_cache", None)
-
-    limits.get_limits()
-    limits.get_limits()
-    assert calls["n"] == 1
-
-    t["now"] += limits._LIMITS_ERROR_CACHE_TTL_SEC + 1
-    limits.get_limits()
-    assert calls["n"] == 2
-
-
-def test_get_limits_retries_non_resettable_error_snapshots_soon(monkeypatch):
-    calls = {"n": 0}
-    t = {"now": 10.0}
-
-    def fake_monotonic():
-        return t["now"]
-
-    def fake_get_limits_fresh():
-        calls["n"] += 1
-        return limits.AllLimits(
-            claude=limits.ProviderLimits(error="token expired"),
-            gemini=limits.ProviderLimits(error="unknown"),
-            codex=limits.ProviderLimits(error="missing"),
-        )
-
-    monkeypatch.setattr(limits.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(limits, "_get_limits_fresh", fake_get_limits_fresh)
-    monkeypatch.setattr(limits, "_limits_cache", None)
-
-    limits.get_limits()
-    limits.get_limits()
-    assert calls["n"] == 1
-
-    t["now"] += limits._LIMITS_ERROR_CACHE_TTL_SEC + 1
-    limits.get_limits()
-    assert calls["n"] == 2
+    assert fake_wake.wait_flags == [True]
 
 
 # ── WindowData population tests ───────────────────────────────────────────────

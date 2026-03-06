@@ -35,6 +35,7 @@ from typing import Optional
 from config import (
     MEMORY_HALF_LIFE_DAYS,
     MEMORY_MAX_AGE_DAYS,
+    MEMORY_MIN_SCORE,
     MEMORY_SUMMARY_MAX_CHARS,
     MEMORY_TOP_K,
     VAULT_PATH,
@@ -46,6 +47,11 @@ logger = logging.getLogger(__name__)
 _MEMORY_ROOT = VAULT_PATH / "99_System" / "AI" / "memory"
 _TASK_RESULTS_DIR = _MEMORY_ROOT / "task_results"
 _ARCHIVE_DIR = _MEMORY_ROOT / "archive"
+
+# Pre-compiled tokenizer patterns (avoids recompilation on every search call)
+_RE_CAMEL_SPLIT = re.compile(r"([a-z])([A-Z])")
+_RE_DELIMITERS  = re.compile(r"[_\-/\\.]")
+_RE_WORDS       = re.compile(r"[a-zA-ZäöüÄÖÜß0-9]{3,}")
 
 # Simple stopwords for tokenization
 _STOPWORDS = {
@@ -93,8 +99,10 @@ def _truncate_summary(text: str) -> str:
 
 
 def _tokenize(text: str) -> set[str]:
-    """Lowercase, extract alphanumeric words ≥3 chars, remove stopwords."""
-    words = re.findall(r"[a-zA-ZäöüÄÖÜß0-9]{3,}", text.lower())
+    """Lowercase, split on delimiters and camelCase, keep words ≥3 chars, remove stopwords."""
+    text = _RE_CAMEL_SPLIT.sub(r"\1 \2", text)
+    text = _RE_DELIMITERS.sub(" ", text)
+    words = _RE_WORDS.findall(text.lower())
     return {w for w in words if w not in _STOPWORDS}
 
 
@@ -245,7 +253,7 @@ def search_memory(
         score = _temporal_score(sim, age_days)
 
         # CWD bonus
-        if cwd and mem["cwd"] and Path(cwd).resolve() == Path(mem["cwd"]).resolve():
+        if cwd and mem["cwd"] and _paths_match(cwd, mem["cwd"]):
             score *= 1.2
 
         if score > 0:
@@ -267,13 +275,35 @@ def get_context_for_task(task_text: str, cwd: Optional[str] = None) -> str:
     """Build an injectable memory context block for a task.
 
     - Searches by keyword similarity + temporal decay.
-    - Generic tasks with no keyword match: use N most recent from same CWD,
-      or N most recent overall.
+    - Discards results below MEMORY_MIN_SCORE to avoid polluting the prompt.
+    - Generic tasks with no keyword match above threshold: use N most recent
+      from same CWD, or N most recent overall.
     - Returns "" if no memories found.
     """
-    results = search_memory(task_text, cwd=cwd)
+    all_results = search_memory(task_text, cwd=cwd)
 
-    if not results:
+    # Apply minimum score threshold — only use similarity results if they're meaningful
+    results = [r for r in all_results if r["score"] >= MEMORY_MIN_SCORE]
+
+    if results:
+        log_preview = results[:3]
+        logger.info(
+            "[memory] %d relevant match(es) found (threshold %.2f):%s",
+            len(results),
+            MEMORY_MIN_SCORE,
+            "".join(
+                f"\n  #{i} score={m['score']:.3f} [{m['timestamp'].strftime('%Y-%m-%d')}] {m['task'][:60]}"
+                for i, m in enumerate(log_preview, 1)
+            ),
+        )
+    else:
+        if all_results:
+            logger.info(
+                "[memory] %d match(es) below threshold %.2f (best=%.3f) — using recent fallback",
+                len(all_results),
+                MEMORY_MIN_SCORE,
+                all_results[0]["score"],
+            )
         # Fallback: most recent memories
         results = _get_recent_memories(cwd=cwd, n=MEMORY_TOP_K)
 

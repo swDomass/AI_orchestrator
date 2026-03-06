@@ -17,6 +17,13 @@ def _reset_singleton():
     us._suggester = None
 
 
+@pytest.fixture(autouse=True)
+def _isolate_suggested_hashes_file(tmp_path):
+    """Keep suggestion-history writes inside the test tempdir."""
+    with patch.object(us, "_SUGGESTED_HASHES_FILE", tmp_path / "suggested_tasks.json"):
+        yield
+
+
 def _make_suggester():
     return us.get_suggester()
 

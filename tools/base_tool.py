@@ -7,6 +7,7 @@ They run iterative loops (review→fix→recheck) and report progress.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from config import get_system_prompt
 from providers.base import BaseProvider
 
 
@@ -18,6 +19,14 @@ class ToolResult:
     error: str = ""
     error_code: str = ""
     retryable: bool = False
+
+
+def _build_system_prompt(provider_name: str, memory_context: str = "") -> str:
+    """Assemble system prompt with optional memory context."""
+    prompt = get_system_prompt(provider_name)
+    if memory_context:
+        prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
+    return prompt
 
 
 class BaseTool(ABC):

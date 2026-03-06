@@ -8,20 +8,6 @@ import policy as policy_module
 from tools.base_tool import ToolResult
 
 
-def test_get_limits_force_refresh_passes_force_refresh(monkeypatch):
-    seen = {"force_refresh": None}
-
-    def fake_get_limits(force_refresh=False):
-        seen["force_refresh"] = force_refresh
-        return "fresh"
-
-    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
-
-    result = orchestrator._get_limits_force_refresh()
-
-    assert result == "fresh"
-    assert seen["force_refresh"] is True
-
 
 def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
     provider = SimpleNamespace(name="codex")
@@ -102,7 +88,7 @@ def test_run_once_retries_tool_task_with_next_provider_and_passes_timeout(monkey
     monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_timeout", fake_extract_timeout)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
     monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
     monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
     monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
@@ -156,15 +142,16 @@ def test_run_once_sets_rate_limit_cooldown_for_tool_task(monkeypatch):
     monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    fake_limits = SimpleNamespace(
+        claude=SimpleNamespace(resets_in_sec=45),
+        codex=SimpleNamespace(resets_in_sec=0),
+        gemini=SimpleNamespace(resets_in_sec=0),
+        earliest_reset_sec=lambda: 300,
+    )
     monkeypatch.setattr(
         orchestrator,
         "get_limits",
-        lambda: SimpleNamespace(
-            claude=SimpleNamespace(resets_in_sec=45),
-            codex=SimpleNamespace(resets_in_sec=0),
-            gemini=SimpleNamespace(resets_in_sec=0),
-            earliest_reset_sec=lambda: 300,
-        ),
+        lambda force_refresh=False: fake_limits,
     )
     monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
     monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
@@ -237,7 +224,7 @@ def test_run_once_stops_when_atomic_queue_finalization_fails(monkeypatch):
     monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
     monkeypatch.setattr(orchestrator, "select_provider", lambda *_args, **_kwargs: provider)
     monkeypatch.setattr(orchestrator, "_build_prompt", lambda *_args, **_kwargs: "prompt")
     monkeypatch.setattr(
@@ -315,7 +302,7 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
     monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
     monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_args, **_kwargs: "")
     monkeypatch.setattr(orchestrator, "mark_retry", mark_retry)
@@ -346,7 +333,7 @@ def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
     monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1)
     monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
     monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_args, **_kwargs: "")
@@ -382,7 +369,7 @@ def test_run_once_parallel_exception_marks_retry_instead_of_done(monkeypatch):
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
-    monkeypatch.setattr(orchestrator, "get_limits", lambda: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
     monkeypatch.setattr(orchestrator, "mark_retry", mark_retry)
     monkeypatch.setattr(orchestrator, "mark_done", mark_done)
     monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)

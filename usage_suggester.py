@@ -19,6 +19,8 @@ The top 3 candidates are sent to Telegram.  The user responds with:
 If no response arrives within 5 minutes the suggestions expire silently.
 """
 
+import hashlib
+import json
 import logging
 import re
 import subprocess
@@ -39,6 +41,7 @@ from config import (
     USAGE_SUGGEST_TIMEOUT_SEC,
     USAGE_SUGGEST_SKILL_COOLDOWN_DAYS,
     USAGE_SUGGEST_RETRY_WINDOW_DAYS,
+    USAGE_SUGGEST_TASK_COOLDOWN_DAYS,
     USAGE_SUGGEST_VAULT_TASK_DIRS,
     VAULT_PATH,
 )
@@ -46,6 +49,9 @@ from config import (
 logger = logging.getLogger(__name__)
 
 _COOLDOWN_SEC = 20 * 60  # Don't re-fire within same window
+
+# Per-task suggestion history (avoids always showing the same high-scoring tasks)
+_SUGGESTED_HASHES_FILE = VAULT_PATH / "99_System" / "AI" / "memory" / "suggested_tasks.json"
 
 
 @dataclass
@@ -140,6 +146,7 @@ class UsageSuggester:
             # Send via Telegram
             from notifier import notify_usage_suggestions
             notify_usage_suggestions(suggestions, remaining_pct, resets_in_sec, pace_info=seven_day_pace)
+            self._record_suggestions(suggestions)
 
             # Block waiting for response
             responded = event.wait(timeout=USAGE_SUGGEST_TIMEOUT_SEC)
@@ -419,6 +426,62 @@ class UsageSuggester:
         return suggestions
 
     # ------------------------------------------------------------------
+    # Per-task suggestion history (prevents same tasks repeating)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _task_hash(task_text: str) -> str:
+        return hashlib.md5(task_text.strip().encode("utf-8")).hexdigest()[:16]
+
+    def _load_suggested_hashes(self) -> dict[str, float]:
+        """Return {hash: unix_timestamp} of recently suggested tasks."""
+        try:
+            raw = json.loads(_SUGGESTED_HASHES_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cleaned: dict[str, float] = {}
+                for key, value in raw.items():
+                    if not isinstance(key, str):
+                        continue
+                    try:
+                        cleaned[key] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                return cleaned
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug("usage-suggest: could not load suggested hashes: %s", e)
+        return {}
+
+    def _save_suggested_hashes(self, hashes: dict[str, float]) -> None:
+        try:
+            _SUGGESTED_HASHES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = _SUGGESTED_HASHES_FILE.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(hashes), encoding="utf-8")
+            tmp_path.replace(_SUGGESTED_HASHES_FILE)
+        except Exception as e:
+            logger.debug("usage-suggest: could not save suggested hashes: %s", e)
+
+    def _is_recently_suggested(self, task_text: str, hashes: dict[str, float], cutoff: float) -> bool:
+        ts = hashes.get(self._task_hash(task_text))
+        return ts is not None and ts > cutoff
+
+    def _record_suggestions(self, suggestions: list) -> None:
+        """Persist recently suggested vault-task hashes to avoid short-term repeats."""
+        vault_suggestions = [s for s in suggestions if getattr(s, "source", "") == "vault"]
+        if not vault_suggestions:
+            return
+
+        hashes = self._load_suggested_hashes()
+        now = datetime.now()
+        now_ts = now.timestamp()
+        cutoff = (now - timedelta(days=30)).timestamp()  # retain ~10× the cooldown window
+        hashes = {h: ts for h, ts in hashes.items() if ts > cutoff}
+        for s in vault_suggestions:
+            hashes[self._task_hash(s.task_text)] = now_ts
+        self._save_suggested_hashes(hashes)
+
+    # ------------------------------------------------------------------
     # Strategy D: Vault tasks (with optional LLM autonomy assessment)
     # ------------------------------------------------------------------
 
@@ -449,7 +512,7 @@ class UsageSuggester:
                 else:
                     final = pre_score * 0.4
 
-                # Scale to 0.5–2.5 range (pre_score max ~5, llm max 10 → raw max ~8.5)
+                # Scale to 0.5–2.5 range (pre_score max ~7.5, llm max 10 → raw max ~9.25); clamped
                 scaled = 0.5 + (final / 8.5) * 2.0
                 scaled = max(0.5, min(2.5, scaled))
 
@@ -481,9 +544,15 @@ class UsageSuggester:
         """Scan vault files for open tasks with Tasks-plugin metadata.
 
         Returns list of (task_text, heuristic_pre_score) tuples.
+        Tasks suggested within USAGE_SUGGEST_TASK_COOLDOWN_DAYS are excluded.
+        Tasks in files modified within 7 days receive a recency score bonus.
         """
         results: list[tuple[str, float]] = []
         open_task_re = re.compile(r"^- \[ \] (.+)", re.MULTILINE)
+        now = datetime.now()
+        recent_cutoff = (now - timedelta(days=7)).timestamp()
+        task_cutoff = (now - timedelta(days=USAGE_SUGGEST_TASK_COOLDOWN_DAYS)).timestamp()
+        suggested_hashes = self._load_suggested_hashes()
 
         for rel_path in USAGE_SUGGEST_VAULT_TASK_DIRS:
             full = VAULT_PATH / rel_path
@@ -500,6 +569,7 @@ class UsageSuggester:
 
             for fpath in files:
                 try:
+                    file_is_recent = fpath.stat().st_mtime > recent_cutoff
                     content = fpath.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue
@@ -508,8 +578,10 @@ class UsageSuggester:
                     filtered = self._filter_vault_task(task_line)
                     if filtered is None:
                         continue
-                    score = self._heuristic_score(task_line)
-                    results.append((task_line, score))
+                    if self._is_recently_suggested(filtered, suggested_hashes, task_cutoff):
+                        continue
+                    score = self._heuristic_score(filtered, file_is_recent=file_is_recent)
+                    results.append((filtered, score))
 
         return results
 
@@ -553,9 +625,13 @@ class UsageSuggester:
             return None
         return text
 
-    def _heuristic_score(self, text: str) -> float:
-        """Compute heuristic pre-score (0–5 scale) for a vault task."""
+    def _heuristic_score(self, text: str, file_is_recent: bool = False) -> float:
+        """Compute heuristic pre-score (0–7.5 scale) for a vault task."""
         score = 0.0
+
+        # Recency bonus: task lives in a file modified in the last 7 days
+        if file_is_recent:
+            score += 1.5
 
         # Urgency
         if "#Urgent/1" in text:

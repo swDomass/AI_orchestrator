@@ -132,6 +132,7 @@ TELEGRAM_MAX_TASK_LENGTH = 500
 TOOL_MAX_ITERATIONS = 10
 TOOL_REVIEW_TIMEOUT_SEC = 1_200  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
+TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations
 
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
@@ -143,6 +144,7 @@ MEMORY_HALF_LIFE_DAYS    = 30
 MEMORY_MAX_AGE_DAYS      = 180
 MEMORY_TOP_K             = 5
 MEMORY_SUMMARY_MAX_CHARS = 700   # first 500 + "...\n" + last 200
+MEMORY_MIN_SCORE         = 0.10  # discard matches below this threshold (avoids noise injection)
 
 # --- Heartbeat ---
 HEARTBEAT_FILE           = VAULT_PATH / "99_System" / "AI" / "HEARTBEAT.md"
@@ -171,6 +173,7 @@ USAGE_SUGGEST_RESET_WINDOW_SEC    = 15 * 60
 USAGE_SUGGEST_TIMEOUT_SEC         = 5 * 60
 USAGE_SUGGEST_SKILL_COOLDOWN_DAYS = 7
 USAGE_SUGGEST_RETRY_WINDOW_DAYS   = 3
+USAGE_SUGGEST_TASK_COOLDOWN_DAYS  = 3  # don't re-suggest same vault task within N days
 USAGE_SUGGEST_LLM_TIMEOUT_SEC    = 3 * 60
 USAGE_SUGGEST_MAX_PACE_FACTOR     = 2.5  # Suppress suggestions if daily usage > 2.5× target
 USAGE_SUGGEST_VAULT_TASK_DIRS     = [

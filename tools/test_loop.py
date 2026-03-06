@@ -9,10 +9,10 @@ Usage in queue:
 import re
 import time
 
-from config import get_system_prompt, TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC
+from config import TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC, TOOL_INTER_STEP_SLEEP_SEC
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, ToolResult
+from tools.base_tool import BaseTool, ToolResult, _build_system_prompt
 
 _TEST_PROMPT_BODY = """
 Run the test suite in the current working directory.
@@ -40,13 +40,7 @@ Test failures:
 
 
 # Patterns that indicate failure when no explicit green summary is detected
-FAIL_PATTERNS = [
-    "FAILED",
-    "failed",
-    "ERROR",
-    "error",
-    "FAILURES",
-]
+_FAIL_PATTERNS = ["failed", "error", "failures"]
 
 # Regex patterns for pass/fail detection to avoid substring false positives
 _PYTEST_PASSED_RE = re.compile(r"\d+\s+passed")
@@ -72,10 +66,6 @@ def _tests_passed(output: str) -> bool:
     if _UNITTEST_OK_RE.search(output):
         return True
 
-    has_fail = any(p.lower() in lower for p in FAIL_PATTERNS)
-    if has_fail:
-        return False
-
     return False
 
 
@@ -93,11 +83,7 @@ class TestLoopTool(BaseTool):
     ) -> ToolResult:
         print(f"  [test-loop] Starte iterativen Test/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
-        # Build prompts using system-wide personality + memory context
-        system_prompt = get_system_prompt(provider.name)
-        if memory_context:
-            system_prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
-
+        system_prompt = _build_system_prompt(provider.name, memory_context)
         test_prompt = f"{system_prompt}\n\n{task}\n\n{_TEST_PROMPT_BODY}"
         all_outputs: list[str] = []
         last_failures: str = ""
@@ -157,7 +143,7 @@ class TestLoopTool(BaseTool):
                                   error_code=fix_result.error, retryable=True)
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
-            time.sleep(2)
+            time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht."
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)

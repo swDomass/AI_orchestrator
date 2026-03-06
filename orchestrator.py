@@ -124,10 +124,6 @@ def _rate_limit_cooldown_sec(limits: AllLimits, provider_name: str) -> int:
     return max(60, min(reset_sec, 30 * 60))
 
 
-def _get_limits_force_refresh() -> AllLimits:
-    """Get a fresh limits snapshot, bypassing the cache."""
-    return get_limits(force_refresh=True)
-
 
 def _snapshot_dir(cwd: str) -> dict[str, tuple[float, int]]:
     """Recursively snapshot files as {relative_path: (mtime, size)}."""
@@ -871,6 +867,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 if outcome.error_code == "unreachable":
                     provider.set_cooldown()
                 elif outcome.error_code == "rate_limit":
+                    limits = get_limits(force_refresh=True)
                     provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
                 elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
@@ -979,6 +976,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             print(f"  ❌ Fehler: {error}")
 
             if error == "rate_limit":
+                limits = get_limits(force_refresh=True)
                 lim = getattr(limits, provider.name)
                 provider_reset = fmt_time(lim.resets_in_sec) if lim.resets_in_sec else "unbekannt"
                 msg = f"{provider.name} rate-limit → reset in {provider_reset}"
@@ -1120,7 +1118,7 @@ def run_watch(dry_run: bool = False) -> None:
                 continue
 
             print("\nPrüfe Reset-Zeiten...")
-            limits = _get_limits_force_refresh()
+            limits = get_limits(force_refresh=True)
             sleep_sec = _get_next_retry_sec(limits)
             sleep_sec = min(sleep_sec, SLEEP_POLL_INTERVAL * 10)
 

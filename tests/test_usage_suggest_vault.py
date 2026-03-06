@@ -3,7 +3,7 @@
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -203,6 +203,88 @@ class TestScanVaultTasks:
             results = s._scan_vault_tasks()
 
         assert results == []
+
+    def test_scan_ignores_malformed_suggested_hashes_file(self, tmp_path):
+        task_file = tmp_path / "01_Tasks" / "01_Tasks_Lake.md"
+        task_file.parent.mkdir(parents=True)
+        task_file.write_text("- [ ] Write docs #Rolle/arbeit\n", encoding="utf-8")
+        bad_hashes = tmp_path / "99_System" / "AI" / "memory" / "suggested_tasks.json"
+        bad_hashes.parent.mkdir(parents=True)
+        bad_hashes.write_text('["broken"]', encoding="utf-8")
+
+        s = _make_suggester()
+        with (
+            patch.object(us, "VAULT_PATH", tmp_path),
+            patch.object(us, "USAGE_SUGGEST_VAULT_TASK_DIRS", ["01_Tasks/01_Tasks_Lake.md"]),
+            patch.object(us, "_SUGGESTED_HASHES_FILE", bad_hashes),
+        ):
+            results = s._scan_vault_tasks()
+
+        assert len(results) == 1
+        assert "Write docs" in results[0][0]
+
+    def test_scan_uses_filtered_text_for_history_and_scoring(self, tmp_path):
+        task_file = tmp_path / "01_Tasks" / "01_Tasks_Lake.md"
+        task_file.parent.mkdir(parents=True)
+        task_file.write_text("- [ ] Write docs #Rolle/arbeit #Urgent/1\n", encoding="utf-8")
+
+        s = _make_suggester()
+        with (
+            patch.object(us, "VAULT_PATH", tmp_path),
+            patch.object(us, "USAGE_SUGGEST_VAULT_TASK_DIRS", ["01_Tasks/01_Tasks_Lake.md"]),
+            patch.object(us.UsageSuggester, "_filter_vault_task", return_value="Write docs"),
+            patch.object(us.UsageSuggester, "_is_recently_suggested", return_value=False) as recent_mock,
+            patch.object(us.UsageSuggester, "_heuristic_score", return_value=1.25) as score_mock,
+        ):
+            results = s._scan_vault_tasks()
+
+        recent_mock.assert_called_once_with("Write docs", ANY, ANY)
+        score_mock.assert_called_once_with("Write docs", file_is_recent=ANY)
+        assert results == [("Write docs", 1.25)]
+
+
+class TestSuggestedHashesPersistence:
+    def test_load_suggested_hashes_filters_invalid_entries(self, tmp_path):
+        hashes_file = tmp_path / "suggested_tasks.json"
+        hashes_file.write_text(
+            '{"good": 123.5, "also_good": "456", "bad": "nope", "nullish": null}',
+            encoding="utf-8",
+        )
+
+        s = _make_suggester()
+        with patch.object(us, "_SUGGESTED_HASHES_FILE", hashes_file):
+            loaded = s._load_suggested_hashes()
+
+        assert loaded == {"good": 123.5, "also_good": 456.0}
+
+    def test_save_suggested_hashes_replaces_existing_file_atomically(self, tmp_path):
+        hashes_file = tmp_path / "suggested_tasks.json"
+        hashes_file.write_text('{"old": 1}', encoding="utf-8")
+
+        s = _make_suggester()
+        with patch.object(us, "_SUGGESTED_HASHES_FILE", hashes_file):
+            s._save_suggested_hashes({"new": 2.0})
+
+        assert hashes_file.read_text(encoding="utf-8") == '{"new": 2.0}'
+        assert not hashes_file.with_suffix(".tmp").exists()
+
+    def test_record_suggestions_only_persists_vault_tasks(self, tmp_path):
+        hashes_file = tmp_path / "suggested_tasks.json"
+        s = _make_suggester()
+        suggestions = [
+            us.Suggestion(rank=1, label="Vault", task_text="Review docs #Rolle/arbeit", source="vault", score=1.0),
+            us.Suggestion(rank=2, label="Retry", task_text="Review docs #Rolle/arbeit", source="retry", score=0.6),
+            us.Suggestion(rank=3, label="Skill", task_text="Run skill", source="skill", score=1.5),
+        ]
+
+        with patch.object(us, "_SUGGESTED_HASHES_FILE", hashes_file):
+            s._record_suggestions(suggestions)
+            loaded = s._load_suggested_hashes()
+
+        task_hash = s._task_hash("Review docs #Rolle/arbeit")
+        assert len(loaded) == 1
+        assert task_hash in loaded
+        assert isinstance(loaded[task_hash], float)
 
 
 # ------------------------------------------------------------------

@@ -1,0 +1,6 @@
+# Optional dependencies — install separately when needed:
+#   pip install -r requirements-optional.txt
+
+# Local JSONL fallback for Claude 429 resilience.
+# Requires CLAUDE_PLAN=pro|max5|max20|custom in .env
+claude-monitor>=3.0.0

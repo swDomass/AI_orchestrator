@@ -1,5 +1,5 @@
 """
-Wrapper around `npx cclimits --json`.
+Wrapper around `cclimits --json`.
 Parses usage limits for Claude, Gemini (all 3 tiers), and Codex.
 Auto-refreshes expired OAuth tokens before querying.
 """
@@ -13,6 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from config import (
+    CLAUDE_PLAN,
     ESTIMATE_CHARS_PER_TOKEN,
     ESTIMATE_OUTPUT_TOKEN_WEIGHT,
     ESTIMATE_TOKENS_PER_PCT,
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # On Windows, npm-installed CLIs are .cmd files
 _CMD_SUFFIX = ".cmd" if sys.platform == "win32" else ""
-NPX_CMD = f"npx{_CMD_SUFFIX}"
+_CCLIMITS_CMD = f"cclimits{_CMD_SUFFIX}"
 _CLAUDE_CMD = "claude.exe" if sys.platform == "win32" else "claude"
 _GEMINI_CMD = f"gemini{_CMD_SUFFIX}"
 
@@ -36,6 +37,16 @@ _429_MAX_BASE_AGE_SEC  = 3600 # 1h maximum age for a 429 base snapshot
 _CCLIMITS_TIMEOUT_SEC = 15
 _CCLIMITS_429_RETRY_TIMEOUT_SEC = 5
 _CCLIMITS_429_RETRY_SLEEP_SEC = (1, 2)
+_CCLIMITS_CACHE_TTL_SEC = 600  # pass to cclimits --cache-ttl → max 6 real API calls/h
+
+# Token limits per 5-hour window, by Claude subscription plan.
+# Sourced from claude-monitor's plans.py; override via CLAUDE_PLAN in .env.
+_CLAUDE_LOCAL_PLAN_LIMITS: dict[str, int] = {
+    "pro":    19_000,
+    "max5":   88_000,
+    "max20": 220_000,
+    "custom": 44_000,
+}
 _RUN_CCLIMITS_DEFAULT = None
 
 _limits_cache: "tuple[AllLimits, float] | None" = None
@@ -56,7 +67,6 @@ _429_snapshots: dict[str, tuple[ProviderLimits, float]] = {}
 # Maps provider name -> window name -> estimated percentage consumed.
 _429_estimated_usage: dict[str, dict[str, float]] = {}
 _429_notified: set[str] = set()
-
 
 @dataclass
 class WindowData:
@@ -441,6 +451,12 @@ def _apply_429_fallback(result: AllLimits, p429: set[str]) -> AllLimits:
     with _limits_cache_lock:
         cached_tuple = _limits_cache
 
+    # For Claude: try reading local JSONL files before acquiring the state lock.
+    # This is IO-bound and must not run while holding _429_estimate_lock.
+    local_claude_pl: "ProviderLimits | None" = (
+        _get_claude_limits_from_local(CLAUDE_PLAN) if "claude" in p429 else None
+    )
+
     with _429_estimate_lock:
         now = time.monotonic()
 
@@ -466,6 +482,17 @@ def _apply_429_fallback(result: AllLimits, p429: set[str]) -> AllLimits:
                     _429_notified.discard(name)
 
         for name in p429:
+            # 0. For Claude: use local JSONL data (no API calls, always fresh)
+            if name == "claude" and local_claude_pl is not None:
+                _429_snapshots[name] = (local_claude_pl, now)
+                _429_estimated_usage[name] = {}
+                setattr(result, name, local_claude_pl)
+                logger.info(
+                    "  [claude] HTTP 429 -> local JSONL files (%.0f%% remaining, resets in %ds)",
+                    local_claude_pl.remaining_pct, local_claude_pl.resets_in_sec,
+                )
+                continue
+
             # 1. Try existing per-provider snapshot
             if name in _429_snapshots:
                 base_pl, snapshot_time = _429_snapshots[name]
@@ -547,27 +574,117 @@ def _clear_429_state(result: AllLimits) -> None:
             pass
 
 
-def _run_cclimits_impl(timeout_sec: int) -> dict | None:
-    """Run npx cclimits --json and return parsed dict, or None on failure."""
+def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
+    """Read Claude usage from ~/.claude/projects JSONL files via claude-monitor.
+
+    No HTTP requests — immune to rate limiting on the Anthropic monitoring API.
+    Returns None if claude-monitor is not installed, the plan is unknown, or data
+    is unavailable (e.g. no recent sessions).
+    """
+    if not plan:
+        return None
+    token_limit = _CLAUDE_LOCAL_PLAN_LIMITS.get(plan.lower())
+    if not token_limit:
+        logger.debug("CLAUDE_PLAN=%r not recognised — skipping local fallback", plan)
+        return None
     try:
+        from claude_monitor.core.models import CostMode
+        from claude_monitor.data.analyzer import SessionAnalyzer
+        from claude_monitor.data.reader import load_usage_entries
+    except ImportError:
+        logger.debug("claude-monitor not installed — skipping local fallback")
+        return None
+    except Exception as e:
+        logger.debug("Failed to import claude-monitor: %s", e)
+        return None
+    try:
+        import datetime as _dt
+        entries, _ = load_usage_entries(hours_back=10, mode=CostMode.AUTO)
+        if not entries:
+            logger.debug("No claude-monitor usage entries found in last 10h")
+            return None
+        blocks = SessionAnalyzer(session_duration_hours=5).transform_to_blocks(entries)
+        if not blocks:
+            logger.debug("No claude-monitor session blocks found")
+            return None
+        active = next((b for b in reversed(blocks) if b.is_active), None)
+        if active is None:
+            # No active 5-hour block means the previous window already ended.
+            # Treat the current window as fully reset rather than reusing stale usage.
+            window = WindowData(remaining_pct=100.0, resets_in_sec=0)
+            return ProviderLimits(
+                available=True,
+                remaining_pct=100.0,
+                resets_in_sec=0,
+                windows={"five_hour": window},
+                error="HTTP 429 (local-files)",
+            )
+        tokens_used = active.token_counts.total_tokens  # input + output + cache_creation + cache_read
+        remaining_pct = max(0.0, (1.0 - tokens_used / token_limit) * 100)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        end = active.end_time
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=_dt.timezone.utc)
+        resets_in_sec = max(0, int((end - now).total_seconds()))
+        window = WindowData(remaining_pct=remaining_pct, resets_in_sec=resets_in_sec)
+        return ProviderLimits(
+            available=remaining_pct >= MIN_CAPACITY_PERCENT,
+            remaining_pct=remaining_pct,
+            resets_in_sec=resets_in_sec,
+            windows={"five_hour": window},
+            error="HTTP 429 (local-files)",
+        )
+    except Exception as e:
+        logger.debug("claude-monitor local fallback failed: %s", e)
+        return None
+
+
+def _run_cclimits_impl(timeout_sec: int, *, use_cache: bool = True) -> dict | None:
+    """Run cclimits --json and return parsed dict, or None on failure.
+
+    use_cache=True passes --cache-ttl to cclimits so it reads/writes a local
+    disk cache and only hits the real Anthropic API every _CCLIMITS_CACHE_TTL_SEC
+    seconds.  use_cache=False bypasses the cache for 429 retry probes.
+    """
+    try:
+        cmd = [_CCLIMITS_CMD, "--json"]
+        if use_cache:
+            cmd += ["--cache-ttl", str(_CCLIMITS_CACHE_TTL_SEC)]
         result = subprocess.run(
-            [NPX_CMD, "cclimits", "--json"],
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout_sec,
+            shell=sys.platform == "win32",
         )
+        if result.returncode != 0:
+            # Some cclimits versions write valid JSON to stdout even on non-zero exit
+            # (e.g. partial data with a warning). Try to honour that data first.
+            if result.stdout and result.stdout.strip():
+                try:
+                    return json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    pass
+            # No usable JSON. If --cache-ttl was used, retry without it. Some CLI
+            # frameworks don't echo the unknown flag name in the error text, so we
+            # treat any non-zero exit during a cached call as a potential flag-compat
+            # issue rather than relying solely on _cache_ttl_flag_unsupported().
+            if use_cache:
+                logger.info("cclimits exited non-zero with --cache-ttl; retrying without cache")
+                return _run_cclimits_impl(timeout_sec, use_cache=False)
+            return None
         return json.loads(result.stdout)
     except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
         return None
 
 
-def _run_cclimits_with_timeout(timeout_sec: int) -> dict | None:
+def _run_cclimits_with_timeout(timeout_sec: int, *, use_cache: bool = True) -> dict | None:
     runner = globals().get("_run_cclimits")
     if runner is not None and runner is not _RUN_CCLIMITS_DEFAULT:
         return runner()
-    return _run_cclimits_impl(timeout_sec)
+    return _run_cclimits_impl(timeout_sec, use_cache=use_cache)
 
 
 def _run_cclimits() -> dict | None:
@@ -600,6 +717,7 @@ def _refresh_token(provider: str) -> bool:
             r = subprocess.run(
                 [_CLAUDE_CMD, "auth", "status"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+                shell=sys.platform == "win32",
             )
             combined_out = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
             if r.returncode == 0 and "expired" not in combined_out:
@@ -635,6 +753,7 @@ def _refresh_token(provider: str) -> bool:
                 encoding="utf-8",
                 errors="replace",
                 timeout=45,
+                shell=sys.platform == "win32",
             )
             if r.returncode == 0:
                 return True
@@ -687,7 +806,9 @@ def _get_limits_fresh() -> AllLimits:
         if p429:
             for sleep_sec in _CCLIMITS_429_RETRY_SLEEP_SEC:
                 time.sleep(sleep_sec)
-                fresh = _run_cclimits_with_timeout(_CCLIMITS_429_RETRY_TIMEOUT_SEC)
+                # Bypass cache so we probe the real API instead of re-reading the
+                # cached 429 that was just written by the first call.
+                fresh = _run_cclimits_with_timeout(_CCLIMITS_429_RETRY_TIMEOUT_SEC, use_cache=False)
                 if fresh is not None:
                     raw = fresh
                     p429 = _providers_with_429(raw)

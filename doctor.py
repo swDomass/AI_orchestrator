@@ -101,17 +101,19 @@ def check_git() -> CheckResult:
 
 
 def check_cclimits() -> CheckResult:
+    cmd_suffix = ".cmd" if os.name == "nt" else ""
+    cclimits_cmd = f"cclimits{cmd_suffix}"
     try:
         r = subprocess.run(
-            ["npx", "cclimits", "--json"],
+            [cclimits_cmd, "--json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             shell=os.name == "nt",
         )
         if r.returncode == 0:
-            return CheckResult(PASS, "cclimits", "npx cclimits --json succeeded")
+            return CheckResult(PASS, "cclimits", "cclimits --json succeeded")
         return CheckResult(WARN, "cclimits", f"exited {r.returncode}: {(r.stderr or r.stdout).strip()[:80]}")
     except FileNotFoundError:
-        return CheckResult(WARN, "cclimits", "npx not found — Node.js required")
+        return CheckResult(WARN, "cclimits", "not found in PATH or failed to execute (install: npm install -g cclimits)")
     except subprocess.TimeoutExpired:
         return CheckResult(WARN, "cclimits", "timed out after 15s")
     except Exception as e:

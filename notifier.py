@@ -13,6 +13,7 @@ from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TELEGRAM_ENABLED,
+    NOTIFY_ON_TASK_STARTED,
     NOTIFY_ON_TASK_DONE,
     NOTIFY_ON_ERROR,
     NOTIFY_ON_QUEUE_COMPLETE,
@@ -89,6 +90,20 @@ def start_session() -> None:
         _stats["tasks_done"] = 0
         _stats["tasks_failed"] = 0
         _stats["providers_used"] = {}
+
+
+def notify_task_started(task: str, provider: str) -> None:
+    """Notify that a task is about to be executed."""
+    if not NOTIFY_ON_TASK_STARTED:
+        return
+
+    provider_safe = _escape_markdown(provider)
+    task_safe = _strip_backticks(_truncate(task, 100))
+
+    _send(
+        f"🚀 *Task gestartet* ({provider_safe})\n"
+        f"`{task_safe}`"
+    )
 
 
 def notify_task_done(task: str, provider: str, output: str, change_summary: str | None = None) -> None:
@@ -261,6 +276,26 @@ def notify_usage_suggestions(
     lines.append("/decline — Nichts davon")
 
     _send("\n".join(lines))
+
+
+def notify_limits_429_fallback(provider_name: str, remaining_pct: float) -> None:
+    """Notify that cclimits is rate-limited and using cached/estimated data."""
+    provider_safe = _escape_markdown(provider_name)
+    _send(
+        f"*cclimits HTTP 429* ({provider_safe})\n"
+        f"Monitoring-API rate-limited. Provider weiterhin verfuegbar.\n"
+        f"Geschaetzte Kapazitaet: {remaining_pct:.0f}% remaining (cached)\n"
+        f"Naechster Versuch in 5 Min."
+    )
+
+
+def notify_limits_429_cleared(provider_name: str, remaining_pct: float) -> None:
+    """Notify that cclimits 429 has cleared and real data is available again."""
+    provider_safe = _escape_markdown(provider_name)
+    _send(
+        f"*cclimits 429 aufgeloest* ({provider_safe})\n"
+        f"Echte Kapazitaet: {remaining_pct:.0f}% remaining"
+    )
 
 
 def notify_tool_progress(tool_name: str, iteration: int, max_iter: int, message: str) -> None:

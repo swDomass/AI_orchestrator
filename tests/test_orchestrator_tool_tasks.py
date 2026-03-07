@@ -14,6 +14,7 @@ def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
     tool = Mock()
     tool.name = "test-loop"
     tool.description = "Test loop"
+    tool.read_only = False
     tool.run.return_value = ToolResult(
         success=False,
         error="Tests konnten nicht ausgeführt werden: timeout",
@@ -33,8 +34,7 @@ def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
     monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
     monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
 
-    import skills
-    monkeypatch.setattr(skills, "load_skill", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
 
     outcome = orchestrator._execute_tool_task(
         "Run tests #tool:test-loop",
@@ -171,6 +171,7 @@ def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monk
     tool = Mock()
     tool.name = "test-loop"
     tool.description = "Test loop"
+    tool.read_only = False
     tool.run.return_value = ToolResult(
         success=True,
         output="ALL TESTS PASSED",
@@ -189,8 +190,7 @@ def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monk
     monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
     monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
 
-    import skills
-    monkeypatch.setattr(skills, "load_skill", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
 
     outcome = orchestrator._execute_tool_task(
         "Run tests #tool:test-loop",
@@ -211,6 +211,45 @@ def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monk
         line_no=42,
         subtasks=None,
     )
+
+
+def test_execute_read_only_tool_skips_git_snapshot(monkeypatch, tmp_path):
+    provider = SimpleNamespace(name="codex")
+    tool = Mock()
+    tool.name = "research-qa"
+    tool.description = "Research"
+    tool.read_only = True
+    tool.run.return_value = ToolResult(
+        success=True,
+        output="analysis",
+        iterations=1,
+    )
+
+    git_snapshot = Mock()
+
+    monkeypatch.setattr(orchestrator, "get_tool", lambda _name: tool)
+    monkeypatch.setattr(orchestrator, "_is_git_repo", lambda _cwd: True)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", git_snapshot)
+    monkeypatch.setattr(orchestrator, "_get_change_summary", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "finalize_task_with_result", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
+
+    outcome = orchestrator._execute_tool_task(
+        "Research task #tool:research-qa",
+        "research-qa",
+        provider,
+        cwd=str(tmp_path),
+    )
+
+    assert outcome.success is True
+    git_snapshot.assert_not_called()
 
 
 def test_run_once_stops_when_atomic_queue_finalization_fails(monkeypatch):

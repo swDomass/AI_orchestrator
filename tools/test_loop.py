@@ -90,6 +90,9 @@ class TestLoopTool(BaseTool):
 
         step_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
 
+        total_input_tokens = 0
+        total_output_tokens = 0
+
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [test-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: TESTS ===")
 
@@ -98,6 +101,8 @@ class TestLoopTool(BaseTool):
                 cwd=cwd,
                 timeout=step_timeout,
             )
+            total_input_tokens += test_result.input_tokens
+            total_output_tokens += test_result.output_tokens
 
             if not test_result.success:
                 msg = f"Tests konnten nicht ausgeführt werden: {test_result.error}"
@@ -105,7 +110,9 @@ class TestLoopTool(BaseTool):
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
                                   iterations=iteration, error=msg,
-                                  error_code=test_result.error, retryable=True)
+                                  error_code=test_result.error, retryable=True,
+                                  input_tokens=total_input_tokens,
+                                  output_tokens=total_output_tokens)
 
             all_outputs.append(f"--- Test Run {iteration} ---\n{test_result.output}")
 
@@ -114,7 +121,9 @@ class TestLoopTool(BaseTool):
                 print(f"  [test-loop] ✅ {msg}")
                 notify_tool_done(self.name, iteration, True, msg)
                 return ToolResult(success=True, output="\n\n".join(all_outputs),
-                                  iterations=iteration)
+                                  iterations=iteration,
+                                  input_tokens=total_input_tokens,
+                                  output_tokens=total_output_tokens)
 
             # Tests failed - check if same failures as before (loop detection)
             current_failures = test_result.output
@@ -123,7 +132,9 @@ class TestLoopTool(BaseTool):
                 print(f"  [test-loop] ⚠️ {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
-                                  iterations=iteration, error=msg)
+                                  iterations=iteration, error=msg,
+                                  input_tokens=total_input_tokens,
+                                  output_tokens=total_output_tokens)
             last_failures = current_failures
 
             # Fix
@@ -133,6 +144,8 @@ class TestLoopTool(BaseTool):
 
             fix_prompt = f"{system_prompt}\n\n" + _FIX_PROMPT_BODY.format(iteration=iteration, failures=test_result.output)
             fix_result = provider.run(fix_prompt, cwd=cwd, timeout=step_timeout)
+            total_input_tokens += fix_result.input_tokens
+            total_output_tokens += fix_result.output_tokens
 
             if not fix_result.success:
                 msg = f"Fix fehlgeschlagen: {fix_result.error}"
@@ -140,7 +153,9 @@ class TestLoopTool(BaseTool):
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
                                   iterations=iteration, error=msg,
-                                  error_code=fix_result.error, retryable=True)
+                                  error_code=fix_result.error, retryable=True,
+                                  input_tokens=total_input_tokens,
+                                  output_tokens=total_output_tokens)
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
@@ -148,4 +163,6 @@ class TestLoopTool(BaseTool):
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht."
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)
         return ToolResult(success=False, output="\n\n".join(all_outputs),
-                          iterations=TOOL_MAX_ITERATIONS, error=msg)
+                          iterations=TOOL_MAX_ITERATIONS, error=msg,
+                          input_tokens=total_input_tokens,
+                          output_tokens=total_output_tokens)

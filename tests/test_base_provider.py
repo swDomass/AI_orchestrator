@@ -1,11 +1,12 @@
 """
-Tests for providers/base.py — thread-safety changes.
+Tests for providers/base.py and providers/claude.py.
 
 Covers:
   - Basic cooldown lifecycle (set, check, expire)
   - cooldown_remaining_str() format
   - Per-instance isolation (no shared class-level state)
   - Concurrent reads and writes don't raise or corrupt state
+  - Claude JSON output parsing with token extraction
 """
 
 import threading
@@ -14,6 +15,7 @@ import time
 import pytest
 
 from providers.base import BaseProvider, RunResult
+from providers.claude import ClaudeProvider
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +197,126 @@ def test_multiple_providers_concurrent_no_cross_contamination():
     t2.join()
 
     assert errors == [], "\n".join(errors)
+
+
+# ---------------------------------------------------------------------------
+# Claude JSON output parsing
+# ---------------------------------------------------------------------------
+
+def test_parse_json_response_extracts_tokens():
+    """Valid JSON with usage data → output text + token counts."""
+    import json
+    data = {
+        "type": "result",
+        "subtype": "success",
+        "result": "Hello world",
+        "usage": {"input_tokens": 5000, "output_tokens": 1200},
+    }
+    output, inp, out = ClaudeProvider._parse_json_response(json.dumps(data))
+    assert output == "Hello world"
+    assert inp == 5000
+    assert out == 1200
+
+
+def test_parse_json_response_missing_usage():
+    """JSON without usage field → tokens default to 0."""
+    import json
+    data = {"type": "result", "result": "ok"}
+    output, inp, out = ClaudeProvider._parse_json_response(json.dumps(data))
+    assert output == "ok"
+    assert inp == 0
+    assert out == 0
+
+
+def test_parse_json_response_plain_text_fallback():
+    """Non-JSON stdout → returned as-is with 0 tokens."""
+    output, inp, out = ClaudeProvider._parse_json_response("plain text output")
+    assert output == "plain text output"
+    assert inp == 0
+    assert out == 0
+
+
+def test_parse_json_response_empty_string():
+    output, inp, out = ClaudeProvider._parse_json_response("")
+    assert output == ""
+    assert inp == 0
+    assert out == 0
+
+
+def test_parse_json_response_malformed_json():
+    """Broken JSON → falls back to raw string."""
+    output, inp, out = ClaudeProvider._parse_json_response('{"broken')
+    assert output == '{"broken'
+    assert inp == 0
+    assert out == 0
+
+
+def test_claude_run_returns_tokens_from_json(monkeypatch):
+    """Full integration: ClaudeProvider.run() extracts tokens from JSON output."""
+    import json
+    from types import SimpleNamespace
+
+    json_out = json.dumps({
+        "type": "result",
+        "result": "Task done successfully",
+        "usage": {"input_tokens": 8000, "output_tokens": 3000},
+    })
+
+    monkeypatch.setattr(
+        "providers.claude.subprocess.run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
+    )
+
+    p = ClaudeProvider()
+    result = p.run("test task")
+    assert result.success is True
+    assert result.output == "Task done successfully"
+    assert result.input_tokens == 8000
+    assert result.output_tokens == 3000
+
+
+def test_claude_run_rejects_non_success_json_without_result(monkeypatch):
+    """Structured JSON abort/error payloads must not be treated as success."""
+    import json
+    from types import SimpleNamespace
+
+    json_out = json.dumps({
+        "type": "result",
+        "subtype": "error_max_turns",
+        "usage": {"input_tokens": 120, "output_tokens": 45},
+    })
+
+    monkeypatch.setattr(
+        "providers.claude.subprocess.run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
+    )
+
+    result = ClaudeProvider().run("test task")
+    assert result.success is False
+    assert '"subtype": "error_max_turns"' in result.error
+    assert result.input_tokens == 120
+    assert result.output_tokens == 45
+
+
+def test_claude_run_rejects_non_success_json_even_with_result(monkeypatch):
+    """A non-success subtype must override a textual result field."""
+    import json
+    from types import SimpleNamespace
+
+    json_out = json.dumps({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "result": "Task aborted",
+        "usage": {"input_tokens": 300, "output_tokens": 50},
+    })
+
+    monkeypatch.setattr(
+        "providers.claude.subprocess.run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
+    )
+
+    result = ClaudeProvider().run("test task")
+    assert result.success is False
+    assert result.error == "Task aborted"
+    assert result.input_tokens == 300
+    assert result.output_tokens == 50

@@ -13,6 +13,8 @@ class RunResult:
     success: bool
     output: str = ""
     error: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class BaseProvider(ABC):
@@ -57,6 +59,15 @@ class BaseProvider(ABC):
 
 
     @abstractmethod
-    def run(self, task: str, cwd: str | None = None, timeout: int = TASK_TIMEOUT_SEC) -> RunResult:
-        """Execute task via CLI and return result."""
+    def run(
+        self,
+        task: str,
+        cwd: str | None = None,
+        timeout: int = TASK_TIMEOUT_SEC,
+        read_only: bool = False,
+    ) -> RunResult:
+        """Execute task via CLI and return result.
+
+        Providers should deny write-capable tools when ``read_only`` is set.
+        """
         ...

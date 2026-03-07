@@ -29,7 +29,7 @@ from config import (
 )
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, ToolResult, _build_system_prompt
+from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _write_tool_file
 from tools.review_loop import _is_no_findings_output, _parse_findings
 
 DEV_LOOP_DIR = ".dev-loop"
@@ -57,11 +57,6 @@ def _parse_resolution(text: str) -> str:
             best_label, best_pos = label, m.start()
     return best_label
 
-
-def _write_dev_file(dev_loop_dir: Path, filename: str, content: str) -> None:
-    """Write a file into the .dev-loop directory, creating it if needed."""
-    dev_loop_dir.mkdir(parents=True, exist_ok=True)
-    (dev_loop_dir / filename).write_text(content, encoding="utf-8")
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -191,10 +186,15 @@ class DevLoopTool(BaseTool):
         quality_timeout = timeout or TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC
         resolution_timeout = timeout or TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC
 
+        total_input_tokens = 0
+        total_output_tokens = 0
+
         # ── Phase 1: Research ─────────────────────────────────────────────────
         print("  [dev-loop] === Phase 1: RESEARCH ===")
         research_prompt = system_prompt + "\n\n" + _RESEARCH_PROMPT.format(task=task)
         research_result = provider.run(research_prompt, cwd=cwd, timeout=research_timeout)
+        total_input_tokens += research_result.input_tokens
+        total_output_tokens += research_result.output_tokens
 
         if not research_result.success:
             msg = f"Research fehlgeschlagen: {research_result.error}"
@@ -207,11 +207,13 @@ class DevLoopTool(BaseTool):
                 error=msg,
                 error_code=research_result.error,
                 retryable=True,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
             )
 
         research_output = research_result.output.strip()
         all_outputs.append(f"--- Research ---\n{research_output}")
-        _write_dev_file(
+        _write_tool_file(
             dev_loop_dir,
             "research.md",
             f"# Dev-Loop Research\n\nTask: {task}\n\n{research_output}\n",
@@ -254,6 +256,8 @@ class DevLoopTool(BaseTool):
                 self.name, iteration, TOOL_MAX_ITERATIONS, "Implementierung läuft..."
             )
             exec_result = provider.run(exec_prompt, cwd=cwd, timeout=exec_timeout)
+            total_input_tokens += exec_result.input_tokens
+            total_output_tokens += exec_result.output_tokens
 
             if not exec_result.success:
                 msg = f"Execution fehlgeschlagen in Iteration {iteration}: {exec_result.error}"
@@ -266,6 +270,8 @@ class DevLoopTool(BaseTool):
                     error=msg,
                     error_code=exec_result.error,
                     retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             exec_output = exec_result.output.strip()
@@ -276,6 +282,8 @@ class DevLoopTool(BaseTool):
             print(f"  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: QUALITY REVIEW ===")
             quality_prompt = system_prompt + "\n\n" + _QUALITY_REVIEW_PROMPT.format(task=task)
             quality_result = provider.run(quality_prompt, cwd=cwd, timeout=quality_timeout)
+            total_input_tokens += quality_result.input_tokens
+            total_output_tokens += quality_result.output_tokens
 
             if not quality_result.success:
                 msg = f"Quality-Review fehlgeschlagen in Iteration {iteration}: {quality_result.error}"
@@ -288,6 +296,8 @@ class DevLoopTool(BaseTool):
                     error=msg,
                     error_code=quality_result.error,
                     retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             quality_output = quality_result.output.strip()
@@ -306,6 +316,8 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
             # P3-only findings are non-blocking; only P1/P2 block progress
             blocking_findings = [f for f in quality_findings if not f.startswith("- [P3]")]
@@ -316,6 +328,8 @@ class DevLoopTool(BaseTool):
             print(f"  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: RESOLUTION REVIEW ===")
             resolution_prompt = system_prompt + "\n\n" + _RESOLUTION_REVIEW_PROMPT.format(task=task)
             resolution_result = provider.run(resolution_prompt, cwd=cwd, timeout=resolution_timeout)
+            total_input_tokens += resolution_result.input_tokens
+            total_output_tokens += resolution_result.output_tokens
 
             if not resolution_result.success:
                 msg = f"Resolution-Review fehlgeschlagen in Iteration {iteration}: {resolution_result.error}"
@@ -328,6 +342,8 @@ class DevLoopTool(BaseTool):
                     error=msg,
                     error_code=resolution_result.error,
                     retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             resolution_output = resolution_result.output.strip()
@@ -345,11 +361,13 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
             resolution_ok = resolution_status == "RESOLVED"
 
             # ── Write round file ──────────────────────────────────────────────
-            _write_dev_file(
+            _write_tool_file(
                 dev_loop_dir,
                 f"round-{iteration:03d}.md",
                 (
@@ -375,7 +393,7 @@ class DevLoopTool(BaseTool):
                     "Bereit fuer deinen Review + Push."
                 )
                 print(f"  [dev-loop] {msg}")
-                _write_dev_file(
+                _write_tool_file(
                     dev_loop_dir,
                     "summary.md",
                     (
@@ -390,6 +408,8 @@ class DevLoopTool(BaseTool):
                     success=True,
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             # ── Infinite loop detection (same quality findings twice) ──────────
@@ -407,6 +427,8 @@ class DevLoopTool(BaseTool):
                         output="\n\n".join(all_outputs),
                         iterations=iteration,
                         error=msg,
+                        input_tokens=total_input_tokens,
+                        output_tokens=total_output_tokens,
                     )
                 seen_quality_signatures.add(sig)
 
@@ -423,6 +445,8 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
             seen_review_signatures.add(review_sig)
 
@@ -440,4 +464,6 @@ class DevLoopTool(BaseTool):
             output="\n\n".join(all_outputs),
             iterations=TOOL_MAX_ITERATIONS,
             error=msg,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
         )

@@ -1,4 +1,5 @@
 import threading
+import time
 from types import SimpleNamespace
 
 import limits
@@ -429,3 +430,631 @@ def test_parse_gemini_windows_populated():
     assert "gemini_2_5_pro" in result.windows
     assert "gemini_2_0_flash" in result.windows
     assert abs(result.windows["gemini_2_5_pro"].remaining_pct - 95.0) < 0.1
+
+
+# ── HTTP 429 handling tests ────────────────────────────────────────────────────
+
+def _reset_429_state(monkeypatch):
+    """Reset all 429 estimation state."""
+    monkeypatch.setattr(limits, "_429_snapshots", {})
+    monkeypatch.setattr(limits, "_429_estimated_usage", {})
+    monkeypatch.setattr(limits, "_429_notified", set())
+
+
+def test_is_provider_429_detects_error():
+    assert limits._is_provider_429({"error": "HTTP 429", "details": "Too Many Requests"})
+    assert limits._is_provider_429({"error": "HTTP 429"})
+    assert not limits._is_provider_429({"status": "ok"})
+    assert not limits._is_provider_429({"error": "expired"})
+    assert not limits._is_provider_429({})
+
+
+def test_providers_with_429_returns_affected_set():
+    raw = {
+        "claude": {"error": "HTTP 429", "details": "Too Many Requests"},
+        "gemini": {"status": "ok", "models": {}},
+        "codex": {"status": "ok"},
+    }
+    assert limits._providers_with_429(raw) == {"claude"}
+
+
+def test_providers_with_429_returns_empty_when_no_429():
+    raw = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%"}},
+        "gemini": {"status": "ok", "models": {}},
+        "codex": {"status": "ok"},
+    }
+    assert limits._providers_with_429(raw) == set()
+
+
+def test_estimate_task_usage_pct_by_duration():
+    """Tier 3: duration heuristic when no tokens or text available."""
+    assert limits.estimate_task_usage_pct(10) == 2.0
+    assert limits.estimate_task_usage_pct(59) == 2.0
+    assert limits.estimate_task_usage_pct(60) == 5.0
+    assert limits.estimate_task_usage_pct(200) == 5.0
+    assert limits.estimate_task_usage_pct(300) == 10.0
+    assert limits.estimate_task_usage_pct(500) == 10.0
+    assert limits.estimate_task_usage_pct(600) == 15.0
+    assert limits.estimate_task_usage_pct(1200) == 15.0
+
+
+def test_estimate_task_usage_pct_from_actual_tokens():
+    """Tier 1: actual token counts from provider (e.g. Claude JSON output)."""
+    # 10000 input + 2000 output * 5 weight = 20000 effective
+    # 20000 / 15000 (claude default) ≈ 1.33%
+    pct = limits.estimate_task_usage_pct(
+        input_tokens=10000, output_tokens=2000, provider="claude",
+    )
+    assert abs(pct - 20000 / 15000) < 0.01
+
+    # Large task: 50000 input + 10000 output = 100000 effective → 6.67%
+    pct = limits.estimate_task_usage_pct(
+        input_tokens=50000, output_tokens=10000, provider="claude",
+    )
+    assert abs(pct - 100000 / 15000) < 0.01
+
+
+def test_estimate_task_usage_pct_from_text():
+    """Tier 2: text-based estimate from prompt/output character lengths."""
+    # 4000 chars prompt = ~1000 tokens input
+    # 2000 chars output = ~500 tokens output * 5 weight = 2500
+    # effective = 3500, / 15000 ≈ 0.233%
+    pct = limits.estimate_task_usage_pct(
+        prompt_text="x" * 4000, output_text="y" * 2000, provider="claude",
+    )
+    assert abs(pct - 3500 / 15000) < 0.01
+
+
+def test_estimate_task_usage_pct_tokens_beat_text_and_duration():
+    """Tier 1 (actual tokens) takes priority over Tier 2 (text) and Tier 3 (duration)."""
+    pct_tokens = limits.estimate_task_usage_pct(
+        duration_sec=600,  # would be 15% via duration
+        input_tokens=1000, output_tokens=200,  # 1000 + 200*5 = 2000 / 15000 = 0.133%
+        prompt_text="x" * 100_000,  # would be much larger via text
+        provider="claude",
+    )
+    assert pct_tokens < 1.0  # tokens win over duration (15%) and text
+
+
+def test_estimate_task_usage_pct_duration_can_beat_short_text():
+    """Tier 3 (duration) wins over Tier 2 (text) if it is more conservative (P3 finding)."""
+    # Duration: 600s → 15%
+    # Text: ~0.023%
+    pct = limits.estimate_task_usage_pct(
+        duration_sec=600,
+        prompt_text="x" * 400, output_text="y" * 200,
+        provider="claude",
+    )
+    assert pct == 15.0  # duration wins (conservative fallback for tools)
+
+
+def test_estimate_task_usage_pct_respects_provider_budget():
+    """Different providers have different tokens_per_pct budgets."""
+    kwargs = dict(input_tokens=10000, output_tokens=2000)
+    effective = 10000 + 2000 * 5  # 20000
+
+    pct_claude = limits.estimate_task_usage_pct(**kwargs, provider="claude")
+    pct_gemini = limits.estimate_task_usage_pct(**kwargs, provider="gemini")
+
+    # Gemini has higher budget → lower percentage for same tokens
+    assert pct_claude > pct_gemini
+    assert abs(pct_claude - effective / 15000) < 0.01
+    assert abs(pct_gemini - effective / 100000) < 0.01
+
+
+def test_estimate_task_usage_pct_minimum_clamp():
+    """Token/text-based estimates are clamped to at least 0.1%."""
+    pct = limits.estimate_task_usage_pct(input_tokens=1, output_tokens=0, provider="claude")
+    assert pct == 0.1
+
+
+def test_report_estimated_usage_accumulates_only_in_429_mode(monkeypatch):
+    """report_estimated_usage only accumulates when _429_base_snapshot is set."""
+    _reset_429_state(monkeypatch)
+
+    # Without base snapshot, reporting does nothing
+    limits.report_estimated_usage("claude", 5.0)
+    assert limits._429_estimated_usage == {}
+
+    # Set a base snapshot
+    base_pl = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
+        "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+    })
+    monkeypatch.setattr(limits, "_429_snapshots", {"claude": (base_pl, time.monotonic())})
+
+    limits.report_estimated_usage("claude", 5.0)
+    limits.report_estimated_usage("claude", 3.0)
+    assert limits._429_estimated_usage["claude"] == {"five_hour": 8.0}
+
+
+def test_report_estimated_usage_scales_nested_long_windows(monkeypatch):
+    _reset_429_state(monkeypatch)
+
+    base_pl = limits.ProviderLimits(
+        available=True,
+        remaining_pct=80.0,
+        windows={
+            "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+            "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
+        },
+    )
+    monkeypatch.setattr(limits, "_429_snapshots", {"claude": (base_pl, time.monotonic())})
+
+    limits.report_estimated_usage("claude", 24.0)
+
+    assert limits._429_estimated_usage["claude"]["five_hour"] == 24.0
+    assert abs(limits._429_estimated_usage["claude"]["seven_day"] - 1.0) < 0.01
+
+
+def test_build_429_fallback_provider_adjusts_remaining():
+    base = limits.ProviderLimits(
+        available=True,
+        remaining_pct=80.0,
+        resets_in_sec=3600,
+        windows={
+            "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+            "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
+        },
+    )
+    # Use current time as snapshot_time (no elapsed)
+    adjusted = limits._build_429_fallback_provider(base, 15.0, time.monotonic())
+    assert adjusted.remaining_pct == 65.0
+    assert adjusted.available is True
+    assert adjusted.windows["five_hour"].remaining_pct == 65.0
+    assert abs(adjusted.windows["seven_day"].remaining_pct - 89.375) < 0.01
+    assert "15%" in adjusted.error
+
+
+def test_build_429_fallback_provider_decrements_resets(monkeypatch):
+    base = limits.ProviderLimits(
+        available=True,
+        remaining_pct=80.0,
+        resets_in_sec=3600,
+        windows={
+            "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+        },
+    )
+    # Simulate snapshot taken 10 minutes (600s) ago
+    snapshot_time = time.monotonic() - 600
+    adjusted = limits._build_429_fallback_provider(base, 0.0, snapshot_time)
+    
+    # 3600 - 600 = 3000
+    assert adjusted.resets_in_sec == 3000
+    assert adjusted.windows["five_hour"].resets_in_sec == 3000
+
+
+def test_build_429_fallback_provider_marks_unavailable_below_threshold():
+    base = limits.ProviderLimits(
+        available=True,
+        remaining_pct=10.0,
+        resets_in_sec=300,
+        windows={"five_hour": limits.WindowData(remaining_pct=10.0, resets_in_sec=300)},
+    )
+    adjusted = limits._build_429_fallback_provider(base, 8.0, time.monotonic())
+    assert adjusted.remaining_pct == 2.0
+    assert adjusted.available is False
+
+
+def test_optimistic_429_provider_is_available():
+    p = limits._optimistic_429_provider()
+    assert p.available is True
+    assert p.remaining_pct == 100.0
+    assert "429" in p.error
+
+
+def test_get_limits_fresh_retries_on_429_then_succeeds(monkeypatch):
+    """When cclimits returns 429, retry with backoff; if retry succeeds, use real data."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    calls = {"n": 0}
+    def fake_run_cclimits():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "claude": {"error": "HTTP 429", "details": "Too Many Requests"},
+                "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+                "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+            }
+        return {
+            "claude": {"status": "ok", "five_hour": {"remaining": "75%", "resets_in": "2h"}},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+
+    result = limits._get_limits_fresh()
+    assert calls["n"] >= 2
+    assert result.claude.available is True
+    assert result.claude.remaining_pct == 75.0
+    assert "claude" not in limits._429_snapshots
+
+
+def test_get_limits_fresh_uses_short_retry_timeout_after_429(monkeypatch):
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    calls: list[int] = []
+
+    def fake_run(timeout_sec):
+        calls.append(timeout_sec)
+        return {
+            "claude": {"error": "HTTP 429"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_run_cclimits_with_timeout", fake_run)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    limits._get_limits_fresh()
+
+    assert calls == [
+        limits._CCLIMITS_TIMEOUT_SEC,
+        limits._CCLIMITS_429_RETRY_TIMEOUT_SEC,
+        limits._CCLIMITS_429_RETRY_TIMEOUT_SEC,
+    ]
+
+
+def test_get_limits_fresh_falls_back_to_cache_on_persistent_429(monkeypatch):
+    """When 429 persists after retries, fall back to cached data."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429", "details": "Too Many Requests"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    # Pre-populate cache with good data
+    good_cache = limits.AllLimits(
+        claude=limits.ProviderLimits(
+            available=True, remaining_pct=60.0, resets_in_sec=1800,
+            windows={"five_hour": limits.WindowData(remaining_pct=60.0, resets_in_sec=1800)},
+        ),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=99.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=90.0),
+    )
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", (good_cache, time.monotonic()))
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    # Suppress Telegram notifications in tests
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits._get_limits_fresh()
+
+    assert result.claude.available is True
+    assert result.claude.remaining_pct == 60.0
+    assert "429" in result.claude.error
+    assert "claude" in limits._429_snapshots
+
+
+def test_get_limits_fresh_ignores_stale_cache_on_persistent_429(monkeypatch):
+    """A stale global cache must not seed the first 429 fallback snapshot."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429", "details": "Too Many Requests"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    stale_cache = limits.AllLimits(
+        claude=limits.ProviderLimits(
+            available=True, remaining_pct=60.0, resets_in_sec=1800,
+            windows={"five_hour": limits.WindowData(remaining_pct=60.0, resets_in_sec=1800)},
+        ),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=99.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=90.0),
+    )
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(
+        limits,
+        "_limits_cache",
+        (stale_cache, time.monotonic() - limits._429_MAX_BASE_AGE_SEC - 1),
+    )
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits._get_limits_fresh()
+
+    assert result.claude.available is True
+    assert result.claude.remaining_pct == 100.0
+    assert "assumed available" in result.claude.error
+
+
+def test_get_limits_fresh_ignores_error_cache_on_persistent_429(monkeypatch):
+    """A fresh cache entry without real capacity data must not seed 429 fallback."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429", "details": "Too Many Requests"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    error_cache = limits.AllLimits(
+        claude=limits.ProviderLimits(error="cclimits timeout"),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=99.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=90.0),
+    )
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", (error_cache, time.monotonic()))
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits._get_limits_fresh()
+
+    assert result.claude.available is True
+    assert result.claude.remaining_pct == 100.0
+    assert "assumed available" in result.claude.error
+
+
+def test_apply_429_fallback_ignores_stale_active_snapshot(monkeypatch):
+    """An active 429 provider must not keep using a base snapshot older than 1h."""
+    _reset_429_state(monkeypatch)
+
+    stale_base = limits.ProviderLimits(
+        available=True,
+        remaining_pct=25.0,
+        resets_in_sec=1200,
+        windows={"five_hour": limits.WindowData(remaining_pct=25.0, resets_in_sec=1200)},
+    )
+    monkeypatch.setattr(
+        limits,
+        "_429_snapshots",
+        {"claude": (stale_base, time.monotonic() - limits._429_MAX_BASE_AGE_SEC - 1)},
+    )
+    monkeypatch.setattr(limits, "_429_estimated_usage", {"claude": {"five_hour": 12.0}})
+    monkeypatch.setattr(limits, "_limits_cache", None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(error="HTTP 429"),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=90.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=85.0),
+    )
+
+    adjusted = limits._apply_429_fallback(result, {"claude"})
+
+    assert adjusted.claude.remaining_pct == 100.0
+    assert "assumed available" in adjusted.claude.error
+    assert limits._429_estimated_usage["claude"] == {}
+
+
+def test_get_limits_fresh_uses_optimistic_on_cold_start_429(monkeypatch):
+    """When 429 occurs without cache, assume provider is available."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", None)
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits._get_limits_fresh()
+
+    assert result.claude.available is True
+    assert result.claude.remaining_pct == 100.0
+    assert "assumed available" in result.claude.error
+
+
+def test_get_limits_fresh_accumulates_estimated_usage(monkeypatch):
+    """Estimated usage is subtracted from cached data across multiple calls."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    good_cache = limits.AllLimits(
+        claude=limits.ProviderLimits(
+            available=True, remaining_pct=50.0, resets_in_sec=1800,
+            windows={"five_hour": limits.WindowData(remaining_pct=50.0, resets_in_sec=1800)},
+        ),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=99.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=90.0),
+    )
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", (good_cache, time.monotonic()))
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    # First call: 429, fall back to cache (50%)
+    result1 = limits._get_limits_fresh()
+    assert result1.claude.remaining_pct == 50.0
+
+    # Simulate task consuming estimated 10%
+    limits.report_estimated_usage("claude", 10.0)
+
+    # Second call: 429 still, should show 50% - 10% = 40%
+    result2 = limits._get_limits_fresh()
+    assert result2.claude.remaining_pct == 40.0
+    assert result2.claude.available is True
+
+    # Simulate another task consuming 5%
+    limits.report_estimated_usage("claude", 5.0)
+
+    # Third call: should show 50% - 15% = 35%
+    result3 = limits._get_limits_fresh()
+    assert result3.claude.remaining_pct == 35.0
+
+
+def test_get_limits_fresh_clears_429_state_when_resolved(monkeypatch):
+    """When 429 clears, reset all estimation state."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    calls = {"n": 0}
+    def fake_run_cclimits():
+        calls["n"] += 1
+        if calls["n"] <= 3:  # first 3 calls: 429 (initial + 2 retries)
+            return {
+                "claude": {"error": "HTTP 429"},
+                "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+                "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+            }
+        return {
+            "claude": {"status": "ok", "five_hour": {"remaining": "70%", "resets_in": "2h"}},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    good_cache = limits.AllLimits(
+        claude=limits.ProviderLimits(
+            available=True, remaining_pct=80.0, resets_in_sec=3600,
+            windows={"five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600)},
+        ),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=99.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=90.0),
+    )
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", (good_cache, time.monotonic()))
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+    monkeypatch.setattr(notifier, "notify_limits_429_cleared", lambda *a: None)
+
+    # First call: 429 with cache fallback
+    result1 = limits._get_limits_fresh()
+    assert "claude" in limits._429_snapshots
+    limits.report_estimated_usage("claude", 10.0)
+
+    # Second call: 429 clears (call #4+ returns real data)
+    result2 = limits._get_limits_fresh()
+    assert result2.claude.remaining_pct == 70.0
+    assert "claude" not in limits._429_snapshots
+    assert limits._429_estimated_usage == {}
+
+
+def test_compute_next_poll_sec_returns_429_interval():
+    """When _429_snapshots is not empty, poll interval should be _BG_POLL_429_SEC."""
+    import limits as lm
+    old = lm._429_snapshots
+    try:
+        dummy_pl = limits.ProviderLimits()
+        lm._429_snapshots = {"claude": (dummy_pl, 0.0)}
+        result = limits.AllLimits(
+            claude=limits.ProviderLimits(available=True, remaining_pct=50.0, resets_in_sec=3600),
+            gemini=limits.ProviderLimits(error="missing"),
+            codex=limits.ProviderLimits(error="missing"),
+        )
+        assert limits._compute_next_poll_sec(result) == limits._BG_POLL_429_SEC
+    finally:
+        lm._429_snapshots = old
+
+
+def test_notify_429_sent_only_once_per_period(monkeypatch):
+    """Telegram 429 notification is sent only once per 429 period per provider."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    notify_calls = []
+    def fake_notify(name, pct):
+        notify_calls.append(name)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    good_cache = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
+            "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+        }),
+    )
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", (good_cache, time.monotonic()))
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", fake_notify)
+
+    # Call twice — notification only once
+    limits._get_limits_fresh()
+    limits._get_limits_fresh()
+
+    assert notify_calls == ["claude"]
+
+
+def test_apply_429_fallback_re_notifies_after_provider_recovers(monkeypatch):
+    """A provider that recovers during another provider's 429 period can notify again."""
+    _reset_429_state(monkeypatch)
+
+    notify_calls = []
+
+    def fake_notify(name, pct):
+        notify_calls.append(name)
+
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", fake_notify)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+    monkeypatch.setattr(limits, "_429_notified", {"claude", "gemini"})
+
+    result_recovered = limits.AllLimits(
+        claude=limits.ProviderLimits(
+            available=True,
+            remaining_pct=70.0,
+            resets_in_sec=1800,
+            windows={"five_hour": limits.WindowData(remaining_pct=70.0, resets_in_sec=1800)},
+        ),
+        gemini=limits.ProviderLimits(error="HTTP 429"),
+        codex=limits.ProviderLimits(available=True, remaining_pct=80.0),
+    )
+
+    limits._apply_429_fallback(result_recovered, {"gemini"})
+    assert limits._429_notified == {"gemini"}
+
+    result_second_429 = limits.AllLimits(
+        claude=limits.ProviderLimits(error="HTTP 429"),
+        gemini=limits.ProviderLimits(error="HTTP 429"),
+        codex=limits.ProviderLimits(available=True, remaining_pct=80.0),
+    )
+
+    limits._apply_429_fallback(result_second_429, {"claude", "gemini"})
+
+    assert notify_calls == ["claude"]

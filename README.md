@@ -10,7 +10,7 @@ Ziel: Routinearbeit aus einer Markdown-Queue ausführen lassen (Code, Reviews, T
 - Limit-/Kapazitätsprüfung via `npx cclimits`
 - Retry-Handling bei Rate-Limits / Provider-Ausfällen
 - Obsidian-Queue mit `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*`
-- Tool-Loops (`dev-loop`, `review-loop`, `test-loop`)
+- Tool-Loops (`dev-loop`, `review-loop`, `test-loop`, `research-qa`)
 - Skills/`SKILL.md` Discovery + Requirements-Gating
 - Memory (TF-IDF + Temporal Decay) für wiederkehrende Tasks
 - Execution Profiles (Provider-Reihenfolge, erlaubte Skills, Timeout, Policy-Overrides)
@@ -94,6 +94,7 @@ Die Queue wird aus Markdown gelesen. Offene Aufgaben sind normale Checkbox-Zeile
 - [ ] Review + fix repo #tool:review-loop cwd:"D:\projects\my repo" #agent:work
 - [ ] Fix login bug #tool:dev-loop cwd:D:\projects\app
 - [ ] Add CSV export to dashboard #tool:dev-loop cwd:D:\projects\app #agent:work
+- [ ] Add OAuth2 login flow #tool:research-qa cwd:D:\projects\app
 ```
 
 Der Orchestrator ergänzt automatisch:
@@ -152,9 +153,14 @@ Aktuell registrierte `#tool:`-Handler:
   - Beide Reviews müssen bestehen; kein Auto-Push
   - Output in `{cwd}/.dev-loop/` (research.md, round-NNN.md, summary.md)
 - `review-loop`
-  - Iterativer Review -> Fix -> Re-Review Loop (P1/P2/P3)
+  - Iterativer Review -> Fix -> Re-Review Loop (P1/P2/P3, alle Findings werden gefixt)
+  - Max 20 Iterationen, Infinite-Loop-Detection via Signature-Vergleich
 - `test-loop`
   - Iterativer Test/Fix Loop (bis Tests grün oder Max-Iterationen)
+- `research-qa`
+  - Read-only Pre-Implementation Research (Discovery -> Analysis -> Fragen-Katalog)
+  - Output in `{cwd}/.research-qa/` (01-discovery.md, 02-analysis.md, 03-questions.md, research-qa-complete.md)
+  - Keine Code-Änderungen — nur Analyse und Fragen mit [BLOCKING]-Markierungen
 
 Tool-Liste anzeigen:
 
@@ -209,6 +215,49 @@ Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED)
 | `TOOL_DEV_EXEC_TIMEOUT_SEC` | 2400 (40 min) | Execution |
 | `TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC` | 1200 (20 min) | Quality Review |
 | `TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC` | 600 (10 min) | Resolution Review |
+
+## Research-QA (`#tool:research-qa`)
+
+Der `research-qa` ist ein drei-phasiger Read-only Workflow für Pre-Implementation Research:
+
+```
+Phase 1 — Discovery
+  Erkundet Codebase: Docs, Verzeichnisstruktur, relevante Source-Files,
+  Tests, Configs, Git-History. Kein Code wird verändert.
+  → Gespeichert in {cwd}/.research-qa/01-discovery.md
+
+Phase 2 — Analysis
+  Tiefenanalyse: 2-3 Implementierungsansätze (Pros/Cons/Effort/Risk),
+  Security, Performance, Testing-Strategie, Risiken, Edge Cases.
+  → Gespeichert in {cwd}/.research-qa/02-analysis.md
+
+Phase 3 — Questions
+  Priorisierter Fragen-Katalog (8-20 Fragen) mit:
+  - [BLOCKING]-Markierungen für kritische Blocker
+  - Konkreten Code-Referenzen
+  - Vorgeschlagenen Optionen (Option A / Option B)
+  Kategorien: Requirements, Architecture, Scope, Technical Unknowns,
+  Risk & Rollback, Testing & Validation.
+  → Gespeichert in {cwd}/.research-qa/03-questions.md
+
+→ Kombiniertes Dokument: {cwd}/.research-qa/research-qa-complete.md
+→ Keine Code-Änderungen — reine Analyse und Fragen.
+```
+
+**Queue-Beispiele:**
+
+```md
+- [ ] Add OAuth2 login flow #tool:research-qa cwd:D:\projects\app
+- [ ] Migrate DB from SQLite to Postgres #tool:research-qa cwd:D:\projects\backend
+```
+
+**Konfiguration in `config.py`:**
+
+| Konstante | Default | Phase |
+|---|---|---|
+| `TOOL_RQA_DISCOVERY_TIMEOUT_SEC` | 1200 (20 min) | Discovery |
+| `TOOL_RQA_ANALYSIS_TIMEOUT_SEC` | 1200 (20 min) | Analysis |
+| `TOOL_RQA_QUESTIONS_TIMEOUT_SEC` | 600 (10 min) | Questions |
 
 ## Skills (`SKILL.md`)
 
@@ -518,7 +567,7 @@ orchestrator.py
   -> telegram_listener.py   (Telegram Commands + Chat)
   -> notifier.py            (Telegram Notifications)
   -> shutdown.py            (Shutdown Countdown / Cancel)
-  -> limits.py              (cclimits Wrapper / Provider-Kapazität, TTL-Cache)
+  -> limits.py              (cclimits Wrapper / Provider-Kapazität, TTL-Cache, HTTP 429 Resilience)
   -> logging_setup.py       (Rotating File Logger)
   -> doctor.py              (Setup-Validierung / --doctor)
   -> config.py              (Konstanten, .env, SOUL.md Loader)

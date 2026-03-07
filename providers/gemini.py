@@ -16,16 +16,27 @@ _GEMINI_CMD = "gemini"
 class GeminiProvider(BaseProvider):
     name = "gemini"
 
-    def run(self, task: str, cwd: str | None = None, timeout: int = TASK_TIMEOUT_SEC) -> RunResult:
+    def run(
+        self,
+        task: str,
+        cwd: str | None = None,
+        timeout: int = TASK_TIMEOUT_SEC,
+        read_only: bool = False,
+    ) -> RunResult:
         print(f"  [gemini] Führe Task aus...")
         try:
+            cmd = [
+                _GEMINI_CMD,
+                "--prompt", "",
+                "--output-format", "text",
+            ]
+            if read_only:
+                # In non-interactive mode, default approval excludes shell/edit/write tools.
+                cmd.extend(["--approval-mode", "default"])
+            else:
+                cmd.append("--yolo")
             result = subprocess.run(
-                [
-                    _GEMINI_CMD,
-                    "--prompt", "",
-                    "--yolo",
-                    "--output-format", "text",
-                ],
+                cmd,
                 input=task,
                 capture_output=True,
                 text=True,

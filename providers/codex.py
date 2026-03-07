@@ -15,16 +15,33 @@ _CODEX_CMD = "codex"
 class CodexProvider(BaseProvider):
     name = "codex"
 
-    def run(self, task: str, cwd: str | None = None, timeout: int = TASK_TIMEOUT_SEC) -> RunResult:
+    @staticmethod
+    def _build_command(read_only: bool) -> list[str]:
+        cmd = [
+            _CODEX_CMD,
+            "exec",
+        ]
+        if read_only:
+            # research-qa runs fully unattended, so read-only mode must also avoid
+            # approval prompts while still enforcing a read-only sandbox.
+            cmd.extend(["--ask-for-approval", "never", "--sandbox", "read-only"])
+        else:
+            cmd.append("--full-auto")
+        cmd.append("-")
+        return cmd
+
+    def run(
+        self,
+        task: str,
+        cwd: str | None = None,
+        timeout: int = TASK_TIMEOUT_SEC,
+        read_only: bool = False,
+    ) -> RunResult:
         print(f"  [codex] Führe Task aus...")
         try:
+            cmd = self._build_command(read_only=read_only)
             result = subprocess.run(
-                [
-                    _CODEX_CMD,
-                    "exec",
-                    "--full-auto",
-                    "-",
-                ],
+                cmd,
                 input=task,
                 capture_output=True,
                 text=True,

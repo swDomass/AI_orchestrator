@@ -68,7 +68,7 @@ _FIX_PROMPT_BODY = """
 You are fixing issues found by a code review (iteration {iteration}).
 
 Task:
-- Fix ALL P1, P2, P3 issues listed below.
+- Fix ALL P1, P2, and P3 issues listed below.
 - Apply changes directly to the files.
 - Run validation/tests if feasible.
 - Summarize what was fixed.
@@ -80,7 +80,10 @@ Review findings:
 
 class ReviewLoopTool(BaseTool):
     name = "review-loop"
-    description = "Review/Fix-Loop auf uncommitted Changes (max 10, P3-only x3 = Exit)"
+
+    @property
+    def description(self) -> str:
+        return f"Review/Fix-Loop auf uncommitted Changes (max {TOOL_MAX_ITERATIONS}, P1-P3 alle fixen)"
 
     def run(
         self,
@@ -96,10 +99,12 @@ class ReviewLoopTool(BaseTool):
         review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
         seen_signatures: set[tuple[str, ...]] = set()
         all_outputs: list[str] = []
-        consecutive_p3_only = 0
 
         review_timeout = timeout or TOOL_REVIEW_TIMEOUT_SEC
         fix_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
+
+        total_input_tokens = 0
+        total_output_tokens = 0
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: REVIEW ===")
@@ -110,6 +115,8 @@ class ReviewLoopTool(BaseTool):
                 cwd=cwd,
                 timeout=review_timeout,
             )
+            total_input_tokens += review_result.input_tokens
+            total_output_tokens += review_result.output_tokens
 
             if not review_result.success:
                 msg = f"Review fehlgeschlagen: {review_result.error}"
@@ -122,6 +129,8 @@ class ReviewLoopTool(BaseTool):
                     error=msg,
                     error_code=review_result.error,
                     retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             all_outputs.append(f"--- Review {iteration} ---\n{review_result.output}")
@@ -141,6 +150,8 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             print(f"  [review-loop] {len(findings)} Findings gefunden")
@@ -158,29 +169,13 @@ class ReviewLoopTool(BaseTool):
                     success=True,
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
-
-            p3_only = bool(findings) and all(f.startswith("- [P3]") for f in findings)
-            if p3_only:
-                consecutive_p3_only += 1
-                if consecutive_p3_only >= 3:
-                    msg = (
-                        "Nur P3-Findings in 3 Iterationen in Folge. "
-                        "Loop beendet (P3-Exit-Regel)."
-                    )
-                    print(f"  [review-loop] ✅ {msg}")
-                    notify_tool_done(self.name, iteration, True, msg)
-                    return ToolResult(
-                        success=True,
-                        output="\n\n".join(all_outputs),
-                        iterations=iteration,
-                    )
-            else:
-                consecutive_p3_only = 0
 
             # Check for repeated findings (infinite loop detection)
             signature = tuple(sorted(findings))
-            if not p3_only and signature in seen_signatures:
+            if signature in seen_signatures:
                 msg = f"Findings wiederholen sich nach {iteration} Iterationen. Loop beendet."
                 print(f"  [review-loop] ⚠️ {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
@@ -189,6 +184,8 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
             seen_signatures.add(signature)
 
@@ -207,6 +204,8 @@ class ReviewLoopTool(BaseTool):
                 cwd=cwd,
                 timeout=fix_timeout,
             )
+            total_input_tokens += fix_result.input_tokens
+            total_output_tokens += fix_result.output_tokens
 
             if not fix_result.success:
                 msg = f"Fix fehlgeschlagen in Iteration {iteration}: {fix_result.error}"
@@ -219,6 +218,8 @@ class ReviewLoopTool(BaseTool):
                     error=msg,
                     error_code=fix_result.error,
                     retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
@@ -236,4 +237,6 @@ class ReviewLoopTool(BaseTool):
             output="\n\n".join(all_outputs),
             iterations=TOOL_MAX_ITERATIONS,
             error=msg,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
         )

@@ -48,7 +48,7 @@ def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(mo
     assert "UNCOMMITTED changes" in provider.prompts[0]
 
 
-def test_review_loop_exits_after_three_consecutive_p3_only_iterations(monkeypatch):
+def test_review_loop_fixes_p3_findings_too(monkeypatch):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
@@ -57,9 +57,7 @@ def test_review_loop_exits_after_three_consecutive_p3_only_iterations(monkeypatc
         outputs=[
             "- [P3] docs typo 1",
             "Fixed typo 1",
-            "- [P3] docs typo 2",
-            "Fixed typo 2",
-            "- [P3] docs typo 3",
+            "No P1/P2/P3 findings.",
         ]
     )
     tool = ReviewLoopTool()
@@ -67,6 +65,31 @@ def test_review_loop_exits_after_three_consecutive_p3_only_iterations(monkeypatc
     result = tool.run("Review now", provider, cwd=".")
 
     assert result.success is True
-    assert result.iterations == 3
-    # Review, fix, review, fix, review (no fix in iteration 3 due P3-only exit rule)
-    assert len(provider.prompts) == 5
+    assert result.iterations == 2
+    assert len(provider.prompts) == 3
+    assert "docs typo 1" in provider.prompts[1]
+    assert "--- Fix 1 ---" in result.output
+
+def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch):
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+
+    provider = _ScriptedProvider(
+        outputs=[
+            "- [P3] Minor issue 1",
+            "Fixing 1",
+            "- [P3] Minor issue 2",
+            "Fixing 2",
+            "- [P3] Minor issue 3",
+            "Fixing 3",
+            "No P1/P2/P3 findings.",
+        ]
+    )
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=".")
+
+    assert result.success is True
+    assert result.iterations == 4
+    assert len(provider.prompts) == 7

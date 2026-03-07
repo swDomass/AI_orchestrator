@@ -299,6 +299,57 @@ def test_run_single_subtask_applies_forced_claude_model(monkeypatch):
     assert result.provider_name == "claude"
 
 
+def test_run_single_subtask_reports_estimated_usage_for_plain_tasks(monkeypatch):
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="codex")
+    subtask = SubTask(
+        text="Do the thing",
+        provider_forced=None,
+        cwd=None,
+        tool_name=None,
+        timeout=30,
+    )
+
+    reported = []
+
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *_args, **_kwargs: "prompt")
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_with_retry",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(
+                success=True,
+                output="ok",
+                error="",
+                input_tokens=123,
+                output_tokens=45,
+            ),
+            0.0,
+        ),
+    )
+    monkeypatch.setattr(parallel_runner_module, "estimate_task_usage_pct", lambda *a, **kw: 7.5)
+    monkeypatch.setattr(
+        parallel_runner_module,
+        "report_estimated_usage",
+        lambda provider_name, estimated_pct: reported.append((provider_name, estimated_pct)),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask,
+        idx=0,
+        limits=AllLimits(),
+        memory_context="",
+        pause_event=None,
+    )
+
+    assert result.success is True
+    assert reported == [("codex", 7.5)]
+
+
 def test_run_single_subtask_tool_success_preserves_tool_output(monkeypatch):
     import dispatcher
     import orchestrator

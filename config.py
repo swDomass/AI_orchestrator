@@ -108,6 +108,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 # When to notify (all default True)
+NOTIFY_ON_TASK_STARTED = True
 NOTIFY_ON_TASK_DONE = True
 NOTIFY_ON_ERROR = True
 NOTIFY_ON_QUEUE_COMPLETE = True
@@ -129,7 +130,7 @@ TELEGRAM_MAX_TASK_LENGTH = 500
 
 # --- Tools ---
 # Max iterations for review/fix loops
-TOOL_MAX_ITERATIONS = 10
+TOOL_MAX_ITERATIONS = 20
 TOOL_REVIEW_TIMEOUT_SEC = 1_200  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
 TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations
@@ -139,6 +140,11 @@ TOOL_DEV_RESEARCH_TIMEOUT_SEC          = 1_200  # 20 min: Research phase
 TOOL_DEV_EXEC_TIMEOUT_SEC              = 2_400  # 40 min: Execution phase
 TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC    = 1_200  # 20 min: Code Quality Review
 TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC =   600  # 10 min: Issue Resolution Review
+
+# Research-QA timeouts (Discovery → Analysis → Questions)
+TOOL_RQA_DISCOVERY_TIMEOUT_SEC = 1_200  # 20 min: Codebase exploration
+TOOL_RQA_ANALYSIS_TIMEOUT_SEC  = 1_200  # 20 min: Deep analysis
+TOOL_RQA_QUESTIONS_TIMEOUT_SEC =   600  # 10 min: Question generation
 
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
@@ -200,6 +206,19 @@ USAGE_SUGGEST_CLAUDE_MODEL = CLAUDE_MODEL_ALIASES["claude_haiku"]
 
 # --- Startup ---
 STARTUP_DELAY_SEC = 5 * 60  # 5 minutes: wait for tokens to renew
+
+# --- 429 Token Estimation ---
+# Chars-per-token ratio for text-based estimation (fallback when no real token counts)
+ESTIMATE_CHARS_PER_TOKEN = int(os.getenv("ORCH_CHARS_PER_TOKEN", "4"))
+# Output tokens are weighted heavier for rate-limit capacity (Anthropic weights ~5:1)
+ESTIMATE_OUTPUT_TOKEN_WEIGHT = float(os.getenv("ORCH_OUTPUT_TOKEN_WEIGHT", "5"))
+# Effective tokens (input + output*weight) that equal 1% of primary window capacity.
+# Tune per subscription plan. These defaults assume Claude Max / Gemini free / Codex Plus.
+ESTIMATE_TOKENS_PER_PCT: dict[str, int] = {
+    "claude": int(os.getenv("ORCH_TOKENS_PER_PCT_CLAUDE", "15000")),
+    "gemini": int(os.getenv("ORCH_TOKENS_PER_PCT_GEMINI", "100000")),
+    "codex": int(os.getenv("ORCH_TOKENS_PER_PCT_CODEX", "30000")),
+}
 
 # --- Shutdown ---
 SHUTDOWN_DELAY_SEC = 60

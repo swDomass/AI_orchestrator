@@ -13,9 +13,10 @@ Different CWD groups run in parallel threads.
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field, replace
 
-from limits import AllLimits
+from limits import AllLimits, estimate_task_usage_pct, report_estimated_usage
 
 logger = logging.getLogger(__name__)
 
@@ -141,10 +142,24 @@ def _run_single_subtask(
 
         # Plain single-shot subtask
         prompt = _build_prompt(subtask.text, provider.name, memory_context=memory_context)
+        start_time = time.time()
         result, _ = _run_with_retry(
             provider, subtask.text, prompt, subtask.cwd, subtask.timeout,
             pause_event=pause_event,
         )
+        duration = time.time() - start_time
+        if result.error not in ("rate_limit", "unreachable", "paused"):
+            report_estimated_usage(
+                provider.name,
+                estimate_task_usage_pct(
+                    duration,
+                    input_tokens=getattr(result, "input_tokens", 0),
+                    output_tokens=getattr(result, "output_tokens", 0),
+                    prompt_text=prompt,
+                    output_text=result.output,
+                    provider=provider.name,
+                ),
+            )
         return SubTaskResult(
             text=subtask.text,
             provider_name=provider.name,

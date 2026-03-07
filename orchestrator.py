@@ -49,12 +49,13 @@ from config import (
     get_system_prompt,
 )
 from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag
-from limits import get_limits, AllLimits
+from limits import get_limits, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
     notify_error,
     notify_providers_exhausted,
     notify_queue_complete,
     notify_task_done,
+    notify_task_started,
     start_session,
 )
 from providers.base import RunResult
@@ -463,9 +464,10 @@ def _execute_tool_task(
             return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
 
     # Safety: snapshot before execution
+    tool_is_read_only = getattr(tool, "read_only", False)
     is_git = bool(cwd) and _is_git_repo(cwd)
     snap_before = _snapshot_dir(cwd) if cwd and TRACK_FILE_CHANGES else None
-    if cwd:
+    if cwd and not tool_is_read_only:
         _git_snapshot(cwd, is_git=is_git)
 
     print(f"  → Tool: {tool.name} ({tool.description})")
@@ -473,6 +475,17 @@ def _execute_tool_task(
     _tool_start = time.time()
     tool_result = tool.run(clean_task, provider, cwd=cwd, timeout=timeout, memory_context=memory_context)
     _tool_duration = time.time() - _tool_start
+
+    # Track estimated usage for 429 capacity estimation
+    if (tool_result.error_code or "") not in ("rate_limit", "unreachable"):
+        report_estimated_usage(provider.name, estimate_task_usage_pct(
+            _tool_duration,
+            input_tokens=tool_result.input_tokens,
+            output_tokens=tool_result.output_tokens,
+            prompt_text=clean_task,
+            output_text=tool_result.output,
+            provider=provider.name,
+        ))
 
     # Safety: build change summary
     change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
@@ -776,6 +789,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # --- Feature 7: Parallel sub-agent spawning ---
         if getattr(queue_task, "subtasks", None):
             print(f"  [parallel] {len(task_subtasks)} Subtask(s)")
+            notify_task_started(task, "parallel")
             try:
                 from parallel_runner import run_parallel, format_parallel_result
                 results = run_parallel(
@@ -836,6 +850,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     return False
 
                 print(f"  → Provider: {provider.name}")
+                if not tried_providers:
+                    notify_task_started(task, provider.name)
                 previous_forced_model = None
                 if provider.name == "claude":
                     previous_forced_model = getattr(provider, "_forced_model", None)
@@ -932,6 +948,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 break
 
             print(f"  → Provider: {provider.name}")
+            if not tried_providers:
+                notify_task_started(task, provider.name)
             previous_forced_model = None
             if provider.name == "claude":
                 previous_forced_model = getattr(provider, "_forced_model", None)
@@ -946,13 +964,25 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 if provider.name == "claude":
                     setattr(provider, "_forced_model", previous_forced_model)
 
+            # Track estimated usage for 429 capacity estimation
+            _task_duration = time.time() - start_time
+            if result.error not in ("rate_limit", "unreachable", "paused"):
+                report_estimated_usage(provider.name, estimate_task_usage_pct(
+                    _task_duration,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    prompt_text=prompt,
+                    output_text=result.output,
+                    provider=provider.name,
+                ))
+
             if result.error == "paused":
                 print("\n[pause] Queue-Verarbeitung pausiert.")
                 append_log("Queue-Verarbeitung pausiert")
                 return False
 
             if result.success:
-                duration = time.time() - start_time
+                duration = _task_duration
                 print(f"  ✅ Erledigt ({len(result.output)} Zeichen Output)")
                 change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
                 if change_summary:

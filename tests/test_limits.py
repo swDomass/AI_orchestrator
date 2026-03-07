@@ -439,6 +439,8 @@ def _reset_429_state(monkeypatch):
     monkeypatch.setattr(limits, "_429_snapshots", {})
     monkeypatch.setattr(limits, "_429_estimated_usage", {})
     monkeypatch.setattr(limits, "_429_notified", set())
+    # Disable local JSONL fallback so tests control which tier is exercised
+    monkeypatch.setattr(limits, "_get_claude_limits_from_local", lambda *_: None)
 
 
 def test_is_provider_429_detects_error():
@@ -680,7 +682,7 @@ def test_get_limits_fresh_uses_short_retry_timeout_after_429(monkeypatch):
 
     calls: list[int] = []
 
-    def fake_run(timeout_sec):
+    def fake_run(timeout_sec, **_kwargs):
         calls.append(timeout_sec)
         return {
             "claude": {"error": "HTTP 429"},
@@ -1058,3 +1060,225 @@ def test_apply_429_fallback_re_notifies_after_provider_recovers(monkeypatch):
     limits._apply_429_fallback(result_second_429, {"claude", "gemini"})
 
     assert notify_calls == ["claude"]
+
+
+# ── _get_claude_limits_from_local tests ───────────────────────────────────────
+
+def test_get_claude_limits_from_local_returns_none_for_empty_plan():
+    assert limits._get_claude_limits_from_local("") is None
+
+
+def test_get_claude_limits_from_local_returns_none_for_unknown_plan():
+    assert limits._get_claude_limits_from_local("unknown_xyz") is None
+
+
+def test_get_claude_limits_from_local_returns_none_when_claude_monitor_missing(monkeypatch):
+    """If claude_monitor is unavailable (ImportError), return None gracefully."""
+    import sys
+    # Block the top-level package so the internal imports raise ImportError
+    monkeypatch.setitem(sys.modules, "claude_monitor", None)
+    result = limits._get_claude_limits_from_local("pro")
+    assert result is None
+
+
+def test_get_claude_limits_from_local_handles_runtime_exception(monkeypatch):
+    """Any unexpected exception inside the function is caught and returns None."""
+    import sys
+    # Remove any previously cached modules so the inner import is attempted
+    for key in list(sys.modules):
+        if key.startswith("claude_monitor"):
+            monkeypatch.delitem(sys.modules, key, raising=False)
+
+    class _BadModule:
+        """Importable stub that raises on attribute access."""
+        def __getattr__(self, name):
+            raise RuntimeError("simulated failure")
+
+    monkeypatch.setitem(sys.modules, "claude_monitor.core.models", _BadModule())
+    result = limits._get_claude_limits_from_local("pro")
+    assert result is None
+
+
+def test_get_claude_limits_from_local_returns_full_capacity_when_no_block_is_active(monkeypatch):
+    pytest.importorskip("claude_monitor")
+    import datetime as dt
+    import claude_monitor.data.analyzer as analyzer
+    import claude_monitor.data.reader as reader
+
+    class FakeAnalyzer:
+        def __init__(self, session_duration_hours):
+            assert session_duration_hours == 5
+
+        def transform_to_blocks(self, entries):
+            return [
+                SimpleNamespace(
+                    is_active=False,
+                    end_time=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1),
+                    token_counts=SimpleNamespace(total_tokens=19_000),
+                )
+            ]
+
+    monkeypatch.setattr(reader, "load_usage_entries", lambda **_kwargs: ([object()], None))
+    monkeypatch.setattr(analyzer, "SessionAnalyzer", FakeAnalyzer)
+
+    result = limits._get_claude_limits_from_local("pro")
+
+    assert result is not None
+    assert result.available is True
+    assert result.remaining_pct == 100.0
+    assert result.resets_in_sec == 0
+    assert result.windows["five_hour"].remaining_pct == 100.0
+
+
+# ── _run_cclimits_impl cache-ttl flag tests ───────────────────────────────────
+
+def test_run_cclimits_impl_includes_cache_ttl_when_use_cache_true(monkeypatch):
+    from types import SimpleNamespace
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return SimpleNamespace(returncode=0, stdout="{}")
+
+    monkeypatch.setattr(limits.subprocess, "run", fake_run)
+    result = limits._run_cclimits_impl(5, use_cache=True)
+    assert "--cache-ttl" in captured["cmd"]
+    assert str(limits._CCLIMITS_CACHE_TTL_SEC) in captured["cmd"]
+    assert result == {}
+
+
+def test_run_cclimits_impl_omits_cache_ttl_when_use_cache_false(monkeypatch):
+    from types import SimpleNamespace
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return SimpleNamespace(returncode=0, stdout="{}")
+
+    monkeypatch.setattr(limits.subprocess, "run", fake_run)
+    result = limits._run_cclimits_impl(5, use_cache=False)
+    assert "--cache-ttl" not in captured["cmd"]
+    assert result == {}
+
+
+def test_run_cclimits_impl_retries_without_cache_ttl_when_flag_is_unsupported(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            return SimpleNamespace(
+                returncode=2,
+                stdout="",
+                stderr="error: unrecognized arguments: --cache-ttl",
+            )
+        return SimpleNamespace(returncode=0, stdout='{"claude": {"status": "ok"}}', stderr="")
+
+    monkeypatch.setattr(limits.subprocess, "run", fake_run)
+
+    result = limits._run_cclimits_impl(5, use_cache=True)
+
+    assert result == {"claude": {"status": "ok"}}
+    assert "--cache-ttl" in calls[0]
+    assert "--cache-ttl" not in calls[1]
+
+
+# ── Tier 0 (local JSONL) fallback path in _apply_429_fallback ─────────────────
+
+def test_apply_429_fallback_tier0_uses_local_data(monkeypatch):
+    """When local JSONL data is available it takes precedence over snapshot/cache."""
+    _reset_429_state(monkeypatch)
+
+    local_pl = limits.ProviderLimits(
+        available=True,
+        remaining_pct=75.0,
+        resets_in_sec=3600,
+        windows={"five_hour": limits.WindowData(remaining_pct=75.0, resets_in_sec=3600)},
+        error="HTTP 429 (local-files)",
+    )
+    monkeypatch.setattr(limits, "_get_claude_limits_from_local", lambda *_: local_pl)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(error="HTTP 429"),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=90.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=85.0),
+    )
+
+    adjusted = limits._apply_429_fallback(result, {"claude"})
+
+    assert adjusted.claude.remaining_pct == 75.0
+    assert adjusted.claude.available is True
+    assert "local-files" in adjusted.claude.error
+    assert "claude" in limits._429_snapshots
+    assert limits._429_estimated_usage.get("claude") == {}
+
+
+def test_apply_429_fallback_tier0_resets_estimated_usage(monkeypatch):
+    """Tier 0 discards accumulated estimated usage because local data is always fresh."""
+    _reset_429_state(monkeypatch)
+
+    local_pl = limits.ProviderLimits(
+        available=True,
+        remaining_pct=60.0,
+        resets_in_sec=1800,
+        windows={"five_hour": limits.WindowData(remaining_pct=60.0, resets_in_sec=1800)},
+        error="HTTP 429 (local-files)",
+    )
+    monkeypatch.setattr(limits, "_get_claude_limits_from_local", lambda *_: local_pl)
+    monkeypatch.setattr(limits, "_limits_cache", None)
+    monkeypatch.setattr(limits, "_429_estimated_usage", {"claude": {"five_hour": 20.0}})
+    monkeypatch.setattr(limits, "_429_snapshots", {"claude": (local_pl, 0.0)})
+
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(error="HTTP 429"),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=90.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=85.0),
+    )
+
+    limits._apply_429_fallback(result, {"claude"})
+
+    assert limits._429_estimated_usage["claude"] == {}
+
+
+def test_get_limits_fresh_uses_tier0_local_data_on_429(monkeypatch):
+    """End-to-end: 429 + local JSONL available → tier 0 result returned."""
+    _reset_bg_state(monkeypatch)
+    _reset_429_state(monkeypatch)
+
+    local_pl = limits.ProviderLimits(
+        available=True,
+        remaining_pct=70.0,
+        resets_in_sec=2400,
+        windows={"five_hour": limits.WindowData(remaining_pct=70.0, resets_in_sec=2400)},
+        error="HTTP 429 (local-files)",
+    )
+    # Override the fixture's disabled stub with real local data
+    monkeypatch.setattr(limits, "_get_claude_limits_from_local", lambda *_: local_pl)
+
+    def fake_run_cclimits():
+        return {
+            "claude": {"error": "HTTP 429"},
+            "gemini": {"status": "ok", "models": {"flash": {"remaining": "99%", "resets_in": "1h"}}},
+            "codex": {"status": "ok", "primary_window": {"remaining": "90%", "resets_in": "2h"}},
+        }
+
+    monkeypatch.setattr(limits, "_fresh_limits_lock", threading.Lock())
+    monkeypatch.setattr(limits, "_limits_cache", None)
+    monkeypatch.setattr(limits, "_run_cclimits", fake_run_cclimits)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_: None)
+    import notifier
+    monkeypatch.setattr(notifier, "notify_limits_429_fallback", lambda *a: None)
+
+    result = limits._get_limits_fresh()
+
+    assert result.claude.available is True
+    assert result.claude.remaining_pct == 70.0
+    assert "local-files" in result.claude.error
+    assert "claude" in limits._429_snapshots

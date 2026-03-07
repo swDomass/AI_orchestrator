@@ -61,6 +61,12 @@ PROVIDER_COOLDOWN_SEC = 30 * 60  # 30 minutes
 # Minimum remaining capacity to consider a provider usable (percent)
 MIN_CAPACITY_PERCENT = 5
 
+# Claude subscription plan — used by the local-file 429 fallback to calculate
+# remaining capacity from ~/.claude/projects JSONL data when cclimits is rate-limited.
+# Values: pro (19k tokens/5h), max5 (88k), max20 (220k), custom (44k).
+# Leave empty to disable the local fallback (existing snapshot logic is used instead).
+CLAUDE_PLAN = os.getenv("CLAUDE_PLAN", "")
+
 # How long to wait between cclimits polls when sleeping (seconds)
 SLEEP_POLL_INTERVAL = 5 * 60
 

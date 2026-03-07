@@ -55,7 +55,7 @@ Key components:
 - **`analytics.py`**: Parses task results, log files, queue events into `TaskRecord`/`LimitSnapshot`/`QueueEvent` dataclasses. Aggregation functions + `get_dashboard_data()` with 30s TTL cache
 - **`dashboard.py`**: Standalone HTTP server (port 8411) serving Chart.js dashboard. `GET /` HTML, `GET /api/data` JSON. Auto-refresh 60s. Also launchable via `--dashboard` flag
 - **`config.py`**: Centralized constants (~65+), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases
-- **`limits.py`**: `cclimits` wrapper for provider capacity checks, OAuth refresh handling. HTTP 429 resilience: retry with backoff, cache fallback with estimated usage tracking, Telegram notifications
+- **`limits.py`**: `cclimits` wrapper for provider capacity checks, OAuth refresh handling. Direct `cclimits` invocation (no npx); disk-cache via `--cache-ttl 600` limits API calls to ~6/h. HTTP 429 resilience: (tier 0) local JSONL fallback via `claude-monitor` (no HTTP, `CLAUDE_PLAN` env var), (tier 1) snapshot cache with estimated usage tracking, Telegram notifications on 429 start/clear.
 - **`logging_setup.py`**: Rotating file logger (5MB, 3 backups) + console output
 - **`doctor.py`**: 15+ setup validation checks, `--fix`/`--yes` auto-repair mode
 - **`shutdown.py`**: Shutdown state machine with countdown, cancellation via Telegram or new queue tasks
@@ -71,7 +71,7 @@ Key components:
 - **Subtask-aware queue mutations**: `mark_done/mark_retry/finalize_task_with_result` accept `subtasks` kwarg; `_replace_open_task_line` uses it to disambiguate duplicate task texts in parallel queues. Fallback re-scan is O(N) — skips subtask block scan for non-matching task lines.
 - **`task_subtasks` in run_once**: Extracted via `getattr(queue_task, "subtasks", None)` at loop start for test-mock compatibility (some tests use bare `SimpleNamespace`).
 - **`.env` comment stripping**: `_normalize_dotenv_value()` requires whitespace before `#` for unquoted values (protects URLs/paths containing `#`); quoted values allow `#` anywhere after the closing quote.
-- **HTTP 429 resilience**: When `cclimits` monitoring API returns 429, `limits.py` retries with backoff (5s/10s), falls back to cached data with estimated usage tracking (`_429_base_snapshot`, `_429_estimated_usage`), and backs off polling to 5 minutes. `report_estimated_usage()` called by orchestrator after each task subtracts estimated capacity. State resets when 429 clears. Telegram notifications on 429 start/clear.
+- **HTTP 429 resilience**: When `cclimits` monitoring API returns 429, `limits.py` retries with backoff (5s/10s), then applies 3-tier fallback: (0) local JSONL via `claude-monitor` (`_get_claude_limits_from_local`, `CLAUDE_PLAN` env var, uses `token_counts.total_tokens`), (1) snapshot cache with estimated usage tracking (`_429_base_snapshot`, `_429_estimated_usage`), (2) optimistic cold-start. Polls back off to 5 minutes. `report_estimated_usage()` called after each task. State resets when 429 clears. Disk-cache (`--cache-ttl 600`) reduces normal API calls.
 - **3-tier token estimation**: `estimate_task_usage_pct()` in `limits.py` — (1) actual token counts from Claude JSON output, (2) text-based estimate from prompt/output char lengths, (3) duration heuristic fallback. Configured per provider via `ESTIMATE_TOKENS_PER_PCT`.
 
 ## Testing Conventions

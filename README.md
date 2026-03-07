@@ -7,7 +7,7 @@ Ziel: Routinearbeit aus einer Markdown-Queue ausführen lassen (Code, Reviews, T
 ## Überblick
 
 - Multi-Provider Routing mit Fallback (`Claude -> Gemini -> Codex`)
-- Limit-/Kapazitätsprüfung via `npx cclimits`
+- Limit-/Kapazitätsprüfung via `cclimits` (mit lokalem JSONL-Fallback bei HTTP 429)
 - Retry-Handling bei Rate-Limits / Provider-Ausfällen
 - Obsidian-Queue mit `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*`
 - Tool-Loops (`dev-loop`, `review-loop`, `test-loop`, `research-qa`)
@@ -22,7 +22,7 @@ Ziel: Routinearbeit aus einer Markdown-Queue ausführen lassen (Code, Reviews, T
 ## Voraussetzungen
 
 - Python `3.10+`
-- Node.js (`npx` für `cclimits`)
+- `cclimits` CLI (`npm install -g cclimits`)
 - Installierte CLIs in `PATH`
   - `claude`
   - `gemini`
@@ -37,9 +37,10 @@ cd AI_orchestrator
 pip install -r requirements.txt
 ```
 
-`requirements.txt` enthält aktuell nur:
+`requirements.txt` enthält:
 
 - `pyyaml>=6.0`
+- `claude-monitor>=3.0.0` *(optional — aktiviert lokalen JSONL-Fallback für Claude HTTP 429; benötigt `CLAUDE_PLAN` in `.env`)*
 
 ## Konfiguration (`.env` / Environment)
 
@@ -53,6 +54,7 @@ Wichtige Variablen:
   - Optionaler direkter Pfad zur Queue-Datei (überschreibt Vault-Standardpfad)
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+- `CLAUDE_PLAN` *(optional — Claude-Abo-Plan für HTTP 429 JSONL-Fallback; Werte: `pro`, `max5`, `max20`, `custom`)*
 
 Standardpfad der Queue-Datei (wenn `ORCH_QUEUE_FILE` nicht gesetzt ist):
 
@@ -535,7 +537,7 @@ Wikilinks und Memory werden intelligent gekürzt: relevante Abschnitte werden pe
 `python orchestrator.py --doctor` führt 15+ Checks durch:
 
 - Provider-CLIs (`claude`, `gemini`, `codex`)
-- `node`, `git`, `npx cclimits`
+- `git`, `cclimits`
 - Vault-Pfad + Queue-Datei
 - Telegram Bot-Konfiguration (`getMe` API-Call)
 - `.env` (vorhanden + erforderliche Keys)
@@ -567,7 +569,7 @@ orchestrator.py
   -> telegram_listener.py   (Telegram Commands + Chat)
   -> notifier.py            (Telegram Notifications)
   -> shutdown.py            (Shutdown Countdown / Cancel)
-  -> limits.py              (cclimits Wrapper / Provider-Kapazität, TTL-Cache, HTTP 429 Resilience)
+  -> limits.py              (cclimits Wrapper / Provider-Kapazität, Disk-Cache, HTTP 429 Resilience + lokaler JSONL-Fallback)
   -> logging_setup.py       (Rotating File Logger)
   -> doctor.py              (Setup-Validierung / --doctor)
   -> config.py              (Konstanten, .env, SOUL.md Loader)

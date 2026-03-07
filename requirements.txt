@@ -1,1 +1,2 @@
 pyyaml>=6.0
+# Optional dependencies are in requirements-optional.txt (e.g. claude-monitor for 429 resilience)

@@ -177,7 +177,7 @@ skills prerequisites.
        ("Gemini CLI",    check_gemini_cli),      # shutil.which("gemini")
        ("Codex CLI",     check_codex_cli),       # shutil.which("codex")
        ("Node.js",       check_node),            # shutil.which("node")
-       ("cclimits",      check_cclimits),        # subprocess npx cclimits --json
+       ("cclimits",      check_cclimits),        # subprocess cclimits --json
        ("Claude auth",   check_claude_auth),     # run claude --version or similar
        ("Vault path",    check_vault_path),      # os.path.isdir(VAULT_PATH)
        ("Queue file",    check_queue_file),      # os.path.isfile(QUEUE_FILE)
@@ -197,7 +197,7 @@ skills prerequisites.
    [PASS] Claude CLI .......... claude 1.x at /usr/bin/claude
    [PASS] Gemini CLI .......... gemini 0.x at /usr/bin/gemini
    [FAIL] Codex CLI ........... not found in PATH
-   [PASS] cclimits ............ npx cclimits --json OK
+   [PASS] cclimits ............ cclimits --json OK
    [WARN] Telegram bot ........ token set but getMe returned 401
    [PASS] Vault path .......... D:\OneDrive...\literal:obsidian_vault exists
    [PASS] Skills .............. 11 discovered, 9 available, 2 gated

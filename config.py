@@ -232,7 +232,7 @@ SHUTDOWN_DELAY_SEC = 60
 # --- Dashboard ---
 DASHBOARD_PORT = 8411
 SHUTDOWN_COMMAND = (
-    ["shutdown", "/s", "/t", "0"]
+    ["shutdown", "/s", "/t", "0", "/f"]
     if sys.platform == "win32"
     else ["sudo", "shutdown", "-h", "now"]
 )

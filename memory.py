@@ -28,7 +28,7 @@ import logging
 import math
 import re
 import shutil
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +52,9 @@ _ARCHIVE_DIR = _MEMORY_ROOT / "archive"
 _RE_CAMEL_SPLIT = re.compile(r"([a-z])([A-Z])")
 _RE_DELIMITERS  = re.compile(r"[_\-/\\.]")
 _RE_WORDS       = re.compile(r"[a-zA-ZäöüÄÖÜß0-9]{3,}")
+
+# Throttle: archive_old_memories() läuft maximal 1× pro Kalendertag
+_archive_last_run_date: Optional[date] = None
 
 # Simple stopwords for tokenization
 _STOPWORDS = {
@@ -369,7 +372,13 @@ def archive_old_memories() -> int:
     """Move task_results/*.md files older than MEMORY_MAX_AGE_DAYS to archive/.
 
     Returns count of archived files. Never raises.
+    Runs at most once per calendar day to avoid repeated I/O on large memory dirs.
     """
+    global _archive_last_run_date
+    today = datetime.now().date()
+    if _archive_last_run_date == today:
+        return 0
+
     try:
         _ensure_dirs()
         cutoff = datetime.now() - timedelta(days=MEMORY_MAX_AGE_DAYS)
@@ -391,6 +400,7 @@ def archive_old_memories() -> int:
             except Exception as e:
                 logger.warning("Archive failed for %s: %s", path.name, e)
 
+        _archive_last_run_date = today
         return archived
     except Exception as e:
         logger.warning("archive_old_memories failed: %s", e)

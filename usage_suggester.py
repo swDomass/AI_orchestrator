@@ -33,6 +33,7 @@ from typing import Any, Callable, Optional
 
 from config import (
     ALLOWED_CWD_ROOTS,
+    TELEGRAM_ENABLED,
     USAGE_SUGGEST_CLAUDE_MODEL,
     USAGE_SUGGEST_LLM_TIMEOUT_SEC,
     USAGE_SUGGEST_MAX_PACE_FACTOR,
@@ -80,6 +81,9 @@ class UsageSuggester:
 
     def check_and_suggest(self, queue_read_fn: Callable) -> Optional[str]:
         """Main entry point. Returns a status string or None."""
+
+        if not TELEGRAM_ENABLED:
+            return "telegram_disabled"
 
         # Guard: already waiting for a response / cooldown
         now = datetime.now()
@@ -338,7 +342,7 @@ class UsageSuggester:
         """Strategy B: Git repos with uncommitted changes.
 
         ALLOWED_CWD_ROOTS are parent directories, not git repos themselves.
-        We scan one level deep for directories containing a .git folder.
+        We scan up to 2 levels deep for directories containing a .git folder.
         """
         suggestions: list[Suggestion] = []
         roots = ALLOWED_CWD_ROOTS or []
@@ -347,17 +351,30 @@ class UsageSuggester:
         for root in roots:
             if not root.is_dir():
                 continue
-            # Check if root itself is a git repo
+            # Level 0: root itself
             if (root / ".git").exists():
                 repo_dirs.append(root)
                 continue
-            # Scan one level deep for git repos
+            # Level 1: direct children
             try:
                 for child in root.iterdir():
-                    if child.is_dir() and (child / ".git").exists():
+                    if not child.is_dir():
+                        continue
+                    if (child / ".git").exists():
                         repo_dirs.append(child)
+                    else:
+                        # Level 2: grandchildren
+                        try:
+                            for grandchild in child.iterdir():
+                                if grandchild.is_dir() and (grandchild / ".git").exists():
+                                    repo_dirs.append(grandchild)
+                        except OSError:
+                            pass
             except OSError:
                 pass
+
+        # Deduplicate repos
+        repo_dirs = list(dict.fromkeys(repo_dirs))
 
         for repo in repo_dirs:
             try:

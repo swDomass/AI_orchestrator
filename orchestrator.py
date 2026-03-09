@@ -1174,8 +1174,16 @@ def run_watch(dry_run: bool = False) -> None:
 
             print("\nPrüfe Reset-Zeiten...")
             limits = get_limits(force_refresh=True)
-            sleep_sec = _get_next_retry_sec(limits)
-            sleep_sec = min(sleep_sec, SLEEP_POLL_INTERVAL * 10)
+
+            if limits.any_available():
+                # Providers are available — failure was task-specific (tool error,
+                # format mismatch, etc.), not capacity exhaustion.  Retry quickly
+                # so remaining queue tasks are not blocked for 50 minutes.
+                sleep_sec = 30
+                print(f"Provider verfügbar — kurze Pause ({sleep_sec}s) vor nächstem Versuch")
+            else:
+                sleep_sec = _get_next_retry_sec(limits)
+                sleep_sec = min(sleep_sec, SLEEP_POLL_INTERVAL * 10)
 
             # Ensure minimal sleep to prevent busy loops
             sleep_sec = max(5, sleep_sec)

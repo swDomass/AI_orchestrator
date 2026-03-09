@@ -98,6 +98,7 @@ def _reset_bg_state(monkeypatch):
     monkeypatch.setattr(limits, "_bg_thread", None)
     monkeypatch.setattr(limits, "_bg_wake", threading.Event())
     monkeypatch.setattr(limits, "_cache_ready", threading.Event())
+    monkeypatch.setattr(limits, "_refresh_failed_until", {})
 
 
 def test_get_limits_requeries_after_successful_refresh(monkeypatch):
@@ -162,6 +163,96 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
     got = limits.get_limits()
 
     assert calls["n"] >= 2
+    assert got.gemini.available is True
+
+
+def test_refresh_failed_cooldown_skips_retry(monkeypatch):
+    """After a failed refresh, subsequent calls skip the refresh until cooldown expires."""
+    expired = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "gemini": {"status": "error", "error": "expired"},
+        "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
+    }
+    refresh_calls = {"n": 0}
+
+    def fake_refresh(provider):
+        refresh_calls["n"] += 1
+        return False  # always fail
+
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_run_cclimits", lambda: expired)
+    monkeypatch.setattr(limits, "_refresh_token", fake_refresh)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
+
+    # First call: refresh attempted and fails, cooldown set
+    limits.get_limits(force_refresh=True)
+    assert refresh_calls["n"] == 1
+    assert "gemini" in limits._refresh_failed_until
+
+    # Second call within cooldown: refresh must NOT be attempted again
+    # (force_refresh bypasses the cache so _get_limits_fresh runs again)
+    limits.get_limits(force_refresh=True)
+    assert refresh_calls["n"] == 1  # still 1, not 2
+
+
+def test_refresh_false_positive_sets_cooldown(monkeypatch):
+    """If _refresh_token returns True but cclimits still shows expired, set cooldown."""
+    # cclimits always reports gemini as expired (refresh was a false positive)
+    expired = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "gemini": {"status": "error", "error": "expired"},
+        "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
+    }
+    refresh_calls = {"n": 0}
+
+    def fake_refresh(provider):
+        refresh_calls["n"] += 1
+        return True  # CLI says success, but token is still expired
+
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_run_cclimits", lambda: expired)
+    monkeypatch.setattr(limits, "_refresh_token", fake_refresh)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
+
+    # First call: refresh "succeeds" but token still expired → cooldown set
+    limits.get_limits(force_refresh=True)
+    assert refresh_calls["n"] == 1
+    assert "gemini" in limits._refresh_failed_until
+
+    # Second call within cooldown: refresh must NOT be attempted again
+    # (force_refresh bypasses the cache so _get_limits_fresh runs again)
+    limits.get_limits(force_refresh=True)
+    assert refresh_calls["n"] == 1  # still 1, cooldown prevents retry
+
+
+def test_refresh_failed_cooldown_cleared_on_success(monkeypatch):
+    """A successful refresh clears the cooldown for that provider."""
+    expired = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "gemini": {"status": "error", "error": "expired"},
+        "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
+    }
+    fresh = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "gemini": {"status": "ok", "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}}},
+        "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
+    }
+    calls = {"cclimits": 0, "refresh": 0}
+
+    def fake_cclimits():
+        calls["cclimits"] += 1
+        return expired if calls["cclimits"] == 1 else fresh
+
+    _reset_bg_state(monkeypatch)
+    # Pre-seed a failed cooldown
+    monkeypatch.setattr(limits, "_refresh_failed_until", {"gemini": time.monotonic() - 1})
+    monkeypatch.setattr(limits, "_run_cclimits", fake_cclimits)
+    monkeypatch.setattr(limits, "_refresh_token", lambda p: True)  # success
+    monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
+
+    got = limits.get_limits()
+    # Cooldown was expired, so refresh ran and succeeded
+    assert "gemini" not in limits._refresh_failed_until
     assert got.gemini.available is True
 
 

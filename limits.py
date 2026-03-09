@@ -68,6 +68,12 @@ _429_snapshots: dict[str, tuple[ProviderLimits, float]] = {}
 _429_estimated_usage: dict[str, dict[str, float]] = {}
 _429_notified: set[str] = set()
 
+# Cooldown after failed token refresh — avoids hammering the CLI every 90 s
+# when re-auth requires manual intervention (e.g. browser login).
+_REFRESH_FAILED_BACKOFF_SEC = 600   # 10 min; matches cclimits disk-cache TTL
+_refresh_failed_until: dict[str, float] = {}   # provider -> monotonic deadline
+
+
 @dataclass
 class WindowData:
     """Per-window usage data (e.g. five_hour, seven_day, 24h tier)."""
@@ -780,11 +786,23 @@ def _get_limits_fresh() -> AllLimits:
 
         # Auto-refresh expired tokens and re-query
         refresh_attempted = False
+        now = time.monotonic()
         for provider in ("claude", "gemini"):
             if _needs_token_refresh(raw, provider):
+                cooldown_until = _refresh_failed_until.get(provider, 0.0)
+                if now < cooldown_until:
+                    remaining = int(cooldown_until - now)
+                    logger.info(
+                        "  [%s] Token expired — refresh on cooldown (%ds remaining), skipping",
+                        provider, remaining,
+                    )
+                    continue
                 refresh_attempted = True
                 logger.info("  [%s] Token expired → refreshing...", provider)
-                if not _refresh_token(provider):
+                if _refresh_token(provider):
+                    _refresh_failed_until.pop(provider, None)
+                else:
+                    _refresh_failed_until[provider] = now + _REFRESH_FAILED_BACKOFF_SEC
                     logger.error("  [%s] Token-Refresh fehlgeschlagen — Provider wird als unavailable gemeldet", provider)
 
         if refresh_attempted:
@@ -797,6 +815,18 @@ def _get_limits_fresh() -> AllLimits:
                     if not any(_needs_token_refresh(raw, p) for p in ("claude", "gemini")):
                         break
                 time.sleep(2)
+
+            # Guard against false-positive refreshes: if a provider's CLI reported
+            # success but cclimits still shows the token as expired, treat it as a
+            # failed refresh and activate the backoff cooldown.
+            post_now = time.monotonic()
+            for provider in ("claude", "gemini"):
+                if _needs_token_refresh(raw, provider) and provider not in _refresh_failed_until:
+                    _refresh_failed_until[provider] = post_now + _REFRESH_FAILED_BACKOFF_SEC
+                    logger.warning(
+                        "  [%s] Token still expired after refresh → cooldown %ds",
+                        provider, _REFRESH_FAILED_BACKOFF_SEC,
+                    )
 
         # Detect HTTP 429 rate-limiting on the monitoring API itself
         p429 = _providers_with_429(raw)

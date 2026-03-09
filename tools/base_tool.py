@@ -6,10 +6,13 @@ They run iterative loops (review→fix→recheck) and report progress.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 
 from config import get_system_prompt
 from providers.base import BaseProvider
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,8 +34,30 @@ def _write_tool_file(output_dir: Path, filename: str, content: str) -> None:
 
 
 def _build_system_prompt(provider_name: str, memory_context: str = "") -> str:
-    """Assemble system prompt with optional memory context."""
+    """Assemble system prompt with layered memory context for tool workflows."""
     prompt = get_system_prompt(provider_name)
+
+    try:
+        import memory as memory_module
+    except Exception as exc:
+        logger.warning("Tool prompt memory import failed: %s", exc)
+        memory_module = None
+
+    if memory_module is not None:
+        try:
+            curated = memory_module.get_curated_memory()
+            if curated:
+                prompt += f"\n\n## Langzeit-Kontext\n{curated}"
+        except Exception as exc:
+            logger.warning("Tool prompt curated memory load failed: %s", exc)
+
+        try:
+            daily = memory_module.get_daily_context()
+            if daily:
+                prompt += f"\n\n## Heutiger Verlauf\n{daily}"
+        except Exception as exc:
+            logger.warning("Tool prompt daily memory load failed: %s", exc)
+
     if memory_context:
         prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
     return prompt

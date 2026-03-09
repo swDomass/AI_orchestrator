@@ -41,6 +41,7 @@ import logging
 import math
 import re
 import shutil
+import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -64,6 +65,7 @@ _TASK_RESULTS_DIR = _MEMORY_ROOT / "task_results"
 _ARCHIVE_DIR = _MEMORY_ROOT / "archive"
 _DAILY_DIR = _MEMORY_ROOT / "daily"
 _CURATED_MEMORY_FILE = _MEMORY_ROOT / "MEMORY.md"
+_daily_log_lock = threading.Lock()
 
 # Pre-compiled tokenizer patterns (avoids recompilation on every search call)
 _RE_CAMEL_SPLIT = re.compile(r"([a-z])([A-Z])")
@@ -456,13 +458,14 @@ def append_daily_log(
             f"- {summary}\n"
         )
 
-        # Append-mode is atomic-enough on Windows to avoid races
-        # when parallel tasks call store_result simultaneously.
-        is_new = not path.exists()
-        with open(path, "a", encoding="utf-8") as f:
-            if is_new:
-                f.write(f"# Memory {today.isoformat()}\n")
-            f.write(entry)
+        # Parallel subtasks run in threads within the same orchestrator process.
+        # Guard creation so only one writer emits the daily header.
+        with _daily_log_lock:
+            if not path.exists():
+                path.write_text(f"# Memory {today.isoformat()}\n{entry}", encoding="utf-8")
+            else:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(entry)
 
         logger.debug("Daily log appended: %s", path.name)
         return True
@@ -483,26 +486,51 @@ def get_daily_context(max_chars: int = 0) -> str:
     if not max_chars:
         max_chars = PROMPT_DAILY_LOG_TOKENS * 5  # ~5 chars/token
 
-    parts: list[str] = []
-    for d in (today, yesterday):
+    def _read_daily_log(d: date) -> str:
         path = _daily_log_path(d)
-        if path.exists():
-            try:
-                content = path.read_text(encoding="utf-8").strip()
-                if content:
-                    parts.append(content)
-            except Exception as e:
-                logger.warning("Failed to read daily log %s: %s", path.name, e)
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.warning("Failed to read daily log %s: %s", path.name, e)
+            return ""
 
-    if not parts:
+    def _tail_truncate(text: str, budget: int) -> str:
+        if len(text) <= budget:
+            return text
+        if budget <= 4:
+            return text[-budget:]
+        return "...\n" + text[-(budget - 4):]
+
+    today_content = _read_daily_log(today)
+    yesterday_content = _read_daily_log(yesterday)
+
+    if not today_content and not yesterday_content:
         return ""
 
-    combined = "\n\n---\n\n".join(parts)
+    separator = "\n\n---\n\n"
 
-    # Truncate from the end (keep most recent = today's entries)
+    if today_content and len(today_content) >= max_chars:
+        return _tail_truncate(today_content, max_chars)
+
+    if today_content:
+        parts = [today_content]
+        used = len(today_content)
+    else:
+        parts = []
+        used = 0
+
+    if yesterday_content:
+        budget = max_chars - used
+        if parts:
+            budget -= len(separator)
+        if budget > 0:
+            parts.append(_tail_truncate(yesterday_content, budget))
+
+    combined = separator.join(parts) if parts else _tail_truncate(yesterday_content, max_chars)
     if len(combined) > max_chars:
-        combined = combined[:max_chars] + "\n..."
-
+        return _tail_truncate(combined, max_chars)
     return combined
 
 

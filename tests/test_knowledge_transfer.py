@@ -75,6 +75,12 @@ class TestExtractTopic:
         result = _extract_topic("Transfer: Simulation cwd:/some/path #tool:knowledge-transfer")
         assert result == "Simulation"
 
+    def test_strips_quoted_cwd_tag_with_spaces(self):
+        result = _extract_topic(
+            'Transfer: Simulation cwd:"D:\\My Repo\\Project Root" #tool:knowledge-transfer'
+        )
+        assert result == "Simulation"
+
     def test_no_tags_plain_colon(self):
         assert _extract_topic("Topic: MyTopic") == "MyTopic"
 

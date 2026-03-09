@@ -5,8 +5,10 @@ Layer 2: Daily append-only logs
 Layer 3: TF-IDF search (existing, tested indirectly)
 """
 
+import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +18,10 @@ import pytest
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+with patch("config._load_dotenv"):
+    import config
+    from tools.base_tool import _build_system_prompt
+
 
 @pytest.fixture()
 def memory_root(tmp_path):
@@ -24,8 +30,6 @@ def memory_root(tmp_path):
     vault.mkdir()
     # Patch config before importing memory
     with patch("config._load_dotenv"):
-        import importlib
-        import config
         old_vault = config.VAULT_PATH
         config.VAULT_PATH = vault
 
@@ -107,7 +111,20 @@ class TestDailyLog:
         content = path.read_text(encoding="utf-8")
         assert "Task 1" in content
         assert "Task 2" in content
+        assert content.count(f"# Memory {date.today().isoformat()}") == 1
         assert content.count("## ") == 2  # Two time-stamped sections
+
+    def test_parallel_appends_write_header_once(self, memory_root):
+        def _append(i: int) -> bool:
+            return memory_root.append_daily_log(f"Task {i}", f"Result {i}", "claude", 5.0)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(_append, (1, 2)))
+
+        assert all(results)
+        path = memory_root._daily_log_path(date.today())
+        content = path.read_text(encoding="utf-8")
+        assert content.count(f"# Memory {date.today().isoformat()}") == 1
 
     def test_append_failed_task(self, memory_root):
         memory_root.append_daily_log("Failing task", "Error msg", "claude", 5.0, success=False)
@@ -183,7 +200,21 @@ class TestDailyContext:
 
         ctx = memory_root.get_daily_context(max_chars=500)
         assert len(ctx) <= 510
-        assert ctx.endswith("...")
+        assert ctx.startswith("...\n")
+
+    def test_truncation_keeps_latest_today_entries(self, memory_root):
+        memory_root._ensure_dirs()
+        path = memory_root._daily_log_path(date.today())
+        path.write_text(
+            "# Memory today\n\n"
+            "older entry\n" + ("x" * 800) + "\n"
+            "latest important entry\n",
+            encoding="utf-8",
+        )
+
+        ctx = memory_root.get_daily_context(max_chars=120)
+        assert "latest important entry" in ctx
+        assert "older entry" not in ctx
 
 
 # ── store_result also writes daily log ──────────────────────────────────────
@@ -233,3 +264,33 @@ class TestTfIdfSearch:
         memory_root.store_result("Setup pytest", "Configured pytest for project", "gemini", 10.0)
         ctx = memory_root.get_context_for_task("run pytest tests")
         assert ctx  # Should return something (either TF-IDF match or recent fallback)
+
+
+class TestToolPromptMemoryLayers:
+    def test_tool_prompt_includes_curated_and_daily_layers(self):
+        with (
+            patch("tools.base_tool.get_system_prompt", return_value="CORE"),
+            patch("memory.get_curated_memory", return_value="CURATED"),
+            patch("memory.get_daily_context", return_value="DAILY"),
+        ):
+            prompt = _build_system_prompt("claude", "MATCHES")
+
+        assert "CORE" in prompt
+        assert "## Langzeit-Kontext\nCURATED" in prompt
+        assert "## Heutiger Verlauf\nDAILY" in prompt
+        assert "## Relevanter vergangener Kontext\nMATCHES" in prompt
+
+    def test_tool_prompt_keeps_daily_when_curated_lookup_fails(self, caplog):
+        with (
+            patch("tools.base_tool.get_system_prompt", return_value="CORE"),
+            patch("memory.get_curated_memory", side_effect=RuntimeError("boom")),
+            patch("memory.get_daily_context", return_value="DAILY"),
+            caplog.at_level(logging.WARNING),
+        ):
+            prompt = _build_system_prompt("claude", "MATCHES")
+
+        assert "CORE" in prompt
+        assert "## Langzeit-Kontext" not in prompt
+        assert "## Heutiger Verlauf\nDAILY" in prompt
+        assert "## Relevanter vergangener Kontext\nMATCHES" in prompt
+        assert "Tool prompt curated memory load failed" in caplog.text

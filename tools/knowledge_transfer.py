@@ -28,6 +28,7 @@ from config import (
 )
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
+from queue_manager import strip_metadata_tags
 from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _write_tool_file
 
 _KT_OUTPUT_DIR = "01_Ideen"
@@ -124,8 +125,7 @@ def _extract_topic(task: str) -> str | None:
     Returns None when no meaningful topic remains after stripping tags
     (e.g. 'Knowledge Transfer: #tool:knowledge-transfer' → empty → None).
     """
-    clean = re.sub(r"#\S+", "", task)
-    clean = re.sub(r"\bcwd:\S+", "", clean).strip()
+    clean = strip_metadata_tags(task)
     if ":" in clean:
         after = clean.split(":", 1)[1].strip()
         if after:

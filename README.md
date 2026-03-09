@@ -162,7 +162,7 @@ Aktuell registrierte `#tool:`-Handler:
 - `research-qa`
   - Read-only Pre-Implementation Research (Discovery -> Analysis -> Fragen-Katalog)
   - Output in `{cwd}/.research-qa/` (01-discovery.md, 02-analysis.md, 03-questions.md, research-qa-complete.md)
-  - Keine Code-Ã„nderungen â€” nur Analyse und Fragen mit [BLOCKING]-Markierungen
+  - Keine Code-Änderungen — nur Analyse und Fragen mit [BLOCKING]-Markierungen
 - `knowledge-transfer`
   - Cross-Domain Know-How-Transfer (Vault-Expertise analysieren -> Branchenanwendungen per WebSearch finden -> Obsidian-Ideen-Notiz schreiben)
   - Output in `01_Ideen/KT_YYYY-MM-DD_<slug>/`
@@ -267,25 +267,25 @@ Phase 3 — Questions
 
 ## Knowledge-Transfer (`#tool:knowledge-transfer`)
 
-Der `knowledge-transfer` ist ein vier-phasiger Workflow zur Entdeckung neuer Anwendungen fÃ¼r bestehendes Fachwissen:
+Der `knowledge-transfer` ist ein vier-phasiger Workflow zur Entdeckung neuer Anwendungen für bestehendes Fachwissen:
 
 ```
-Phase 0 â€” Vault-Scan
+Phase 0 — Vault-Scan
   Durchsucht den Obsidian-Vault intelligent nach Notizen mit hoher Wissenstiefe.
   Bewertung nach Wikilinks, technischem Vokabular und Projekttiefe.
-  â†’ Top-Notizen werden als Kontext geladen.
+  → Top-Notizen werden als Kontext geladen.
 
-Phase 1 â€” Know-How-Extraktion (LLM)
-  Identifiziert eine spezifische, tiefe FachdomÃ¤ne der Person.
+Phase 1 — Know-How-Extraktion (LLM)
+  Identifiziert eine spezifische, tiefe Fachdomäne der Person.
   Liest "zwischen den Zeilen" (Methoden, Vokabular, Projekttyp).
 
-Phase 2 â€” Cross-Domain-Recherche (LLM + WebSearch)
+Phase 2 — Cross-Domain-Recherche (LLM + WebSearch)
   Findet konkrete Probleme in ANDEREN Branchen, die mit diesem
-  Wissen gelÃ¶st werden kÃ¶nnten (z.B. Bremsschwingungs-Mathematik 
-  angewendet auf Finanzmarkt-InstabilitÃ¤ten).
+  Wissen gelöst werden könnten (z.B. Bremsschwingungs-Mathematik 
+  angewendet auf Finanzmarkt-Instabilitäten).
 
-Phase 3 â€” Synthese
-  Arbeitet die beste Idee zu einer vollstÃ¤ndigen Obsidian-Notiz aus.
+Phase 3 — Synthese
+  Arbeitet die beste Idee zu einer vollständigen Obsidian-Notiz aus.
   Speichert diese unter 01_Ideen/KT_YYYY-MM-DD_<slug>/.
 ```
 
@@ -385,8 +385,8 @@ Max. Task-Länge via `/task`: 500 Zeichen (konfigurierbar via `TELEGRAM_MAX_TASK
 - **Memory (`memory.py`)**
   - **Drei-Layer Architektur:**
     1. **Curated (`MEMORY.md`)**: Langfristige Muster, Konventionen, Entscheidungen. Immer im Prompt (Layer 1).
-    2. **Daily Logs (`daily/`)**: Append-only Verlauf von heute + gestern fÃ¼r zeitliche LokalitÃ¤t (Layer 2).
-    3. **TF-IDF Deep Search (`task_results/`)**: Keyword-Matching + Temporal Decay Ã¼ber alle vergangenen Tasks (Layer 3).
+    2. **Daily Logs (`daily/`)**: Append-only Verlauf von heute + gestern für zeitliche Lokalität (Layer 2).
+    3. **TF-IDF Deep Search (`task_results/`)**: Keyword-Matching + Temporal Decay über alle vergangenen Tasks (Layer 3).
   - Top-K relevante Erinnerungen werden intelligent in den Prompt injiziert.
   - Automatische Archivierung nach 180 Tagen in `memory/archive/`.
 - **Heartbeat (`heartbeat.py`)**
@@ -551,10 +551,10 @@ Der Orchestrator baut den Prompt aus mehreren Quellen zusammen, jede mit eigenem
 | Komponente | Budget | Quelle |
 |---|---|---|
 | Core (Task + Safety) | ~200 Tokens | `config.py` / `SOUL.md` |
-| Curated Memory (L1) | ~500 Tokens | `MEMORY.md` â€” Dauerhafter Kontext |
-| Daily Log (L2) | ~1500 Tokens | `daily/` â€” Verlauf heute + gestern |
-| TF-IDF Memory (L3) | ~2000 Tokens | `memory.py` â€” Relevante Tasks |
-| Wikilink-Kontext | ~3000 Tokens | `queue_manager.py` â€” `[[verlinkte Dateien]]` |
+| Curated Memory (L1) | ~500 Tokens | `MEMORY.md` — Dauerhafter Kontext |
+| Daily Log (L2) | ~1500 Tokens | `daily/` — Verlauf heute + gestern |
+| TF-IDF Memory (L3) | ~2000 Tokens | `memory.py` — Relevante Tasks |
+| Wikilink-Kontext | ~3000 Tokens | `queue_manager.py` — `[[verlinkte Dateien]]` |
 | Skill-Prompt | ~2000 Tokens | `SKILL.md` Body (nur bei `#tool:` Tag) |
 | **Gesamt** | **~10000 Tokens** | |
 

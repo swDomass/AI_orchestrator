@@ -10,6 +10,7 @@ import re
 
 from tools.base_tool import BaseTool
 from tools.dev_loop import DevLoopTool
+from tools.knowledge_transfer import KnowledgeTransferTool
 from tools.research_qa import ResearchQATool
 from tools.review_loop import ReviewLoopTool
 from tools.test_loop import TestLoopTool
@@ -22,6 +23,7 @@ _TOOLS: dict[str, BaseTool] = {
     "test-loop": TestLoopTool(),
     "dev-loop": DevLoopTool(),
     "research-qa": ResearchQATool(),
+    "knowledge-transfer": KnowledgeTransferTool(),
 }
 
 

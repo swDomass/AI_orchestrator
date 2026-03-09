@@ -152,6 +152,12 @@ TOOL_RQA_DISCOVERY_TIMEOUT_SEC = 1_200  # 20 min: Codebase exploration
 TOOL_RQA_ANALYSIS_TIMEOUT_SEC  = 1_200  # 20 min: Deep analysis
 TOOL_RQA_QUESTIONS_TIMEOUT_SEC =   600  # 10 min: Question generation
 
+# Knowledge-Transfer timeouts (Know-How → Applications → Synthesis)
+TOOL_KT_VAULT_SCAN_MAX_CHARS      = 80_000  # chars of vault content fed to LLM
+TOOL_KT_KNOWHOW_TIMEOUT_SEC       =    600  # 10 min: know-how extraction
+TOOL_KT_APPLICATIONS_TIMEOUT_SEC  =    900  # 15 min: cross-domain with WebSearch
+TOOL_KT_SYNTHESIS_TIMEOUT_SEC     =    600  # 10 min: solution synthesis
+
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
@@ -172,11 +178,13 @@ HEARTBEAT_GIT_STALE_DAYS = 7
 HEARTBEAT_QUEUE_IDLE_HOURS = 2
 
 # --- Prompt Budget (token ≈ word heuristic) ---
-PROMPT_BUDGET_TOKENS     = 8_000
-PROMPT_CORE_TOKENS       = 200
-PROMPT_MEMORY_TOKENS     = 2_000
-PROMPT_WIKILINK_TOKENS   = 3_000
-PROMPT_SKILL_TOKENS      = 2_000
+PROMPT_BUDGET_TOKENS          = 10_000
+PROMPT_CORE_TOKENS            = 200
+PROMPT_CURATED_MEMORY_TOKENS  = 500    # Layer 1: curated MEMORY.md (always loaded)
+PROMPT_DAILY_LOG_TOKENS       = 1_500  # Layer 2: today + yesterday daily log
+PROMPT_MEMORY_TOKENS          = 2_000  # Layer 3: TF-IDF deep search
+PROMPT_WIKILINK_TOKENS        = 3_000
+PROMPT_SKILL_TOKENS           = 2_000
 
 # --- Profiles ---
 PROFILES_DIR = VAULT_PATH / "99_System" / "AI" / "profiles"

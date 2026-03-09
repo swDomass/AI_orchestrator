@@ -223,6 +223,7 @@ def check_memory_dir() -> CheckResult:
             def _fix():
                 (memory_root / "task_results").mkdir(parents=True, exist_ok=True)
                 (memory_root / "archive").mkdir(parents=True, exist_ok=True)
+                (memory_root / "daily").mkdir(parents=True, exist_ok=True)
                 print(f"    Created memory directory at {memory_root}")
 
             return CheckResult(
@@ -233,8 +234,15 @@ def check_memory_dir() -> CheckResult:
             )
 
         task_results = memory_root / "task_results"
+        daily_dir = memory_root / "daily"
+        curated = memory_root / "MEMORY.md"
         count = len(list(task_results.glob("*.md"))) if task_results.exists() else 0
-        return CheckResult(PASS, "Memory dir", f"{memory_root.name} ({count} stored results)")
+        daily_count = len(list(daily_dir.glob("*.md"))) if daily_dir.exists() else 0
+        has_curated = curated.exists()
+        details = f"{count} results, {daily_count} daily logs"
+        if has_curated:
+            details += ", MEMORY.md present"
+        return CheckResult(PASS, "Memory dir", f"{memory_root.name} ({details})")
     except Exception as e:
         return CheckResult(WARN, "Memory dir", f"check failed: {e}")
 

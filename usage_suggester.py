@@ -4,14 +4,14 @@ AI Orchestrator — Usage Suggester
 When running in --watch mode the heartbeat calls this module every 5 minutes.
 It checks whether Claude's usage window is about to reset with significant
 capacity still unused (>30 % remaining, <15 min to reset) and the queue is
-empty.  If so it gathers 2-3 task suggestions from four strategies:
+empty.  If so it gathers up to 5 task suggestions from four strategies:
 
   1. Vault skills that haven't run in the last 7 days  (score 1.0 – 3.0)
   2. Git repos with uncommitted changes                (score 0.8 – 1.3)
   3. Recently failed tasks from memory                 (score 0.6)
   4. Open vault tasks assessed for AI autonomy         (score 0.5 – 2.5)
 
-The top 3 candidates are sent to Telegram.  The user responds with:
+The top 5 candidates are sent to Telegram.  The user responds with:
 
   /pick N    — pick suggestion N, adds it to the queue automatically
   /decline   — dismiss all suggestions (20 min cooldown before next)
@@ -293,9 +293,9 @@ class UsageSuggester:
         candidates.extend(self._suggest_failed_retries())
         candidates.extend(self._suggest_vault_tasks())
 
-        # Sort by score descending, take top 3
+        # Sort by score descending, take top 5
         candidates.sort(key=lambda s: s.score, reverse=True)
-        top = candidates[:3]
+        top = candidates[:5]
 
         # Assign ranks
         for i, s in enumerate(top):
@@ -311,6 +311,13 @@ class UsageSuggester:
             skills = discover_skills(vault_path=VAULT_PATH)
         except Exception:
             return suggestions
+
+        # Skills that have a matching Python tool need #tool: tag to trigger correctly
+        try:
+            from tools.registry import get_tool
+            _has_tool = lambda n: get_tool(n) is not None
+        except Exception:
+            _has_tool = lambda n: False
 
         now = datetime.now()
         for name, skill in skills.items():
@@ -328,10 +335,14 @@ class UsageSuggester:
                 score = max(score, 2.5)
 
             desc = skill.description or name
+            if _has_tool(name):
+                task_text = f"{desc} #tool:{name}"
+            else:
+                task_text = f"Führe den Skill '{name}' aus: {desc}"
             suggestions.append(Suggestion(
                 rank=0,
                 label=f"Skill: {name}",
-                task_text=f"Führe den Skill '{name}' aus: {desc}",
+                task_text=task_text,
                 source="skill",
                 score=score,
             ))
@@ -552,7 +563,7 @@ class UsageSuggester:
                     score=scaled,
                 ))
 
-            return suggestions[:3]
+            return suggestions[:5]
         except Exception as e:
             logger.debug("usage-suggest: vault task scan error: %s", e)
             return []

@@ -46,6 +46,7 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 16 | Usage Budgeting & Pace Analysis (7d rolling) | DONE |
 | 17 | Research-QA Tool (pre-implementation research) | DONE |
 | 18 | Claude JSON token tracking for capacity estimation | DONE |
+| 19 | Knowledge-Transfer Tool (cross-domain innovation) | DONE |
 
 ## Tier 4 ÔÇö Overkill for Now
 

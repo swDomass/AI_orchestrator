@@ -162,7 +162,11 @@ Aktuell registrierte `#tool:`-Handler:
 - `research-qa`
   - Read-only Pre-Implementation Research (Discovery -> Analysis -> Fragen-Katalog)
   - Output in `{cwd}/.research-qa/` (01-discovery.md, 02-analysis.md, 03-questions.md, research-qa-complete.md)
-  - Keine Code-Änderungen — nur Analyse und Fragen mit [BLOCKING]-Markierungen
+  - Keine Code-Ã„nderungen â€” nur Analyse und Fragen mit [BLOCKING]-Markierungen
+- `knowledge-transfer`
+  - Cross-Domain Know-How-Transfer (Vault-Expertise analysieren -> Branchenanwendungen per WebSearch finden -> Obsidian-Ideen-Notiz schreiben)
+  - Output in `01_Ideen/KT_YYYY-MM-DD_<slug>/`
+  - Nutzt 4-Phasen-Workflow (Scan, Extraktion, Recherche, Synthese)
 
 Tool-Liste anzeigen:
 
@@ -261,6 +265,39 @@ Phase 3 — Questions
 | `TOOL_RQA_ANALYSIS_TIMEOUT_SEC` | 1200 (20 min) | Analysis |
 | `TOOL_RQA_QUESTIONS_TIMEOUT_SEC` | 600 (10 min) | Questions |
 
+## Knowledge-Transfer (`#tool:knowledge-transfer`)
+
+Der `knowledge-transfer` ist ein vier-phasiger Workflow zur Entdeckung neuer Anwendungen fÃ¼r bestehendes Fachwissen:
+
+```
+Phase 0 â€” Vault-Scan
+  Durchsucht den Obsidian-Vault intelligent nach Notizen mit hoher Wissenstiefe.
+  Bewertung nach Wikilinks, technischem Vokabular und Projekttiefe.
+  â†’ Top-Notizen werden als Kontext geladen.
+
+Phase 1 â€” Know-How-Extraktion (LLM)
+  Identifiziert eine spezifische, tiefe FachdomÃ¤ne der Person.
+  Liest "zwischen den Zeilen" (Methoden, Vokabular, Projekttyp).
+
+Phase 2 â€” Cross-Domain-Recherche (LLM + WebSearch)
+  Findet konkrete Probleme in ANDEREN Branchen, die mit diesem
+  Wissen gelÃ¶st werden kÃ¶nnten (z.B. Bremsschwingungs-Mathematik 
+  angewendet auf Finanzmarkt-InstabilitÃ¤ten).
+
+Phase 3 â€” Synthese
+  Arbeitet die beste Idee zu einer vollstÃ¤ndigen Obsidian-Notiz aus.
+  Speichert diese unter 01_Ideen/KT_YYYY-MM-DD_<slug>/.
+```
+
+**Konfiguration in `config.py`:**
+
+| Konstante | Default | Phase |
+|---|---|---|
+| `TOOL_KT_VAULT_SCAN_MAX_CHARS` | 80.000 | Scan-Budget |
+| `TOOL_KT_KNOWHOW_TIMEOUT_SEC` | 600 (10 min) | Extraktion |
+| `TOOL_KT_APPLICATIONS_TIMEOUT_SEC` | 900 (15 min) | Recherche |
+| `TOOL_KT_SYNTHESIS_TIMEOUT_SEC` | 600 (10 min) | Synthese |
+
 ## Skills (`SKILL.md`)
 
 Zusätzlich zu den Built-in Tools können Skills aus `SKILL.md` entdeckt werden.
@@ -346,10 +383,12 @@ Max. Task-Länge via `/task`: 500 Zeichen (konfigurierbar via `TELEGRAM_MAX_TASK
 ## Memory, Heartbeat, SOUL.md
 
 - **Memory (`memory.py`)**
-  - speichert Task-Ergebnisse als Markdown mit YAML-Frontmatter in `99_System/AI/memory/task_results/`
-  - TF-IDF Keyword-Matching + Temporal Decay (Halbwertszeit: 30 Tage)
-  - Top-K relevante Erinnerungen (Standard: 5) werden in den Prompt injiziert (max. 2000 Tokens)
-  - Automatische Archivierung nach 180 Tagen in `memory/archive/`
+  - **Drei-Layer Architektur:**
+    1. **Curated (`MEMORY.md`)**: Langfristige Muster, Konventionen, Entscheidungen. Immer im Prompt (Layer 1).
+    2. **Daily Logs (`daily/`)**: Append-only Verlauf von heute + gestern fÃ¼r zeitliche LokalitÃ¤t (Layer 2).
+    3. **TF-IDF Deep Search (`task_results/`)**: Keyword-Matching + Temporal Decay Ã¼ber alle vergangenen Tasks (Layer 3).
+  - Top-K relevante Erinnerungen werden intelligent in den Prompt injiziert.
+  - Automatische Archivierung nach 180 Tagen in `memory/archive/`.
 - **Heartbeat (`heartbeat.py`)**
   - proaktive Checks im `--watch` Modus, konfiguriert über `99_System/AI/HEARTBEAT.md`
   - 7 Built-in Handler: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `summarize`, `stale-branch`, `usage-suggest`
@@ -512,10 +551,12 @@ Der Orchestrator baut den Prompt aus mehreren Quellen zusammen, jede mit eigenem
 | Komponente | Budget | Quelle |
 |---|---|---|
 | Core (Task + Safety) | ~200 Tokens | `config.py` / `SOUL.md` |
-| Memory-Kontext | ~2000 Tokens | `memory.py` — relevante vergangene Tasks |
-| Wikilink-Kontext | ~3000 Tokens | `queue_manager.py` — `[[verlinkte Dateien]]` |
+| Curated Memory (L1) | ~500 Tokens | `MEMORY.md` â€” Dauerhafter Kontext |
+| Daily Log (L2) | ~1500 Tokens | `daily/` â€” Verlauf heute + gestern |
+| TF-IDF Memory (L3) | ~2000 Tokens | `memory.py` â€” Relevante Tasks |
+| Wikilink-Kontext | ~3000 Tokens | `queue_manager.py` â€” `[[verlinkte Dateien]]` |
 | Skill-Prompt | ~2000 Tokens | `SKILL.md` Body (nur bei `#tool:` Tag) |
-| **Gesamt** | **~8000 Tokens** | |
+| **Gesamt** | **~10000 Tokens** | |
 
 Wikilinks und Memory werden intelligent gekürzt: relevante Abschnitte werden per Keyword-Matching extrahiert, nicht einfach abgeschnitten.
 

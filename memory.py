@@ -1,17 +1,30 @@
 """
 AI Orchestrator — Persistent Memory System
 
-Stores task results as Markdown files in the vault and retrieves relevant
-past context for new tasks using TF-IDF similarity with temporal decay.
+Three-layer memory architecture:
+
+1. **Curated MEMORY.md** — long-term patterns, decisions, conventions.
+   Always loaded into prompt (small, high-value). User-editable.
+   Path: VAULT_PATH/99_System/AI/memory/MEMORY.md
+
+2. **Daily logs** — append-only session log per day.
+   Read today + yesterday at task start for cheap temporal locality.
+   Path: VAULT_PATH/99_System/AI/memory/daily/Memory YYYY-MM-DD.md
+
+3. **TF-IDF search** — keyword-similarity + temporal decay over all
+   past task results for deep relevant context from weeks/months ago.
+   Path: VAULT_PATH/99_System/AI/memory/task_results/*.md
 
 Storage layout:
     VAULT_PATH/99_System/AI/memory/
-        task_results/   ← one .md per completed task
+        MEMORY.md       ← curated long-term memory (layer 1)
+        daily/          ← daily append-only logs (layer 2)
+        task_results/   ← one .md per completed task (layer 3)
         error_patterns/ ← reserved
         preferences/    ← reserved
         archive/        ← memories older than MEMORY_MAX_AGE_DAYS
 
-File format:
+Task result file format:
     ---
     task: "Review und fixe Bugs"
     provider: claude+review-loop
@@ -38,6 +51,8 @@ from config import (
     MEMORY_MIN_SCORE,
     MEMORY_SUMMARY_MAX_CHARS,
     MEMORY_TOP_K,
+    PROMPT_CURATED_MEMORY_TOKENS,
+    PROMPT_DAILY_LOG_TOKENS,
     VAULT_PATH,
 )
 
@@ -47,6 +62,8 @@ logger = logging.getLogger(__name__)
 _MEMORY_ROOT = VAULT_PATH / "99_System" / "AI" / "memory"
 _TASK_RESULTS_DIR = _MEMORY_ROOT / "task_results"
 _ARCHIVE_DIR = _MEMORY_ROOT / "archive"
+_DAILY_DIR = _MEMORY_ROOT / "daily"
+_CURATED_MEMORY_FILE = _MEMORY_ROOT / "MEMORY.md"
 
 # Pre-compiled tokenizer patterns (avoids recompilation on every search call)
 _RE_CAMEL_SPLIT = re.compile(r"([a-z])([A-Z])")
@@ -69,7 +86,7 @@ _STOPWORDS = {
 
 def _ensure_dirs() -> None:
     """Create memory directory tree if missing."""
-    for d in (_TASK_RESULTS_DIR, _ARCHIVE_DIR,
+    for d in (_TASK_RESULTS_DIR, _ARCHIVE_DIR, _DAILY_DIR,
               _MEMORY_ROOT / "error_patterns",
               _MEMORY_ROOT / "preferences"):
         d.mkdir(parents=True, exist_ok=True)
@@ -219,6 +236,10 @@ def store_result(
 
         dest.write_text(content, encoding="utf-8")
         logger.debug("Memory stored: %s", dest.name)
+
+        # Also append to today's daily log
+        append_daily_log(task, result, provider, duration_sec, cwd=cwd, success=success)
+
         return dest
     except Exception as e:
         logger.warning("Memory store failed: %s", e)
@@ -367,6 +388,128 @@ def _paths_match(a: str, b: str) -> bool:
     except Exception:
         return a == b
 
+
+# ── Layer 1: Curated MEMORY.md ───────────────────────────────────────────────
+
+def get_curated_memory(max_chars: int = 0) -> str:
+    """Read the curated MEMORY.md file.
+
+    Returns the file content (truncated to max_chars if set), or "" if missing.
+    This file is user-maintained — the orchestrator never writes to it automatically.
+    """
+    if not _CURATED_MEMORY_FILE.exists():
+        return ""
+    try:
+        content = _CURATED_MEMORY_FILE.read_text(encoding="utf-8").strip()
+        if not max_chars:
+            max_chars = PROMPT_CURATED_MEMORY_TOKENS * 5  # ~5 chars/token
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n..."
+        return content
+    except Exception as e:
+        logger.warning("Failed to read curated memory: %s", e)
+        return ""
+
+
+# ── Layer 2: Daily Logs ──────────────────────────────────────────────────────
+
+def _daily_log_path(d: date) -> Path:
+    """Return path for a given day's log: daily/Memory YYYY-MM-DD.md"""
+    return _DAILY_DIR / f"Memory {d.isoformat()}.md"
+
+
+def append_daily_log(
+    task: str,
+    result: str,
+    provider: str,
+    duration_sec: float,
+    cwd: Optional[str] = None,
+    *,
+    success: bool = True,
+) -> bool:
+    """Append a task entry to today's daily log.
+
+    Format is Obsidian-friendly Markdown. Returns True on success.
+    """
+    try:
+        _ensure_dirs()
+        today = date.today()
+        path = _daily_log_path(today)
+        now = datetime.now()
+        ts = now.strftime("%H:%M")
+        status = "success" if success else "failed"
+
+        # Truncate result for daily log (shorter than full task_results)
+        summary = result[:300].replace("\n", " ").strip()
+        if len(result) > 300:
+            summary += "..."
+
+        entry = (
+            f"\n## {ts} — {task[:120]}\n"
+            f"- **Provider:** {provider}\n"
+        )
+        if cwd:
+            entry += f"- **CWD:** {cwd}\n"
+        entry += (
+            f"- **Duration:** {duration_sec:.0f}s\n"
+            f"- **Status:** {status}\n"
+            f"- {summary}\n"
+        )
+
+        # Append-mode is atomic-enough on Windows to avoid races
+        # when parallel tasks call store_result simultaneously.
+        is_new = not path.exists()
+        with open(path, "a", encoding="utf-8") as f:
+            if is_new:
+                f.write(f"# Memory {today.isoformat()}\n")
+            f.write(entry)
+
+        logger.debug("Daily log appended: %s", path.name)
+        return True
+    except Exception as e:
+        logger.warning("Daily log append failed: %s", e)
+        return False
+
+
+def get_daily_context(max_chars: int = 0) -> str:
+    """Read today's and yesterday's daily logs.
+
+    Returns combined content (today first, then yesterday), truncated to
+    max_chars. Returns "" if no daily logs exist for either day.
+    """
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    if not max_chars:
+        max_chars = PROMPT_DAILY_LOG_TOKENS * 5  # ~5 chars/token
+
+    parts: list[str] = []
+    for d in (today, yesterday):
+        path = _daily_log_path(d)
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(content)
+            except Exception as e:
+                logger.warning("Failed to read daily log %s: %s", path.name, e)
+
+    if not parts:
+        return ""
+
+    combined = "\n\n---\n\n".join(parts)
+
+    # Truncate from the end (keep most recent = today's entries)
+    if len(combined) > max_chars:
+        combined = combined[:max_chars] + "\n..."
+
+    return combined
+
+
+# ── Layer 3: TF-IDF search (existing) — see search_memory / get_context_for_task
+
+
+# ── Archival ─────────────────────────────────────────────────────────────────
 
 def archive_old_memories() -> int:
     """Move task_results/*.md files older than MEMORY_MAX_AGE_DAYS to archive/.

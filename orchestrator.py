@@ -39,6 +39,8 @@ from config import (
     CLAUDE_MODEL_ALIASES,
     GIT_AUTO_STASH,
     MAX_RETRIES_PER_PROVIDER,
+    PROMPT_CURATED_MEMORY_TOKENS,
+    PROMPT_DAILY_LOG_TOKENS,
     PROMPT_MEMORY_TOKENS,
     PROMPT_SKILL_TOKENS,
     PROMPT_WIKILINK_TOKENS,
@@ -280,8 +282,10 @@ def _build_prompt(
     Components (in order):
     1. Core system prompt (SOUL.md base + provider override) — always included
     2. Skill body — only when skill_name is provided
-    3. Relevant past context (memory) — budget-capped
-    4. File/wikilink context + task text — budget-capped
+    3. Curated MEMORY.md (layer 1) — long-term patterns, always loaded
+    4. Daily log today+yesterday (layer 2) — recent temporal context
+    5. TF-IDF memory matches (layer 3) — relevant deep history
+    6. File/wikilink context + task text — budget-capped
     """
     from skills import load_skill
 
@@ -298,10 +302,20 @@ def _build_prompt(
         if skill and skill.prompt:
             skill_prompt = _truncate_tokens(skill.prompt, PROMPT_SKILL_TOKENS)
 
-    # 3. Memory context (pre-filtered by get_context_for_task)
+    # 3. Curated MEMORY.md (layer 1 — long-term patterns)
+    curated = memory_module.get_curated_memory()
+    if curated:
+        curated = _truncate_tokens(curated, PROMPT_CURATED_MEMORY_TOKENS)
+
+    # 4. Daily log (layer 2 — today + yesterday)
+    daily = memory_module.get_daily_context()
+    if daily:
+        daily = _truncate_tokens(daily, PROMPT_DAILY_LOG_TOKENS)
+
+    # 5. TF-IDF memory context (layer 3 — pre-filtered by get_context_for_task)
     mem_block = _truncate_tokens(memory_context, PROMPT_MEMORY_TOKENS) if memory_context else ""
 
-    # 4. Wikilink / file context (budget-capped); ~5 chars per token
+    # 6. Wikilink / file context (budget-capped); ~5 chars per token
     max_wiki_chars = PROMPT_WIKILINK_TOKENS * 5
     wiki_ctx = inject_file_context(clean_task, max_chars=max_wiki_chars)
 
@@ -311,6 +325,10 @@ def _build_prompt(
         parts.append(core)
     if skill_prompt:
         parts.append(f"## Skill: {skill_name}\n{skill_prompt}")
+    if curated:
+        parts.append(f"## Langzeit-Kontext\n{curated}")
+    if daily:
+        parts.append(f"## Heutiger Verlauf\n{daily}")
     if mem_block:
         parts.append(f"## Relevanter vergangener Kontext\n{mem_block}")
     parts.append(wiki_ctx)

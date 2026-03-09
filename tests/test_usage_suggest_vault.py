@@ -454,7 +454,7 @@ class TestSuggestVaultTasks:
         # LLM scored < 3, should be filtered out
         assert len(results) == 0
 
-    def test_max_3_suggestions(self, tmp_path):
+    def test_max_5_suggestions(self, tmp_path):
         task_file = tmp_path / "tasks.md"
         lines = [
             f"- [ ] Task {i} #Rolle/arbeit #Urgent/1 #Dauer/15min\n"
@@ -480,7 +480,7 @@ class TestSuggestVaultTasks:
         ):
             results = s._suggest_vault_tasks()
 
-        assert len(results) <= 3
+        assert len(results) <= 5
 
 
 # ------------------------------------------------------------------

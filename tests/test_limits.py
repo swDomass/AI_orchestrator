@@ -425,6 +425,72 @@ def test_compute_next_poll_sec_returns_error_interval_for_transient():
     assert limits._compute_next_poll_sec(result) == limits._BG_POLL_ERROR_SEC
 
 
+def test_compute_next_poll_sec_returns_idle_interval_when_queue_is_empty(monkeypatch):
+    """When _queue_idle is set and capacity is available, return the longer idle interval."""
+    monkeypatch.setattr(limits, "_queue_idle", threading.Event())
+    limits._queue_idle.set()
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=50.0, resets_in_sec=3600),
+        gemini=limits.ProviderLimits(error="missing"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    assert limits._compute_next_poll_sec(result) == limits._BG_POLL_IDLE_SEC
+
+
+def test_compute_next_poll_sec_ignores_idle_flag_when_at_limit(monkeypatch):
+    """Idle flag is irrelevant when all providers are at limit — use reset time."""
+    monkeypatch.setattr(limits, "_queue_idle", threading.Event())
+    limits._queue_idle.set()
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=200),
+        gemini=limits.ProviderLimits(error="missing"),
+        codex=limits.ProviderLimits(error="missing"),
+    )
+    assert limits._compute_next_poll_sec(result) == 200
+
+
+# ── set_queue_idle tests ───────────────────────────────────────────────────────
+
+def test_set_queue_idle_true_sets_event(monkeypatch):
+    fake_idle = threading.Event()
+    fake_wake = threading.Event()
+    monkeypatch.setattr(limits, "_queue_idle", fake_idle)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+
+    limits.set_queue_idle(True)
+
+    assert fake_idle.is_set()
+    assert not fake_wake.is_set()  # no wake when going idle
+
+
+def test_set_queue_idle_false_clears_event_and_wakes_thread(monkeypatch):
+    """Transitioning from idle → active clears the event and wakes the bg thread."""
+    fake_idle = threading.Event()
+    fake_idle.set()  # was idle
+    fake_wake = threading.Event()
+    monkeypatch.setattr(limits, "_queue_idle", fake_idle)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+
+    limits.set_queue_idle(False)
+
+    assert not fake_idle.is_set()
+    assert fake_wake.is_set()  # bg thread should refresh before task runs
+
+
+def test_set_queue_idle_false_when_already_active_does_not_wake(monkeypatch):
+    """If not previously idle, set_queue_idle(False) must not spuriously wake the thread."""
+    fake_idle = threading.Event()
+    # not set — already active
+    fake_wake = threading.Event()
+    monkeypatch.setattr(limits, "_queue_idle", fake_idle)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+
+    limits.set_queue_idle(False)
+
+    assert not fake_idle.is_set()
+    assert not fake_wake.is_set()
+
+
 def test_get_limits_returns_cached_result_without_extra_call(monkeypatch):
     """With a populated cache, get_limits() returns immediately without calling _get_limits_fresh."""
     call_count = {"n": 0}

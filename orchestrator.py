@@ -51,7 +51,7 @@ from config import (
     get_system_prompt,
 )
 from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag
-from limits import get_limits, AllLimits, report_estimated_usage, estimate_task_usage_pct
+from limits import get_limits, set_queue_idle, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
     notify_error,
     notify_providers_exhausted,
@@ -1093,6 +1093,7 @@ def run_watch(dry_run: bool = False) -> None:
         print("CRITICAL: Startup checks failed. Run --doctor to see details.")
         sys.exit(1)
 
+    set_queue_idle(False)  # reset any stale idle state from a previous run
     print("Orchestrator gestartet (--watch Modus). Ctrl+C zum Beenden.")
     append_log("Orchestrator gestartet (watch)")
     start_session()
@@ -1141,11 +1142,13 @@ def run_watch(dry_run: bool = False) -> None:
                 except Exception:
                     pass
 
+                set_queue_idle(True)   # reduce cclimits polling to 10 min while idle
                 print("\nQueue leer. Warte auf neue Tasks (alle 5min prüfen)...")
                 heartbeat.run_due(read_queue)
                 time.sleep(SLEEP_POLL_INTERVAL)
                 continue
 
+            set_queue_idle(False)  # task found → wake bg thread for fresh limits check
             done = run_once(dry_run=dry_run, pause_event=pause_event)
 
             # Run heartbeat checks after each queue cycle

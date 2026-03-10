@@ -31,6 +31,7 @@ _GEMINI_CMD = f"gemini{_CMD_SUFFIX}"
 # Background refresh intervals — the daemon thread owns all cclimits calls so
 # get_limits() never blocks after the first call.
 _BG_POLL_AVAILABLE_SEC = 90   # refresh every 90 s when capacity is available
+_BG_POLL_IDLE_SEC      = 600  # refresh every 10 min when queue is empty (no tasks pending)
 _BG_POLL_ERROR_SEC     = 30   # initial retry after errors (thread backs off up to 90 s)
 _BG_POLL_429_SEC       = 300  # back off when cclimits itself gets rate-limited (5 min)
 _429_MAX_BASE_AGE_SEC  = 3600 # 1h maximum age for a 429 base snapshot
@@ -58,6 +59,7 @@ _bg_thread: "threading.Thread | None" = None
 _bg_thread_lock = threading.Lock()
 _bg_wake  = threading.Event()   # poke to interrupt the thread's sleep early
 _cache_ready = threading.Event() # set after the first successful cache population
+_queue_idle = threading.Event()  # set when queue is empty → longer poll interval
 
 # HTTP 429 estimation state — tracks estimated provider usage when cclimits
 # itself is rate-limited and real capacity data is unavailable.
@@ -625,7 +627,22 @@ def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
                 windows={"five_hour": window},
                 error="HTTP 429 (local-files)",
             )
-        tokens_used = active.token_counts.total_tokens  # input + output + cache_creation + cache_read
+        # Use only input + output tokens.  cache_creation tokens are charged at 1.25×
+        # for billing but are NOT counted against the 5-hour rate-limit quota at all.
+        # cache_read tokens are counted at a much lower weight (~0.1×) and omitting
+        # them causes only slight under-reporting — far better than the 100-1000×
+        # over-reporting that total_tokens produced when cache tokens dominated.
+        tokens_used = active.token_counts.input_tokens + active.token_counts.output_tokens
+        logger.debug(
+            "  [claude] local JSONL: input=%d output=%d cache_creation=%d cache_read=%d"
+            " → tokens_used=%d / limit=%d",
+            active.token_counts.input_tokens,
+            active.token_counts.output_tokens,
+            active.token_counts.cache_creation_tokens,
+            active.token_counts.cache_read_tokens,
+            tokens_used,
+            token_limit,
+        )
         remaining_pct = max(0.0, (1.0 - tokens_used / token_limit) * 100)
         now = _dt.datetime.now(_dt.timezone.utc)
         end = active.end_time
@@ -918,6 +935,10 @@ def _compute_next_poll_sec(result: AllLimits) -> int:
         if _429_snapshots:
             return _BG_POLL_429_SEC
     if result.any_available():
+        # When queue is empty there's no reason to poll aggressively — save
+        # the monitoring API calls and reduce 429 risk.
+        if _queue_idle.is_set():
+            return _BG_POLL_IDLE_SEC
         return _BG_POLL_AVAILABLE_SEC
     # At limit: wait until the earliest reset; no point hammering cclimits sooner.
     return max(60, min(result.earliest_reset_sec(), 3600))
@@ -1027,3 +1048,22 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
         _limits_cache = (fallback, time.monotonic())
         _cache_ready.set()
         return fallback
+
+
+def set_queue_idle(idle: bool) -> None:
+    """Signal whether the task queue is currently empty.
+
+    When idle=True the background refresh thread uses a longer poll interval
+    (_BG_POLL_IDLE_SEC = 10 min) instead of the default 90 s, reducing
+    unnecessary calls to the cclimits monitoring API and lowering 429 risk.
+
+    When idle=False (task found) the thread is woken immediately so the next
+    get_limits() call returns a fresh snapshot before the task starts.
+    """
+    if idle:
+        _queue_idle.set()
+    else:
+        was_idle = _queue_idle.is_set()
+        _queue_idle.clear()
+        if was_idle:
+            _bg_wake.set()   # wake thread immediately to refresh before task runs

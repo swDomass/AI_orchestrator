@@ -102,7 +102,7 @@ def _reset_bg_state(monkeypatch):
 
 
 def test_get_limits_requeries_after_successful_refresh(monkeypatch):
-    """After a successful token refresh, get_limits re-queries cclimits."""
+    """After a successful token refresh, _get_limits_fresh re-queries cclimits."""
     expired = {
         "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
         "gemini": {"status": "error", "error": "expired"},
@@ -127,7 +127,8 @@ def test_get_limits_requeries_after_successful_refresh(monkeypatch):
     monkeypatch.setattr(limits, "_refresh_token", lambda provider: True)
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
 
-    got = limits.get_limits()
+    # Call _get_limits_fresh directly to test refresh logic without bg-thread races
+    got = limits._get_limits_fresh()
 
     assert calls["n"] >= 2
     assert got.gemini.available is True
@@ -160,7 +161,8 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
     monkeypatch.setattr(limits, "_refresh_token", lambda provider: False)
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
 
-    got = limits.get_limits()
+    # Call _get_limits_fresh directly to test refresh logic without bg-thread races
+    got = limits._get_limits_fresh()
 
     assert calls["n"] >= 2
     assert got.gemini.available is True
@@ -256,6 +258,125 @@ def test_refresh_failed_cooldown_cleared_on_success(monkeypatch):
     assert got.gemini.available is True
 
 
+def test_post_refresh_requery_bypasses_disk_cache(monkeypatch):
+    """After token refresh, re-queries must use use_cache=False to avoid reading
+    the stale 'expired' result that the first cclimits call wrote to disk."""
+    expired = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "gemini": {"status": "error", "error": "expired"},
+        "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
+    }
+    fresh = {
+        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}},
+        },
+        "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
+    }
+    calls = []  # track (use_cache,) for each call
+
+    def fake_run(timeout_sec, *, use_cache=True):
+        calls.append(use_cache)
+        # First call (cached): returns expired; subsequent (no-cache): returns fresh
+        return expired if use_cache else fresh
+
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_run_cclimits_with_timeout", fake_run)
+    monkeypatch.setattr(limits, "_refresh_token", lambda provider: True)
+    monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
+
+    got = limits._get_limits_fresh()
+
+    # First call should use cache; post-refresh re-queries must NOT use cache
+    assert calls[0] is True, "initial cclimits call should use disk cache"
+    assert any(c is False for c in calls[1:]), "post-refresh re-queries must bypass disk cache"
+    assert got.gemini.available is True
+
+
+def test_force_fresh_bypasses_disk_cache(monkeypatch):
+    """force_fresh=True makes the initial cclimits call bypass disk cache."""
+    calls = []
+
+    def fake_run(timeout_sec, *, use_cache=True):
+        calls.append(use_cache)
+        return {
+            "claude": {"status": "ok", "five_hour": {"remaining": "80%", "resets_in": "2h"}},
+            "gemini": {"status": "missing"},
+            "codex": {"status": "missing"},
+        }
+
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_run_cclimits_with_timeout", fake_run)
+
+    limits._get_limits_fresh(force_fresh=True)
+    assert calls[0] is False, "force_fresh=True must bypass disk cache"
+
+
+def test_force_refresh_passes_force_fresh(monkeypatch):
+    """get_limits(force_refresh=True) delegates to _get_limits_fresh(force_fresh=True)."""
+    kwargs_seen = {}
+
+    def fake_fresh(**kwargs):
+        kwargs_seen.update(kwargs)
+        return limits.AllLimits(
+            claude=limits.ProviderLimits(available=True, remaining_pct=50.0),
+            gemini=limits.ProviderLimits(error="missing"),
+            codex=limits.ProviderLimits(error="missing"),
+        )
+
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_fresh)
+    limits.get_limits(force_refresh=True)
+    assert kwargs_seen.get("force_fresh") is True
+
+
+def test_bg_loop_survives_exception(monkeypatch):
+    """Background refresh loop must not die on unexpected exceptions."""
+    call_count = {"n": 0}
+
+    def fake_fresh(on_preliminary=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated crash")
+        # Second call: return valid data, then stop the loop
+        return limits.AllLimits(
+            claude=limits.ProviderLimits(available=True, remaining_pct=70.0),
+            gemini=limits.ProviderLimits(error="missing"),
+            codex=limits.ProviderLimits(error="missing"),
+        )
+
+    class FakeWakeEvent:
+        def __init__(self):
+            self.wait_count = 0
+
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
+        def wait(self, timeout=None):
+            self.wait_count += 1
+            if self.wait_count >= 2:
+                # SystemExit (BaseException) bypasses except Exception
+                raise SystemExit("stop loop")
+
+    fake_wake = FakeWakeEvent()
+    _reset_bg_state(monkeypatch)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+    monkeypatch.setattr(limits, "_get_limits_fresh", fake_fresh)
+    monkeypatch.setattr(limits, "_compute_next_poll_sec", lambda _result: 90)
+
+    with pytest.raises(SystemExit, match="stop loop"):
+        limits._bg_refresh_loop()
+
+    # The loop survived the first crash and made a second call
+    assert call_count["n"] == 2
+    # _cache_ready must be set even after crash
+    assert limits._cache_ready.is_set()
+
+
 # ── Background-thread polling interval tests ──────────────────────────────────
 
 def test_compute_next_poll_sec_returns_available_interval():
@@ -308,7 +429,7 @@ def test_get_limits_returns_cached_result_without_extra_call(monkeypatch):
     """With a populated cache, get_limits() returns immediately without calling _get_limits_fresh."""
     call_count = {"n": 0}
 
-    def fake_fresh():
+    def fake_fresh(**_kw):
         call_count["n"] += 1
         return limits.AllLimits(claude=limits.ProviderLimits(available=True, remaining_pct=80.0))
 
@@ -333,7 +454,7 @@ def test_get_limits_force_refresh_calls_fresh_and_updates_cache(monkeypatch):
     """force_refresh=True always calls _get_limits_fresh synchronously."""
     call_count = {"n": 0}
 
-    def fake_fresh():
+    def fake_fresh(**_kw):
         call_count["n"] += 1
         return limits.AllLimits(
             claude=limits.ProviderLimits(available=True, remaining_pct=float(call_count["n"]) * 10),
@@ -443,11 +564,12 @@ def test_bg_refresh_loop_preserves_force_refresh_wakeup_until_wait(monkeypatch):
 
         def wait(self, timeout=None):
             self.wait_flags.append(self.flag)
-            raise RuntimeError("stop loop")
+            # Use SystemExit (BaseException) to bypass the except Exception handler
+            raise SystemExit("stop loop")
 
     fake_wake = FakeWakeEvent()
 
-    def fake_fresh():
+    def fake_fresh(on_preliminary=None):
         # Simulate force_refresh() waking the background thread after the loop
         # already started its iteration but before it begins waiting.
         fake_wake.set()
@@ -462,7 +584,7 @@ def test_bg_refresh_loop_preserves_force_refresh_wakeup_until_wait(monkeypatch):
     monkeypatch.setattr(limits, "_get_limits_fresh", fake_fresh)
     monkeypatch.setattr(limits, "_compute_next_poll_sec", lambda _result: 90)
 
-    with pytest.raises(RuntimeError, match="stop loop"):
+    with pytest.raises(SystemExit, match="stop loop"):
         limits._bg_refresh_loop()
 
     assert fake_wake.wait_flags == [True]

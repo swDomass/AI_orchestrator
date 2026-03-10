@@ -773,10 +773,20 @@ def _refresh_token(provider: str) -> bool:
         return False
 
 
-def _get_limits_fresh() -> AllLimits:
-    """Actually run cclimits and parse the result (no caching)."""
+def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
+    """Actually run cclimits and parse the result.
+
+    on_preliminary: optional callback(AllLimits) called with the pre-refresh
+    result so callers see accurate data ("token expired") instead of blocking
+    for the full refresh cycle.
+
+    force_fresh: bypass the cclimits disk cache on the initial call (used by
+    force_refresh and after known failures).
+    """
     with _fresh_limits_lock:
-        raw = _run_cclimits()
+        raw = _run_cclimits_with_timeout(
+            _CCLIMITS_TIMEOUT_SEC, use_cache=not force_fresh,
+        )
         if raw is None:
             return AllLimits(
                 claude=ProviderLimits(error="cclimits timeout"),
@@ -786,6 +796,20 @@ def _get_limits_fresh() -> AllLimits:
 
         # Auto-refresh expired tokens and re-query
         refresh_attempted = False
+        needs_refresh = any(
+            _needs_token_refresh(raw, p) for p in ("claude", "gemini")
+        )
+
+        # Publish preliminary result before the slow token refresh so that
+        # get_limits() callers don't time out waiting for _cache_ready.
+        if needs_refresh and on_preliminary is not None:
+            preliminary = AllLimits(
+                claude=_parse_claude(raw.get("claude", {"status": "missing"})),
+                gemini=_parse_gemini(raw.get("gemini", {"status": "missing"})),
+                codex=_parse_codex(raw.get("codex", {"status": "missing"})),
+            )
+            on_preliminary(preliminary)
+
         now = time.monotonic()
         for provider in ("claude", "gemini"):
             if _needs_token_refresh(raw, provider):
@@ -806,10 +830,13 @@ def _get_limits_fresh() -> AllLimits:
                     logger.error("  [%s] Token-Refresh fehlgeschlagen — Provider wird als unavailable gemeldet", provider)
 
         if refresh_attempted:
-            # Re-query after any refresh attempt.
-            # Some CLIs refresh OAuth asynchronously and may still return non-zero once.
-            for _ in range(3):
-                fresh = _run_cclimits()
+            # Re-query after any refresh attempt.  MUST bypass disk cache —
+            # the first cclimits call wrote the "expired" result into the cache
+            # and --cache-ttl would just re-read that stale entry.
+            for retry_i in range(3):
+                fresh = _run_cclimits_with_timeout(
+                    _CCLIMITS_TIMEOUT_SEC, use_cache=False,
+                )
                 if fresh is not None:
                     raw = fresh
                     if not any(_needs_token_refresh(raw, p) for p in ("claude", "gemini")):
@@ -901,37 +928,52 @@ def _bg_refresh_loop() -> None:
     global _limits_cache
     backoff = _BG_POLL_ERROR_SEC
     while True:
-        # Clear the wake event at loop start so a concurrent force_refresh()
-        # that happens during refresh/scheduling is still observed by wait().
-        _bg_wake.clear()
+        try:
+            # Clear the wake event at loop start so a concurrent force_refresh()
+            # that happens during refresh/scheduling is still observed by wait().
+            _bg_wake.clear()
 
-        # Single lock acquisition: check skip and read result atomically.
-        with _limits_cache_lock:
-            cached = _limits_cache
-            skip = cached is not None and (time.monotonic() - cached[1]) < 5
-
-        if skip:
-            # Cache was freshly updated by force_refresh — just recalibrate sleep.
-            # Reset backoff if the fresh snapshot is healthy so the next real error
-            # doesn't inherit an elevated retry interval from a previous error streak.
-            result = cached[0]
-            is_error = _is_timeout_snapshot(result) or _is_transient_error_snapshot(result)
-            sleep_sec = _BG_POLL_ERROR_SEC if is_error else _compute_next_poll_sec(result)
-            if not is_error:
-                backoff = _BG_POLL_ERROR_SEC
-        else:
-            result = _get_limits_fresh()
+            # Single lock acquisition: check skip and read result atomically.
             with _limits_cache_lock:
-                _limits_cache = (result, time.monotonic())
-            _cache_ready.set()
-            if _is_timeout_snapshot(result) or _is_transient_error_snapshot(result):
-                sleep_sec = backoff
-                backoff = min(backoff * 3, _BG_POLL_AVAILABLE_SEC)
-            else:
-                backoff = _BG_POLL_ERROR_SEC
-                sleep_sec = _compute_next_poll_sec(result)
+                cached = _limits_cache
+                skip = cached is not None and (time.monotonic() - cached[1]) < 5
 
-        _bg_wake.wait(timeout=sleep_sec)
+            if skip:
+                # Cache was freshly updated by force_refresh — just recalibrate sleep.
+                # Reset backoff if the fresh snapshot is healthy so the next real error
+                # doesn't inherit an elevated retry interval from a previous error streak.
+                result = cached[0]
+                is_error = _is_timeout_snapshot(result) or _is_transient_error_snapshot(result)
+                sleep_sec = _BG_POLL_ERROR_SEC if is_error else _compute_next_poll_sec(result)
+                if not is_error:
+                    backoff = _BG_POLL_ERROR_SEC
+            else:
+                def _publish_preliminary(preliminary: AllLimits) -> None:
+                    """Cache pre-refresh result so get_limits() doesn't time out."""
+                    global _limits_cache
+                    with _limits_cache_lock:
+                        _limits_cache = (preliminary, time.monotonic())
+                    _cache_ready.set()
+
+                result = _get_limits_fresh(on_preliminary=_publish_preliminary)
+                with _limits_cache_lock:
+                    _limits_cache = (result, time.monotonic())
+                _cache_ready.set()
+                if _is_timeout_snapshot(result) or _is_transient_error_snapshot(result):
+                    sleep_sec = backoff
+                    backoff = min(backoff * 3, _BG_POLL_AVAILABLE_SEC)
+                else:
+                    backoff = _BG_POLL_ERROR_SEC
+                    sleep_sec = _compute_next_poll_sec(result)
+
+            _bg_wake.wait(timeout=sleep_sec)
+        except Exception:
+            logger.exception("limits bg refresh crashed — retrying in %ds", backoff)
+            # Ensure _cache_ready is set even on crash so get_limits() callers
+            # don't block forever waiting for the first result.
+            _cache_ready.set()
+            _bg_wake.wait(timeout=backoff)
+            backoff = min(backoff * 2, _BG_POLL_AVAILABLE_SEC)
 
 
 def _start_bg_thread() -> None:
@@ -960,7 +1002,7 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
     """
     global _limits_cache
     if force_refresh:
-        result = _get_limits_fresh()
+        result = _get_limits_fresh(force_fresh=True)
         with _limits_cache_lock:
             _limits_cache = (result, time.monotonic())
         _cache_ready.set()

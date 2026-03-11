@@ -49,6 +49,9 @@ TIMEOUT_RE = re.compile(r"(?i)(?<!\S)#timeout:(\d+)([smh])(?=\s|$)")
 # Matches #tool:name metadata tag
 TOOL_TAG_RE = re.compile(r"#tool:[\w-]+")
 
+# Matches #tool_providers:p1,p2 metadata tag
+TOOL_PROVIDERS_TAG_RE = re.compile(r"(?i)#tool_providers:([\w,]+)")
+
 # Matches provider selection tags
 PROVIDER_TAG_RE = re.compile(r"#(?:claude|gemini|codex)\b", re.IGNORECASE)
 
@@ -470,11 +473,20 @@ def extract_model_tag(task: str) -> str | None:
     return m.group(1).lower() if m else None
 
 
+def extract_tool_providers(task: str) -> list[str] | None:
+    """Extract allowed providers for the task's tool from #tool_providers:p1,p2."""
+    match = TOOL_PROVIDERS_TAG_RE.search(task)
+    if not match:
+        return None
+    return [p.strip().lower() for p in match.group(1).split(",") if p.strip()]
+
+
 def strip_metadata_tags(task: str) -> str:
     """Remove routing/metadata tags before sending the task text to a provider."""
     task = CWD_RE.sub("", task)
     task = TIMEOUT_RE.sub("", task)
     task = TOOL_TAG_RE.sub("", task)
+    task = TOOL_PROVIDERS_TAG_RE.sub("", task)
     task = PROVIDER_TAG_RE.sub("", task)
     task = PROFILE_TAG_RE.sub("", task)
     task = PREAPPROVE_TAG_RE.sub("", task)

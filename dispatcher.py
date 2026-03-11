@@ -84,11 +84,26 @@ def select_provider(
 
     # Tool Policy Layering: filter allowed providers for this tool
     allowed_by_policy = None
+    
+    # 1. Task level (#tool_providers:p1,p2)
     try:
-        from policy import get_engine
-        allowed_by_policy = get_engine().get_allowed_providers(tool_name)
+        from queue_manager import extract_tool_providers
+        allowed_by_policy = extract_tool_providers(task)
     except Exception:
         pass
+    
+    # 2. Profile level (profile.tool_providers)
+    if allowed_by_policy is None:
+        if profile and tool_name and hasattr(profile, "tool_providers"):
+            allowed_by_policy = profile.tool_providers.get(tool_name)
+    
+    # 3. Global level (policy.yaml)
+    if allowed_by_policy is None:
+        try:
+            from policy import get_engine
+            allowed_by_policy = get_engine().get_allowed_providers(tool_name)
+        except Exception:
+            pass
 
     # Profile provider order overrides _PRIORITY
     if profile and getattr(profile, "providers", None):

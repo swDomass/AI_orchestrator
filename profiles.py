@@ -33,6 +33,7 @@ class ProfileConfig:
     sandbox: str = "off"       # off | ro | rw
     safety_level: str = "standard"  # strict | standard | yolo
     policy: dict = field(default_factory=dict)   # {"auto": [...], "approve": [...], "deny": [...]}
+    tool_providers: dict[str, list[str]] = field(default_factory=dict)  # {"tool_name": ["p1", "p2"]}
 
 
 def get_default_profile() -> ProfileConfig:
@@ -122,4 +123,5 @@ def _build_profile_config(name: str, data: dict) -> ProfileConfig:
         sandbox=str(data.get("sandbox", "off")),
         safety_level=str(data.get("safety_level", "standard")),
         policy=data.get("policy") or {},
+        tool_providers=data.get("tool_providers") or {},
     )

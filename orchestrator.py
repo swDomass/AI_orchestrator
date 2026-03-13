@@ -1088,7 +1088,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 def run_watch(dry_run: bool = False) -> None:
     """Continuously process queue, sleeping when all providers are exhausted."""
     from doctor import run_startup_checks
-    from heartbeat import HeartbeatRunner
+    from heartbeat import HeartbeatRunner, _log_capacity
     if not run_startup_checks():
         print("CRITICAL: Startup checks failed. Run --doctor to see details.")
         sys.exit(1)
@@ -1116,6 +1116,14 @@ def run_watch(dry_run: bool = False) -> None:
     listener.start()
 
     heartbeat = HeartbeatRunner()
+
+    # Write a fresh capacity snapshot right after startup so the dashboard
+    # timeline is current from the first second. _log_capacity() reads from
+    # the bg-daemon in-memory cache — no extra cclimits call.
+    try:
+        _log_capacity()
+    except Exception:
+        logger.debug("Startup capacity snapshot failed")
 
     def _cleanup():
         listener.stop()

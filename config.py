@@ -59,7 +59,11 @@ LOG_SECTION = "## Log"
 PROVIDER_COOLDOWN_SEC = 30 * 60  # 30 minutes
 
 # Minimum remaining capacity to consider a provider usable (percent)
-MIN_CAPACITY_PERCENT = 5
+# Override via .env: MIN_CAPACITY_PERCENT=15
+try:
+    MIN_CAPACITY_PERCENT = int(os.getenv("MIN_CAPACITY_PERCENT") or "10")
+except ValueError:
+    MIN_CAPACITY_PERCENT = 10
 
 # Claude subscription plan — used by the local-file 429 fallback to calculate
 # remaining capacity from ~/.claude/projects JSONL data when cclimits is rate-limited.

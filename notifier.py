@@ -76,8 +76,8 @@ def _send(text: str) -> bool:
         return False
 
 
-def _truncate(text: str, max_len: int = 300) -> str:
-    """Truncate text for Telegram (4096 char limit)."""
+def _truncate(text: str, max_len: int = 3500) -> str:
+    """Truncate text for Telegram (4096 char limit per message)."""
     if len(text) <= max_len:
         return text
     return text[:max_len] + "..."
@@ -98,7 +98,7 @@ def notify_task_started(task: str, provider: str) -> None:
         return
 
     provider_safe = _escape_markdown(provider)
-    task_safe = _strip_backticks(_truncate(task, 100))
+    task_safe = _strip_backticks(_truncate(task, 300))
 
     _send(
         f"🚀 *Task gestartet* ({provider_safe})\n"
@@ -116,18 +116,18 @@ def notify_task_done(task: str, provider: str, output: str, change_summary: str 
         _stats["providers_used"][provider] = _stats["providers_used"].get(provider, 0) + 1
 
     provider_safe = _escape_markdown(provider)
-    task_safe = _strip_backticks(_truncate(task, 100))
-    output_safe = _escape_markdown(_truncate(output))
+    task_safe = _strip_backticks(_truncate(task, 300))
 
     changes_block = ""
     if change_summary:
         changes_block = f"\n\n📁 *Änderungen:*\n{_escape_markdown(_truncate(change_summary, 500))}"
 
-    _send(
-        f"✅ *Task erledigt* ({provider_safe})\n"
-        f"`{task_safe}`\n\n"
-        f"{output_safe}{changes_block}"
-    )
+    header = f"✅ *Task erledigt* ({provider_safe})\n`{task_safe}`\n\n"
+    # Dynamically cap output so header + output + changes_block stays within Telegram's 4096 limit.
+    max_output = max(200, 4096 - len(header) - len(changes_block) - 10)
+    output_safe = _truncate(_escape_markdown(output), min(3900, max_output))
+
+    _send(header + output_safe + changes_block)
 
 
 def notify_error(task: str, provider: str, error: str) -> None:
@@ -139,8 +139,8 @@ def notify_error(task: str, provider: str, error: str) -> None:
         _stats["tasks_failed"] += 1
 
     provider_safe = _escape_markdown(provider)
-    task_safe = _strip_backticks(_truncate(task, 100))
-    error_safe = _escape_markdown(str(error))
+    task_safe = _strip_backticks(_truncate(task, 300))
+    error_safe = _escape_markdown(_truncate(str(error), 3500))
 
     _send(
         f"❌ *Fehler* ({provider_safe})\n"

@@ -20,7 +20,9 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 2 | `--doctor` / onboarding command | DONE |
 | 3 | Memory system with temporal decay | DONE |
 | 4 | Heartbeat / proactive scheduled tasks | DONE |
-| 10 | `#shutdown` ÔÇö graceful OS shutdown via Telegram or queue tag | DONE |
+| 10 | `#shutdown` — graceful OS shutdown via Telegram or queue tag | DONE |
+| 20 | Increased Telegram output (3.5k) + context-aware AI chat | DONE |
+
 
 ## Tier 2 ÔÇö Strong Value, Moderate Effort
 

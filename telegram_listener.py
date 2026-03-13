@@ -37,11 +37,13 @@ from config import (
     TELEGRAM_CHAT_TIMEOUT_SEC,
     TELEGRAM_ENABLED,
     TELEGRAM_MAX_TASK_LENGTH,
+    get_system_prompt,
 )
 from dispatcher import select_provider
 from limits import get_limits
 from notifier import send_message
 from queue_manager import append_task, read_queue
+import memory as memory_module
 
 logger = logging.getLogger("telegram-listener")
 
@@ -539,7 +541,12 @@ class TelegramListener:
                 thinking_timer.daemon = True
                 thinking_timer.start()
                 try:
-                    result = provider.run(text, timeout=TELEGRAM_CHAT_TIMEOUT_SEC)
+                    # Build chat prompt with system rules and temporal context
+                    core = get_system_prompt(provider.name)
+                    daily = memory_module.get_daily_context()
+                    prompt = f"{core}\n\n## Aktueller Verlauf (Gedaechtnis)\n{daily}\n\n## Benutzer-Frage\n{text}"
+
+                    result = provider.run(prompt, timeout=TELEGRAM_CHAT_TIMEOUT_SEC)
                 finally:
                     provider_done.set()
                     thinking_timer.cancel()

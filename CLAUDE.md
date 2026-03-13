@@ -13,7 +13,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~343 tests, ~17s)
+# Run all tests (~445 tests, ~4s)
 python -m pytest tests/ -q
 
 # Run a single test file
@@ -43,7 +43,7 @@ python orchestrator.py --dashboard    # launch analytics web dashboard
 **Execution flow**: Queue read → provider selection (fallback chain) → profile loading → policy check → skill gating → memory context injection → prompt building → provider execution → result persistence → heartbeat.
 
 Key components:
-- **`orchestrator.py`**: Main loop (`run_once`/`run_watch`), prompt building (`_build_prompt`), file change tracking via before/after snapshots
+- **`orchestrator.py`**: Main loop (`run_once`/`run_watch`), prompt building (`_build_prompt`), file change tracking via before/after snapshots. `run_watch()` calls `_log_capacity()` once after startup delay so the dashboard timeline has a fresh data point from the first second
 - **`dispatcher.py`**: Provider selection with fallback chain (Claude → Gemini → Codex), cooldown management, Claude model aliases (`#claude_haiku`, `#claude_sonnet`, `#claude_opus`)
 - **`queue_manager.py`**: Obsidian MD queue parsing with sidecar `.lock` file locking (msvcrt on Windows, fcntl on Unix). Regex-based metadata extraction (`cwd:`, `#tool:`, `#agent:`, `#parallel`, `#claude_*`, etc.). UTF-8 with cp1252 fallback. Smart wikilink/file context injection with TF-IDF section extraction. `_parse_subtask_line()` shared helper used by both `read_queue_items()` and `_replace_open_task_line()`. Subtask-aware task matching in queue mutations (mark_done/mark_retry/finalize) prevents wrong-task collisions in parallel queues.
 - **`providers/base.py`**: `BaseProvider` ABC with per-provider `_lock` for cooldown state and `threading.local()` for per-thread forced model. `RunResult` includes `input_tokens`/`output_tokens` for capacity estimation
@@ -52,13 +52,15 @@ Key components:
 - **`usage_suggester.py`**: `UsageSuggester` singleton — proactive task suggestions when provider capacity is underutilized. Same threading pattern as PolicyEngine
 - **`memory.py`**: TF-IDF + temporal decay search over past task results stored in vault. Auto-archival after 180 days.
 - **`heartbeat.py`**: Scheduled health checks with mtime-reloading config from vault `HEARTBEAT.md`. 7 built-in handlers: queue-idle, git-status, disk-space, check-limits, summarize, stale-branch, usage-suggest
-- **`analytics.py`**: Parses task results, log files, queue events into `TaskRecord`/`LimitSnapshot`/`QueueEvent` dataclasses. Aggregation functions + `get_dashboard_data()` with 30s TTL cache
+- **`analytics.py`**: Parses task results, log files, queue events into `TaskRecord`/`LimitSnapshot`/`QueueEvent` dataclasses. Aggregation functions + `get_dashboard_data()` with 30s TTL cache. `_get_current_limits()` fetches live data from the bg-daemon cache (no extra cclimits call); result exposed as `current_limits` in dashboard API
 - **`dashboard.py`**: Standalone HTTP server (port 8411) serving Chart.js dashboard. `GET /` HTML, `GET /api/data` JSON. Auto-refresh 60s. Also launchable via `--dashboard` flag
-- **`config.py`**: Centralized constants (~65+), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases
+- **`config.py`**: Centralized constants (~65+), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases. `MIN_CAPACITY_PERCENT` env-configurable (`MIN_CAPACITY_PERCENT=10` default; override via `.env`)
 - **`limits.py`**: `cclimits` wrapper for provider capacity checks, OAuth refresh handling. Direct `cclimits` invocation (no npx); disk-cache via `--cache-ttl 600` limits API calls to ~6/h. HTTP 429 resilience: (tier 0) local JSONL fallback via `claude-monitor` (no HTTP, `CLAUDE_PLAN` env var), (tier 1) snapshot cache with estimated usage tracking, Telegram notifications on 429 start/clear.
 - **`logging_setup.py`**: Rotating file logger (5MB, 3 backups) + console output
 - **`doctor.py`**: 15+ setup validation checks, `--fix`/`--yes` auto-repair mode
 - **`shutdown.py`**: Shutdown state machine with countdown, cancellation via Telegram or new queue tasks
+- **`notifier.py`**: Telegram notifications. `_truncate()` default raised to 3500 chars (was 300); task text in start/done notifications up to 300 chars (was 100)
+- **`telegram_listener.py`**: Telegram bot listener. AI chat mode (`/chat`) builds context-aware prompt: SOUL.md system prompt + `memory.get_daily_context()` + user question
 - **`tools/research_qa.py`**: `ResearchQATool` — 3-phase read-only pre-implementation workflow (Discovery → Analysis → Questions). Output to `{cwd}/.research-qa/`. Registered as `#tool:research-qa`
 - **`tools/review_loop.py`**: `ReviewLoopTool` — iterative code review fixing ALL P1/P2/P3 findings (max 20 iterations). Infinite-loop detection via finding signature dedup
 

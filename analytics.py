@@ -418,6 +418,30 @@ _cache: dict[str, object] = {"data": None, "ts": 0.0}
 _CACHE_TTL = 30  # seconds
 
 
+def _get_current_limits() -> dict:
+    """Fetch live limits via the limits module.
+
+    In the main orchestrator process this reads from the already-running
+    background daemon (no extra cclimits call). In a standalone dashboard
+    process the first call may block up to 30 s while the background polling
+    thread starts and warms up. Returns {} only if an exception is raised.
+    """
+    try:
+        from limits import get_limits
+        lims = get_limits()
+        result = {}
+        for name in ("claude", "gemini", "codex"):
+            lim = getattr(lims, name)
+            result[name] = {
+                "available": lim.available,
+                "remaining_pct": lim.remaining_pct,
+                "error": lim.error or "",
+            }
+        return result
+    except Exception:
+        return {}
+
+
 def get_dashboard_data() -> dict:
     """Single entry-point: aggregate all data sources into a dict.
 
@@ -463,6 +487,7 @@ def get_dashboard_data() -> dict:
         "tasks_per_day": {"labels": tpd_labels, "values": tpd_values},
         "provider_distribution": {"labels": pd_labels, "values": pd_values},
         "limits_timeline": _limits_timeline(snapshots, hours=90 * 24),
+        "current_limits": _get_current_limits(),
         "recent_events": _recent_events(error_lines, queue_events, suggest_events),
         "usage_suggest_today": suggest_today,
         "session": session,

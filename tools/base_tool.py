@@ -33,7 +33,11 @@ def _write_tool_file(output_dir: Path, filename: str, content: str) -> None:
     (output_dir / filename).write_text(content, encoding="utf-8")
 
 
-def _build_system_prompt(provider_name: str, memory_context: str = "") -> str:
+def _build_system_prompt(
+    provider_name: str,
+    memory_context: str = "",
+    tool_name: str | None = None,
+) -> str:
     """Assemble system prompt with layered memory context for tool workflows."""
     prompt = get_system_prompt(provider_name)
 
@@ -57,6 +61,14 @@ def _build_system_prompt(provider_name: str, memory_context: str = "") -> str:
                 prompt += f"\n\n## Heutiger Verlauf\n{daily}"
         except Exception as exc:
             logger.warning("Tool prompt daily memory load failed: %s", exc)
+
+        # Layer 4: Lessons learned (filtered by tool if available)
+        try:
+            lessons = memory_module.get_lessons_context(tool_name=tool_name)
+            if lessons:
+                prompt += f"\n\n## Lessons Learned\n{lessons}"
+        except Exception as exc:
+            logger.warning("Tool prompt lessons load failed: %s", exc)
 
     if memory_context:
         prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from config import (
     TOOL_DEV_EXEC_TIMEOUT_SEC,
+    TOOL_DEV_PLAN_TIMEOUT_SEC,
     TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC,
     TOOL_DEV_RESEARCH_TIMEOUT_SEC,
     TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC,
@@ -90,17 +91,45 @@ Output format (required sections):
 [External libs, API changes, error handling concerns, edge cases]
 """
 
-_EXECUTION_PROMPT = """\
-You are an Execution Agent. Implement the following task based on the research \
-findings below.
+_PLAN_PROMPT = """\
+You are a Planning Agent. Based on the research findings, create a concrete \
+implementation plan.
 
 ORIGINAL TASK: {task}
 
 RESEARCH FINDINGS:
 {research}
+
+Create a plan with these sections:
+
+## Implementation Plan
+1. Files to create or modify (exact paths)
+2. Changes per file (brief description of what to add/modify/remove)
+3. Order of operations (which changes first)
+
+## Test Strategy
+- How to verify the changes work
+- Which tests to run or create
+
+## Risks & Edge Cases
+- What could go wrong
+- Edge cases to handle
+"""
+
+_EXECUTION_PROMPT = """\
+You are an Execution Agent. Implement the following task based on the research \
+findings and implementation plan below.
+
+ORIGINAL TASK: {task}
+
+RESEARCH FINDINGS:
+{research}
+
+IMPLEMENTATION PLAN:
+{plan}
 {review_context}
 Instructions:
-- Implement the solution exactly as planned in the research findings.
+- Implement the solution exactly as laid out in the implementation plan.
 - Fix ALL issues raised in previous reviews (listed above, if any).
 - Apply changes directly to the files.
 - Run existing tests if feasible.
@@ -165,6 +194,16 @@ class DevLoopTool(BaseTool):
         "(Code Quality + Issue Resolution) bis beide Reviews grünes Licht geben"
     )
 
+    def _get_plan_approval_mode(self) -> str:
+        """Check policy.yaml for plan approval mode: auto | approve | skip."""
+        try:
+            from policy import load_policy
+            policy = load_policy()
+            phases = policy.get("tool_phases", {}).get("dev-loop", {})
+            return phases.get("plan_approval", "auto")
+        except Exception:
+            return "auto"
+
     def run(
         self,
         task: str,
@@ -176,18 +215,25 @@ class DevLoopTool(BaseTool):
         print(f"  [dev-loop] Starte Dev-Loop (max {TOOL_MAX_ITERATIONS} Iterationen)")
 
         dev_loop_dir = Path(cwd or ".") / DEV_LOOP_DIR
-        system_prompt = _build_system_prompt(provider.name, memory_context)
+        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name)
         all_outputs: list[str] = []
         seen_quality_signatures: set[tuple[str, ...]] = set()
         seen_review_signatures: set[tuple[tuple[str, ...], str, str]] = set()
 
         research_timeout = timeout or TOOL_DEV_RESEARCH_TIMEOUT_SEC
+        plan_timeout = timeout or TOOL_DEV_PLAN_TIMEOUT_SEC
         exec_timeout = timeout or TOOL_DEV_EXEC_TIMEOUT_SEC
         quality_timeout = timeout or TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC
         resolution_timeout = timeout or TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC
 
         total_input_tokens = 0
         total_output_tokens = 0
+
+        # Load memory module for lessons
+        try:
+            import memory as memory_module
+        except Exception:
+            memory_module = None
 
         # ── Phase 1: Research ─────────────────────────────────────────────────
         print("  [dev-loop] === Phase 1: RESEARCH ===")
@@ -220,6 +266,69 @@ class DevLoopTool(BaseTool):
         )
         print(f"  [dev-loop] Research abgeschlossen → {dev_loop_dir / 'research.md'}")
 
+        # ── Phase 1.5: Plan ───────────────────────────────────────────────────
+        plan_approval_mode = self._get_plan_approval_mode()
+        plan_output = ""
+
+        if plan_approval_mode != "skip":
+            print("  [dev-loop] === Phase 1.5: PLAN ===")
+            plan_prompt = system_prompt + "\n\n" + _PLAN_PROMPT.format(
+                task=task,
+                research=research_output,
+            )
+            plan_result = provider.run(plan_prompt, cwd=cwd, timeout=plan_timeout)
+            total_input_tokens += plan_result.input_tokens
+            total_output_tokens += plan_result.output_tokens
+
+            if not plan_result.success:
+                msg = f"Plan-Phase fehlgeschlagen: {plan_result.error}"
+                print(f"  [dev-loop] {msg}")
+                notify_tool_done(self.name, 0, False, msg)
+                return ToolResult(
+                    success=False,
+                    output="\n\n".join(all_outputs),
+                    iterations=0,
+                    error=msg,
+                    error_code=plan_result.error,
+                    retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
+
+            plan_output = plan_result.output.strip()
+            all_outputs.append(f"--- Plan ---\n{plan_output}")
+            _write_tool_file(
+                dev_loop_dir,
+                "plan.md",
+                f"# Dev-Loop Plan\n\nTask: {task}\n\n{plan_output}\n",
+            )
+            print(f"  [dev-loop] Plan erstellt → {dev_loop_dir / 'plan.md'}")
+
+            # Telegram approval if configured
+            if plan_approval_mode == "approve":
+                try:
+                    from notifier import request_approval
+                    approved = request_approval(
+                        f"Dev-Loop Plan fuer: {task[:100]}\n\n{plan_output[:500]}",
+                        timeout=600,
+                    )
+                    if not approved:
+                        msg = "Plan wurde via Telegram abgelehnt."
+                        print(f"  [dev-loop] {msg}")
+                        notify_tool_done(self.name, 0, False, msg)
+                        return ToolResult(
+                            success=False,
+                            output="\n\n".join(all_outputs),
+                            iterations=0,
+                            error=msg,
+                            input_tokens=total_input_tokens,
+                            output_tokens=total_output_tokens,
+                        )
+                except Exception as exc:
+                    print(f"  [dev-loop] Plan-Approval uebersprungen (Fehler: {exc})")
+
+            time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
+
         # ── Phase 2+3: Execute → Dual-Review → Iterate ───────────────────────
         previous_quality_findings: list[str] = []
         previous_resolution_output: str = ""
@@ -247,9 +356,23 @@ class DevLoopTool(BaseTool):
                     + "\n"
                 )
 
+            # Search lessons for hints related to current review findings
+            lessons_context = ""
+            if previous_quality_findings and memory_module is not None:
+                try:
+                    findings_text = "\n".join(previous_quality_findings)
+                    hint = memory_module.search_lessons(findings_text)
+                    if hint:
+                        review_context += (
+                            f"\nLESSONS FROM PREVIOUS SIMILAR ISSUES:\n{hint}\n"
+                        )
+                except Exception:
+                    pass
+
             exec_prompt = system_prompt + "\n\n" + _EXECUTION_PROMPT.format(
                 task=task,
                 research=research_output,
+                plan=plan_output or "(no plan generated)",
                 review_context=review_context,
             )
             notify_tool_progress(
@@ -403,6 +526,21 @@ class DevLoopTool(BaseTool):
                         f"Status: DONE — bereit fuer Review + Git Push\n"
                     ),
                 )
+
+                # Auto-lesson: if >2 iterations, record patterns for future loops
+                if iteration > 2 and memory_module is not None:
+                    try:
+                        last_findings = list(seen_quality_signatures)[-1] if seen_quality_signatures else ()
+                        memory_module.append_lesson(
+                            tool_name=self.name,
+                            cwd=cwd or ".",
+                            pattern=f"Benoetigte {iteration} Iterationen. Letzte blocking Findings: {'; '.join(last_findings[:3])}",
+                            fix="Task wurde nach mehreren Iterationen geloest",
+                            tool_hint="Bei aehnlichen Findings: Research-Phase gruendlicher analysieren, Plan-Phase nicht ueberspringen",
+                        )
+                    except Exception:
+                        pass
+
                 notify_tool_done(self.name, iteration, True, msg)
                 return ToolResult(
                     success=True,

@@ -145,11 +145,15 @@ TOOL_REVIEW_TIMEOUT_SEC = 1_200  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
 TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations
 
-# Dev-Loop timeouts (Research → Execute → Dual-Review)
+# Dev-Loop timeouts (Research → Plan → Execute → Dual-Review)
 TOOL_DEV_RESEARCH_TIMEOUT_SEC          = 1_200  # 20 min: Research phase
+TOOL_DEV_PLAN_TIMEOUT_SEC              =   600  # 10 min: Plan phase
 TOOL_DEV_EXEC_TIMEOUT_SEC              = 2_400  # 40 min: Execution phase
 TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC    = 1_200  # 20 min: Code Quality Review
 TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC =   600  # 10 min: Issue Resolution Review
+
+# Review-Loop verification phase timeout
+TOOL_VERIFICATION_TIMEOUT_SEC          =   600  # 10 min: Final verification after no findings
 
 # Research-QA timeouts (Discovery → Analysis → Questions)
 TOOL_RQA_DISCOVERY_TIMEOUT_SEC = 1_200  # 20 min: Codebase exploration

@@ -537,6 +537,133 @@ def get_daily_context(max_chars: int = 0) -> str:
 # ── Layer 3: TF-IDF search (existing) — see search_memory / get_context_for_task
 
 
+# ── Layer 4: Lessons Learned ─────────────────────────────────────────────────
+
+_LESSONS_FILE = _MEMORY_ROOT / "lessons.md"
+
+
+def get_lessons_context(tool_name: str | None = None, max_chars: int = 2000) -> str:
+    """Read lessons.md and return entries, optionally filtered by tool name.
+
+    Returns relevant lesson entries as a string block for prompt injection.
+    """
+    if not _LESSONS_FILE.exists():
+        return ""
+    try:
+        content = _LESSONS_FILE.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.warning("Failed to read lessons.md: %s", e)
+        return ""
+
+    if not content:
+        return ""
+
+    # Strip HTML comments (used for format templates)
+    content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL).strip()
+
+    # Parse sections (## headings)
+    sections = re.split(r"^(## .+)$", content, flags=re.MULTILINE)
+    entries: list[str] = []
+
+    for i in range(1, len(sections), 2):
+        heading = sections[i].strip()
+        body = sections[i + 1].strip() if i + 1 < len(sections) else ""
+        if not body:
+            continue
+        # Filter by tool name if specified
+        if tool_name and f"| {tool_name} |" not in heading.lower() and tool_name not in heading.lower():
+            continue
+        entries.append(f"{heading}\n{body}")
+
+    if not entries:
+        return ""
+
+    result = "\n\n".join(entries)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n..."
+    return result
+
+
+def search_lessons(query: str, max_results: int = 3) -> str:
+    """Search lessons.md for entries matching a query (keyword-based).
+
+    Returns matching lesson entries as a string for prompt injection.
+    """
+    if not _LESSONS_FILE.exists():
+        return ""
+
+    try:
+        content = _LESSONS_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+    # Strip HTML comments
+    content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL).strip()
+
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return ""
+
+    sections = re.split(r"^(## .+)$", content, flags=re.MULTILINE)
+    scored: list[tuple[float, str]] = []
+
+    for i in range(1, len(sections), 2):
+        heading = sections[i].strip()
+        body = sections[i + 1].strip() if i + 1 < len(sections) else ""
+        if not body:
+            continue
+        entry_text = f"{heading}\n{body}"
+        entry_tokens = _tokenize(entry_text)
+        sim = _tfidf_sim(query_tokens, entry_tokens)
+        if sim > 0:
+            scored.append((sim, entry_text))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    matches = [text for _, text in scored[:max_results]]
+    return "\n\n".join(matches) if matches else ""
+
+
+def append_lesson(
+    tool_name: str,
+    cwd: str,
+    pattern: str,
+    fix: str,
+    tool_hint: str,
+) -> bool:
+    """Append a new lesson entry to lessons.md.
+
+    Called automatically when a tool loop takes >2 iterations.
+    Returns True on success.
+    """
+    try:
+        _ensure_dirs()
+        today = datetime.now().strftime("%Y-%m-%d")
+        # Extract project name from cwd
+        project = Path(cwd).name if cwd else "unknown"
+
+        entry = (
+            f"\n## {today} | {tool_name} | {project}\n"
+            f"- **Pattern:** {pattern}\n"
+            f"- **Fix:** {fix}\n"
+            f"- **Tool-Hint:** {tool_hint}\n"
+        )
+
+        if not _LESSONS_FILE.exists():
+            _LESSONS_FILE.write_text(
+                f"# Lessons Learned\n{entry}",
+                encoding="utf-8",
+            )
+        else:
+            with open(_LESSONS_FILE, "a", encoding="utf-8") as f:
+                f.write(entry)
+
+        logger.info("Lesson appended: %s | %s | %s", today, tool_name, project)
+        return True
+    except Exception as e:
+        logger.warning("Failed to append lesson: %s", e)
+        return False
+
+
 # ── Archival ─────────────────────────────────────────────────────────────────
 
 def archive_old_memories() -> int:

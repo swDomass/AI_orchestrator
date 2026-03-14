@@ -1123,7 +1123,7 @@ def run_watch(dry_run: bool = False) -> None:
     try:
         _log_capacity()
     except Exception:
-        logger.debug("Startup capacity snapshot failed")
+        pass  # non-critical: dashboard will get fresh data on next heartbeat
 
     def _cleanup():
         listener.stop()

@@ -73,6 +73,12 @@ PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
 # Matches Claude model selection tags: #claude_haiku, #claude_sonnet, #claude_opus
 MODEL_TAG_RE = re.compile(r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus))(?![\w-])")
 
+# Matches #id:name — gives a task a unique ID for dependency tracking
+ID_TAG_RE = re.compile(r"(?i)(?<!\S)#id:([\w-]+)(?=\s|$)")
+
+# Matches #needs:name1,name2 — declares task dependencies (comma-separated)
+NEEDS_TAG_RE = re.compile(r"(?i)(?<!\S)#needs:([\w,\-]+)(?=\s|$)")
+
 # Extract only the markdown body under "## Queue" (until the next H2 heading)
 QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)
 
@@ -82,6 +88,7 @@ class QueueTask:
     task_text: str
     line_no: int
     subtasks: tuple[str, ...] = ()   # populated for #parallel tasks
+    blocked_reason: str = ""         # non-empty = task is blocked by unmet #needs: deps
 
 
 def _find_heading_line(content: str, heading: str, prefer_last: bool = False):
@@ -481,6 +488,20 @@ def extract_tool_providers(task: str) -> list[str] | None:
     return [p.strip().lower() for p in match.group(1).split(",") if p.strip()]
 
 
+def extract_id_tag(task: str) -> str | None:
+    """Extract #id:<name> from task text. Returns lowercased name or None."""
+    m = ID_TAG_RE.search(task)
+    return m.group(1).lower() if m else None
+
+
+def extract_needs_tags(task: str) -> list[str]:
+    """Extract #needs:<deps> from task text. Returns list of lowercased dep names."""
+    m = NEEDS_TAG_RE.search(task)
+    if not m:
+        return []
+    return [dep.strip().lower() for dep in m.group(1).split(",") if dep.strip()]
+
+
 def strip_metadata_tags(task: str) -> str:
     """Remove routing/metadata tags before sending the task text to a provider."""
     task = CWD_RE.sub("", task)
@@ -493,6 +514,8 @@ def strip_metadata_tags(task: str) -> str:
     task = SHUTDOWN_TAG_RE.sub("", task)
     task = PARALLEL_TAG_RE.sub("", task)
     task = MODEL_TAG_RE.sub("", task)
+    task = ID_TAG_RE.sub("", task)
+    task = NEEDS_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 
@@ -619,6 +642,19 @@ def inject_file_context(task: str, max_chars: int = 0) -> str:
 
 # --- Queue operations ---
 
+_DONE_OR_FAILED_RE = re.compile(r"^- \[[x\-]\] (.+)$", re.MULTILINE)
+
+
+def _collect_completed_ids(content: str) -> set[str]:
+    """Return all #id: values from done ([x]) or failed ([-]) tasks in the full file."""
+    completed: set[str] = set()
+    for m in _DONE_OR_FAILED_RE.finditer(content):
+        task_id = extract_id_tag(m.group(1))
+        if task_id:
+            completed.add(task_id)
+    return completed
+
+
 def read_queue_items() -> list[QueueTask]:
     """Return open queue items with stable line identity, skipping future retry markers."""
     content = _read_queue_content()
@@ -663,6 +699,25 @@ def read_queue_items() -> list[QueueTask]:
             subtask_lines = tuple(collected)
 
         items.append(QueueTask(task_text=task_text, line_no=line_no, subtasks=subtask_lines))
+
+    # Pass 2: Resolve #needs: dependencies
+    needs_per_item = [extract_needs_tags(item.task_text) for item in items]
+    if any(needs_per_item):
+        completed_ids = _collect_completed_ids(content)
+        resolved: list[QueueTask] = []
+        for item, needs in zip(items, needs_per_item):
+            if needs:
+                missing = [dep for dep in needs if dep not in completed_ids]
+                if missing:
+                    resolved.append(QueueTask(
+                        task_text=item.task_text,
+                        line_no=item.line_no,
+                        subtasks=item.subtasks,
+                        blocked_reason=f"needs {', '.join(missing)}",
+                    ))
+                    continue
+            resolved.append(item)
+        return resolved
 
     return items
 

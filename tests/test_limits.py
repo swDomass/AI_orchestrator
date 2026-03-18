@@ -394,7 +394,8 @@ def test_compute_next_poll_sec_returns_reset_time_when_at_limit():
         gemini=limits.ProviderLimits(error="missing"),
         codex=limits.ProviderLimits(error="missing"),
     )
-    assert limits._compute_next_poll_sec(result) == 120
+    # Allow ±2 s for live epoch computation drift
+    assert 118 <= limits._compute_next_poll_sec(result) <= 120
 
 
 def test_compute_next_poll_sec_clamps_reset_to_minimum():
@@ -446,7 +447,8 @@ def test_compute_next_poll_sec_ignores_idle_flag_when_at_limit(monkeypatch):
         gemini=limits.ProviderLimits(error="missing"),
         codex=limits.ProviderLimits(error="missing"),
     )
-    assert limits._compute_next_poll_sec(result) == 200
+    # Allow ±2 s for live epoch computation drift
+    assert 198 <= limits._compute_next_poll_sec(result) <= 200
 
 
 # ── set_queue_idle tests ───────────────────────────────────────────────────────
@@ -693,6 +695,82 @@ def test_parse_codex_windows_populated():
     assert "secondary_window" in result.windows
     assert abs(result.windows["primary_window"].remaining_pct - 70.0) < 0.1
     assert abs(result.windows["secondary_window"].remaining_pct - 90.0) < 0.1
+
+
+def test_parse_claude_per_window_thresholds(monkeypatch):
+    """five_hour uses CLAUDE_FIVE_HOUR_MIN (10%), seven_day uses CLAUDE_SEVEN_DAY_MIN (3%)."""
+    monkeypatch.setattr(limits, "CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT", 10)
+    monkeypatch.setattr(limits, "CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT", 3)
+
+    # Both above their thresholds → available
+    r = limits._parse_claude({
+        "status": "ok",
+        "five_hour": {"remaining": "15%", "resets_in": "1h"},
+        "seven_day": {"remaining": "8%", "resets_in": "38h"},
+    })
+    assert r.available is True
+
+    # five_hour below 10% → unavailable
+    r = limits._parse_claude({
+        "status": "ok",
+        "five_hour": {"remaining": "8%", "resets_in": "1h"},
+        "seven_day": {"remaining": "50%", "resets_in": "38h"},
+    })
+    assert r.available is False
+
+    # seven_day below 3% → unavailable
+    r = limits._parse_claude({
+        "status": "ok",
+        "five_hour": {"remaining": "50%", "resets_in": "1h"},
+        "seven_day": {"remaining": "2%", "resets_in": "38h"},
+    })
+    assert r.available is False
+
+    # seven_day between 3–10%: available (would have been blocked with old single threshold)
+    r = limits._parse_claude({
+        "status": "ok",
+        "five_hour": {"remaining": "50%", "resets_in": "1h"},
+        "seven_day": {"remaining": "7%", "resets_in": "38h"},
+    })
+    assert r.available is True
+
+
+def test_parse_codex_per_window_thresholds(monkeypatch):
+    """primary uses CODEX_PRIMARY_MIN (10%), secondary uses CODEX_SECONDARY_MIN (3%)."""
+    monkeypatch.setattr(limits, "CODEX_PRIMARY_MIN_CAPACITY_PCT", 10)
+    monkeypatch.setattr(limits, "CODEX_SECONDARY_MIN_CAPACITY_PCT", 3)
+
+    # Both above their thresholds → available
+    r = limits._parse_codex({
+        "status": "ok",
+        "primary_window": {"remaining": "15%", "resets_in": "1h"},
+        "secondary_window": {"remaining": "8%", "resets_in": "2h"},
+    })
+    assert r.available is True
+
+    # Primary below 10% → unavailable even though secondary is fine
+    r = limits._parse_codex({
+        "status": "ok",
+        "primary_window": {"remaining": "8%", "resets_in": "1h"},
+        "secondary_window": {"remaining": "20%", "resets_in": "2h"},
+    })
+    assert r.available is False
+
+    # Secondary below 3% → unavailable even though primary is fine
+    r = limits._parse_codex({
+        "status": "ok",
+        "primary_window": {"remaining": "50%", "resets_in": "1h"},
+        "secondary_window": {"remaining": "2%", "resets_in": "2h"},
+    })
+    assert r.available is False
+
+    # Secondary between 3–10%: available (would have been blocked with old single threshold)
+    r = limits._parse_codex({
+        "status": "ok",
+        "primary_window": {"remaining": "50%", "resets_in": "1h"},
+        "secondary_window": {"remaining": "7%", "resets_in": "2h"},
+    })
+    assert r.available is True
 
 
 def test_parse_gemini_windows_populated():

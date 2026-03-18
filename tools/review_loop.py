@@ -18,9 +18,10 @@ from config import (
     TOOL_INTER_STEP_SLEEP_SEC,
     TOOL_VERIFICATION_TIMEOUT_SEC,
 )
+from limits import is_cached_provider_available
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, ToolResult, _build_system_prompt
+from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _make_capacity_exhausted_result
 
 # Matches priority findings like: - [P1] Some issue
 FINDING_RE = re.compile(r"^\s*-\s+\[P[1-3]\]\s+.+", re.MULTILINE)
@@ -146,6 +147,12 @@ class ReviewLoopTool(BaseTool):
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: REVIEW ===")
+
+            # Capacity guard: abort loop if provider is below threshold (RAM-cache, no API call)
+            if not is_cached_provider_available(provider.name):
+                msg = f"Provider nicht verfügbar — Suspend nach Iteration {iteration - 1}"
+                print(f"  [review-loop] ⏸ {msg}")
+                return _make_capacity_exhausted_result(msg, "\n\n".join(all_outputs), iteration - 1, total_input_tokens, total_output_tokens)
 
             # Step 1: Review
             review_result = provider.run(

@@ -15,6 +15,9 @@ Usage in queue:
     - [ ] Add CSV export to dashboard #tool:dev-loop cwd:/d/programmieren/projekt
 """
 
+import hashlib
+import json
+import os
 import re
 import time
 from pathlib import Path
@@ -28,12 +31,50 @@ from config import (
     TOOL_INTER_STEP_SLEEP_SEC,
     TOOL_MAX_ITERATIONS,
 )
+from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _write_tool_file
+from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
 from tools.review_loop import _is_no_findings_output, _parse_findings
 
 DEV_LOOP_DIR = ".dev-loop"
+_STATE_FILE = "state.json"
+
+
+def _task_hash(task: str) -> str:
+    return hashlib.sha256(task.encode()).hexdigest()[:8]
+
+
+def _load_state(cwd: str, task_hash: str) -> "dict | None":
+    """Load persisted research state if it matches the current task."""
+    path = os.path.join(cwd, DEV_LOOP_DIR, _STATE_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        if state.get("task_hash") == task_hash and state.get("tool") == "dev-loop":
+            return state
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _save_state(cwd: str, state: dict) -> None:
+    """Persist state to .dev-loop/state.json (creates dir if needed)."""
+    dir_path = os.path.join(cwd, DEV_LOOP_DIR)
+    os.makedirs(dir_path, exist_ok=True)
+    path = os.path.join(dir_path, _STATE_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def _clear_state(cwd: str) -> None:
+    """Remove persisted state after successful completion."""
+    path = os.path.join(cwd, DEV_LOOP_DIR, _STATE_FILE)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
 
 # Resolution review output patterns
 _RESOLVED_RE = re.compile(r"^\s*RESOLVED\s*:", re.IGNORECASE | re.MULTILINE)
@@ -237,35 +278,58 @@ class DevLoopTool(BaseTool):
             memory_module = None
 
         # ── Phase 1: Research ─────────────────────────────────────────────────
-        print("  [dev-loop] === Phase 1: RESEARCH ===")
-        research_prompt = system_prompt + "\n\n" + _RESEARCH_PROMPT.format(task=task)
-        research_result = provider.run(research_prompt, cwd=cwd, timeout=research_timeout)
-        total_input_tokens += research_result.input_tokens
-        total_output_tokens += research_result.output_tokens
+        t_hash = _task_hash(task)
+        cached_state = _load_state(cwd, t_hash) if cwd else None
 
-        if not research_result.success:
-            msg = f"Research fehlgeschlagen: {research_result.error}"
-            print(f"  [dev-loop] {msg}")
-            notify_tool_done(self.name, 0, False, msg)
-            return ToolResult(
-                success=False,
-                output="",
-                iterations=0,
-                error=msg,
-                error_code=research_result.error,
-                retryable=True,
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
+        if cached_state and cached_state.get("phase") == "research_done":
+            print(f"  [dev-loop] Research aus Cache geladen (task_hash={t_hash})")
+            research_output = cached_state["research_output"]
+            all_outputs.append(f"--- Research (cached) ---\n{research_output}")
+        else:
+            # Capacity guard before expensive research phase
+            if not is_cached_provider_available(provider.name):
+                msg = "Provider nicht verfügbar — Suspend vor Research-Phase"
+                print(f"  [dev-loop] ⏸ {msg}")
+                return _make_capacity_exhausted_result(msg, "", 0, total_input_tokens, total_output_tokens)
+
+            print("  [dev-loop] === Phase 1: RESEARCH ===")
+            research_prompt = system_prompt + "\n\n" + _RESEARCH_PROMPT.format(task=task)
+            research_result = provider.run(research_prompt, cwd=cwd, timeout=research_timeout)
+            total_input_tokens += research_result.input_tokens
+            total_output_tokens += research_result.output_tokens
+
+            if not research_result.success:
+                msg = f"Research fehlgeschlagen: {research_result.error}"
+                print(f"  [dev-loop] {msg}")
+                notify_tool_done(self.name, 0, False, msg)
+                return ToolResult(
+                    success=False,
+                    output="",
+                    iterations=0,
+                    error=msg,
+                    error_code=research_result.error,
+                    retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
+
+            research_output = research_result.output.strip()
+            all_outputs.append(f"--- Research ---\n{research_output}")
+            _write_tool_file(
+                dev_loop_dir,
+                "research.md",
+                f"# Dev-Loop Research\n\nTask: {task}\n\n{research_output}\n",
             )
+            print(f"  [dev-loop] Research abgeschlossen → {dev_loop_dir / 'research.md'}")
 
-        research_output = research_result.output.strip()
-        all_outputs.append(f"--- Research ---\n{research_output}")
-        _write_tool_file(
-            dev_loop_dir,
-            "research.md",
-            f"# Dev-Loop Research\n\nTask: {task}\n\n{research_output}\n",
-        )
-        print(f"  [dev-loop] Research abgeschlossen → {dev_loop_dir / 'research.md'}")
+            # Persist research so a capacity-exhausted retry can skip this phase
+            if cwd:
+                _save_state(cwd, {
+                    "tool": "dev-loop",
+                    "task_hash": t_hash,
+                    "phase": "research_done",
+                    "research_output": research_output,
+                })
 
         # ── Phase 1.5: Plan ───────────────────────────────────────────────────
         plan_approval_mode = self._get_plan_approval_mode()
@@ -336,6 +400,12 @@ class DevLoopTool(BaseTool):
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: EXECUTION ===")
+
+            # Capacity guard: abort loop if provider is below threshold (RAM-cache, no API call)
+            if not is_cached_provider_available(provider.name):
+                msg = f"Provider nicht verfügbar — Suspend nach Iteration {iteration - 1}"
+                print(f"  [dev-loop] ⏸ {msg}")
+                return _make_capacity_exhausted_result(msg, "\n\n".join(all_outputs), iteration - 1, total_input_tokens, total_output_tokens)
 
             # Build review context for execution prompt (empty on first iteration)
             review_context = ""
@@ -543,6 +613,8 @@ class DevLoopTool(BaseTool):
                         pass
 
                 notify_tool_done(self.name, iteration, True, msg)
+                if cwd:
+                    _clear_state(cwd)
                 return ToolResult(
                     success=True,
                     output="\n\n".join(all_outputs),

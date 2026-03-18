@@ -605,7 +605,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         return True
 
     print(f"\n{'='*60}")
-    print(f"Queue: {len(task_items)} offene Task(s)")
+    blocked_count = sum(1 for t in task_items if getattr(t, "blocked_reason", ""))
+    eligible = len(task_items) - blocked_count
+    suffix = f" ({eligible} ausführbar, {blocked_count} blockiert)" if blocked_count else ""
+    print(f"Queue: {len(task_items)} offene Task(s){suffix}")
     print(f"{'='*60}")
 
     for i, queue_task in enumerate(task_items, 1):
@@ -616,6 +619,14 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
         task = queue_task.task_text
         task_subtasks: tuple[str, ...] | None = getattr(queue_task, "subtasks", None)  # getattr for test-mock compat
+
+        # Dependency check — skip blocked tasks without marking them done
+        blocked_reason = getattr(queue_task, "blocked_reason", "")
+        if blocked_reason:
+            print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
+            print(f"  [blocked] {blocked_reason} — übersprungen")
+            continue
+
         print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
 
         # --- Feature 6: Load execution profile ---
@@ -895,6 +906,21 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 if not outcome.retryable:
                     print("  ❌ Tool-Task nicht finalisiert (Queue-Update-Fehler). Task bleibt offen.")
                     append_log("Tool-Task nicht finalisiert wegen Queue-Update-Fehler")
+                    return False
+
+                # Capacity exhausted mid-loop: suspend task, don't try other providers
+                if outcome.error_code == "capacity_exhausted":
+                    limits = get_limits()
+                    earliest = _get_next_retry_sec(limits)
+                    reset_dt = datetime.now() + timedelta(seconds=earliest)
+                    reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                    msg = (
+                        f"Kapazität erschöpft während Tool-Ausführung "
+                        f"→ Suspend bis ~{reset_dt.strftime('%H:%M')}"
+                    )
+                    print(f"  ⏸ {msg}")
+                    append_log(msg)
+                    _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks)
                     return False
 
                 tried_providers.add(provider.name)

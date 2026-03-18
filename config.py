@@ -58,12 +58,28 @@ LOG_SECTION = "## Log"
 # Provider cooldown after unreachable error (seconds)
 PROVIDER_COOLDOWN_SEC = 30 * 60  # 30 minutes
 
+def _parse_int_env(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key) or str(default))
+    except ValueError:
+        return default
+
+
 # Minimum remaining capacity to consider a provider usable (percent)
 # Override via .env: MIN_CAPACITY_PERCENT=15
-try:
-    MIN_CAPACITY_PERCENT = int(os.getenv("MIN_CAPACITY_PERCENT") or "10")
-except ValueError:
-    MIN_CAPACITY_PERCENT = 10
+MIN_CAPACITY_PERCENT = _parse_int_env("MIN_CAPACITY_PERCENT", 10)
+
+# Per-window thresholds for Claude (five_hour resets every 5h, seven_day every 7d)
+# five_hour is consumed faster → higher default; seven_day can go lower.
+# Override via .env: CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT=15, CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT=3
+CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT = _parse_int_env("CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT", 10)
+CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT = _parse_int_env("CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT", 3)
+
+# Per-window thresholds for Codex (primary resets every 5h, secondary every 7d)
+# Primary is consumed faster → keep the higher default; secondary can go lower.
+# Override via .env: CODEX_PRIMARY_MIN_CAPACITY_PCT=15, CODEX_SECONDARY_MIN_CAPACITY_PCT=3
+CODEX_PRIMARY_MIN_CAPACITY_PCT = _parse_int_env("CODEX_PRIMARY_MIN_CAPACITY_PCT", 10)
+CODEX_SECONDARY_MIN_CAPACITY_PCT = _parse_int_env("CODEX_SECONDARY_MIN_CAPACITY_PCT", 3)
 
 # Claude subscription plan — used by the local-file 429 fallback to calculate
 # remaining capacity from ~/.claude/projects JSONL data when cclimits is rate-limited.

@@ -27,6 +27,26 @@ class ToolResult:
     output_tokens: int = 0
 
 
+def _make_capacity_exhausted_result(
+    msg: str,
+    output: str,
+    iterations: int,
+    input_tokens: int,
+    output_tokens: int,
+) -> ToolResult:
+    """Return a ToolResult signalling capacity exhaustion (retryable)."""
+    return ToolResult(
+        success=False,
+        output=output,
+        iterations=iterations,
+        error=msg,
+        error_code="capacity_exhausted",
+        retryable=True,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
 def _write_tool_file(output_dir: Path, filename: str, content: str) -> None:
     """Write a file into a tool output directory, creating it if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)

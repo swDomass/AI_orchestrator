@@ -14,6 +14,10 @@ import time
 from dataclasses import dataclass, field
 from config import (
     CLAUDE_PLAN,
+    CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT,
+    CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT,
+    CODEX_PRIMARY_MIN_CAPACITY_PCT,
+    CODEX_SECONDARY_MIN_CAPACITY_PCT,
     ESTIMATE_CHARS_PER_TOKEN,
     ESTIMATE_OUTPUT_TOKEN_WEIGHT,
     ESTIMATE_TOKENS_PER_PCT,
@@ -87,9 +91,16 @@ class WindowData:
 class ProviderLimits:
     available: bool = False       # Has any usable capacity
     remaining_pct: float = 0.0   # Lowest remaining % across all tiers
-    resets_in_sec: int = 0        # Seconds until earliest reset
+    resets_in_sec: int = 0        # Seconds until earliest reset (relative, at fetch time)
+    reset_at_epoch: float = 0.0   # Absolute unix timestamp of reset (set in __post_init__)
     error: str = ""               # Error message if unavailable
     windows: "dict[str, WindowData]" = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Auto-compute absolute reset epoch so earliest_reset_sec() stays accurate
+        # across long cache lifetimes without requiring callers to set this manually.
+        if self.reset_at_epoch == 0.0 and self.resets_in_sec > 0:
+            self.reset_at_epoch = time.time() + self.resets_in_sec
 
 
 @dataclass
@@ -99,12 +110,14 @@ class AllLimits:
     codex: ProviderLimits = field(default_factory=ProviderLimits)
 
     def earliest_reset_sec(self) -> int:
-        """Returns seconds until the earliest provider resets."""
-        times = [
-            p.resets_in_sec for p in [self.claude, self.gemini, self.codex]
-            if p.resets_in_sec > 0
+        """Live calculation from absolute epoch — accurate regardless of cache age."""
+        epochs = [
+            p.reset_at_epoch for p in (self.claude, self.gemini, self.codex)
+            if p.reset_at_epoch > 0
         ]
-        return min(times) if times else 3600  # default 1h fallback
+        if not epochs:
+            return 3600  # default 1h fallback
+        return max(0, int(min(epochs) - time.time()))
 
     def any_available(self) -> bool:
         return any((self.claude.available, self.gemini.available, self.codex.available))
@@ -129,31 +142,46 @@ def _parse_percent(pct_str: str) -> float:
         return 0.0
 
 
-def _parse_claude(data: dict) -> ProviderLimits:
+def _parse_dual_window_provider(
+    data: dict,
+    window_keys: tuple[str, str],
+    thresholds: dict[str, int],
+) -> ProviderLimits:
+    """Generic parser for two-window providers (Claude, Codex)."""
     if data.get("status") != "ok":
         return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
 
-    window_tuples = []
+    window_tuples: list[tuple[float, int]] = []
+    window_avail: list[bool] = []
     window_data: dict[str, WindowData] = {}
-    for key in ("five_hour", "seven_day"):
+    for key in window_keys:
         w = data.get(key, {})
         if "remaining" in w:
             pct = _parse_percent(w["remaining"])
             sec = _parse_resets_in(w.get("resets_in", ""))
             window_tuples.append((pct, sec))
+            window_avail.append(pct >= thresholds[key])
             window_data[key] = WindowData(remaining_pct=pct, resets_in_sec=sec)
 
     if not window_tuples:
         return ProviderLimits(error="no window data")
 
     remaining = min(r for r, _ in window_tuples)
-    resets_in = min(t for _, t in window_tuples if t > 0) if any(t > 0 for _, t in window_tuples) else 0
+    resets_in = min((t for _, t in window_tuples if t > 0), default=0)
 
     return ProviderLimits(
-        available=remaining >= MIN_CAPACITY_PERCENT,
+        available=all(window_avail),
         remaining_pct=remaining,
         resets_in_sec=resets_in,
         windows=window_data,
+    )
+
+
+def _parse_claude(data: dict) -> ProviderLimits:
+    return _parse_dual_window_provider(
+        data,
+        ("five_hour", "seven_day"),
+        {"five_hour": CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT, "seven_day": CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT},
     )
 
 
@@ -191,30 +219,10 @@ def _parse_gemini(data: dict) -> ProviderLimits:
 
 
 def _parse_codex(data: dict) -> ProviderLimits:
-    if data.get("status") != "ok":
-        return ProviderLimits(error=data.get("error") or data.get("token_status") or "unknown")
-
-    window_tuples = []
-    window_data: dict[str, WindowData] = {}
-    for key in ("primary_window", "secondary_window"):
-        w = data.get(key, {})
-        if "remaining" in w:
-            pct = _parse_percent(w["remaining"])
-            sec = _parse_resets_in(w.get("resets_in", ""))
-            window_tuples.append((pct, sec))
-            window_data[key] = WindowData(remaining_pct=pct, resets_in_sec=sec)
-
-    if not window_tuples:
-        return ProviderLimits(error="no window data")
-
-    remaining = min(r for r, _ in window_tuples)
-    resets_in = min(t for _, t in window_tuples if t > 0) if any(t > 0 for _, t in window_tuples) else 0
-
-    return ProviderLimits(
-        available=remaining >= MIN_CAPACITY_PERCENT,
-        remaining_pct=remaining,
-        resets_in_sec=resets_in,
-        windows=window_data,
+    return _parse_dual_window_provider(
+        data,
+        ("primary_window", "secondary_window"),
+        {"primary_window": CODEX_PRIMARY_MIN_CAPACITY_PCT, "secondary_window": CODEX_SECONDARY_MIN_CAPACITY_PCT},
     )
 
 
@@ -1048,6 +1056,41 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
         _limits_cache = (fallback, time.monotonic())
         _cache_ready.set()
         return fallback
+
+
+def _get_cached_provider(provider_name: str) -> "ProviderLimits | None":
+    """Return the cached ProviderLimits for *provider_name*, or None if cache is empty."""
+    with _limits_cache_lock:
+        cached = _limits_cache
+    if cached is None:
+        return None
+    limits, _ = cached
+    return getattr(limits, provider_name, None)
+
+
+def get_cached_provider_pct(provider_name: str) -> float:
+    """Return remaining_pct for *provider_name* from the in-memory cache.
+
+    No API call is made.  Returns 100.0 (safe default) when the cache is empty
+    so tools don't abort prematurely on first startup.
+    """
+    p = _get_cached_provider(provider_name)
+    return p.remaining_pct if p is not None else 100.0
+
+
+def is_cached_provider_available(provider_name: str) -> bool:
+    """Return the ``available`` flag for *provider_name* from the in-memory cache.
+
+    Unlike :func:`get_cached_provider_pct` (which returns the raw min-across-
+    windows percentage), this function respects the **per-window** thresholds
+    used by ``_parse_claude`` / ``_parse_codex``.  Tools should prefer this
+    over comparing ``remaining_pct`` against ``MIN_CAPACITY_PERCENT``.
+
+    Returns ``True`` (safe default) when the cache is empty so tools don't
+    abort prematurely on first startup.
+    """
+    p = _get_cached_provider(provider_name)
+    return p.available if p is not None else True
 
 
 def set_queue_idle(idle: bool) -> None:

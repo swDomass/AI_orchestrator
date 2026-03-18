@@ -283,7 +283,7 @@ class TestToolPromptMemoryLayers:
     def test_tool_prompt_keeps_daily_when_curated_lookup_fails(self, caplog):
         with (
             patch("tools.base_tool.get_system_prompt", return_value="CORE"),
-            patch("memory.get_curated_memory", side_effect=RuntimeError("boom")),
+            patch("memory.get_curated_memory", side_effect=OSError("boom")),
             patch("memory.get_daily_context", return_value="DAILY"),
             caplog.at_level(logging.WARNING),
         ):

@@ -6,12 +6,13 @@ Uses --output-format json to capture actual token usage for capacity estimation.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from providers.base import BaseProvider, RunResult
 from config import TASK_TIMEOUT_SEC
 
-_CLAUDE_CMD = "claude"
+_CLAUDE_CMD = shutil.which("claude") or "claude"
 
 
 class ClaudeProvider(BaseProvider):
@@ -89,7 +90,7 @@ class ClaudeProvider(BaseProvider):
             return RunResult(success=False, error="timeout")
         except FileNotFoundError:
             return RunResult(success=False, error="claude CLI not found")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return RunResult(success=False, error=str(e))
 
     @staticmethod

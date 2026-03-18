@@ -379,7 +379,7 @@ def report_estimated_usage(provider_name: str, estimated_pct: float) -> None:
             _429_estimated_usage.get(provider_name, {}),
         )
         for key, pct in usage_delta.items():
-            current_usage[key] = current_usage.get(key, 0.0) + pct
+            current_usage[key] = round(current_usage.get(key, 0.0) + pct, 2)
         _429_estimated_usage[provider_name] = current_usage
 
 

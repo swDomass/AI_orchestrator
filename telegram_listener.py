@@ -22,6 +22,7 @@ Any other text is forwarded to the best available AI provider and the
 response is sent back to the same chat.
 """
 
+import collections
 import json
 import logging
 import re
@@ -106,14 +107,16 @@ class _RateLimiter:
     def __init__(self, max_calls: int, window_sec: float) -> None:
         self._max_calls = max_calls
         self._window = window_sec
-        self._timestamps: list[float] = []
+        self._timestamps: collections.deque[float] = collections.deque(maxlen=max_calls)
         self._lock = threading.Lock()
 
     def allow(self) -> bool:
         import time
         now = time.time()
         with self._lock:
-            self._timestamps = [t for t in self._timestamps if now - t < self._window]
+            # Remove expired timestamps from the front
+            while self._timestamps and now - self._timestamps[0] >= self._window:
+                self._timestamps.popleft()
             if len(self._timestamps) >= self._max_calls:
                 return False
             self._timestamps.append(now)

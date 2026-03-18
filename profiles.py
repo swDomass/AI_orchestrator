@@ -106,6 +106,8 @@ def _build_profile_config(name: str, data: dict) -> ProfileConfig:
     """Build a ProfileConfig from a YAML dict, applying defaults."""
     def _list(key: str) -> list:
         v = data.get(key, [])
+        if isinstance(v, str):
+            return [v]
         return list(v) if v else []
 
     providers = _list("providers") or ["claude", "gemini", "codex"]

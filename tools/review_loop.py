@@ -112,7 +112,7 @@ class ReviewLoopTool(BaseTool):
             policy = load_policy()
             phases = policy.get("tool_phases", {}).get("review-loop", {})
             return phases.get("verification", "auto") != "skip"
-        except Exception:
+        except (ImportError, OSError, ValueError):
             return True  # default: verify
 
     def run(
@@ -128,6 +128,7 @@ class ReviewLoopTool(BaseTool):
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name)
         review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
         seen_signatures: set[tuple[str, ...]] = set()
+        last_findings_tuple: tuple[str, ...] = ()
         all_outputs: list[str] = []
 
         review_timeout = timeout or TOOL_REVIEW_TIMEOUT_SEC
@@ -140,7 +141,7 @@ class ReviewLoopTool(BaseTool):
         # Load lessons for fix-prompt injection
         try:
             import memory as memory_module
-        except Exception:
+        except (ImportError, OSError):
             memory_module = None
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
@@ -229,7 +230,7 @@ class ReviewLoopTool(BaseTool):
                 # Auto-lesson: if >2 iterations were needed, record what happened
                 if iteration > 2 and memory_module is not None:
                     try:
-                        last_findings = list(seen_signatures)[-1] if seen_signatures else ()
+                        last_findings = last_findings_tuple
                         memory_module.append_lesson(
                             tool_name=self.name,
                             cwd=cwd or ".",
@@ -237,7 +238,7 @@ class ReviewLoopTool(BaseTool):
                             fix="Siehe Fix-Output in all_outputs",
                             tool_hint=f"Bei aehnlichen Findings: priorisiere Root-Cause-Analyse statt symptomatischer Fixes",
                         )
-                    except Exception:
+                    except (ImportError, OSError, ValueError):
                         pass
 
                 notify_tool_done(self.name, iteration, True, msg)
@@ -264,6 +265,7 @@ class ReviewLoopTool(BaseTool):
                     output_tokens=total_output_tokens,
                 )
             seen_signatures.add(signature)
+            last_findings_tuple = signature
 
             # Step 2: Fix — with lessons injection
             print(f"  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: FIX ===")
@@ -283,7 +285,7 @@ class ReviewLoopTool(BaseTool):
                         lessons_hint = (
                             f"\nPrevious lessons for similar issues:\n{hint}\n"
                         )
-                except Exception:
+                except (ImportError, OSError, ValueError):
                     pass
 
             fix_prompt = (

@@ -43,7 +43,7 @@ def _build_system_prompt(
 
     try:
         import memory as memory_module
-    except Exception as exc:
+    except (ImportError, OSError) as exc:
         logger.warning("Tool prompt memory import failed: %s", exc)
         memory_module = None
 
@@ -52,14 +52,14 @@ def _build_system_prompt(
             curated = memory_module.get_curated_memory()
             if curated:
                 prompt += f"\n\n## Langzeit-Kontext\n{curated}"
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Tool prompt curated memory load failed: %s", exc)
 
         try:
             daily = memory_module.get_daily_context()
             if daily:
                 prompt += f"\n\n## Heutiger Verlauf\n{daily}"
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Tool prompt daily memory load failed: %s", exc)
 
         # Layer 4: Lessons learned (filtered by tool if available)
@@ -67,7 +67,7 @@ def _build_system_prompt(
             lessons = memory_module.get_lessons_context(tool_name=tool_name)
             if lessons:
                 prompt += f"\n\n## Lessons Learned\n{lessons}"
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Tool prompt lessons load failed: %s", exc)
 
     if memory_context:

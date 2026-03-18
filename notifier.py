@@ -77,10 +77,11 @@ def _send(text: str) -> bool:
 
 
 def _truncate(text: str, max_len: int = 3500) -> str:
-    """Truncate text for Telegram (4096 char limit per message)."""
-    if len(text) <= max_len:
+    """Truncate text for Telegram (4096 byte limit per message)."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_len:
         return text
-    return text[:max_len] + "..."
+    return encoded[:max_len].decode("utf-8", errors="ignore") + "..."
 
 
 def start_session() -> None:
@@ -123,9 +124,11 @@ def notify_task_done(task: str, provider: str, output: str, change_summary: str 
         changes_block = f"\n\n📁 *Änderungen:*\n{_escape_markdown(_truncate(change_summary, 500))}"
 
     header = f"✅ *Task erledigt* ({provider_safe})\n`{task_safe}`\n\n"
-    # Dynamically cap output so header + output + changes_block stays within Telegram's 4096 limit.
-    max_output = max(200, 4096 - len(header) - len(changes_block) - 10)
-    output_safe = _truncate(_escape_markdown(output), min(3900, max_output))
+    # Dynamically cap output so header + output + changes_block stays within Telegram's 4096 byte limit.
+    # Escape output first, then truncate based on remaining byte budget.
+    output_escaped = _escape_markdown(output)
+    max_output = max(200, 4096 - len(header.encode("utf-8")) - len(changes_block.encode("utf-8")) - 10)
+    output_safe = _truncate(output_escaped, min(3900, max_output))
 
     _send(header + output_safe + changes_block)
 

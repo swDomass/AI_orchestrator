@@ -596,7 +596,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         archived = memory_module.archive_old_memories()
         if archived:
             _log.debug("Archived %d old memories", archived)
-    except Exception:
+    except (OSError, ImportError):
         pass
 
     task_items = read_queue_items()

@@ -89,7 +89,7 @@ def select_provider(
     try:
         from queue_manager import extract_tool_providers
         allowed_by_policy = extract_tool_providers(task)
-    except Exception:
+    except (ImportError, ValueError, AttributeError):
         pass
     
     # 2. Profile level (profile.tool_providers)
@@ -102,7 +102,7 @@ def select_provider(
         try:
             from policy import get_engine
             allowed_by_policy = get_engine().get_allowed_providers(tool_name)
-        except Exception:
+        except (ImportError, ValueError, AttributeError):
             pass
 
     # Profile provider order overrides _PRIORITY

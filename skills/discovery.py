@@ -23,7 +23,14 @@ def parse_skill_md(file_path: Path) -> Optional[SkillConfig]:
     try:
         content = file_path.read_text(encoding="utf-8")
         if content.startswith("---"):
-            _, frontmatter, body = content.split("---", 2)
+            parts = content.split("---", 2)
+            if len(parts) < 3:
+                return SkillConfig(
+                    name=file_path.parent.name,
+                    path=file_path.parent,
+                    prompt=content.strip(),
+                )
+            _, frontmatter, body = parts
             data = yaml.safe_load(frontmatter)
             if data is None:
                 data = {}

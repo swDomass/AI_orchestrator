@@ -128,12 +128,17 @@ NOTIFY_ON_ALL_PROVIDERS_EXHAUSTED = True
 # Allowed root directories for cwd: tags (empty list = allow all).
 # When set, only tasks with cwd paths under these roots will be executed.
 # Example: ALLOWED_CWD_ROOTS = [Path("D:/programmieren"), Path("C:/projects")]
-ALLOWED_CWD_ROOTS: list[Path] = [
-    Path("D:/programmieren"),
-    Path(r"literal:/path/to/your/obsidian_vault"),
-    Path(r"literal:D:\projects\work"),
-    Path(r"literal:D:\OneDrive - YourOrg\YourOrg-Data\marketing\AI_Marketing")
-]
+_env_cwd_roots = os.getenv("ALLOWED_CWD_ROOTS", "")
+ALLOWED_CWD_ROOTS: list[Path] = (
+    [Path(p.strip()) for p in _env_cwd_roots.split(";") if p.strip()]
+    if _env_cwd_roots
+    else [
+        Path("D:/programmieren"),
+        Path(r"literal:/path/to/your/obsidian_vault"),
+        Path(r"literal:D:\projects\work"),
+        Path(r"literal:D:\OneDrive - YourOrg\YourOrg-Data\marketing\AI_Marketing"),
+    ]
+)
 
 # Max task length accepted via Telegram /task command (characters)
 TELEGRAM_MAX_TASK_LENGTH = 500
@@ -312,7 +317,7 @@ def load_soul() -> dict[str, str]:
             _soul_cache = sections
             _soul_mtime = mtime
             return sections
-    except Exception:
+    except (OSError, ValueError, KeyError, re.error):
         return {}
 
 

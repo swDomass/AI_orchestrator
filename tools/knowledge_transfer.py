@@ -438,14 +438,12 @@ class KnowledgeTransferTool(BaseTool):
         slug = _make_slug(title)
         folder_name = f"KT_{today}_{slug}"
         note_dir = VAULT_PATH / _KT_OUTPUT_DIR / folder_name
-        # Dedup: append counter if folder already exists (same topic, same day)
+        # Dedup: append hash suffix if folder already exists (same topic, same day)
         if note_dir.exists():
-            for i in range(2, 100):
-                candidate = VAULT_PATH / _KT_OUTPUT_DIR / f"{folder_name}_{i}"
-                if not candidate.exists():
-                    folder_name = f"{folder_name}_{i}"
-                    note_dir = candidate
-                    break
+            import hashlib
+            hash_suffix = hashlib.sha256(note_content.encode("utf-8")).hexdigest()[:6]
+            folder_name = f"{folder_name}_{hash_suffix}"
+            note_dir = VAULT_PATH / _KT_OUTPUT_DIR / folder_name
         note_filename = f"{folder_name}.md"
         try:
             _write_tool_file(note_dir, note_filename, note_content + "\n")

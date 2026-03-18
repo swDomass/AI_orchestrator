@@ -5,12 +5,13 @@ Uses Google OAuth subscription auth - no API key needed.
 Gemini CLI decides internally which model tier to use (Flash / Pro / etc.).
 """
 
+import shutil
 import subprocess
 import sys
 from providers.base import BaseProvider, RunResult
 from config import TASK_TIMEOUT_SEC
 
-_GEMINI_CMD = "gemini"
+_GEMINI_CMD = shutil.which("gemini") or "gemini"
 
 
 class GeminiProvider(BaseProvider):
@@ -65,5 +66,5 @@ class GeminiProvider(BaseProvider):
             return RunResult(success=False, error="timeout")
         except FileNotFoundError:
             return RunResult(success=False, error="gemini CLI not found")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return RunResult(success=False, error=str(e))

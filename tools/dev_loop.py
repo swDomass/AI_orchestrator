@@ -201,7 +201,7 @@ class DevLoopTool(BaseTool):
             policy = load_policy()
             phases = policy.get("tool_phases", {}).get("dev-loop", {})
             return phases.get("plan_approval", "auto")
-        except Exception:
+        except (ImportError, OSError, ValueError):
             return "auto"
 
     def run(
@@ -218,6 +218,7 @@ class DevLoopTool(BaseTool):
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name)
         all_outputs: list[str] = []
         seen_quality_signatures: set[tuple[str, ...]] = set()
+        last_quality_tuple: tuple[str, ...] = ()
         seen_review_signatures: set[tuple[tuple[str, ...], str, str]] = set()
 
         research_timeout = timeout or TOOL_DEV_RESEARCH_TIMEOUT_SEC
@@ -232,7 +233,7 @@ class DevLoopTool(BaseTool):
         # Load memory module for lessons
         try:
             import memory as memory_module
-        except Exception:
+        except (ImportError, OSError):
             memory_module = None
 
         # ── Phase 1: Research ─────────────────────────────────────────────────
@@ -324,7 +325,7 @@ class DevLoopTool(BaseTool):
                             input_tokens=total_input_tokens,
                             output_tokens=total_output_tokens,
                         )
-                except Exception as exc:
+                except (ImportError, OSError, ValueError) as exc:
                     print(f"  [dev-loop] Plan-Approval uebersprungen (Fehler: {exc})")
 
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
@@ -366,7 +367,7 @@ class DevLoopTool(BaseTool):
                         review_context += (
                             f"\nLESSONS FROM PREVIOUS SIMILAR ISSUES:\n{hint}\n"
                         )
-                except Exception:
+                except (ImportError, OSError, ValueError):
                     pass
 
             exec_prompt = system_prompt + "\n\n" + _EXECUTION_PROMPT.format(
@@ -530,7 +531,7 @@ class DevLoopTool(BaseTool):
                 # Auto-lesson: if >2 iterations, record patterns for future loops
                 if iteration > 2 and memory_module is not None:
                     try:
-                        last_findings = list(seen_quality_signatures)[-1] if seen_quality_signatures else ()
+                        last_findings = last_quality_tuple
                         memory_module.append_lesson(
                             tool_name=self.name,
                             cwd=cwd or ".",
@@ -538,7 +539,7 @@ class DevLoopTool(BaseTool):
                             fix="Task wurde nach mehreren Iterationen geloest",
                             tool_hint="Bei aehnlichen Findings: Research-Phase gruendlicher analysieren, Plan-Phase nicht ueberspringen",
                         )
-                    except Exception:
+                    except (ImportError, OSError, ValueError):
                         pass
 
                 notify_tool_done(self.name, iteration, True, msg)
@@ -569,6 +570,7 @@ class DevLoopTool(BaseTool):
                         output_tokens=total_output_tokens,
                     )
                 seen_quality_signatures.add(sig)
+                last_quality_tuple = sig
 
             review_sig = (tuple(sorted(blocking_findings)), resolution_status, resolution_output)
             if review_sig in seen_review_signatures:

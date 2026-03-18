@@ -61,6 +61,7 @@ class HeartbeatItem:
 # ── Module-level state for queue-idle tracking ─────────────────────────────
 
 _queue_empty_since: Optional[datetime] = None
+_queue_empty_lock = threading.Lock()
 _usage_suggest_thread: Optional[threading.Thread] = None
 
 
@@ -72,24 +73,25 @@ def _check_queue_idle(queue_read_fn: Callable) -> Optional[str]:
 
     try:
         tasks = queue_read_fn()
-    except Exception:
-        return None
-
-    if tasks:
-        _queue_empty_since = None
+    except (OSError, ValueError):
         return None
 
     now = datetime.now()
-    if _queue_empty_since is None:
-        _queue_empty_since = now
-        return None
+    with _queue_empty_lock:
+        if tasks:
+            _queue_empty_since = None
+            return None
 
-    idle_hours = (now - _queue_empty_since).total_seconds() / 3600
-    if idle_hours >= HEARTBEAT_QUEUE_IDLE_HOURS:
-        return (
-            f"Queue seit {idle_hours:.1f}h leer — "
-            f"keine neuen Tasks seit {_queue_empty_since.strftime('%H:%M')}."
-        )
+        if _queue_empty_since is None:
+            _queue_empty_since = now
+            return None
+
+        idle_hours = (now - _queue_empty_since).total_seconds() / 3600
+        if idle_hours >= HEARTBEAT_QUEUE_IDLE_HOURS:
+            return (
+                f"Queue seit {idle_hours:.1f}h leer — "
+                f"keine neuen Tasks seit {_queue_empty_since.strftime('%H:%M')}."
+            )
     return None
 
 
@@ -222,7 +224,7 @@ def _check_limits(get_limits_fn: Callable) -> Optional[str]:
                     w = lim.windows["seven_day"]
                     pace = compute_window_pace(w.remaining_pct, w.resets_in_sec, 7)
                     parts.append(f"  {format_pace_status(pace)}")
-                except Exception:
+                except (ImportError, OSError, KeyError, TypeError, ValueError):
                     pass
         _append_capacity_log(limits)
         return "\n".join(parts) if parts else None

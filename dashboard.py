@@ -20,6 +20,7 @@ import json
 import logging
 import socketserver
 import threading
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -193,6 +194,10 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 function providerColor(name) {
   if (name === 'claude_seven_day') return '#b0a8ff';
   if (name.startsWith('claude')) return '#6c63ff';
@@ -410,9 +415,9 @@ function update(d) {
   for (const ev of (d.recent_events || [])) {
     const tr = document.createElement('tr');
     const cls = typeClass[ev.type] || 'tag-queue';
-    tr.innerHTML = '<td>' + ev.ts.slice(0, 16).replace('T', ' ') + '</td>'
-      + '<td class="' + cls + '">' + ev.type + '</td>'
-      + '<td>' + ev.msg.replace(/</g, '&lt;') + '</td>';
+    tr.innerHTML = '<td>' + escapeHtml(ev.ts.slice(0, 16).replace('T', ' ')) + '</td>'
+      + '<td class="' + cls + '">' + escapeHtml(ev.type) + '</td>'
+      + '<td>' + escapeHtml(ev.msg) + '</td>';
     tbody.appendChild(tr);
   }
 
@@ -451,9 +456,10 @@ class _Handler(BaseHTTPRequestHandler):
     """Handles GET / (HTML) and GET /api/data (JSON)."""
 
     def do_GET(self):
-        if self.path == "/api/data":
-            self._json_response()
-        elif self.path == "/" or self.path == "/index.html":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/data":
+            self._json_response(parsed.query)
+        elif parsed.path in ("/", "/index.html"):
             self._html_response()
         else:
             self.send_error(404)
@@ -466,9 +472,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_response(self):
+    def _json_response(self, query_string: str = ""):
         try:
-            data = get_dashboard_data()
+            params = urllib.parse.parse_qs(query_string)
+            days = max(1, min(int(params.get("days", ["7"])[0]), 365))
+            data = get_dashboard_data(days=days)
             body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         except Exception as e:
             logger.exception("dashboard data error")
@@ -476,7 +484,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 

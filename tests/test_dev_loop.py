@@ -60,22 +60,24 @@ def test_dev_loop_succeeds_in_one_iteration(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "## Problem Analysis\nBug found.\n## Relevant Files\nauth.py\n## Implementation Plan\nFix it.",  # research
-        "Fixed the bug in auth.py.",                                                                      # execution
-        "No P1/P2/P3 findings.",                                                                          # quality review
-        "RESOLVED: Bug is fixed.",                                                                        # resolution review
+        "## Implementation Plan\n1. Fix the auth bug.",                                                    # plan
+        "Fixed the bug in auth.py.",                                                                       # execution
+        "No P1/P2/P3 findings.",                                                                           # quality review
+        "RESOLVED: Bug is fixed.",                                                                         # resolution review
     ])
     tool = DevLoopTool()
     result = tool.run("Fix login bug", provider, cwd=str(tmp_path))
 
     assert result.success is True
     assert result.iterations == 1
-    assert len(provider.prompts) == 4
+    assert len(provider.prompts) == 5
 
 
 def test_dev_loop_writes_research_file(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "## Problem Analysis\nFound it.",
+        "## Implementation Plan\n1. Fix it.",
         "Fixed.",
         "No P1/P2/P3 findings.",
         "RESOLVED: done.",
@@ -91,6 +93,7 @@ def test_dev_loop_writes_round_file(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research output.",
+        "## Implementation Plan\n1. Do it.",
         "Execution output.",
         "No P1/P2/P3 findings.",
         "RESOLVED: task solved.",
@@ -107,7 +110,11 @@ def test_dev_loop_writes_round_file(monkeypatch, tmp_path):
 def test_dev_loop_writes_summary_on_success(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.", "Execution.", "No P1/P2/P3 findings.", "RESOLVED: done.",
+        "Research.",
+        "## Implementation Plan\n1. Fix it.",
+        "Execution.",
+        "No P1/P2/P3 findings.",
+        "RESOLVED: done.",
     ])
     DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
 
@@ -121,13 +128,14 @@ def test_dev_loop_writes_summary_on_success(monkeypatch, tmp_path):
 def test_dev_loop_retries_on_quality_failure(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",                       # research
-        "First attempt.",                  # execution iter 1
-        "- [P1] Null pointer in auth.py",  # quality review iter 1 — fail
-        "RESOLVED: task done.",            # resolution review iter 1
-        "Fixed null pointer.",             # execution iter 2
-        "No P1/P2/P3 findings.",           # quality review iter 2 — pass
-        "RESOLVED: task done.",            # resolution review iter 2
+        "Research.",                                    # research
+        "## Implementation Plan\n1. Fix it.",           # plan
+        "First attempt.",                               # execution iter 1
+        "- [P1] Null pointer in auth.py",               # quality review iter 1 — fail
+        "RESOLVED: task done.",                         # resolution review iter 1
+        "Fixed null pointer.",                          # execution iter 2
+        "No P1/P2/P3 findings.",                        # quality review iter 2 — pass
+        "RESOLVED: task done.",                         # resolution review iter 2
     ])
     tool = DevLoopTool()
     result = tool.run("Fix bug", provider, cwd=str(tmp_path))
@@ -142,6 +150,7 @@ def test_dev_loop_retries_on_resolution_partial(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Fix it.",
         "Partial fix.",
         "No P1/P2/P3 findings.",           # quality ok
         "PARTIAL: logout not fixed yet.",  # resolution fail
@@ -159,6 +168,7 @@ def test_dev_loop_previous_reviews_passed_to_execution(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Fix it.",
         "Bad impl.",
         "- [P2] Missing error handling",
         "PARTIAL: logout not fixed.",
@@ -170,7 +180,8 @@ def test_dev_loop_previous_reviews_passed_to_execution(monkeypatch, tmp_path):
     tool.run("Fix bug", provider, cwd=str(tmp_path))
 
     # Second execution prompt must contain both previous reviews
-    exec_prompt_iter2 = provider.prompts[4]  # research, exec1, qual1, res1, exec2
+    # prompts: research(0), plan(1), exec1(2), qual1(3), res1(4), exec2(5)
+    exec_prompt_iter2 = provider.prompts[5]
     assert "QUALITY REVIEW" in exec_prompt_iter2
     assert "Missing error handling" in exec_prompt_iter2
     assert "RESOLUTION REVIEW" in exec_prompt_iter2
@@ -183,6 +194,7 @@ def test_dev_loop_p3_only_quality_does_not_block(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Do it.",
         "Implementation.",
         "- [P3] Minor naming issue in utils.py",  # P3 only → non-blocking
         "RESOLVED: done.",
@@ -220,8 +232,8 @@ def test_dev_loop_fails_on_execution_error(monkeypatch, tmp_path):
         _calls = 0
         def run(self, task, cwd=None, timeout=0):
             self._calls += 1
-            if self._calls == 1:
-                return RunResult(success=True, output="Research output.")
+            if self._calls <= 2:  # research + plan
+                return RunResult(success=True, output="Research output." if self._calls == 1 else "## Implementation Plan\n1. Fix it.")
             return RunResult(success=False, error="exec error")
 
     result = DevLoopTool().run("Fix bug", _FailExec(), cwd=str(tmp_path))
@@ -237,6 +249,7 @@ def test_dev_loop_detects_infinite_loop(monkeypatch, tmp_path):
     # Same P1 finding twice → infinite loop detection
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Fix it.",
         "Attempt 1.",
         "- [P1] Missing auth check",  # quality iter 1
         "RESOLVED: done.",
@@ -254,6 +267,7 @@ def test_dev_loop_fails_on_invalid_quality_review_output(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Fix it.",
         "Implementation.",
         "Looks good overall.",  # invalid quality format
     ])
@@ -268,6 +282,7 @@ def test_dev_loop_fails_on_invalid_resolution_review_output(monkeypatch, tmp_pat
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Fix it.",
         "Implementation.",
         "No P1/P2/P3 findings.",
         "Looks solved to me.",  # invalid resolution format
@@ -283,6 +298,7 @@ def test_dev_loop_detects_repeated_resolution_feedback(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
         "Research.",
+        "## Implementation Plan\n1. Fix it.",
         "Attempt 1.",
         "No P1/P2/P3 findings.",
         "PARTIAL: logout flow is still missing.",
@@ -300,7 +316,6 @@ def test_dev_loop_detects_repeated_resolution_feedback(monkeypatch, tmp_path):
 def test_dev_loop_respects_max_iterations(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.dev_loop.TOOL_MAX_ITERATIONS", 2)
     _patch(monkeypatch)
-    # Always returns different P1 findings (no infinite loop detection) but never resolves
     call_count = [0]
 
     class _AlwaysFailing:
@@ -310,9 +325,13 @@ def test_dev_loop_respects_max_iterations(monkeypatch, tmp_path):
             n = call_count[0]
             if n == 1:
                 return RunResult(success=True, output="Research.")
-            if n % 3 == 2:  # execution
+            if n == 2:
+                return RunResult(success=True, output="## Implementation Plan\n1. Fix it.")
+            adj = n - 2  # 1-based iteration cycle index
+            phase = (adj - 1) % 3  # 0=exec, 1=quality, 2=resolution
+            if phase == 0:  # execution
                 return RunResult(success=True, output=f"Attempt {n}.")
-            if n % 3 == 0:  # quality
+            if phase == 1:  # quality
                 return RunResult(success=True, output=f"- [P1] Unique finding #{n}")
             return RunResult(success=True, output="UNRESOLVED: still broken.")
 

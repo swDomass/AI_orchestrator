@@ -164,7 +164,8 @@ def _parse_log_limits(text: str) -> list[LimitSnapshot]:
             # Collect all provider data: may be on the same line or continuation lines
             block = first_data
             j = i + 1
-            while j < len(lines):
+            max_continuation = 50
+            while j < len(lines) and (j - i - 1) < max_continuation:
                 # Continuation lines don't start with a timestamp
                 if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", lines[j]):
                     break
@@ -312,7 +313,7 @@ def _parse_session_stats() -> dict:
                     else None
                 ),
             }
-    except Exception:
+    except (ImportError, OSError, AttributeError):
         return {}
 
 
@@ -438,17 +439,21 @@ def _get_current_limits() -> dict:
                 "error": lim.error or "",
             }
         return result
-    except Exception:
+    except (ImportError, OSError, AttributeError):
         return {}
 
 
-def get_dashboard_data() -> dict:
+def get_dashboard_data(days: int = 7) -> dict:
     """Single entry-point: aggregate all data sources into a dict.
 
-    Results are cached for 30 seconds.
+    Results are cached for 30 seconds (single-slot: new days value invalidates).
     """
     now = time.time()
-    if _cache["data"] is not None and now - _cache["ts"] < _CACHE_TTL:
+    if (
+        _cache.get("days") == days
+        and _cache.get("data") is not None
+        and now - _cache.get("ts", 0) < _CACHE_TTL
+    ):
         return _cache["data"]  # type: ignore[return-value]
 
     # Paths
@@ -472,7 +477,7 @@ def get_dashboard_data() -> dict:
     session = _parse_session_stats()
 
     # Aggregate
-    tpd_labels, tpd_values = _tasks_per_day(records)
+    tpd_labels, tpd_values = _tasks_per_day(records, days=days)
     pd_labels, pd_values = _provider_distribution(records)
 
     cutoff_24h = datetime.now() - timedelta(hours=24)
@@ -495,4 +500,5 @@ def get_dashboard_data() -> dict:
 
     _cache["data"] = data
     _cache["ts"] = now
+    _cache["days"] = days
     return data

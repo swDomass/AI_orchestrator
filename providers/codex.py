@@ -4,12 +4,13 @@ Uses `codex exec` for non-interactive execution with full tool access.
 Uses ChatGPT subscription auth - no API key needed.
 """
 
+import shutil
 import subprocess
 import sys
 from providers.base import BaseProvider, RunResult
 from config import TASK_TIMEOUT_SEC
 
-_CODEX_CMD = "codex"
+_CODEX_CMD = shutil.which("codex") or "codex"
 
 
 class CodexProvider(BaseProvider):
@@ -70,5 +71,5 @@ class CodexProvider(BaseProvider):
             return RunResult(success=False, error="timeout")
         except FileNotFoundError:
             return RunResult(success=False, error="codex CLI not found")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return RunResult(success=False, error=str(e))

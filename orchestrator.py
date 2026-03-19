@@ -934,6 +934,25 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
 
+                # Timeout: task-complexity issue — don't fall back to other providers.
+                # Falling back risks the next provider failing non-retryably, which would
+                # finalize the task as [-] and incorrectly satisfy #needs: dependencies.
+                if outcome.error_code == "timeout":
+                    earliest = _get_next_retry_sec(limits)
+                    reset_dt = datetime.now() + timedelta(seconds=earliest)
+                    reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                    msg = (
+                        f"Tool-Timeout ({provider.name}/{tool_name})"
+                        f" → Task wartet bis ~{reset_dt.strftime('%H:%M')}"
+                    )
+                    if cwd:
+                        msg += f" | Teilarbeit ggf. in {cwd}/.{tool_name}/"
+                    print(f"  {msg}")
+                    append_log(msg)
+                    if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                        return False
+                    break
+
                 if provider_is_forced:
                     # Strict mode: no fallback, retry later
                     earliest = _get_next_retry_sec(limits)
@@ -1114,7 +1133,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 def run_watch(dry_run: bool = False) -> None:
     """Continuously process queue, sleeping when all providers are exhausted."""
     from doctor import run_startup_checks
-    from heartbeat import HeartbeatRunner, _log_capacity
+    from heartbeat import HeartbeatRunner, _log_capacity, start_heartbeat_thread
     if not run_startup_checks():
         print("CRITICAL: Startup checks failed. Run --doctor to see details.")
         sys.exit(1)
@@ -1151,8 +1170,15 @@ def run_watch(dry_run: bool = False) -> None:
     except Exception:
         pass  # non-critical: dashboard will get fresh data on next heartbeat
 
+    # Run heartbeat in a background thread so scheduled checks (log-capacity,
+    # usage-suggest, check-limits, etc.) fire on time even when the main thread
+    # is blocked for hours inside a long-running task.
+    _hb_stop = threading.Event()
+    start_heartbeat_thread(heartbeat, read_queue, _hb_stop)
+
     def _cleanup():
         listener.stop()
+        _hb_stop.set()
 
     try:
         while True:
@@ -1242,6 +1268,7 @@ def run_watch(dry_run: bool = False) -> None:
 
             print()
     finally:
+        _hb_stop.set()
         listener.stop()
 
 

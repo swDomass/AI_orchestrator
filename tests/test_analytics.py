@@ -298,6 +298,53 @@ class TestParseLogSuggestEvents:
         assert d["usage_suggest_today"] >= 1
 
 
+class TestGetCurrentLimits:
+    def test_returns_empty_when_log_missing(self, tmp_path):
+        from analytics import _get_current_limits
+        with patch("analytics.CAPACITY_LOG_FILE", tmp_path / "nonexistent.md"):
+            assert _get_current_limits() == {}
+
+    def test_aggregates_windows_per_provider(self, tmp_path):
+        from analytics import _get_current_limits
+        log = tmp_path / "capacity-log.md"
+        log.write_text(
+            "2026-03-18 12:00:00 | claude_five_hour | 80.0 | true\n"
+            "2026-03-18 12:00:00 | claude_seven_day | 30.0 | true\n"
+            "2026-03-18 12:00:00 | gemini | 60.0 | true\n",
+            encoding="utf-8",
+        )
+        with patch("analytics.CAPACITY_LOG_FILE", log):
+            result = _get_current_limits()
+        assert result["claude"]["remaining_pct"] == pytest.approx(30.0)
+        assert result["claude"]["available"] is True
+        assert result["gemini"]["remaining_pct"] == pytest.approx(60.0)
+
+    def test_only_latest_snapshot_per_provider(self, tmp_path):
+        from analytics import _get_current_limits
+        log = tmp_path / "capacity-log.md"
+        log.write_text(
+            "2026-03-18 11:00:00 | claude_five_hour | 90.0 | true\n"
+            "2026-03-18 12:00:00 | claude_five_hour | 50.0 | true\n",
+            encoding="utf-8",
+        )
+        with patch("analytics.CAPACITY_LOG_FILE", log):
+            result = _get_current_limits()
+        assert result["claude"]["remaining_pct"] == pytest.approx(50.0)
+
+    def test_available_false_when_any_window_unavailable(self, tmp_path):
+        from analytics import _get_current_limits
+        log = tmp_path / "capacity-log.md"
+        log.write_text(
+            "2026-03-18 12:00:00 | claude_five_hour | 80.0 | true\n"
+            "2026-03-18 12:00:00 | claude_seven_day | 5.0 | false\n",
+            encoding="utf-8",
+        )
+        with patch("analytics.CAPACITY_LOG_FILE", log):
+            result = _get_current_limits()
+        assert result["claude"]["available"] is False
+        assert result["claude"]["remaining_pct"] == pytest.approx(5.0)
+
+
 class TestCache:
     def test_cache_returns_same_object(self, tmp_path):
         from analytics import get_dashboard_data, _cache

@@ -52,21 +52,21 @@ def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
     assert tool.run.call_args.kwargs["timeout"] == 77
 
 
-def test_run_once_retries_tool_task_with_next_provider_and_passes_timeout(monkeypatch):
+def test_run_once_marks_tool_task_for_retry_on_timeout_without_provider_fallback(monkeypatch):
+    """A tool-task timeout must mark the task for retry and NOT fall back to a
+    second provider.  Falling back risks the next provider failing non-retryably,
+    which would finalize the task as [-] and incorrectly satisfy #needs: deps."""
     p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
     p2 = SimpleNamespace(name="codex", set_cooldown=Mock())
-    read_queue_calls = iter([[]])
 
-    exec_mock = Mock(side_effect=[
-        orchestrator.ToolTaskExecutionOutcome(
-            success=False,
-            finalized=False,
-            retryable=True,
-            error="timeout",
-            error_code="timeout",
-        ),
-        orchestrator.ToolTaskExecutionOutcome(success=True, finalized=True),
-    ])
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False,
+        finalized=False,
+        retryable=True,
+        error="timeout",
+        error_code="timeout",
+    ))
+    mark_retry_mock = Mock(return_value=True)
 
     def fake_select_provider(_task, _limits, exclude=None, **_kwargs):
         exclude = exclude or set()
@@ -84,27 +84,30 @@ def test_run_once_retries_tool_task_with_next_provider_and_passes_timeout(monkey
         "read_queue_items",
         lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1)],
     )
-    monkeypatch.setattr(orchestrator, "read_queue", lambda: next(read_queue_calls))
+    # Simulate task still pending after retry mark (retry comment keeps it in queue)
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:test-loop"])
     monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_timeout", fake_extract_timeout)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
     monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
     monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
     monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 3600)
     monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
 
     result = orchestrator.run_once()
 
-    assert result is True
-    assert exec_mock.call_count == 2
-    first_call = exec_mock.call_args_list[0]
-    second_call = exec_mock.call_args_list[1]
-    assert first_call.args[2].name == "claude"
-    assert second_call.args[2].name == "codex"
-    assert first_call.kwargs["timeout"] == 77
-    assert second_call.kwargs["timeout"] == 77
+    # Task is still pending (retry-marked) so run_once reports incomplete
+    assert result is False
+    # Only Claude should be tried — no fallback to Codex
+    assert exec_mock.call_count == 1
+    assert exec_mock.call_args_list[0].args[2].name == "claude"
+    assert exec_mock.call_args_list[0].kwargs["timeout"] == 77
+    # Task must be marked for retry so #needs: deps stay blocked
+    mark_retry_mock.assert_called_once()
     p1.set_cooldown.assert_not_called()
     p2.set_cooldown.assert_not_called()
 

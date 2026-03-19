@@ -167,11 +167,11 @@ TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
 TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations
 
 # Dev-Loop timeouts (Research → Plan → Execute → Dual-Review)
-TOOL_DEV_RESEARCH_TIMEOUT_SEC          = 1_200  # 20 min: Research phase
-TOOL_DEV_PLAN_TIMEOUT_SEC              =   600  # 10 min: Plan phase
-TOOL_DEV_EXEC_TIMEOUT_SEC              = 2_400  # 40 min: Execution phase
-TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC    = 1_200  # 20 min: Code Quality Review
-TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC =   600  # 10 min: Issue Resolution Review
+TOOL_DEV_RESEARCH_TIMEOUT_SEC          = 3_600  # 60 min: Research phase
+TOOL_DEV_PLAN_TIMEOUT_SEC              = 1_800  # 30 min: Plan phase
+TOOL_DEV_EXEC_TIMEOUT_SEC              = 7_200  #  2h:   Execution phase (TDD loops)
+TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC    = 3_600  # 60 min: Code Quality Review
+TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC = 1_800  # 30 min: Issue Resolution Review
 
 # Review-Loop verification phase timeout
 TOOL_VERIFICATION_TIMEOUT_SEC          =   600  # 10 min: Final verification after no findings
@@ -201,7 +201,7 @@ MEMORY_MIN_SCORE         = 0.10  # discard matches below this threshold (avoids 
 
 # --- Heartbeat ---
 HEARTBEAT_FILE           = VAULT_PATH / "99_System" / "AI" / "HEARTBEAT.md"
-CAPACITY_LOG_FILE        = VAULT_PATH / "99_System" / "AI" / "capacity-log.md"
+CAPACITY_LOG_FILE        = Path(__file__).parent / "logs" / "capacity-log.md"
 HEARTBEAT_DISK_WARN_PCT  = 10    # warn if free < 10%
 HEARTBEAT_GIT_STALE_DAYS = 7
 HEARTBEAT_QUEUE_IDLE_HOURS = 2

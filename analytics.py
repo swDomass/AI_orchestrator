@@ -420,26 +420,37 @@ _CACHE_TTL = 30  # seconds
 
 
 def _get_current_limits() -> dict:
-    """Fetch live limits via the limits module.
+    """Read current limits from the persistent capacity log.
 
-    In the main orchestrator process this reads from the already-running
-    background daemon (no extra cclimits call). In a standalone dashboard
-    process the first call may block up to 30 s while the background polling
-    thread starts and warms up. Returns {} only if an exception is raised.
+    Uses the most recent entry per provider — written by the --watch process
+    every 20 min (heartbeat) and at startup.  Reading from the log avoids
+    starting a duplicate limits bg-daemon thread in standalone dashboard
+    processes (which would double the JSONL I/O from claude-monitor).
+    Returns {} if the log is empty or unreadable.
     """
     try:
-        from limits import get_limits
-        lims = get_limits()
-        result = {}
-        for name in ("claude", "gemini", "codex"):
-            lim = getattr(lims, name)
-            result[name] = {
-                "available": lim.available,
-                "remaining_pct": lim.remaining_pct,
-                "error": lim.error or "",
-            }
+        snaps = _parse_capacity_log(CAPACITY_LOG_FILE)
+        if not snaps:
+            return {}
+        # Find the most recent timestamp per base provider
+        # (provider strings like "claude_five_hour" → base "claude").
+        latest_ts: dict[str, datetime] = {}
+        for s in snaps:
+            base = s.provider.split("_")[0]
+            if base not in latest_ts or s.timestamp > latest_ts[base]:
+                latest_ts[base] = s.timestamp
+        # Aggregate windows: available = all ok; remaining = minimum across windows.
+        result: dict[str, dict] = {}
+        for s in snaps:
+            base = s.provider.split("_")[0]
+            if s.timestamp < latest_ts.get(base, s.timestamp):
+                continue
+            if base not in result:
+                result[base] = {"available": True, "remaining_pct": 100.0, "error": ""}
+            result[base]["available"] = result[base]["available"] and s.available
+            result[base]["remaining_pct"] = min(result[base]["remaining_pct"], s.remaining_pct)
         return result
-    except (ImportError, OSError, AttributeError):
+    except Exception:
         return {}
 
 

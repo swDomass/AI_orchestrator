@@ -429,6 +429,7 @@ class HeartbeatRunner:
     def __init__(self) -> None:
         self._items: list[HeartbeatItem] = []
         self._mtime: float = 0.0
+        self._lock = threading.Lock()  # prevents concurrent run_due() calls
         self._reload_if_changed()
 
     def _reload_if_changed(self) -> None:
@@ -490,7 +491,21 @@ class HeartbeatRunner:
         """Run all due items, send Telegram notifications for non-empty results.
 
         Never raises — all errors are caught and logged.
+        Safe for concurrent calls: returns immediately if already running.
         """
+        if not self._lock.acquire(blocking=False):
+            return  # bg thread or main loop already running — skip
+        try:
+            self._run_due_locked(queue_read_fn, dispatcher)
+        finally:
+            self._lock.release()
+
+    def _run_due_locked(
+        self,
+        queue_read_fn: Callable,
+        dispatcher: Optional[object] = None,
+    ) -> None:
+        """Inner implementation of run_due — must be called with _lock held."""
         self._reload_if_changed()
         due = self.due_items()
         if not due:
@@ -552,3 +567,29 @@ class HeartbeatRunner:
         else:
             logger.debug("No handler for heartbeat item: %s", item.label)
             return None
+
+
+def start_heartbeat_thread(
+    heartbeat: HeartbeatRunner,
+    queue_read_fn: Callable,
+    stop_event: threading.Event,
+    poll_sec: int = 60,
+) -> threading.Thread:
+    """Start a daemon thread that calls heartbeat.run_due() every *poll_sec* seconds.
+
+    This ensures scheduled checks (log-capacity, usage-suggest, etc.) fire on time
+    even when the main thread is blocked for hours inside a long-running task.
+    The thread is safe to run alongside the existing run_due() calls in the main loop
+    because HeartbeatRunner.run_due() is protected by a non-blocking lock.
+    """
+    def _loop() -> None:
+        while not stop_event.wait(timeout=poll_sec):
+            try:
+                heartbeat.run_due(queue_read_fn)
+            except Exception:
+                logger.debug("heartbeat bg thread error", exc_info=True)
+
+    t = threading.Thread(target=_loop, name="heartbeat-bg", daemon=True)
+    t.start()
+    logger.debug("Heartbeat background thread started (poll=%ds)", poll_sec)
+    return t

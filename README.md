@@ -111,11 +111,14 @@ Der Orchestrator ergänzt automatisch:
 | Provider erzwingen | `#claude`, `#gemini`, `#codex` | `- [ ] Task #codex` |
 | Claude-Modell wählen | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
 | Tool ausführen | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
+| Provider einschränken (Task-Level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
 | Working Directory | `cwd:<pfad>` | `cwd:D:\projects\repo` |
 | Working Directory mit Leerzeichen | `cwd:"<pfad mit spaces>"` | `cwd:"D:\My Projects\App"` |
 | Timeout | `#timeout:<n>[s|m|h]` | `#timeout:30s`, `#timeout:15m`, `#timeout:1h` |
 | Profil | `#agent:<name>` | `#agent:work` |
 | Parallel-Task | `#parallel` | Parent-Task mit eingerückten Subtasks |
+| Task-ID vergeben | `#id:<name>` | `- [ ] Build backend #id:build` |
+| Task-Abhängigkeit | `#needs:<id1,id2>` | `- [ ] Test #needs:build` |
 | Shutdown nach Task | `#shutdown` | `- [ ] Backup #shutdown` |
 | Preapproval | `#approve:<kategorie,...>` | `#approve:push,publish` |
 
@@ -135,6 +138,24 @@ Verhalten:
 - Subtasks mit **gleichem `cwd`** laufen sequentiell in einer Gruppe.
 - Subtasks mit **verschiedenen `cwd`s** laufen parallel in getrennten Threads.
 - Fehler in einem Subtask werden als Ergebnis erfasst; andere Subtasks laufen weiter.
+
+### Task-Abhängigkeiten (`#id:` / `#needs:`)
+
+Jeder Task kann eine eindeutige ID tragen und auf andere Tasks warten:
+
+```md
+- [ ] Build backend #id:build cwd:D:\projects\app
+- [ ] Run integration tests #id:tests #needs:build cwd:D:\projects\app
+- [ ] Deploy to staging #needs:build,tests cwd:D:\projects\app
+```
+
+Verhalten:
+
+- Ein Task mit `#needs:` bleibt **blockiert**, solange nicht alle genannten IDs als `[x]` (erledigt) oder `[-]` (fehlgeschlagen) in der Queue stehen.
+- Blockierte Tasks werden **nicht aus der Queue entfernt** — sie bleiben offen und werden beim nächsten Zyklus automatisch erneut geprüft.
+- Die Queue-Kopfzeile zeigt `(N ausführbar, M blockiert)` wenn blockierte Tasks vorhanden sind.
+- **Zwei-Phasen-Parsing:** Pass 1 sammelt alle offenen Tasks und ihre IDs, Pass 2 löst `#needs:` gegen erledigte IDs auf. Short-circuit wenn keine `#needs:`-Tags vorhanden sind.
+- Auch `[-]`-Tasks (fehlgeschlagen) lösen Abhängigkeiten auf — das Ergebnis des Vorgängers entscheidet der nachfolgende Task selbst.
 
 ### Retry-Marker
 
@@ -217,10 +238,10 @@ Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED)
 
 | Konstante | Default | Phase |
 |---|---|---|
-| `TOOL_DEV_RESEARCH_TIMEOUT_SEC` | 1200 (20 min) | Research |
-| `TOOL_DEV_EXEC_TIMEOUT_SEC` | 2400 (40 min) | Execution |
-| `TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC` | 1200 (20 min) | Quality Review |
-| `TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC` | 600 (10 min) | Resolution Review |
+| `TOOL_DEV_RESEARCH_TIMEOUT_SEC` | 3600 (60 min) | Research |
+| `TOOL_DEV_EXEC_TIMEOUT_SEC` | 7200 (2 h) | Execution |
+| `TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC` | 3600 (60 min) | Quality Review |
+| `TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC` | 1800 (30 min) | Resolution Review |
 
 ## Research-QA (`#tool:research-qa`)
 
@@ -357,7 +378,7 @@ Befehle:
 
 - `/task <beschreibung>` -> Task zur Queue hinzufügen
 - `/status` -> Queue-Größe + Provider-Status
-- `/limits` -> detaillierte Limits
+- `/limits` -> detaillierte Limits inkl. Per-Window-Breakdown (z. B. `five_hour`, `seven_day` für Claude)
 - `/pause` / `/resume`
 - `/approve`, `/approve-all <cat>`, `/deny`, `/skip`
 - `/pick N` -> Usage-Vorschlag auswählen (1-3)
@@ -393,6 +414,7 @@ Max. Task-Länge via `/task`: 500 Zeichen (konfigurierbar via `TELEGRAM_MAX_TASK
   - proaktive Checks im `--watch` Modus, konfiguriert über `99_System/AI/HEARTBEAT.md`
   - 7 Built-in Handler: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `summarize`, `stale-branch`, `usage-suggest`
   - Mtime-cached Config — Änderungen an HEARTBEAT.md werden automatisch übernommen
+  - Läuft zusätzlich in einem **Daemon-Thread** (60s Poll), damit geplante Checks (`log-capacity`, `usage-suggest`, `check-limits`) pünktlich feuern, auch wenn der Hauptthread stundenlang in einem langen Task blockiert ist. `run_due()` ist re-entrancy-sicher (non-blocking Lock).
 - **Usage Suggester (`usage_suggester.py`)**
   - erkennt wenn Claude-Limits bald zurückgesetzt werden und noch >30% Kapazität übrig ist
   - schlägt proaktiv 2-3 Tasks via Telegram vor (Skills, Git-Changes, fehlgeschlagene Retries, Vault-Tasks)
@@ -527,8 +549,11 @@ python dashboard.py --no-open
 |---|---|---|
 | Task Results | `memory/task_results/*.md` + `archive/*.md` | YAML-Frontmatter (Task, Provider, Dauer, Erfolg) |
 | Logs | `logs/orchestrator.log*` | Heartbeat check-limits Einträge + ERROR-Zeilen |
+| Capacity Log | `logs/capacity-log.md` | Pro-Provider/Window-Snapshots (aktueller Stand) |
 | Queue Log | `agent-queue.md` | HTML-Kommentare (`<!-- YYYY-MM-DD HH:MM \| msg -->`) |
 | Session | `notifier._stats` (RAM) | Tasks done/failed, Provider-Nutzung, Startzeit |
+
+`_get_current_limits()` liest den neuesten Eintrag pro Provider aus `logs/capacity-log.md` — kein extra `cclimits`-Aufruf im Dashboard-Prozess.
 
 Der API-Endpunkt `GET /api/data` (JSON) wird alle 60s vom Dashboard abgefragt und intern 30s gecacht.
 

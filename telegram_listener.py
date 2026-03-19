@@ -331,10 +331,15 @@ class TelegramListener:
             lim = getattr(limits, name)
             if lim.available:
                 reset = f", reset in {_fmt_time(lim.resets_in_sec)}" if lim.resets_in_sec else ""
-                lines.append(f"  {name}: {lim.remaining_pct:.1f}% remaining{reset}")
+                lines.append(f"  *{name}*: {lim.remaining_pct:.1f}% remaining{reset}")
             else:
                 err = _escape_telegram_markdown(lim.error or "nicht verfügbar")
-                lines.append(f"  {name}: ❌ {err}")
+                lines.append(f"  *{name}*: ❌ {err}")
+            # Per-window breakdown (Claude: five_hour + seven_day, Codex: primary + secondary)
+            for wname, wdata in sorted(lim.windows.items()):
+                label = wname.replace("_", "\\_")
+                reset_w = f", reset in {_fmt_time(wdata.resets_in_sec)}" if wdata.resets_in_sec else ""
+                lines.append(f"    {label}: {wdata.remaining_pct:.1f}%{reset_w}")
         send_message("\n".join(lines))
 
     def _cmd_pause(self) -> None:

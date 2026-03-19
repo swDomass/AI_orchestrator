@@ -49,6 +49,11 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 17 | Research-QA Tool (pre-implementation research) | DONE |
 | 18 | Claude JSON token tracking for capacity estimation | DONE |
 | 19 | Knowledge-Transfer Tool (cross-domain innovation) | DONE |
+| 20 | Task dependencies (`#id:` / `#needs:`) — two-pass blocking resolution | DONE |
+| 21 | Per-window capacity thresholds (Claude 5h/7d, Codex primary/secondary) | DONE |
+| 22 | Heartbeat background thread (always-on scheduling during long tasks) | DONE |
+| 23 | Dev-loop resilience (capacity guards, research-phase state caching) | DONE |
+| 24 | Robustness hardening (narrow excepts, thread-safety, XSS-safe JS, CORS) | DONE |
 
 ## Tier 4 ÔÇö Overkill for Now
 

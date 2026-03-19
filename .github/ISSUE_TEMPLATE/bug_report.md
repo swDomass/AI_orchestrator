@@ -1,8 +1,8 @@
 ---
 name: Bug report
-about: Create a report to help us improve
-title: ''
-labels: ''
+about: Report a bug in the AI Orchestrator
+title: '[BUG] '
+labels: bug
 assignees: ''
 
 ---
@@ -12,27 +12,39 @@ A clear and concise description of what the bug is.
 
 **To Reproduce**
 Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+1.
+2.
+3.
 
 **Expected behavior**
-A clear and concise description of what you expected to happen.
+What did you expect to happen?
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**Actual behavior**
+What happened instead?
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+**Queue task (if applicable)**
+Paste the relevant queue entry from `agent-queue.md`:
+```markdown
+- [ ] Your task here #tool:... #agent:...
+```
 
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+**Logs**
+Relevant output from `logs/orchestrator.log` (last ~50 lines around the error):
+```
+paste logs here
+```
+
+**Doctor output**
+Output of `python orchestrator.py --doctor`:
+```
+paste here
+```
+
+**Environment**
+- OS: [e.g. Windows 11, Ubuntu 22.04]
+- Python version: [e.g. 3.11.4]
+- Provider(s) affected: [e.g. Claude, Gemini, Codex, all]
+- Orchestrator version / commit: [e.g. `git rev-parse --short HEAD`]
 
 **Additional context**
-Add any other context about the problem here.
+Any other relevant context (profile used, parallel tasks, policy rules, etc.).

@@ -1,20 +1,35 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
-title: ''
-labels: ''
+about: Suggest a new feature or improvement
+title: '[FEATURE] '
+labels: enhancement
 assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+**Problem / motivation**
+What problem does this solve, or what workflow does it improve?
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**Proposed solution**
+A clear description of what you want to happen.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+**Component(s) affected**
+Which part of the orchestrator is this related to?
+- [ ] Queue parsing (`queue_manager.py`)
+- [ ] Provider / dispatcher (`dispatcher.py`, `providers/`)
+- [ ] Tools (`tools/`)
+- [ ] Heartbeat / scheduler (`heartbeat.py`)
+- [ ] Memory (`memory.py`)
+- [ ] Policy engine (`policy.py`)
+- [ ] Profiles (`profiles.py`)
+- [ ] Parallel runner (`parallel_runner.py`)
+- [ ] Dashboard / analytics (`dashboard.py`, `analytics.py`)
+- [ ] Telegram integration (`notifier.py`, `telegram_listener.py`)
+- [ ] Doctor / setup (`doctor.py`)
+- [ ] Config / other
+
+**Alternatives considered**
+Any alternative approaches you've thought about?
 
 **Additional context**
-Add any other context or screenshots about the feature request here.
+Example queue task, config snippet, or any other relevant context.

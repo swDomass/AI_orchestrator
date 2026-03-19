@@ -27,3 +27,8 @@ pytesttmp/
 
 # Logs
 logs/
+
+# Internal planning docs (implemented, not useful for public users)
+docs/review-fix-plan.md
+docs/usage-resilience-plan.md
+docs/github-publish-plan.md

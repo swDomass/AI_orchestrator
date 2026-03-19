@@ -62,8 +62,8 @@ function t_notify {
             $argString = $Arguments -join " "
             $msg = "🔔 *Task Finished*`n`n`$ $Command $argString`n⏱ Dauer: $([Math]::Round($duration, 1))s"
             
-            # Call your Orchestrator's notifier
-            python "D:/programmieren/privat_python/AI_orchestrator/notifier.py" "$msg"
+            # Call your Orchestrator's notifier (path relative to this script)
+            python "$PSScriptRoot\..\notifier.py" "$msg"
         }
     }
 }

@@ -207,7 +207,7 @@ skills prerequisites.
    [FAIL] Codex CLI ........... not found in PATH
    [PASS] cclimits ............ cclimits --json OK
    [WARN] Telegram bot ........ token set but getMe returned 401
-   [PASS] Vault path .......... D:\OneDrive...\literal:obsidian_vault exists
+   [PASS] Vault path .......... C:\Users\you\obsidian_vault exists
    [PASS] Skills .............. 11 discovered, 9 available, 2 gated
    ```
 

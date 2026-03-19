@@ -514,7 +514,9 @@ class UsageSuggester:
     # ------------------------------------------------------------------
 
     # Hard-filter: roles that require physical/manual action
-    _EXCLUDED_ROLES = {"#Rolle/haus", "#Rolle/Fam", "#Rolle/literal:YourOrg", "#Rolle/unternehmungen"}
+    # Roles that require physical/manual action — excluded from AI suggestions.
+    # Customize to match your Obsidian Tasks Plugin role taxonomy.
+    _EXCLUDED_ROLES = {"#Rolle/haus", "#Rolle/Fam", "#Rolle/unternehmungen"}
     _KEPT_ROLES = {"#Rolle/arbeit", "#Rolle/ich"}
     _TAG_CONTINUE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/")
 

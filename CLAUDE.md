@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Obsidian-Projektdoku
 
-`literal:/path/to/your/obsidian_vault\01_Tasks\01_Projekte\03_Unternehmung-Invest\AI-System-Intelligence-Orchestrator.md`
+`<your-vault>/01_Tasks/01_Projekte/.../AI-System-Intelligence-Orchestrator.md`
 
 ## Project
 

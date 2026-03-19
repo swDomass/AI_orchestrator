@@ -47,9 +47,9 @@ class TestFilterVaultTask:
         s = _make_suggester()
         assert s._filter_vault_task("Family dinner #Rolle/Fam") is None
 
-    def test_rejects_rolle_whitelady(self):
+    def test_rejects_rolle_sideproject(self):
         s = _make_suggester()
-        assert s._filter_vault_task("Invoice #Rolle/literal:YourOrg") is None
+        assert s._filter_vault_task("Invoice #Rolle/unternehmungen") is None
 
     def test_rejects_rolle_unternehmungen(self):
         s = _make_suggester()

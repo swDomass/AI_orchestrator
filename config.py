@@ -148,12 +148,7 @@ _env_cwd_roots = os.getenv("ALLOWED_CWD_ROOTS", "")
 ALLOWED_CWD_ROOTS: list[Path] = (
     [Path(p.strip()) for p in _env_cwd_roots.split(";") if p.strip()]
     if _env_cwd_roots
-    else [
-        Path("D:/programmieren"),
-        Path(r"literal:/path/to/your/obsidian_vault"),
-        Path(r"literal:D:\projects\work"),
-        Path(r"literal:D:\OneDrive - YourOrg\YourOrg-Data\marketing\AI_Marketing"),
-    ]
+    else []  # empty = allow all paths; configure via ALLOWED_CWD_ROOTS in .env
 )
 
 # Max task length accepted via Telegram /task command (characters)

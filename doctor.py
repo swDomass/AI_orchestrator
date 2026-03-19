@@ -61,9 +61,8 @@ def _check_cli(label: str, cmd: str, install_hint: str = "") -> CheckResult:
         # Try to get version
         try:
             r = subprocess.run(
-                f"{cmd} --version",
+                [cmd, "--version"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-                shell=True,
             )
             version = (r.stdout or r.stderr).strip().splitlines()[0][:60]
         except Exception:

@@ -193,13 +193,12 @@ class CriticalReviewTool(BaseTool):
             tool_name=self.name,
         )
 
-        review_prompt = _REVIEW_PROMPT_TEMPLATE.replace("{task}", task)
+        review_prompt = system_prompt + "\n\n" + _REVIEW_PROMPT_TEMPLATE.replace("{task}", task)
 
         result = provider.run(
             review_prompt,
             cwd=str(cwd_path),
             timeout=effective_timeout,
-            system_prompt=system_prompt,
         )
 
         if result.error:

@@ -162,13 +162,12 @@ class SecurityAuditTool(BaseTool):
             tool_name=self.name,
         )
 
-        audit_prompt = _AUDIT_PROMPT.replace("{task}", task)
+        audit_prompt = system_prompt + "\n\n" + _AUDIT_PROMPT.replace("{task}", task)
 
         audit_result = provider.run(
             audit_prompt,
             cwd=str(cwd_path),
             timeout=audit_timeout,
-            system_prompt=system_prompt,
             read_only=True,
         )
 
@@ -213,13 +212,12 @@ class SecurityAuditTool(BaseTool):
         # Replace {task} before {audit_output}: audit_output (LLM text) may contain the
         # literal substring "{task}" (e.g. from quoting source code with format strings),
         # which a later .replace("{task}", task) call would incorrectly expand.
-        fix_prompt = _FIX_PROMPT.replace("{task}", task).replace("{audit_output}", audit_output)
+        fix_prompt = system_prompt + "\n\n" + _FIX_PROMPT.replace("{task}", task).replace("{audit_output}", audit_output)
 
         fix_result = provider.run(
             fix_prompt,
             cwd=str(cwd_path),
             timeout=fix_timeout,
-            system_prompt=system_prompt,
         )
 
         in_tok += fix_result.input_tokens

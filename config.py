@@ -187,14 +187,23 @@ TOOL_KT_KNOWHOW_TIMEOUT_SEC       =    600  # 10 min: know-how extraction
 TOOL_KT_APPLICATIONS_TIMEOUT_SEC  =    900  # 15 min: cross-domain with WebSearch
 TOOL_KT_SYNTHESIS_TIMEOUT_SEC     =    600  # 10 min: solution synthesis
 
+# Critical-Review timeouts
+TOOL_CR_REVIEW_TIMEOUT_SEC = 2_400  # 40 min: full radical-honesty architectural review
+
+# Security-Audit timeouts
+TOOL_SA_AUDIT_TIMEOUT_SEC  = 2_400  # 40 min: read-only vulnerability scan (Phase 1)
+
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3
 
 # --- Memory System ---
-MEMORY_HALF_LIFE_DAYS    = 30
-MEMORY_MAX_AGE_DAYS      = 180
+MEMORY_HALF_LIFE_DAYS              = 30
+MEMORY_MAX_AGE_DAYS                = 30   # archive task_results after 30 days
+MEMORY_ARCHIVE_DELETE_DAYS         = 90   # delete from archive/ after 90 days
+MEMORY_DAILY_LOG_RETENTION_DAYS    = 30   # delete daily/*.md after 30 days
+MEMORY_LESSONS_RETENTION_DAYS      = 180  # prune lessons.md entries after 180 days
 MEMORY_TOP_K             = 5
 MEMORY_SUMMARY_MAX_CHARS = 700   # first 500 + "...\n" + last 200
 MEMORY_MIN_SCORE         = 0.10  # discard matches below this threshold (avoids noise injection)
@@ -205,6 +214,15 @@ CAPACITY_LOG_FILE        = Path(__file__).parent / "logs" / "capacity-log.md"
 HEARTBEAT_DISK_WARN_PCT  = 10    # warn if free < 10%
 HEARTBEAT_GIT_STALE_DAYS = 7
 HEARTBEAT_QUEUE_IDLE_HOURS = 2
+CAPACITY_LOG_RETENTION_DAYS = 90  # entries older than this are pruned
+
+# --- Queue Event Log (replaces ## Log section in agent-queue.md) ---
+QUEUE_EVENTS_LOG_FILE           = Path(__file__).parent / "logs" / "queue-events.log"
+QUEUE_EVENTS_LOG_RETENTION_DAYS = 30   # prune log entries older than this
+
+# --- Queue Cleanup (erledigt.md) ---
+QUEUE_DONE_MOVE_HOURS  = 48  # move done tasks to erledigt.md after this many hours
+QUEUE_DONE_DELETE_DAYS = 7   # delete from erledigt.md after this many days
 
 # --- Prompt Budget (token ≈ word heuristic) ---
 PROMPT_BUDGET_TOKENS          = 10_000

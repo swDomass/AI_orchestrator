@@ -124,28 +124,33 @@ def test_mark_retry_handles_backslashes_in_task_text(mock_queue_file):
     assert f"- [ ] {task} <!-- retry: 12:34 -->" in content
 
 
-def test_append_log_uses_real_log_section_when_result_contains_log_heading(mock_queue_file):
-    mock_queue_file.write_text(
+def test_append_log_writes_to_events_log_not_queue_md(mock_queue_file, tmp_path, monkeypatch):
+    """append_log now writes to queue-events.log, not the queue MD file."""
+    events_log = tmp_path / "queue-events.log"
+    monkeypatch.setattr("queue_manager.QUEUE_EVENTS_LOG_FILE", events_log)
+    queue_manager._events_log_cleanup_last_date = None
+
+    original_content = (
         "## Queue\n"
         "- [ ] Task A\n\n"
         "## Ergebnisse\n"
         "Provider output line\n"
         "## Log\n"
         "still provider output\n\n"
-        "## Log\n",
-        encoding="utf-8",
+        "## Log\n"
     )
+    mock_queue_file.write_text(original_content, encoding="utf-8")
 
     queue_manager.append_log("test-entry")
 
-    content = mock_queue_file.read_text(encoding="utf-8")
-    assert "Provider output line\n## Log\nstill provider output" in content
-    tail = content.split("\n## Log\n")[-1]
-    assert "<!-- " in tail
-    assert "test-entry" in tail
+    # Queue MD must be unchanged
+    assert mock_queue_file.read_text(encoding="utf-8") == original_content
+    # Event logged to events file
+    assert "test-entry" in events_log.read_text(encoding="utf-8")
 
 
-def test_append_task_fallback_inserts_before_real_results_heading_only(mock_queue_file):
+def test_append_task_fallback_appends_queue_section_at_end(mock_queue_file):
+    """When no ## Queue section exists, append_task creates one at end of file."""
     mock_queue_file.write_text(
         "Intro mentions ## Ergebnisse inline but is not a heading.\n\n"
         "## Ergebnisse\n"
@@ -158,7 +163,7 @@ def test_append_task_fallback_inserts_before_real_results_heading_only(mock_queu
 
     content = mock_queue_file.read_text(encoding="utf-8")
     assert "Intro mentions ## Ergebnisse inline but is not a heading." in content
-    assert "## Queue\n- [ ] Neue Aufgabe\n\n## Ergebnisse" in content
+    assert "## Queue\n- [ ] Neue Aufgabe" in content
 
 
 def test_mark_done_uses_line_identity_for_duplicate_task_texts(mock_queue_file, monkeypatch):

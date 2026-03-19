@@ -66,6 +66,7 @@ from config import VAULT_PATH
 import memory as memory_module
 from queue_manager import (
     append_log,
+    cleanup_done_tasks,
     ensure_queue_file,
     extract_cwd,
     extract_model_tag,
@@ -596,6 +597,14 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         archived = memory_module.archive_old_memories()
         if archived:
             _log.debug("Archived %d old memories", archived)
+    except (OSError, ImportError):
+        pass
+
+    # Move old completed tasks to erledigt.md once per cycle (silent, never blocks)
+    try:
+        moved = cleanup_done_tasks()
+        if moved:
+            _log.debug("Moved %d done task(s) to erledigt.md", moved)
     except (OSError, ImportError):
         pass
 

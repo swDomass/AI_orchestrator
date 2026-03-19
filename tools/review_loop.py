@@ -234,19 +234,11 @@ class ReviewLoopTool(BaseTool):
                 msg = f"Keine P1/P2/P3 Findings nach {iteration} Iteration(en)."
                 print(f"  [review-loop] ✅ {msg}")
 
-                # Auto-lesson: if >2 iterations were needed, record what happened
-                if iteration > 2 and memory_module is not None:
-                    try:
-                        last_findings = last_findings_tuple
-                        memory_module.append_lesson(
-                            tool_name=self.name,
-                            cwd=cwd or ".",
-                            pattern=f"Benoetigte {iteration} Iterationen. Letzte Findings: {'; '.join(last_findings[:3])}",
-                            fix="Siehe Fix-Output in all_outputs",
-                            tool_hint=f"Bei aehnlichen Findings: priorisiere Root-Cause-Analyse statt symptomatischer Fixes",
-                        )
-                    except (ImportError, OSError, ValueError):
-                        pass
+                # Auto-lesson — DEAKTIVIERT
+                # Speichern von "letzten Findings" ist nicht sinnvoll: die Einträge sind
+                # projektspezifisch und nach Code-Änderungen veraltet. Eine echte Lesson
+                # bräuchte eine LLM-Summary über alle Iterationen (Muster, Root Cause).
+                # TODO: Neu implementieren mit LLM-generierter Summary aus all_outputs.
 
                 notify_tool_done(self.name, iteration, True, msg)
                 return ToolResult(

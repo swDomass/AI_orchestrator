@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from config import CAPACITY_LOG_FILE, LOG_FILE, QUEUE_FILE, VAULT_PATH
+from config import CAPACITY_LOG_FILE, LOG_FILE, QUEUE_EVENTS_LOG_FILE, QUEUE_FILE, VAULT_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -274,16 +274,17 @@ def _parse_capacity_log(path: Path) -> list[LimitSnapshot]:
 
 
 _QUEUE_EVENT_RE = re.compile(
-    r"<!--\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s*\|\s*(.*?)\s*-->"
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s*\|\s*(.*?)\s*$",
+    re.MULTILINE,
 )
 
 
-def _parse_queue_log(queue_file: Path) -> list[QueueEvent]:
-    """Parse HTML comment log entries from the queue file."""
-    if not queue_file.is_file():
+def _parse_queue_log(events_log: Path) -> list[QueueEvent]:
+    """Parse plain-text queue event log (logs/queue-events.log)."""
+    if not events_log.is_file():
         return []
     try:
-        text = queue_file.read_text(encoding="utf-8", errors="replace")
+        text = events_log.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
 
@@ -484,7 +485,7 @@ def get_dashboard_data(days: int = 7) -> dict:
             if (s.timestamp, s.provider) not in seen:
                 snapshots.append(s)
         snapshots.sort(key=lambda s: s.timestamp)
-    queue_events = _parse_queue_log(QUEUE_FILE)
+    queue_events = _parse_queue_log(QUEUE_EVENTS_LOG_FILE)
     session = _parse_session_stats()
 
     # Aggregate

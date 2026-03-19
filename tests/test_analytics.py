@@ -128,19 +128,21 @@ class TestParseLogLimits:
 
 
 class TestParseQueueLog:
-    def test_parses_comments(self, tmp_path):
+    def test_parses_plain_log(self, tmp_path):
         from analytics import _parse_queue_log
-        qf = tmp_path / "queue.md"
-        qf.write_text(
-            "# Queue\n"
-            "<!-- 2026-03-01 08:31 | Alle Tasks erledigt. -->\n"
-            "<!-- 2026-03-01 08:19 | Orchestrator gestartet (watch) -->\n"
-            "- [ ] Some task\n",
+        lf = tmp_path / "queue-events.log"
+        lf.write_text(
+            "2026-03-01 08:19 | Orchestrator gestartet (watch)\n"
+            "2026-03-01 08:31 | Alle Tasks erledigt.\n",
             encoding="utf-8",
         )
-        events = _parse_queue_log(qf)
+        events = _parse_queue_log(lf)
         assert len(events) == 2
         assert events[0].message == "Alle Tasks erledigt."  # most recent first
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        from analytics import _parse_queue_log
+        assert _parse_queue_log(tmp_path / "nonexistent.log") == []
 
 
 # ── Aggregation tests ────────────────────────────────────────────────────────
@@ -290,6 +292,7 @@ class TestParseLogSuggestEvents:
         with patch("analytics.VAULT_PATH", tmp_path), \
              patch("analytics.LOG_FILE", log_dir / "orchestrator.log"), \
              patch("analytics.QUEUE_FILE", tmp_path / "queue.md"), \
+             patch("analytics.QUEUE_EVENTS_LOG_FILE", tmp_path / "queue-events.log"), \
              patch("analytics.CAPACITY_LOG_FILE", tmp_path / "capacity-log.md"):
             d = get_dashboard_data()
         suggest_items = [e for e in d["recent_events"] if e["type"] == "suggest"]
@@ -354,6 +357,7 @@ class TestCache:
         with patch("analytics.VAULT_PATH", tmp_path), \
              patch("analytics.LOG_FILE", tmp_path / "logs" / "orchestrator.log"), \
              patch("analytics.QUEUE_FILE", tmp_path / "queue.md"), \
+             patch("analytics.QUEUE_EVENTS_LOG_FILE", tmp_path / "queue-events.log"), \
              patch("analytics.CAPACITY_LOG_FILE", tmp_path / "capacity-log.md"):
             (tmp_path / "logs").mkdir(exist_ok=True)
             d1 = get_dashboard_data()

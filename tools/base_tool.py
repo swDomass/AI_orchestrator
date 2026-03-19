@@ -53,6 +53,17 @@ def _write_tool_file(output_dir: Path, filename: str, content: str) -> None:
     (output_dir / filename).write_text(content, encoding="utf-8")
 
 
+def _make_report_header(title: str, timestamp: str, task: str, provider_name: str, cwd_path: Path) -> str:
+    """Return a standard Markdown report header for tool output files."""
+    return (
+        f"# {title} — {timestamp}\n\n"
+        f"**Task:** {task}  \n"
+        f"**Provider:** {provider_name}  \n"
+        f"**CWD:** {cwd_path}\n\n"
+        "---\n\n"
+    )
+
+
 def _build_system_prompt(
     provider_name: str,
     memory_context: str = "",
@@ -82,13 +93,13 @@ def _build_system_prompt(
         except (OSError, ValueError) as exc:
             logger.warning("Tool prompt daily memory load failed: %s", exc)
 
-        # Layer 4: Lessons learned (filtered by tool if available)
-        try:
-            lessons = memory_module.get_lessons_context(tool_name=tool_name)
-            if lessons:
-                prompt += f"\n\n## Lessons Learned\n{lessons}"
-        except (OSError, ValueError) as exc:
-            logger.warning("Tool prompt lessons load failed: %s", exc)
+        # Layer 4: Lessons learned — DEAKTIVIERT
+        # Auto-generated lessons (append_lesson) bringen keinen Mehrwert: die gespeicherten
+        # "letzten Findings" sind projektspezifische Dateinamen/Zeilennummern die beim
+        # nächsten Run veraltet sind. Sinnvoll wäre eine LLM-Summary über alle Iterationen
+        # (was hat sich wiederholt, was war der Root Cause) — das ist aber zu aufwändig für
+        # den aktuellen Stand. TODO: Lessons-System mit LLM-generierter Summary pro Loop
+        # ausarbeiten, bevor Injection wieder aktiviert wird.
 
     if memory_context:
         prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"

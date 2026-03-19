@@ -428,7 +428,6 @@ class DevLoopTool(BaseTool):
                 )
 
             # Search lessons for hints related to current review findings
-            lessons_context = ""
             if previous_quality_findings and memory_module is not None:
                 try:
                     findings_text = "\n".join(previous_quality_findings)
@@ -598,19 +597,11 @@ class DevLoopTool(BaseTool):
                     ),
                 )
 
-                # Auto-lesson: if >2 iterations, record patterns for future loops
-                if iteration > 2 and memory_module is not None:
-                    try:
-                        last_findings = last_quality_tuple
-                        memory_module.append_lesson(
-                            tool_name=self.name,
-                            cwd=cwd or ".",
-                            pattern=f"Benoetigte {iteration} Iterationen. Letzte blocking Findings: {'; '.join(last_findings[:3])}",
-                            fix="Task wurde nach mehreren Iterationen geloest",
-                            tool_hint="Bei aehnlichen Findings: Research-Phase gruendlicher analysieren, Plan-Phase nicht ueberspringen",
-                        )
-                    except (ImportError, OSError, ValueError):
-                        pass
+                # Auto-lesson — DEAKTIVIERT
+                # Speichern von "letzten Findings" ist nicht sinnvoll: die Einträge sind
+                # projektspezifisch und nach Code-Änderungen veraltet. Eine echte Lesson
+                # bräuchte eine LLM-Summary über alle Iterationen (Muster, Root Cause).
+                # TODO: Neu implementieren mit LLM-generierter Summary aus all_outputs.
 
                 notify_tool_done(self.name, iteration, True, msg)
                 if cwd:

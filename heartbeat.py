@@ -35,6 +35,7 @@ from typing import Callable, Optional
 from config import (
     ALLOWED_CWD_ROOTS,
     CAPACITY_LOG_FILE,
+    CAPACITY_LOG_RETENTION_DAYS,
     HEARTBEAT_DISK_WARN_PCT,
     HEARTBEAT_FILE,
     HEARTBEAT_GIT_STALE_DAYS,
@@ -42,6 +43,7 @@ from config import (
     MIN_CAPACITY_PERCENT,
     VAULT_PATH,
 )
+from queue_manager import _write_bytes_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +199,67 @@ def _append_capacity_log(limits) -> None:
 
         with CAPACITY_LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
+
+        _cleanup_capacity_log()
     except Exception as e:
         logger.debug("capacity log append failed: %s", e)
+
+
+# Module-level: track last cleanup date to run at most once per day
+_last_capacity_cleanup: Optional[date] = None
+
+
+def _cleanup_capacity_log() -> None:
+    """Remove capacity log entries older than CAPACITY_LOG_RETENTION_DAYS.
+
+    Runs at most once per calendar day. Preserves the header comment lines
+    and rewrites the file in-place only when old entries are actually removed.
+    """
+    global _last_capacity_cleanup
+    today = date.today()
+    if _last_capacity_cleanup == today:
+        return
+
+    if not CAPACITY_LOG_FILE.exists():
+        _last_capacity_cleanup = today
+        return
+
+    cutoff = datetime.now() - timedelta(days=CAPACITY_LOG_RETENTION_DAYS)
+    try:
+        text = CAPACITY_LOG_FILE.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+
+        kept: list[str] = []
+        removed = 0
+        for line in lines:
+            # Header / comment lines are always kept
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("<!--"):
+                kept.append(line)
+                continue
+            # Data lines start with a timestamp: "YYYY-MM-DD HH:MM:SS | ..."
+            ts_part = stripped.split("|", 1)[0].strip()
+            try:
+                ts = datetime.strptime(ts_part, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                kept.append(line)  # unparseable → keep safe
+                continue
+            if ts >= cutoff:
+                kept.append(line)
+            else:
+                removed += 1
+
+        if removed:
+            _write_bytes_atomic(CAPACITY_LOG_FILE, "".join(kept).encode("utf-8"))
+            logger.info(
+                "capacity log pruned %d entries older than %d days",
+                removed,
+                CAPACITY_LOG_RETENTION_DAYS,
+            )
+    except Exception as e:
+        logger.debug("capacity log cleanup failed: %s", e)
+    finally:
+        _last_capacity_cleanup = today
 
 
 def _check_limits(get_limits_fn: Callable) -> Optional[str]:

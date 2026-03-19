@@ -10,7 +10,7 @@ Ziel: Routinearbeit aus einer Markdown-Queue ausführen lassen (Code, Reviews, T
 - Limit-/Kapazitätsprüfung via `cclimits` (mit lokalem JSONL-Fallback bei HTTP 429)
 - Retry-Handling bei Rate-Limits / Provider-Ausfällen
 - Obsidian-Queue mit `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*`
-- Tool-Loops (`dev-loop`, `review-loop`, `test-loop`, `research-qa`)
+- Tool-Loops (`dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`)
 - Skills/`SKILL.md` Discovery + Requirements-Gating
 - Memory (TF-IDF + Temporal Decay) für wiederkehrende Tasks
 - Execution Profiles (Provider-Reihenfolge, erlaubte Skills, Timeout, Policy-Overrides)
@@ -97,6 +97,8 @@ Die Queue wird aus Markdown gelesen. Offene Aufgaben sind normale Checkbox-Zeile
 - [ ] Fix login bug #tool:dev-loop cwd:D:\projects\app
 - [ ] Add CSV export to dashboard #tool:dev-loop cwd:D:\projects\app #agent:work
 - [ ] Add OAuth2 login flow #tool:research-qa cwd:D:\projects\app
+- [ ] Architecture audit #tool:critical-review cwd:D:\projects\app
+- [ ] Security audit #tool:security-audit cwd:D:\projects\app
 ```
 
 Der Orchestrator ergänzt automatisch:
@@ -188,6 +190,15 @@ Aktuell registrierte `#tool:`-Handler:
   - Cross-Domain Know-How-Transfer (Vault-Expertise analysieren -> Branchenanwendungen per WebSearch finden -> Obsidian-Ideen-Notiz schreiben)
   - Output in `01_Ideen/KT_YYYY-MM-DD_<slug>/`
   - Nutzt 4-Phasen-Workflow (Scan, Extraktion, Recherche, Synthese)
+- `critical-review`
+  - Radical-Honesty Architektur-Review — hinterfragt Konzept, Methodik und Code
+  - Single-Pass, Read-only
+  - Output in `{cwd}/docs/critical-review-YYYYMMDD-HHMMSS.md`
+- `security-audit`
+  - Zwei-Phasen Security-Workflow: Audit (read-only) → Fix + Verify
+  - Phase 1 scannt: Hardcoded Secrets, Command Injection, Path Traversal, Input-Validation-Lücken (Null-Bytes, Newlines), Log Injection, unsichere Deserialisierung, SSRF
+  - Phase 2 implementiert alle gefundenen Fixes und führt `pytest` aus
+  - Output in `{cwd}/docs/security-audit-YYYYMMDD-HHMMSS.md`
 
 Tool-Liste anzeigen:
 
@@ -319,6 +330,109 @@ Phase 3 — Synthese
 | `TOOL_KT_APPLICATIONS_TIMEOUT_SEC` | 900 (15 min) | Recherche |
 | `TOOL_KT_SYNTHESIS_TIMEOUT_SEC` | 600 (10 min) | Synthese |
 
+## Critical Review (`#tool:critical-review`)
+
+Der `critical-review` ist ein einmaliger Read-only Workflow, der nicht nur Code-Qualität,
+sondern die gesamte Idee, Methodik und Architektur hinterfragt.
+
+```
+Dimension 0 — Concept & Fundamental Premise  ← wichtigste Dimension
+  Sollte dieses Projekt überhaupt existieren?
+  Was ist die Grundannahme, die — wenn falsch — das ganze Vorhaben sinnlos macht?
+  Wer hat das Problem bereits gelöst, und warum ist dieser Ansatz besser?
+
+Dimension 1 — Problem–Solution Fit
+  Ist die Komplexität gerechtfertigt? Welche Annahme wurde nie hinterfragt?
+
+Dimension 2 — Architecture & Design
+  Wo bricht das Design unter realen Bedingungen? Welche versteckte Kopplung?
+
+Dimension 3 — Code Quality
+  Wo wird Komplexität versteckt statt eliminiert? Welche Tests geben falsches Vertrauen?
+
+Dimension 4 — Operational Reality
+  Was passiert um 2 Uhr morgens wenn etwas schiefläuft?
+
+Dimension 5 — Methodology & Process
+  Wo akkumuliert Tech-Debt schneller als abgebaut wird?
+
+Dimension 6 — Risk & Blind Spots
+  Was weiß der Autor nicht, dass er es nicht weiß?
+
+→ Output: {cwd}/docs/critical-review-YYYYMMDD-HHMMSS.md
+→ Keine Code-Änderungen — reine Analyse.
+```
+
+**Output-Format (immer):**
+1. **Concept Verdict** (2–3 Sätze: Soll das existieren?)
+2. **TL;DR** (3–5 Sätze, unverblümtes Gesamturteil)
+3. **Critical Findings (P0/P1)** — Problem + Konsequenz + Mindestanforderung
+4. **Significant Concerns (P2)**
+5. **Methodology Critique**
+6. **What's Actually Good** (konkret, kein Padding)
+7. **Recommended Action** (eine Sache, keine Liste)
+
+**Verhaltensregeln:** Kein Sandwiching, keine Hedging-Sprache, kein Loben von Aufwand oder Absicht.
+
+**Queue-Beispiele:**
+
+```md
+- [ ] Architecture audit #tool:critical-review cwd:D:\projects\app
+- [ ] Review auth module #tool:critical-review cwd:D:\projects\backend
+```
+
+**Konfiguration in `config.py`:**
+
+| Konstante | Default | Beschreibung |
+|---|---|---|
+| `TOOL_CR_REVIEW_TIMEOUT_SEC` | 2400 (40 min) | Timeout für den Review-Aufruf |
+
+## Security Audit (`#tool:security-audit`)
+
+Der `security-audit` ist ein zwei-phasiger Workflow: zuerst werden Schwachstellen gefunden, dann direkt gefixt und mit Tests verifiziert.
+
+```
+Phase 1 — Audit (read-only, 40 min)
+  Scannt systematisch alle Quelldateien nach:
+  CRITICAL: Hardcoded Secrets (API-Keys, Tokens in Source-Code — nicht .env)
+            Command Injection (shell=True + user-controlled Input)
+            Path Traversal (user Input in Dateipfaden ohne .resolve() + Bounds-Check)
+  HIGH:     Input Validation Gaps (Null-Bytes \x00, Newlines nicht gefiltert)
+            Log Injection (unsanitisierter User-Input in Log-Dateien)
+            Unsafe Deserialization (yaml.load ohne SafeLoader, pickle, eval)
+  MEDIUM:   SSRF (user-controlled URLs an HTTP-Clients)
+            TOCTOU Race Conditions (Exist-Check → Use Fenster)
+            Fehlende Timeouts
+  LOW:      Übermäßig breite Exception-Handler
+            Sensible Daten in Logs
+  → Jedes Finding mit Datei:Zeile, Angriffsvektor und konkretem Fix
+
+Phase 2 — Fix + Verify (2 h)
+  Implementiert alle Findings nach Severity (CRITICAL zuerst).
+  Führt `python -m pytest tests/ -q` aus.
+  Tests müssen grün sein — ggf. werden auch Tests gefixt.
+  Schreibt "## Manual Actions Required" für Dinge die nicht automatisierbar sind
+  (z. B. API-Keys rotieren).
+
+→ Output: {cwd}/docs/security-audit-YYYYMMDD-HHMMSS.md
+→ Bei Kapazitätserschöpfung nach Phase 1: Audit-only Report gespeichert, Fixes
+  werden beim nächsten Retry fortgesetzt.
+```
+
+**Queue-Beispiele:**
+
+```md
+- [ ] Security audit #tool:security-audit cwd:D:\projects\app
+- [ ] Check providers/ for injection risks #tool:security-audit cwd:D:\projects\app
+```
+
+**Konfiguration in `config.py`:**
+
+| Konstante | Default | Phase |
+|---|---|---|
+| `TOOL_CR_REVIEW_TIMEOUT_SEC` | 2400 (40 min) | Audit (Phase 1) |
+| `TOOL_DEV_EXEC_TIMEOUT_SEC` | 7200 (2 h) | Fix + Verify (Phase 2) |
+
 ## Skills (`SKILL.md`)
 
 Zusätzlich zu den Built-in Tools können Skills aus `SKILL.md` entdeckt werden.
@@ -410,6 +524,7 @@ Max. Task-Länge via `/task`: 500 Zeichen (konfigurierbar via `TELEGRAM_MAX_TASK
     3. **TF-IDF Deep Search (`task_results/`)**: Keyword-Matching + Temporal Decay über alle vergangenen Tasks (Layer 3).
   - Top-K relevante Erinnerungen werden intelligent in den Prompt injiziert.
   - Automatische Archivierung nach 180 Tagen in `memory/archive/`.
+  - **Layer 4 (Lessons) — deaktiviert**: `append_lesson()`/Injection vorhanden aber nicht aktiv — gespeicherte "letzte Findings" veralteten zu schnell. TODO: Neu implementieren mit LLM-generierter Summary über alle Loop-Iterationen.
 - **Heartbeat (`heartbeat.py`)**
   - proaktive Checks im `--watch` Modus, konfiguriert über `99_System/AI/HEARTBEAT.md`
   - 7 Built-in Handler: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `summarize`, `stale-branch`, `usage-suggest`

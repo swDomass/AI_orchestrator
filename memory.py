@@ -47,7 +47,10 @@ from pathlib import Path
 from typing import Optional
 
 from config import (
+    MEMORY_ARCHIVE_DELETE_DAYS,
+    MEMORY_DAILY_LOG_RETENTION_DAYS,
     MEMORY_HALF_LIFE_DAYS,
+    MEMORY_LESSONS_RETENTION_DAYS,
     MEMORY_MAX_AGE_DAYS,
     MEMORY_MIN_SCORE,
     MEMORY_SUMMARY_MAX_CHARS,
@@ -56,6 +59,7 @@ from config import (
     PROMPT_DAILY_LOG_TOKENS,
     VAULT_PATH,
 )
+from queue_manager import _write_bytes_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,7 @@ _ARCHIVE_DIR = _MEMORY_ROOT / "archive"
 _DAILY_DIR = _MEMORY_ROOT / "daily"
 _CURATED_MEMORY_FILE = _MEMORY_ROOT / "MEMORY.md"
 _daily_log_lock = threading.Lock()
+_lessons_lock = threading.Lock()
 
 # Pre-compiled tokenizer patterns (avoids recompilation on every search call)
 _RE_CAMEL_SPLIT = re.compile(r"([a-z])([A-Z])")
@@ -546,6 +551,7 @@ def get_lessons_context(tool_name: str | None = None, max_chars: int = 2000) -> 
     """Read lessons.md and return entries, optionally filtered by tool name.
 
     Returns relevant lesson entries as a string block for prompt injection.
+    Each entry has Pattern + Tool-Hint fields (no Fix field).
     """
     if not _LESSONS_FILE.exists():
         return ""
@@ -627,35 +633,48 @@ def append_lesson(
     tool_name: str,
     cwd: str,
     pattern: str,
-    fix: str,
     tool_hint: str,
 ) -> bool:
     """Append a new lesson entry to lessons.md.
 
-    Called automatically when a tool loop takes >2 iterations.
+    Called automatically when a tool loop takes >5 iterations.
+    Skips entries without a real project name (empty cwd) and deduplicates
+    by pattern fingerprint to prevent spam from repeated identical loops.
     Returns True on success.
     """
     try:
         _ensure_dirs()
         today = datetime.now().strftime("%Y-%m-%d")
-        # Extract project name from cwd
-        project = Path(cwd).name if cwd else "unknown"
+        project = Path(cwd).name if cwd else ""
+
+        # Skip entries without a real project name — cwd="." yields name=""
+        if not project or project in (".", "unknown"):
+            logger.debug("Lesson skipped: no real project name for cwd=%r", cwd)
+            return False
 
         entry = (
             f"\n## {today} | {tool_name} | {project}\n"
             f"- **Pattern:** {pattern}\n"
-            f"- **Fix:** {fix}\n"
             f"- **Tool-Hint:** {tool_hint}\n"
         )
 
-        if not _LESSONS_FILE.exists():
-            _LESSONS_FILE.write_text(
-                f"# Lessons Learned\n{entry}",
-                encoding="utf-8",
-            )
-        else:
-            with open(_LESSONS_FILE, "a", encoding="utf-8") as f:
-                f.write(entry)
+        with _lessons_lock:
+            # Dedup: skip if the same pattern fingerprint already exists in the file
+            pattern_fp = pattern[:120]
+            if _LESSONS_FILE.exists():
+                try:
+                    if pattern_fp in _LESSONS_FILE.read_text(encoding="utf-8"):
+                        logger.debug("Lesson skipped (duplicate pattern): %s | %s", tool_name, project)
+                        return False
+                except OSError as e:
+                    logger.debug("Lesson dedup read failed (writing anyway): %s", e)
+                with open(_LESSONS_FILE, "a", encoding="utf-8") as f:
+                    f.write(entry)
+            else:
+                _LESSONS_FILE.write_text(
+                    f"# Lessons Learned\n{entry}",
+                    encoding="utf-8",
+                )
 
         logger.info("Lesson appended: %s | %s | %s", today, tool_name, project)
         return True
@@ -664,29 +683,30 @@ def append_lesson(
         return False
 
 
-# ── Archival ─────────────────────────────────────────────────────────────────
+# ── Archival & Cleanup ────────────────────────────────────────────────────────
 
 def archive_old_memories() -> int:
-    """Move task_results/*.md files older than MEMORY_MAX_AGE_DAYS to archive/.
-
-    Returns count of archived files. Never raises.
-    Runs at most once per calendar day to avoid repeated I/O on large memory dirs.
+    """Move task_results/*.md older than MEMORY_MAX_AGE_DAYS to archive/, then delete
+    archive entries older than MEMORY_ARCHIVE_DELETE_DAYS. Also cleans up daily logs
+    and lessons.md. Returns count of archived files. Never raises.
+    Runs at most once per calendar day.
     """
     global _archive_last_run_date
     today = datetime.now().date()
     if _archive_last_run_date == today:
         return 0
 
+    archived = 0
     try:
         _ensure_dirs()
-        cutoff = datetime.now() - timedelta(days=MEMORY_MAX_AGE_DAYS)
-        archived = 0
+        archive_cutoff = datetime.now() - timedelta(days=MEMORY_MAX_AGE_DAYS)
 
+        # Move task_results → archive
         for path in list(_TASK_RESULTS_DIR.glob("*.md")):
             try:
                 mem = _parse_memory_file(path)
                 ts = mem["timestamp"] if mem else datetime.fromtimestamp(path.stat().st_mtime)
-                if ts < cutoff:
+                if ts < archive_cutoff:
                     dest = _ARCHIVE_DIR / path.name
                     counter = 1
                     while dest.exists():
@@ -698,8 +718,101 @@ def archive_old_memories() -> int:
             except Exception as e:
                 logger.warning("Archive failed for %s: %s", path.name, e)
 
-        _archive_last_run_date = today
-        return archived
+        # Delete old archive entries
+        _cleanup_archive()
+
+        # Delete old daily logs
+        _cleanup_daily_logs()
+
+        # Prune old lessons
+        _cleanup_lessons()
     except Exception as e:
         logger.warning("archive_old_memories failed: %s", e)
+    finally:
+        _archive_last_run_date = today
+
+    return archived
+
+
+def _cleanup_archive() -> int:
+    """Delete archive/*.md files older than MEMORY_ARCHIVE_DELETE_DAYS. Returns count deleted."""
+    if not _ARCHIVE_DIR.exists():
         return 0
+    delete_cutoff = datetime.now() - timedelta(days=MEMORY_ARCHIVE_DELETE_DAYS)
+    deleted = 0
+    for path in list(_ARCHIVE_DIR.glob("*.md")):
+        try:
+            mem = _parse_memory_file(path)
+            ts = mem["timestamp"] if mem else datetime.fromtimestamp(path.stat().st_mtime)
+            if ts < delete_cutoff:
+                path.unlink()
+                deleted += 1
+                logger.debug("Deleted archive: %s", path.name)
+        except Exception as e:
+            logger.warning("Archive delete failed for %s: %s", path.name, e)
+    return deleted
+
+
+def _cleanup_daily_logs() -> int:
+    """Delete daily log files older than MEMORY_DAILY_LOG_RETENTION_DAYS. Returns count deleted."""
+    if not _DAILY_DIR.exists():
+        return 0
+    cutoff = datetime.now() - timedelta(days=MEMORY_DAILY_LOG_RETENTION_DAYS)
+    deleted = 0
+    for path in list(_DAILY_DIR.glob("Memory ????-??-??.md")):
+        try:
+            date_str = path.stem[len("Memory "):]
+            file_date = datetime.strptime(date_str, "%Y-%m-%d")
+            if file_date < cutoff:
+                path.unlink()
+                deleted += 1
+                logger.debug("Deleted daily log: %s", path.name)
+        except Exception as e:
+            logger.warning("Daily log cleanup failed for %s: %s", path.name, e)
+    return deleted
+
+
+def _cleanup_lessons() -> int:
+    """Remove lessons.md entries older than MEMORY_LESSONS_RETENTION_DAYS. Returns count removed."""
+    with _lessons_lock:
+        if not _LESSONS_FILE.exists():
+            return 0
+        try:
+            content = _LESSONS_FILE.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to read lessons.md for cleanup: %s", e)
+            return 0
+
+        cutoff = datetime.now() - timedelta(days=MEMORY_LESSONS_RETENTION_DAYS)
+
+        # Split into header + sections at "## YYYY-MM-DD ..." headings
+        section_re = re.compile(r"^(## \d{4}-\d{2}-\d{2}.*)$", re.MULTILINE)
+        parts = section_re.split(content)
+        header = parts[0]
+
+        kept: list[str] = []
+        removed = 0
+        for i in range(1, len(parts), 2):
+            heading = parts[i]
+            body = parts[i + 1] if i + 1 < len(parts) else ""
+            # heading is guaranteed to start with "## YYYY-MM-DD" by section_re
+            try:
+                entry_date = datetime.strptime(heading[3:13], "%Y-%m-%d")
+                if entry_date < cutoff:
+                    removed += 1
+                    continue
+            except ValueError:
+                pass
+            kept.append(heading + body)
+
+        if removed == 0:
+            return 0
+
+        try:
+            new_content = header + "".join(kept)
+            _write_bytes_atomic(_LESSONS_FILE, new_content.encode("utf-8"))
+            logger.info("Pruned %d old lesson(s) from lessons.md", removed)
+        except OSError as e:
+            logger.warning("Failed to write pruned lessons.md: %s", e)
+            return 0
+        return removed

@@ -9,10 +9,12 @@ Usage in queue file:
 import re
 
 from tools.base_tool import BaseTool
+from tools.critical_review import CriticalReviewTool
 from tools.dev_loop import DevLoopTool
 from tools.knowledge_transfer import KnowledgeTransferTool
 from tools.research_qa import ResearchQATool
 from tools.review_loop import ReviewLoopTool
+from tools.security_audit import SecurityAuditTool
 from tools.test_loop import TestLoopTool
 
 TOOL_TAG_RE = re.compile(r"#tool:([\w-]+)")
@@ -24,6 +26,8 @@ _TOOLS: dict[str, BaseTool] = {
     "dev-loop": DevLoopTool(),
     "research-qa": ResearchQATool(),
     "knowledge-transfer": KnowledgeTransferTool(),
+    "critical-review": CriticalReviewTool(),
+    "security-audit": SecurityAuditTool(),
 }
 
 

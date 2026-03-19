@@ -5,16 +5,31 @@ Supports: file context injection, cwd extraction, file locking, encoding fallbac
 """
 
 from dataclasses import dataclass
+import logging
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from config import QUEUE_FILE, RESULTS_SECTION, LOG_SECTION, VAULT_PATH, MAX_CONTEXT_FILE_SIZE, ALLOWED_CWD_ROOTS
+from config import (
+    ALLOWED_CWD_ROOTS,
+    MAX_CONTEXT_FILE_SIZE,
+    QUEUE_DONE_DELETE_DAYS,
+    QUEUE_DONE_MOVE_HOURS,
+    QUEUE_EVENTS_LOG_FILE,
+    QUEUE_EVENTS_LOG_RETENTION_DAYS,
+    QUEUE_FILE,
+    RESULTS_SECTION,
+    LOG_SECTION,
+    VAULT_PATH,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # Matches:  - [ ] Task text  (optionally with <!-- retry: ... --> comment)
@@ -905,30 +920,6 @@ def mark_retry(
     return _apply_update(update)
 
 
-def append_result(task_text: str, result: str, provider: str) -> bool:
-    """Append task result under the Ergebnisse section. Returns False on queue write failure."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry = _build_result_entry(now, task_text, result, provider)
-
-    def update(content: str) -> str | None:
-        updated = _insert_after_heading(content, RESULTS_SECTION, entry)
-        if updated is not None:
-            return updated
-        return content + f"\n\n{RESULTS_SECTION}{entry}"
-
-    return _apply_update(update)
-
-
-def _build_result_entry(now: str, task_text: str, result: str, provider: str) -> str:
-    """Format a result entry for the Ergebnisse section."""
-    return (
-        f"\n### {now} | {provider}\n"
-        f"**Task:** {task_text}\n\n"
-        f"{result.strip()}\n\n"
-        f"---"
-    )
-
-
 def finalize_task_with_result(
     task_text: str,
     result: str,
@@ -937,10 +928,10 @@ def finalize_task_with_result(
     line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
 ) -> bool:
-    """Atomically mark a task done and append its result in one queue update."""
+    """Atomically mark a task done in one queue update.
+    Result is stored in memory/task_results/, not in the queue file."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     done_replacement = f"- [x] {task_text} ✅ {now} ({provider})"
-    result_entry = _build_result_entry(now, task_text, result, provider)
 
     def update(content: str) -> str | None:
         if line_no is not None:
@@ -957,6 +948,7 @@ def finalize_task_with_result(
                     f"(Zeile {line_no})."
                 )
                 return None
+            return updated
         else:
             pattern = re.compile(
                 r"^- \[ \] \s*" + re.escape(task_text) + r"\s*(?:<!--.*?-->)?\s*$",
@@ -965,29 +957,66 @@ def finalize_task_with_result(
             if not pattern.search(content):
                 print(f"Warnung: Task '{task_text}' konnte nicht atomar finalisiert werden (nicht gefunden).")
                 return None
-            updated = pattern.sub(lambda _m: done_replacement, content, count=1)
-
-        with_result = _insert_after_heading(updated, RESULTS_SECTION, result_entry)
-        if with_result is not None:
-            return with_result
-        return updated + f"\n\n{RESULTS_SECTION}{result_entry}"
+            return pattern.sub(lambda _m: done_replacement, content, count=1)
 
     return _apply_update(update)
 
 
+# Thread-safe lock and rate-limit state for queue events log
+_events_log_lock = threading.Lock()
+_events_log_cleanup_last_date: date | None = None
+_events_log_dir_ensured: bool = False
+
+
 def append_log(message: str) -> None:
-    """Append a log entry to the Log section."""
+    """Append a queue event to logs/queue-events.log (plain text, no longer writes to queue MD)."""
+    global _events_log_dir_ensured
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry = f"\n<!-- {now} | {message} -->"
+    entry = f"{now} | {message}\n"
+    try:
+        with _events_log_lock:
+            if not _events_log_dir_ensured:
+                QUEUE_EVENTS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _events_log_dir_ensured = True
+            with open(QUEUE_EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(entry)
+            _cleanup_queue_events_log()
+    except OSError:
+        pass  # best-effort — never block the orchestrator
 
-    def update(content: str) -> str | None:
-        # Prefer the last exact "## Log" heading to avoid matching user content.
-        updated = _insert_after_heading(content, LOG_SECTION, entry, prefer_last=True)
-        if updated is not None:
-            return updated
-        return content + f"\n\n{LOG_SECTION}{entry}"
 
-    _apply_update(update)
+def _cleanup_queue_events_log() -> None:
+    """Prune queue-events.log entries older than QUEUE_EVENTS_LOG_RETENTION_DAYS. Once per day.
+    Must be called with _events_log_lock held."""
+    global _events_log_cleanup_last_date
+    today = date.today()
+    if _events_log_cleanup_last_date == today:
+        return
+
+    if not QUEUE_EVENTS_LOG_FILE.exists():
+        _events_log_cleanup_last_date = today
+        return
+    try:
+        cutoff = datetime.now() - timedelta(days=QUEUE_EVENTS_LOG_RETENTION_DAYS)
+        lines = QUEUE_EVENTS_LOG_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+        kept = []
+        for line in lines:
+            m = _EVENTS_LOG_TS_RE.match(line)
+            if m:
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+                    if ts < cutoff:
+                        continue
+                except ValueError:
+                    pass
+            kept.append(line)
+        if len(kept) < len(lines):
+            _write_bytes_atomic(QUEUE_EVENTS_LOG_FILE, "".join(kept).encode("utf-8"))
+            logger.debug("Pruned %d old queue event(s)", len(lines) - len(kept))
+    except OSError as e:
+        logger.debug("queue-events.log cleanup failed: %s", e)
+    finally:
+        _events_log_cleanup_last_date = today
 
 
 def append_task(task_text: str) -> bool:
@@ -996,10 +1025,6 @@ def append_task(task_text: str) -> bool:
 
     def update(content: str) -> str | None:
         updated = _insert_after_heading(content, "## Queue", "\n" + new_line)
-        if updated is not None:
-            return updated
-        # No Queue section — prepend before Ergebnisse or at end
-        updated = _insert_before_heading(content, RESULTS_SECTION, f"## Queue\n{new_line}\n\n")
         if updated is not None:
             return updated
         return content + f"\n\n## Queue\n{new_line}\n"
@@ -1018,9 +1043,178 @@ def ensure_queue_file() -> None:
         "<!-- Trage hier Tasks ein. Beispiel: -->\n"
         "<!-- - [ ] Schreibe Zusammenfassung von [[Projekt X]] -->\n"
         "<!-- - [ ] Analysiere Code in [[EEG Programm]] #codex -->\n"
-        "<!-- - [ ] Fix bug in main.py cwd:/d/programmieren/projekt #timeout:10m -->\n\n"
-        f"{RESULTS_SECTION}\n\n"
-        f"{LOG_SECTION}\n",
+        "<!-- - [ ] Fix bug in main.py cwd:/d/programmieren/projekt #timeout:10m -->\n",
         encoding="utf-8"
     )
     print(f"Queue-Datei erstellt: {QUEUE_FILE}")
+
+
+# ── Queue Cleanup (erledigt.md) ───────────────────────────────────────────────
+
+# Erledigt file lives next to the queue file
+_ERLEDIGT_FILE = QUEUE_FILE.with_name("agent-queue-erledigt.md")
+
+# Rate limiting: run at most once per calendar day
+_done_cleanup_last_run_date: date | None = None
+
+# Matches completed tasks with embedded timestamp: - [x] text ✅ YYYY-MM-DD HH:MM (provider)
+_DONE_TASK_TS_RE = re.compile(
+    r"^- \[[x\-]\] .+ ✅ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \([^)]+\)\s*$"
+)
+# Matches timestamp prefix in queue-events.log lines: "YYYY-MM-DD HH:MM |"
+_EVENTS_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \|")
+# Matches erledigt.md date-section headings: "## YYYY-MM-DD"
+_ERLEDIGT_SECTION_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2})\s*$", re.MULTILINE)
+
+
+def cleanup_done_tasks() -> int:
+    """Move completed tasks ≥ QUEUE_DONE_MOVE_HOURS old from queue to agent-queue-erledigt.md.
+    Prune erledigt entries older than QUEUE_DONE_DELETE_DAYS.
+    Returns count of tasks moved. Never raises. Runs at most once per calendar day.
+    """
+    global _done_cleanup_last_run_date
+    today = date.today()
+    if _done_cleanup_last_run_date == today:
+        return 0
+
+    moved = 0
+    try:
+        moved = _move_old_done_tasks()
+        _prune_erledigt_file()
+        if moved:
+            logger.info("Moved %d completed task(s) to erledigt.md", moved)
+    except Exception as e:
+        logger.warning("cleanup_done_tasks failed: %s", e)
+    finally:
+        _done_cleanup_last_run_date = today
+    return moved
+
+
+def _move_old_done_tasks() -> int:
+    """Under queue lock: extract done tasks ≥ QUEUE_DONE_MOVE_HOURS, append to erledigt.md."""
+    cutoff = datetime.now() - timedelta(hours=QUEUE_DONE_MOVE_HOURS)
+    tasks_by_date: dict[str, list[str]] = {}
+    moved_count = 0
+
+    def transform(content: str) -> str | None:
+        nonlocal tasks_by_date, moved_count
+        # Reset on every attempt (safe for _apply_update retries)
+        tasks_by_date.clear()
+        moved_count = 0
+        lines = content.splitlines(keepends=True)
+        kept: list[str] = []
+        local_tasks: dict[str, list[str]] = {}
+        local_count = 0
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m = _DONE_TASK_TS_RE.match(line.rstrip("\n\r"))
+            if m:
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+                except ValueError:
+                    kept.append(line)
+                    i += 1
+                    continue
+                if ts < cutoff:
+                    date_str = ts.strftime("%Y-%m-%d")
+                    task_lines = [line]
+                    local_count += 1
+                    # Collect indented subtask lines belonging to this task
+                    while i + 1 < len(lines) and lines[i + 1].startswith("  "):
+                        i += 1
+                        task_lines.append(lines[i])
+                    local_tasks.setdefault(date_str, []).extend(task_lines)
+                    i += 1
+                    continue
+            kept.append(line)
+            i += 1
+
+        if not local_tasks:
+            return None  # Nothing to move — no queue write needed
+
+        tasks_by_date.update(local_tasks)
+        moved_count = local_count
+        return "".join(kept)
+
+    updated = _apply_update(transform)
+
+    if updated and tasks_by_date:
+        _append_to_erledigt(tasks_by_date)
+    return moved_count if updated else 0
+
+
+def _parse_erledigt_sections(content: str) -> tuple[str, dict[str, str]]:
+    """Parse erledigt.md into (header, {date_str: section_body}) dict."""
+    parts = _ERLEDIGT_SECTION_RE.split(content)
+    header = parts[0]
+    date_sections: dict[str, str] = {}
+    for i in range(1, len(parts), 2):
+        date_str = parts[i].strip()
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        date_sections[date_str] = body
+    return header, date_sections
+
+
+def _build_erledigt_content(header: str, date_sections: dict[str, str]) -> str:
+    """Rebuild erledigt.md from header + date sections (newest date first)."""
+    parts = [header.rstrip()]
+    for ds in sorted(date_sections.keys(), reverse=True):
+        body = date_sections[ds].strip()
+        if body:
+            parts.append(f"\n## {ds}\n\n{body}\n")
+    return "\n".join(parts) + "\n"
+
+
+def _append_to_erledigt(tasks_by_date: dict[str, list[str]]) -> None:
+    """Append moved tasks to agent-queue-erledigt.md, grouped by completion date."""
+    if _ERLEDIGT_FILE.exists():
+        try:
+            existing = _ERLEDIGT_FILE.read_text(encoding="utf-8")
+        except OSError:
+            existing = "# Agent Queue — Erledigt\n"
+    else:
+        existing = "# Agent Queue — Erledigt\n"
+
+    header, date_sections = _parse_erledigt_sections(existing)
+
+    for date_str, lines in tasks_by_date.items():
+        new_block = "".join(lines).strip()
+        if date_str in date_sections:
+            date_sections[date_str] = date_sections[date_str].rstrip() + "\n" + new_block + "\n"
+        else:
+            date_sections[date_str] = new_block + "\n"
+
+    _write_bytes_atomic(_ERLEDIGT_FILE, _build_erledigt_content(header, date_sections).encode("utf-8"))
+
+
+def _prune_erledigt_file() -> int:
+    """Remove date sections older than QUEUE_DONE_DELETE_DAYS from erledigt.md. Returns pruned count."""
+    if not _ERLEDIGT_FILE.exists():
+        return 0
+    try:
+        content = _ERLEDIGT_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+
+    cutoff = (datetime.now() - timedelta(days=QUEUE_DONE_DELETE_DAYS)).date()
+    header, date_sections = _parse_erledigt_sections(content)
+
+    kept: dict[str, str] = {}
+    pruned = 0
+    for date_str, body in date_sections.items():
+        try:
+            if datetime.strptime(date_str, "%Y-%m-%d").date() < cutoff:
+                pruned += 1
+                continue
+        except ValueError:
+            pass
+        kept[date_str] = body
+
+    if pruned == 0:
+        return 0
+
+    _write_bytes_atomic(_ERLEDIGT_FILE, _build_erledigt_content(header, kept).encode("utf-8"))
+    logger.info("Pruned %d old date section(s) from erledigt.md", pruned)
+    return pruned

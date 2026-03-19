@@ -13,7 +13,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~445 tests, ~4s)
+# Run all tests (~557 tests, ~5s)
 python -m pytest tests/ -q
 
 # Run a single test file
@@ -50,11 +50,11 @@ Key components:
 - **`providers/claude.py`**: Uses `--output-format json` to capture actual token usage. `_parse_json_response()` extracts `result` text + `usage.input_tokens`/`output_tokens` from Claude CLI JSON output
 - **`policy.py`**: `PolicyEngine` singleton — AUTO/APPROVE/DENY classification from vault YAML, blocks on `threading.Event` for Telegram approval
 - **`usage_suggester.py`**: `UsageSuggester` singleton — proactive task suggestions when provider capacity is underutilized. Same threading pattern as PolicyEngine
-- **`memory.py`**: TF-IDF + temporal decay search over past task results stored in vault. Auto-archival after 180 days.
+- **`memory.py`**: TF-IDF + temporal decay search over past task results stored in vault. Auto-archival after 180 days. `append_lesson()`/`get_lessons_context()` vorhanden aber **deaktiviert** (Injection in `base_tool.py` auskommentiert, Auto-Append in `review_loop`/`dev_loop` deaktiviert) — gespeicherte "letzte Findings" sind zu projektspezifisch und veralten nach Code-Änderungen. TODO: Neu implementieren mit LLM-generierter Summary über alle Loop-Iterationen.
 - **`heartbeat.py`**: Scheduled health checks with mtime-reloading config from vault `HEARTBEAT.md`. 7 built-in handlers: queue-idle, git-status, disk-space, check-limits, summarize, stale-branch, usage-suggest. `HeartbeatRunner._lock` prevents concurrent `run_due()` calls (non-blocking acquire → skip if already running). `start_heartbeat_thread(heartbeat, queue_read_fn, stop_event, poll_sec=60)` launches a daemon thread so checks fire on time even when the main thread is blocked for hours inside a long task
-- **`analytics.py`**: Parses task results, log files, queue events into `TaskRecord`/`LimitSnapshot`/`QueueEvent` dataclasses. Aggregation functions + `get_dashboard_data()` with 30s TTL cache. `_get_current_limits()` reads the most-recent-per-provider snapshot from `logs/capacity-log.md` (avoids starting a duplicate limits bg-daemon thread in standalone dashboard processes); result exposed as `current_limits` in dashboard API
+- **`analytics.py`**: Parses task results, log files, queue events into `TaskRecord`/`LimitSnapshot`/`QueueEvent` dataclasses. Aggregation functions + `get_dashboard_data()` with 30s TTL cache. `_get_current_limits()` reads the most-recent-per-provider snapshot from `logs/capacity-log.md` (avoids starting a duplicate limits bg-daemon thread in standalone dashboard processes); result exposed as `current_limits` in dashboard API. Queue events read from `logs/queue-events.log` (plain text `YYYY-MM-DD HH:MM | msg` lines)
 - **`dashboard.py`**: Standalone HTTP server (port 8411) serving Chart.js dashboard. `GET /` HTML, `GET /api/data` JSON. Auto-refresh 60s. Also launchable via `--dashboard` flag
-- **`config.py`**: Centralized constants (~65+), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases. `MIN_CAPACITY_PERCENT` env-configurable (`MIN_CAPACITY_PERCENT=10` default; override via `.env`). Per-window thresholds: `CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT`, `CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT`, `CODEX_PRIMARY_MIN_CAPACITY_PCT`, `CODEX_SECONDARY_MIN_CAPACITY_PCT`. `CAPACITY_LOG_FILE = Path(__file__).parent / "logs" / "capacity-log.md"` (moved from vault to repo `logs/`). Dev-loop timeouts: Research 3600s, Exec 7200s, Quality Review 3600s, Resolution Review 1800s
+- **`config.py`**: Centralized constants (~65+), `.env` loader (no external dotenv), mtime-cached `SOUL.md` personality loader, Claude model aliases. `MIN_CAPACITY_PERCENT` env-configurable (`MIN_CAPACITY_PERCENT=10` default; override via `.env`). Per-window thresholds: `CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT`, `CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT`, `CODEX_PRIMARY_MIN_CAPACITY_PCT`, `CODEX_SECONDARY_MIN_CAPACITY_PCT`. `CAPACITY_LOG_FILE = Path(__file__).parent / "logs" / "capacity-log.md"` (moved from vault to repo `logs/`). Dev-loop timeouts: Research 3600s, Exec 7200s, Quality Review 3600s, Resolution Review 1800s. Cleanup constants: `MEMORY_MAX_AGE_DAYS=30`, `MEMORY_ARCHIVE_DELETE_DAYS=90`, `MEMORY_DAILY_LOG_RETENTION_DAYS=30`, `MEMORY_LESSONS_RETENTION_DAYS=180`, `QUEUE_EVENTS_LOG_FILE`, `QUEUE_EVENTS_LOG_RETENTION_DAYS=30`, `QUEUE_DONE_MOVE_HOURS=48`, `QUEUE_DONE_DELETE_DAYS=7`
 - **`limits.py`**: `cclimits` wrapper for provider capacity checks, OAuth refresh handling. Direct `cclimits` invocation (no npx); disk-cache via `--cache-ttl 600` limits API calls to ~6/h. HTTP 429 resilience: (tier 0) local JSONL fallback via `claude-monitor` (no HTTP, `CLAUDE_PLAN` env var), (tier 1) snapshot cache with estimated usage tracking, Telegram notifications on 429 start/clear.
 - **`logging_setup.py`**: Rotating file logger (5MB, 3 backups) + console output
 - **`doctor.py`**: 15+ setup validation checks, `--fix`/`--yes` auto-repair mode
@@ -63,6 +63,8 @@ Key components:
 - **`telegram_listener.py`**: Telegram bot listener. AI chat mode (`/chat`) builds context-aware prompt: SOUL.md system prompt + `memory.get_daily_context()` + user question
 - **`tools/research_qa.py`**: `ResearchQATool` — 3-phase read-only pre-implementation workflow (Discovery → Analysis → Questions). Output to `{cwd}/.research-qa/`. Registered as `#tool:research-qa`
 - **`tools/review_loop.py`**: `ReviewLoopTool` — iterative code review fixing ALL P1/P2/P3 findings (max 20 iterations). Infinite-loop detection via finding signature dedup
+- **`tools/critical_review.py`**: `CriticalReviewTool` — single-pass radical-honesty architectural review. Questions concept/premise (Dim 0), problem–solution fit, architecture, code quality, operational reality, methodology, and blind spots. Read-only. Output to `{cwd}/docs/critical-review-YYYYMMDD-HHMMSS.md`. Registered as `#tool:critical-review`
+- **`tools/security_audit.py`**: `SecurityAuditTool` — 2-phase security audit + fix workflow. Phase 1 (read-only): scans for hardcoded secrets, command injection (`shell=True` + user input), path traversal, input validation gaps (null-byte, newlines), log injection, unsafe deserialization (`yaml.load` without SafeLoader), SSRF. Phase 2 (write): implements all fixes, runs `pytest`. Output to `{cwd}/docs/security-audit-YYYYMMDD-HHMMSS.md`. Registered as `#tool:security-audit`
 
 ## Key Patterns
 

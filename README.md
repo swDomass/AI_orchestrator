@@ -101,6 +101,7 @@ The queue is read from Markdown. Open tasks are standard checkbox lines:
 - [ ] Add CSV export #tool:dev-loop cwd:D:\projects\app #agent:work
 - [ ] Add OAuth2 flow #tool:research-qa cwd:D:\projects\app
 - [ ] Architecture audit #tool:critical-review cwd:D:\projects\app
+- [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:D:\projects\app
 - [ ] Security audit #tool:security-audit cwd:D:\projects\app
 ```
 
@@ -122,6 +123,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Task ID | `#id:<name>` | `- [ ] Build backend #id:build` |
 | Task dependency | `#needs:<id1,id2>` | `- [ ] Test #needs:build` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
+| Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:gemini` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
 
 ### Parallel Tasks (`#parallel`)
@@ -165,7 +167,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | `test-loop` | Iterative test / fix loop until tests pass or max iterations. |
 | `research-qa` | Read-only pre-implementation research: Discovery → Analysis → Question catalogue. Output in `{cwd}/.research-qa/`. No code changes. |
 | `knowledge-transfer` | Cross-domain knowledge transfer: Vault expertise → industry applications (via web search) → Obsidian idea note. |
-| `critical-review` | Radical-honesty architectural review. Questions concept, methodology, and code in a single read-only pass. Output in `{cwd}/docs/critical-review-*.md`. |
+| `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:gemini`. Output in `{cwd}/docs/critical-review-*.md`. |
 | `security-audit` | Two-phase workflow: Audit (read-only) → Fix + pytest. Scans for hardcoded secrets, command injection, path traversal, unsafe deserialization, SSRF, and more. Output in `{cwd}/docs/security-audit-*.md`. |
 
 ```bash
@@ -233,6 +235,46 @@ Phase 3 — Questions
 → Combined document: {cwd}/.research-qa/research-qa-complete.md
 → No code changes — pure analysis and questions.
 ```
+
+## Critical Review (`#tool:critical-review`)
+
+3-pass adversarial review with optional cross-provider support:
+
+```
+Pass 1 — Analysis
+  Radical-honesty review: concept, architecture, code quality,
+  operational reality, methodology, blind spots.
+  → Saved to {cwd}/docs/critical-review-*-pass1.md
+
+Pass 2 — Adversarial Challenge
+  A different persona challenges Pass 1's findings: missed angles,
+  overclaims, underclaims, contradictions.
+  Can use a different provider for real perspective diversity.
+
+Pass 3 — Synthesis (only when plan file referenced)
+  Produces an improved version of the plan based on both reviews.
+  → Saved to {plan_dir}/{name}-v2.md
+
+→ Combined report: {cwd}/docs/critical-review-YYYYMMDD-HHMMSS.md
+```
+
+**Usage examples:**
+
+```md
+# Review-only (no plan file → 2 passes)
+- [ ] Review auth module #tool:critical-review cwd:D:\projects\app
+
+# Plan review with improved output (3 passes)
+- [ ] Prüfe docs/plan.md #tool:critical-review cwd:D:\projects\app
+
+# Cross-provider (Claude analyzes, Gemini challenges)
+- [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:D:\projects\app
+
+# Same provider for both passes
+- [ ] Prüfe [[MyPlan]] #tool:critical-review #pass1:claude #pass2:claude cwd:D:\projects\app
+```
+
+Plan files can be referenced as file paths (`docs/plan.md`) or wikilinks (`[[MyPlan]]`).
 
 ## Skills (`SKILL.md`)
 
@@ -415,7 +457,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~557 tests, ~5 s)
+# Run all tests (~607 tests, ~9 s)
 python -m pytest tests/ -q
 
 # Run a single test file

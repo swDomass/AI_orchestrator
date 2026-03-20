@@ -70,6 +70,7 @@ from queue_manager import (
     ensure_queue_file,
     extract_cwd,
     extract_model_tag,
+    extract_pass_providers,
     extract_preapproved_actions,
     extract_profile_tag,
     extract_shutdown_tag,
@@ -491,8 +492,13 @@ def _execute_tool_task(
 
     print(f"  → Tool: {tool.name} ({tool.description})")
     clean_task = strip_metadata_tags(task)
+    # Extract pass-provider tags from raw task (before strip removes them)
+    pass_providers = extract_pass_providers(task)
     _tool_start = time.time()
-    tool_result = tool.run(clean_task, provider, cwd=cwd, timeout=timeout, memory_context=memory_context)
+    tool_result = tool.run(
+        clean_task, provider, cwd=cwd, timeout=timeout,
+        memory_context=memory_context, pass_providers=pass_providers,
+    )
     _tool_duration = time.time() - _tool_start
 
     # Track estimated usage for 429 capacity estimation

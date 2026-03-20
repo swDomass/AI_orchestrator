@@ -145,6 +145,14 @@ def select_provider(
     return None
 
 
+def get_provider_by_name(name: str) -> BaseProvider | None:
+    """Return a provider instance by name, or None if unknown.
+
+    Used by tools that need cross-provider support (e.g. critical-review multi-pass).
+    """
+    return _providers.get(name)
+
+
 def all_providers() -> list[BaseProvider]:
     return list(_providers.values())
 

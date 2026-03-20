@@ -80,6 +80,7 @@ class TestLoopTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
         print(f"  [test-loop] Starte iterativen Test/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 

@@ -123,6 +123,7 @@ class ReviewLoopTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
         print(f"  [review-loop] Starte iterativen Review/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 

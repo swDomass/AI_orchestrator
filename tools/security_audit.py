@@ -140,6 +140,7 @@ class SecurityAuditTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
         cwd_path = Path(cwd) if cwd else Path(".")
         audit_timeout = TOOL_SA_AUDIT_TIMEOUT_SEC   # 40 min

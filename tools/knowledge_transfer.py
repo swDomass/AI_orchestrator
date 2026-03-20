@@ -350,6 +350,7 @@ class KnowledgeTransferTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
         print("  [knowledge-transfer] Starte Know-How-Transfer")
         topic = _extract_topic(task)

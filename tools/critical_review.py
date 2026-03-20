@@ -1,21 +1,36 @@
 """
-Critical Review Tool: Radical-honesty architectural review.
+Critical Review Tool: 3-pass adversarial plan/architecture review.
 
-Single-pass, read-only workflow. The provider explores the codebase autonomously
-and writes a structured report that questions not just code quality, but methodology,
-design decisions, operational fitness, and blind spots.
+3-pass workflow with optional cross-provider support:
+  Pass 1 (Analysis):   Radical-honesty review of the plan/codebase
+  Pass 2 (Adversarial): A different persona challenges Pass 1's findings
+  Pass 3 (Synthesis):   Produces an improved version of the plan
 
-Output written to {cwd}/docs/critical-review-YYYYMMDD-HHMMSS.md
+If a plan file is referenced (wikilink or file path), Pass 3 writes {name}-v2.md.
+If no plan file, Pass 3 is skipped (2-pass mode, review-only).
 
-Usage in queue:
-    - [ ] Review auth module #tool:critical-review cwd:/d/programmieren/projekt
-    - [ ] Architecture audit #tool:critical-review cwd:/d/programmieren/projekt
+Cross-provider support enables real perspective diversity:
+  - [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:/d/proj
+  - [ ] Prüfe [[Plan]] #tool:critical-review #pass1:claude #pass2:claude cwd:/d/proj
+  - [ ] Review auth #tool:critical-review cwd:/d/proj  (no plan file → 2-pass review-only)
+
+Output:
+  - Review report → {cwd}/docs/critical-review-YYYYMMDD-HHMMSS.md
+  - Improved plan → {plan_dir}/{plan_name}-v2.md (only when plan file referenced)
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
-from config import TOOL_CR_REVIEW_TIMEOUT_SEC
+from config import (
+    TOOL_CR_MAX_PLAN_CHARS,
+    TOOL_CR_PASS1_MAX_INJECT_CHARS,
+    TOOL_CR_PASS1_TIMEOUT_SEC,
+    TOOL_CR_PASS2_TIMEOUT_SEC,
+    TOOL_CR_PASS3_TIMEOUT_SEC,
+    MAX_CONTEXT_FILE_SIZE,
+)
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
@@ -27,6 +42,8 @@ from tools.base_tool import (
     _make_report_header,
     _write_tool_file,
 )
+
+# ── Prompt Templates ─────────────────────────────────────────────────
 
 _REVIEWER_PERSONA = """
 ## Role: Principal Architect — Radical Honesty Review
@@ -138,16 +155,17 @@ One concrete next step. Not a list. One thing.
 - Respect the author's time. Clarity is respect.
 """.strip()
 
-_REVIEW_PROMPT_TEMPLATE = (
-    _REVIEWER_PERSONA
-    + """
+_REVIEW_PROMPT_TEMPLATE = """
+{reviewer_persona}
 
 ---
 
 ## Task
 
-Perform a radical-honesty architectural review of this repository.
+Perform a radical-honesty review.
 Focus area (from queue): {task}
+
+{plan_section}
 
 Start by thoroughly exploring the codebase:
 - Read the README, CLAUDE.md / docs, architecture diagrams
@@ -156,15 +174,246 @@ Start by thoroughly exploring the codebase:
 - Look at CI/CD config, dependencies, error handling patterns
 
 Then write the structured review following the format above.
-Do NOT modify any files. This is a read-only analysis."""
+Do NOT modify any files. This is a read-only analysis.
+""".strip()
+
+_ADVERSARIAL_PROMPT = """
+## Role: Devil's Advocate — Adversarial Review
+
+You are a different senior architect. You have been given a critical review written by
+another reviewer. Your job is NOT to agree or add more of the same. Your job is:
+
+1. **Challenge the reviewer's own assumptions** — what did they take for granted?
+2. **Find what they missed** — which angles did they not consider?
+3. **Question their recommendations** — are the proposed fixes actually correct?
+4. **Stress-test the "What's Actually Good" section** — is the praise deserved?
+5. **Identify contradictions** — where does the review contradict itself?
+6. **Evaluate completeness** — which dimensions (security, ops, perf) got shallow treatment?
+
+You are adversarial to the REVIEW, not to the codebase. The codebase may be
+better than the reviewer claims. Or worse. Find out.
+
+---
+
+## Previous Review to Challenge
+
+{pass1_output}
+
+---
+
+{plan_section}
+
+## Output Format
+
+### Meta-Review Verdict
+2-3 sentences: Was this review thorough and accurate? Or did it miss the point?
+
+### Missed Angles
+Issues the previous review failed to identify. Be specific — name files, patterns,
+consequences.
+
+### Challenged Findings
+For each major finding in the previous review: do you agree, disagree, or
+find it incomplete? State why with evidence.
+
+### Overclaims
+Where did the previous review overstate problems or praise things that don't
+deserve it?
+
+### Underclaims
+Where did the previous review understate real problems?
+
+### Revised Risk Assessment
+Your own prioritized list of the actual top risks, combining valid findings
+from the previous review with your own additions.
+
+### Synthesis: Actionable Recommendations
+Concrete next steps that account for BOTH perspectives. Maximum 5 items,
+prioritized.
+
+---
+
+## Behavioral Constraints
+- You have access to the same codebase. Verify claims, don't just challenge them rhetorically.
+- If the previous review got something right, say so briefly and move on.
+- If you find the previous review was mostly correct, say so — but still identify
+  at least 2-3 angles they missed or understated.
+- Do NOT modify any files. This is a read-only analysis.
+
+## Task context (from queue): {task}
+""".strip()
+
+_SYNTHESIS_PROMPT = """
+## Role: Plan Architect — Synthesis
+
+You are a senior architect. You have the original plan AND two independent reviews:
+- Review 1 (Analysis): found strengths and weaknesses
+- Review 2 (Adversarial): challenged Review 1, found missed angles
+
+Your job: produce an **improved version of the plan** that addresses the valid
+findings from both reviews while keeping what was already good.
+
+---
+
+## Original Plan
+
+{plan_content}
+
+---
+
+## Review 1: Analysis
+
+{pass1_output}
+
+---
+
+## Review 2: Adversarial Challenge
+
+{pass2_output}
+
+---
+
+## Instructions
+
+1. Keep the original plan's structure and intent where it was correct.
+2. Fix every issue that BOTH reviewers agreed on (conceded findings).
+3. For disputed findings: use your judgment. If the adversarial reviewer
+   had a stronger argument, adopt their position.
+4. Add any missing sections or considerations that were identified.
+5. Remove or simplify parts that were criticized as over-engineered.
+6. Mark significant changes with `<!-- CHANGED: reason -->` comments
+   so the author can see what was modified and why.
+
+Output the complete improved plan as a standalone Markdown document.
+Do NOT include the reviews or meta-commentary — just the improved plan.
+Do NOT modify any files in the repository. Just output the plan text.
+""".strip()
+
+# ── File Reference Patterns ──────────────────────────────────────────
+
+# Same patterns as queue_manager but we only need them for local extraction
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]")
+_FILEPATH_RE = re.compile(
+    r"""(["'])((?:[A-Za-z]:)?[\w/\\ .-]+?\.md)\1"""
+    r"""|(?:^|\s)((?:[A-Za-z]:)?[\w/\\.-]+\.md)"""
 )
+
+
+# ── Plan File Resolution ─────────────────────────────────────────────
+
+
+def _resolve_plan_file(task: str, cwd_path: Path) -> tuple[Path | None, str]:
+    """Find a plan file referenced in the task text.
+
+    Searches in order:
+      1. File paths relative to CWD (e.g. "docs/plan.md")
+      2. Wikilinks resolved against vault
+
+    Returns (resolved_path, original_ref) or (None, "") if no file found.
+    """
+    # Collect all file references
+    refs: list[str] = []
+
+    # File paths first (more specific)
+    for m in _FILEPATH_RE.finditer(task):
+        ref = (m.group(2) or m.group(3) or "").strip()
+        if ref:
+            refs.append(ref)
+
+    # Then wikilinks
+    for m in _WIKILINK_RE.finditer(task):
+        refs.append(m.group(1).strip())
+
+    for ref in refs:
+        # Try CWD-relative first
+        candidate = cwd_path / ref
+        if candidate.is_file():
+            return candidate, ref
+
+        # Try with .md extension
+        if not ref.endswith(".md"):
+            candidate_md = cwd_path / (ref + ".md")
+            if candidate_md.is_file():
+                return candidate_md, ref
+
+        # Try vault resolution
+        try:
+            from queue_manager import _resolve_note
+            vault_path = _resolve_note(ref)
+            if vault_path and vault_path.is_file():
+                return vault_path, ref
+        except (ImportError, OSError):
+            pass
+
+    return None, ""
+
+
+def _read_plan_content(plan_path: Path) -> str | None:
+    """Read plan file content with size and encoding safety."""
+    try:
+        size = plan_path.stat().st_size
+        if size > MAX_CONTEXT_FILE_SIZE:
+            print(f"  [critical-review] Plan zu groß ({size // 1024}KB), übersprungen")
+            return None
+        try:
+            return plan_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return plan_path.read_text(encoding="cp1252")
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"  [critical-review] Plan nicht lesbar: {e}")
+        return None
+
+
+def _make_plan_section(plan_content: str | None, plan_ref: str) -> str:
+    """Build the plan injection block for prompts."""
+    if not plan_content:
+        return ""
+    return (
+        f"## Plan Under Review ({plan_ref})\n\n"
+        f"```markdown\n{plan_content}\n```"
+    )
+
+
+def _plan_v2_path(plan_path: Path) -> Path:
+    """Compute the -v2 output path for an improved plan."""
+    stem = plan_path.stem
+    suffix = plan_path.suffix or ".md"
+    return plan_path.parent / f"{stem}-v2{suffix}"
+
+
+# ── Provider Resolution ──────────────────────────────────────────────
+
+
+def _resolve_pass2_provider(
+    pass_providers: dict[int, str],
+    default_provider: BaseProvider,
+) -> BaseProvider:
+    """Resolve the Pass 2 provider from task tags, falling back to the primary provider."""
+    pass2_name = pass_providers.get(2)
+    if not pass2_name:
+        return default_provider
+
+    from dispatcher import get_provider_by_name
+    resolved = get_provider_by_name(pass2_name)
+    if resolved is None:
+        print(
+            f"  [critical-review] Warnung: Pass 2 Provider '{pass2_name}' "
+            f"unbekannt — verwende {default_provider.name}"
+        )
+        return default_provider
+    return resolved
+
+
+# ── Tool ─────────────────────────────────────────────────────────────
 
 
 class CriticalReviewTool(BaseTool):
     name = "critical-review"
     description = (
-        "Radical-honesty architectural review — questions code, methodology, "
-        "and design. Output → docs/critical-review-YYYYMMDD-HHMMSS.md"
+        "Adversarial 3-pass review — analysis + challenge + synthesis. "
+        "Reference a plan file to get {name}-v2.md output. "
+        "Cross-provider via #pass1:#pass2: tags. "
+        "Output → docs/critical-review-*.md + {plan}-v2.md"
     )
     read_only = True
 
@@ -175,17 +424,49 @@ class CriticalReviewTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
-        effective_timeout = timeout or TOOL_CR_REVIEW_TIMEOUT_SEC
+        pass_providers: dict[int, str] = kwargs.get("pass_providers", {})
         cwd_path = Path(cwd) if cwd else Path(".")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        docs_dir = cwd_path / "docs"
+
+        pass1_timeout = timeout or TOOL_CR_PASS1_TIMEOUT_SEC
+        pass2_timeout = timeout or TOOL_CR_PASS2_TIMEOUT_SEC
+        pass3_timeout = timeout or TOOL_CR_PASS3_TIMEOUT_SEC
+
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        # ── Resolve plan file ────────────────────────────────────────
+
+        plan_path, plan_ref = _resolve_plan_file(task, cwd_path)
+        plan_content: str | None = None
+        if plan_path:
+            plan_content = _read_plan_content(plan_path)
+            if plan_content:
+                if len(plan_content) > TOOL_CR_MAX_PLAN_CHARS:
+                    plan_content = (
+                        plan_content[:TOOL_CR_MAX_PLAN_CHARS]
+                        + "\n\n...[Plan truncated]"
+                    )
+                print(f"  [critical-review] Plan geladen: {plan_path.name} ({len(plan_content)} Zeichen)")
+            else:
+                plan_path = None  # reset if unreadable
+
+        has_plan = plan_content is not None
+        total_passes = 3 if has_plan else 2
+        plan_section = _make_plan_section(plan_content, plan_ref)
+
+        # ── Pass 1: Analysis ─────────────────────────────────────────
 
         if not is_cached_provider_available(provider.name):
             msg = "Provider nicht verfügbar — Critical Review abgebrochen"
             print(f"  [critical-review] ⏸ {msg}")
             return _make_capacity_exhausted_result(msg, "", 0, 0, 0)
 
-        notify_tool_progress(self.name, 1, 1, "Codebase-Exploration läuft...")
-        print(f"  [critical-review] Exploring {cwd_path} ...")
+        notify_tool_progress(self.name, 1, total_passes, "Pass 1: Analyse...")
+        print(f"  [critical-review] Pass 1 — Analyse ({cwd_path}) ...")
 
         system_prompt = _build_system_prompt(
             provider.name,
@@ -193,42 +474,225 @@ class CriticalReviewTool(BaseTool):
             tool_name=self.name,
         )
 
-        review_prompt = system_prompt + "\n\n" + _REVIEW_PROMPT_TEMPLATE.replace("{task}", task)
-
-        result = provider.run(
-            review_prompt,
-            cwd=str(cwd_path),
-            timeout=effective_timeout,
+        review_prompt = (
+            system_prompt + "\n\n"
+            + _REVIEW_PROMPT_TEMPLATE
+                .replace("{reviewer_persona}", _REVIEWER_PERSONA)
+                .replace("{task}", task)
+                .replace("{plan_section}", plan_section)
         )
 
-        if result.error:
-            print(f"  [critical-review] ✗ Provider-Fehler: {result.error}")
+        result1 = provider.run(
+            review_prompt,
+            cwd=str(cwd_path),
+            timeout=pass1_timeout,
+            read_only=True,
+        )
+
+        total_input_tokens += result1.input_tokens
+        total_output_tokens += result1.output_tokens
+
+        if result1.error:
+            print(f"  [critical-review] ✗ Pass 1 Fehler: {result1.error}")
+            retryable = result1.error in ("rate_limit", "unreachable", "timeout")
             return ToolResult(
                 success=False,
-                output=result.output,
+                output=result1.output,
                 iterations=1,
-                error=result.error,
-                error_code=result.error_code,
-                retryable=result.retryable,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
+                error=result1.error,
+                error_code=result1.error,
+                retryable=retryable,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
             )
 
-        # Write output to docs/
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"critical-review-{timestamp}.md"
-        docs_dir = cwd_path / "docs"
-        header = _make_report_header("Critical Review", timestamp, task, provider.name, cwd_path)
-        _write_tool_file(docs_dir, filename, header + result.output)
+        # Save Pass 1 standalone (safety net)
+        pass1_filename = f"critical-review-{timestamp}-pass1.md"
+        header1 = _make_report_header(
+            "Critical Review — Pass 1 (Analysis)", timestamp, task,
+            provider.name, cwd_path,
+        )
+        _write_tool_file(docs_dir, pass1_filename, header1 + result1.output)
+        print(f"  [critical-review] ✓ Pass 1 gespeichert: {docs_dir / pass1_filename}")
 
-        print(f"  [critical-review] ✓ Review gespeichert: {docs_dir / filename}")
+        # ── Pass 2: Adversarial Challenge ────────────────────────────
 
-        notify_tool_done(self.name, 1, True, f"Review abgeschlossen → docs/{filename}")
+        pass2_provider = _resolve_pass2_provider(pass_providers, provider)
+
+        if not is_cached_provider_available(pass2_provider.name):
+            msg = (
+                f"Pass 2 Provider ({pass2_provider.name}) nicht verfügbar — "
+                f"Pass 1 gespeichert als {pass1_filename}"
+            )
+            print(f"  [critical-review] ⏸ {msg}")
+            return _make_capacity_exhausted_result(
+                msg, result1.output, 1, total_input_tokens, total_output_tokens,
+            )
+
+        notify_tool_progress(self.name, 2, total_passes, f"Pass 2: Adversarial ({pass2_provider.name})...")
+        print(f"  [critical-review] Pass 2 — Adversarial via {pass2_provider.name} ...")
+
+        system_prompt2 = _build_system_prompt(
+            pass2_provider.name,
+            memory_context=memory_context,
+            tool_name=self.name,
+        )
+
+        pass1_for_injection = result1.output
+        if len(pass1_for_injection) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
+            pass1_for_injection = (
+                pass1_for_injection[:TOOL_CR_PASS1_MAX_INJECT_CHARS]
+                + "\n\n...[Pass 1 output truncated]"
+            )
+
+        adversarial_prompt = (
+            system_prompt2
+            + "\n\n"
+            + _ADVERSARIAL_PROMPT
+                .replace("{pass1_output}", pass1_for_injection)
+                .replace("{task}", task)
+                .replace("{plan_section}", plan_section)
+        )
+
+        result2 = pass2_provider.run(
+            adversarial_prompt,
+            cwd=str(cwd_path),
+            timeout=pass2_timeout,
+            read_only=True,
+        )
+
+        total_input_tokens += result2.input_tokens
+        total_output_tokens += result2.output_tokens
+
+        if result2.error:
+            print(f"  [critical-review] ⚠ Pass 2 Fehler: {result2.error}")
+            print(f"  [critical-review] Pass 1 gespeichert: {docs_dir / pass1_filename}")
+            retryable2 = result2.error in ("rate_limit", "unreachable", "timeout")
+            return ToolResult(
+                success=False,
+                output=(
+                    f"Pass 1 gespeichert: docs/{pass1_filename}\n\n"
+                    f"Pass 2 Fehler: {result2.error}"
+                ),
+                iterations=1,
+                error=result2.error,
+                error_code=result2.error,
+                retryable=retryable2,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+
+        # ── Pass 3: Synthesis (only when plan file present) ──────────
+
+        v2_path: Path | None = None
+
+        if has_plan and plan_path is not None:
+            notify_tool_progress(self.name, 3, 3, "Pass 3: Plan-Synthese...")
+            print(f"  [critical-review] Pass 3 — Synthese → {plan_path.stem}-v2.md ...")
+
+            # Use Pass 1 provider for synthesis (has seen the codebase)
+            if not is_cached_provider_available(provider.name):
+                msg = (
+                    f"Provider ({provider.name}) nicht verfügbar für Synthese — "
+                    f"Review gespeichert, aber kein -v2 Plan erzeugt"
+                )
+                print(f"  [critical-review] ⏸ {msg}")
+                # Continue without Pass 3 — still save the review report
+            else:
+                system_prompt3 = _build_system_prompt(
+                    provider.name,
+                    memory_context=memory_context,
+                    tool_name=self.name,
+                )
+
+                # Truncate review outputs for synthesis prompt
+                p1_for_synth = result1.output
+                if len(p1_for_synth) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
+                    p1_for_synth = p1_for_synth[:TOOL_CR_PASS1_MAX_INJECT_CHARS] + "\n...[truncated]"
+                p2_for_synth = result2.output
+                if len(p2_for_synth) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
+                    p2_for_synth = p2_for_synth[:TOOL_CR_PASS1_MAX_INJECT_CHARS] + "\n...[truncated]"
+
+                synthesis_prompt = (
+                    system_prompt3
+                    + "\n\n"
+                    + _SYNTHESIS_PROMPT
+                        .replace("{plan_content}", plan_content or "")
+                        .replace("{pass1_output}", p1_for_synth)
+                        .replace("{pass2_output}", p2_for_synth)
+                )
+
+                result3 = provider.run(
+                    synthesis_prompt,
+                    cwd=str(cwd_path),
+                    timeout=pass3_timeout,
+                    read_only=True,
+                )
+
+                total_input_tokens += result3.input_tokens
+                total_output_tokens += result3.output_tokens
+
+                if result3.error:
+                    print(f"  [critical-review] ⚠ Pass 3 Fehler: {result3.error} — Review trotzdem gespeichert")
+                else:
+                    v2_path = _plan_v2_path(plan_path)
+                    v2_path.parent.mkdir(parents=True, exist_ok=True)
+                    v2_path.write_text(result3.output, encoding="utf-8")
+                    print(f"  [critical-review] ✓ Verbesserter Plan: {v2_path}")
+
+        # ── Combined Review Report ───────────────────────────────────
+
+        combined_filename = f"critical-review-{timestamp}.md"
+        provider_label = (
+            f"{provider.name} / {pass2_provider.name}"
+            if pass2_provider.name != provider.name
+            else provider.name
+        )
+        combined_header = _make_report_header(
+            "Critical Review (Adversarial)", timestamp, task,
+            provider_label, cwd_path,
+        )
+
+        metadata_lines = [
+            f"- Pass 1 (Analysis): {provider.name}",
+            f"- Pass 2 (Adversarial): {pass2_provider.name}",
+        ]
+        if has_plan:
+            metadata_lines.append(f"- Pass 3 (Synthesis): {provider.name}")
+            metadata_lines.append(f"- Plan: {plan_ref}")
+            if v2_path:
+                metadata_lines.append(f"- Output: {v2_path}")
+        metadata_lines.append(f"- Input tokens: {total_input_tokens}")
+        metadata_lines.append(f"- Output tokens: {total_output_tokens}")
+
+        metadata = "\n\n---\n\n## Review-Metadaten\n" + "\n".join(metadata_lines) + "\n"
+
+        combined_content = (
+            combined_header
+            + "# Part 1: Analysis\n\n" + result1.output
+            + "\n\n---\n\n"
+            + "# Part 2: Adversarial Challenge\n\n" + result2.output
+            + metadata
+        )
+
+        _write_tool_file(docs_dir, combined_filename, combined_content)
+
+        print(f"  [critical-review] ✓ Review gespeichert: {docs_dir / combined_filename}")
+
+        iterations = 3 if v2_path else 2
+        output_parts = [f"Review gespeichert: docs/{combined_filename}"]
+        if v2_path:
+            output_parts.append(f"Verbesserter Plan: {v2_path}")
+
+        notify_tool_done(
+            self.name, iterations, True,
+            " | ".join(output_parts),
+        )
 
         return ToolResult(
             success=True,
-            output=f"Review gespeichert: docs/{filename}\n\n{result.output}",
-            iterations=1,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
+            output="\n".join(output_parts) + "\n\n" + combined_content,
+            iterations=iterations,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
         )

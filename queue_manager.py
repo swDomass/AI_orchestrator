@@ -88,6 +88,9 @@ PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
 # Matches Claude model selection tags: #claude_haiku, #claude_sonnet, #claude_opus
 MODEL_TAG_RE = re.compile(r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus))(?![\w-])")
 
+# Matches #pass1:<provider> and #pass2:<provider> for cross-provider tool support
+PASS_PROVIDER_TAG_RE = re.compile(r"(?i)(?<!\S)#pass([12]):(claude|gemini|codex)(?=\s|$)")
+
 # Matches #id:name — gives a task a unique ID for dependency tracking
 ID_TAG_RE = re.compile(r"(?i)(?<!\S)#id:([\w-]+)(?=\s|$)")
 
@@ -503,6 +506,19 @@ def extract_tool_providers(task: str) -> list[str] | None:
     return [p.strip().lower() for p in match.group(1).split(",") if p.strip()]
 
 
+def extract_pass_providers(task: str) -> dict[int, str]:
+    """Extract #pass1:<provider> and #pass2:<provider> from task text.
+
+    Returns e.g. {1: 'claude', 2: 'gemini'} or {} if none found.
+    """
+    result: dict[int, str] = {}
+    for m in PASS_PROVIDER_TAG_RE.finditer(task):
+        pass_num = int(m.group(1))
+        provider = m.group(2).lower()
+        result[pass_num] = provider
+    return result
+
+
 def extract_id_tag(task: str) -> str | None:
     """Extract #id:<name> from task text. Returns lowercased name or None."""
     m = ID_TAG_RE.search(task)
@@ -531,6 +547,7 @@ def strip_metadata_tags(task: str) -> str:
     task = MODEL_TAG_RE.sub("", task)
     task = ID_TAG_RE.sub("", task)
     task = NEEDS_TAG_RE.sub("", task)
+    task = PASS_PROVIDER_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 

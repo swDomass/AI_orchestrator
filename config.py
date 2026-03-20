@@ -182,8 +182,12 @@ TOOL_KT_KNOWHOW_TIMEOUT_SEC       =    600  # 10 min: know-how extraction
 TOOL_KT_APPLICATIONS_TIMEOUT_SEC  =    900  # 15 min: cross-domain with WebSearch
 TOOL_KT_SYNTHESIS_TIMEOUT_SEC     =    600  # 10 min: solution synthesis
 
-# Critical-Review timeouts
-TOOL_CR_REVIEW_TIMEOUT_SEC = 2_400  # 40 min: full radical-honesty architectural review
+# Critical-Review timeouts (3-pass adversarial)
+TOOL_CR_PASS1_TIMEOUT_SEC = 2_400  # 40 min: Pass 1 — analysis (codebase exploration)
+TOOL_CR_PASS2_TIMEOUT_SEC = 1_800  # 30 min: Pass 2 — adversarial challenge (reviews Pass 1)
+TOOL_CR_PASS3_TIMEOUT_SEC = 1_800  # 30 min: Pass 3 — synthesis (improved plan output)
+TOOL_CR_PASS1_MAX_INJECT_CHARS = 30_000  # max Pass 1 output injected into Pass 2 prompt
+TOOL_CR_MAX_PLAN_CHARS = 50_000          # max plan file content injected into prompts
 
 # Security-Audit timeouts
 TOOL_SA_AUDIT_TIMEOUT_SEC  = 2_400  # 40 min: read-only vulnerability scan (Phase 1)

@@ -252,6 +252,7 @@ class DevLoopTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
         print(f"  [dev-loop] Starte Dev-Loop (max {TOOL_MAX_ITERATIONS} Iterationen)")
 

@@ -431,6 +431,7 @@ class ResearchQATool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        **kwargs,
     ) -> ToolResult:
         print(f"  [research-qa] Starte Research & Fragen-Analyse")
 

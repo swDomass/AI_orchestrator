@@ -637,7 +637,7 @@ def append_lesson(
 ) -> bool:
     """Append a new lesson entry to lessons.md.
 
-    Called automatically when a tool loop takes >5 iterations.
+    Called by create_lesson_from_loop() when a tool loop takes >1 iteration.
     Skips entries without a real project name (empty cwd) and deduplicates
     by pattern fingerprint to prevent spam from repeated identical loops.
     Returns True on success.
@@ -663,7 +663,8 @@ def append_lesson(
             pattern_fp = pattern[:120]
             if _LESSONS_FILE.exists():
                 try:
-                    if pattern_fp in _LESSONS_FILE.read_text(encoding="utf-8"):
+                    content = _LESSONS_FILE.read_text(encoding="utf-8")
+                    if pattern_fp in content:
                         logger.debug("Lesson skipped (duplicate pattern): %s | %s", tool_name, project)
                         return False
                 except OSError as e:
@@ -680,6 +681,85 @@ def append_lesson(
         return True
     except Exception as e:
         logger.warning("Failed to append lesson: %s", e)
+        return False
+
+
+_LESSON_SUMMARIZER_PROMPT = """
+Analyze the following tool execution history and extract a generalized 'Lesson Learned'.
+Identify the root cause of issues encountered (repeated failures, loops) and the key patterns
+that eventually led to success.
+
+Avoid project-specific details like specific filenames, line numbers, or variable names
+unless they represent a generic pattern (e.g. 'unquoted paths in shell').
+
+ORIGINAL TASK:
+{task}
+
+EXECUTION HISTORY:
+{history}
+
+Output exactly in this format:
+Pattern: [Generalized description of the problem/pattern encountered]
+Tool-Hint: [Concise advice for an AI agent to handle this better next time]
+"""
+
+
+def create_lesson_from_loop(
+    tool_name: str,
+    task: str,
+    all_outputs: list[str],
+    provider,
+    cwd: str | None = None,
+) -> bool:
+    """Use an LLM to summarize tool execution history into a lesson.
+    
+    If the summarization is successful, appends it to lessons.md.
+    Returns True if a lesson was created and stored.
+    """
+    if not all_outputs:
+        return False
+    
+    # Combine history, focusing on first and last iterations if too long
+    # (Total budget ~4000 chars for history)
+    if len(all_outputs) > 4:
+        truncated_history = (
+            all_outputs[0] + 
+            "\n\n[... middle iterations omitted ...]\n\n" + 
+            "\n\n".join(all_outputs[-2:])
+        )
+    else:
+        truncated_history = "\n\n".join(all_outputs)
+        
+    if len(truncated_history) > 6000:
+        truncated_history = truncated_history[:3000] + "\n\n[...]\n\n" + truncated_history[-3000:]
+
+    prompt = _LESSON_SUMMARIZER_PROMPT.format(
+        task=task,
+        history=truncated_history
+    )
+
+    try:
+        # Best effort: use the provided provider to summarize.
+        # Use a shorter timeout as this is a background housekeeping task.
+        result = provider.run(prompt, timeout=120, read_only=True)
+        if not result.success:
+            logger.debug("Lesson summarization failed: %s", result.error)
+            return False
+        
+        output = result.output.strip()
+        pattern_match = re.search(r"^Pattern:\s*(.+)$", output, re.MULTILINE | re.IGNORECASE)
+        hint_match = re.search(r"^Tool-Hint:\s*(.+)$", output, re.MULTILINE | re.IGNORECASE)
+        
+        if not pattern_match or not hint_match:
+            logger.debug("Lesson summarizer output format mismatch")
+            return False
+            
+        pattern = pattern_match.group(1).strip()
+        tool_hint = hint_match.group(1).strip()
+        
+        return append_lesson(tool_name, cwd or ".", pattern, tool_hint)
+    except Exception as e:
+        logger.warning("create_lesson_from_loop failed: %s", e)
         return False
 
 

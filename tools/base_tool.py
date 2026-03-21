@@ -93,13 +93,13 @@ def _build_system_prompt(
         except (OSError, ValueError) as exc:
             logger.warning("Tool prompt daily memory load failed: %s", exc)
 
-        # Layer 4: Lessons learned — DEAKTIVIERT
-        # Auto-generated lessons (append_lesson) bringen keinen Mehrwert: die gespeicherten
-        # "letzten Findings" sind projektspezifische Dateinamen/Zeilennummern die beim
-        # nächsten Run veraltet sind. Sinnvoll wäre eine LLM-Summary über alle Iterationen
-        # (was hat sich wiederholt, was war der Root Cause) — das ist aber zu aufwändig für
-        # den aktuellen Stand. TODO: Lessons-System mit LLM-generierter Summary pro Loop
-        # ausarbeiten, bevor Injection wieder aktiviert wird.
+        # Layer 4: Lessons learned
+        try:
+            lessons = memory_module.get_lessons_context(tool_name=tool_name)
+            if lessons:
+                prompt += f"\n\n## Gelernte Lektionen (Best Practices)\n{lessons}"
+        except (OSError, ValueError) as exc:
+            logger.warning("Tool prompt lessons memory load failed: %s", exc)
 
     if memory_context:
         prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"

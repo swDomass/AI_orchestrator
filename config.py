@@ -106,14 +106,58 @@ MAX_RETRIES_PER_PROVIDER = 2
 MAX_CONTEXT_FILE_SIZE = 1_000_000  # 1 MB
 
 # --- Safety Guardrails ---
-SAFETY_RULES = """\
-Safety rules (MUST follow):
-- NEVER run: rm -rf, git push --force, git reset --hard, DROP TABLE, format, mkfs
-- NEVER delete more than 5 files in a single operation
-- NEVER push to remote repositories unless the task explicitly says to
-- NEVER modify files outside the working directory unless the task explicitly says to
-- Prefer creating new files/branches over overwriting existing ones
-- If unsure whether an action is destructive, skip it and report what you would have done"""
+
+# Hard-deny patterns — used by Claude Code PreToolUse hook (scripts/safety_hook.py)
+# AND injected into prompts for all providers (Gemini, Codex have no hook system).
+# Each entry: (regex_pattern, human-readable description)
+SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
+    # Destructive file operations
+    (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+", "rm -rf recursive forced delete"),
+    (r"rm\s+-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\s+", "rm -fr recursive forced delete"),
+    (r"rm\s+--force\s+-r\s+", "rm --force -r recursive forced delete"),
+    (r"rm\s+-r\s+--force\s+", "rm -r --force recursive forced delete"),
+    (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+(/|~|%|\\)", "rm -r on root/home paths"),
+    (r"del\s+/[sfq]", "Windows del with /s /f /q flags"),
+    (r"Remove-Item\s.*-Recurse.*-Force", "PowerShell recursive force delete"),
+    (r"rd\s+/[sq]", "Windows rd /s /q recursive delete"),
+    # Git destructive operations
+    (r"git\s+push\s+.*--force", "git push --force"),
+    (r"git\s+push\s+.*-f\b", "git push -f (force)"),
+    (r"git\s+reset\s+--hard", "git reset --hard"),
+    (r"git\s+clean\s+-[a-zA-Z]*f", "git clean -f (untracked file deletion)"),
+    (r"git\s+checkout\s+--\s+\.", "git checkout -- . (discard all changes)"),
+    # Database destruction
+    (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE/SCHEMA"),
+    (r"TRUNCATE\s+TABLE", "TRUNCATE TABLE"),
+    (r"DELETE\s+FROM\s+\S+\s*;?\s*$", "DELETE FROM without WHERE clause"),
+    # Disk/partition operations
+    (r"format\s+[A-Za-z]:", "Windows format drive"),
+    (r"mkfs\b", "Linux mkfs (format filesystem)"),
+    (r"diskpart", "Windows diskpart"),
+    # System-level danger
+    (r":\(\)\s*\{.*:\|:.*\}", "Fork bomb"),
+    (r">\s*/dev/sda", "Write to raw disk device"),
+    (r"dd\s+.*of=/dev/", "dd to raw device"),
+    # Credential / secret exfiltration
+    (r"curl\s.*(-d|--data)\s.*(_TOKEN|_SECRET|_KEY|PASSWORD)", "Exfiltrating secrets via curl"),
+    (r"wget\s.*(_TOKEN|_SECRET|_KEY|PASSWORD)", "Exfiltrating secrets via wget"),
+]
+
+def _build_safety_rules_text() -> str:
+    """Build the prompt-injectable safety rules from SAFETY_DENY_PATTERNS."""
+    lines = ["Safety rules (MUST follow — violations will be blocked):"]
+    for _, desc in SAFETY_DENY_PATTERNS:
+        lines.append(f"- NEVER run: {desc}")
+    lines.extend([
+        "- NEVER delete more than 5 files in a single operation",
+        "- NEVER push to remote repositories unless the task explicitly says to",
+        "- NEVER modify files outside the working directory unless the task explicitly says to",
+        "- Prefer creating new files/branches over overwriting existing ones",
+        "- If unsure whether an action is destructive, skip it and report what you would have done",
+    ])
+    return "\n".join(lines)
+
+SAFETY_RULES = _build_safety_rules_text()
 
 # Safety: track file changes before/after tasks
 TRACK_FILE_CHANGES = True

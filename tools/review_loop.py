@@ -235,11 +235,12 @@ class ReviewLoopTool(BaseTool):
                 msg = f"Keine P1/P2/P3 Findings nach {iteration} Iteration(en)."
                 print(f"  [review-loop] ✅ {msg}")
 
-                # Auto-lesson — DEAKTIVIERT
-                # Speichern von "letzten Findings" ist nicht sinnvoll: die Einträge sind
-                # projektspezifisch und nach Code-Änderungen veraltet. Eine echte Lesson
-                # bräuchte eine LLM-Summary über alle Iterationen (Muster, Root Cause).
-                # TODO: Neu implementieren mit LLM-generierter Summary aus all_outputs.
+                # Auto-lesson: generate LLM summary if it took more than 1 iteration
+                if iteration > 1 and memory_module is not None:
+                    print(f"  [review-loop] Generiere Lesson Learned...")
+                    memory_module.create_lesson_from_loop(
+                        self.name, task, all_outputs, provider, cwd=cwd
+                    )
 
                 notify_tool_done(self.name, iteration, True, msg)
                 return ToolResult(

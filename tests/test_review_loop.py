@@ -25,7 +25,7 @@ class _ScriptedProvider:
         self._outputs = list(outputs)
         self.prompts: list[str] = []
 
-    def run(self, task: str, cwd: str | None = None, timeout: int = 0) -> RunResult:
+    def run(self, task: str, cwd: str | None = None, timeout: int = 0, read_only: bool = False) -> RunResult:
         self.prompts.append(task)
         if not self._outputs:
             return RunResult(success=False, error="no scripted output left")
@@ -62,6 +62,7 @@ def test_review_loop_fixes_p3_findings_too(monkeypatch):
             "Fixed typo 1",             # fix iter 1
             "No P1/P2/P3 findings.",    # review iter 2
             "VERIFIED",                 # verification phase
+            "Pattern: typo\nTool-Hint: fix it", # summarizer
         ]
     )
     tool = ReviewLoopTool()
@@ -70,7 +71,7 @@ def test_review_loop_fixes_p3_findings_too(monkeypatch):
 
     assert result.success is True
     assert result.iterations == 2
-    assert len(provider.prompts) == 4
+    assert len(provider.prompts) == 5
     assert "docs typo 1" in provider.prompts[1]
     assert "--- Fix 1 ---" in result.output
 
@@ -89,6 +90,7 @@ def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch):
             "Fixing 3",                   # fix iter 3
             "No P1/P2/P3 findings.",      # review iter 4
             "VERIFIED",                   # verification phase
+            "Pattern: issues\nTool-Hint: fix issues", # summarizer
         ]
     )
     tool = ReviewLoopTool()
@@ -97,4 +99,4 @@ def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch):
 
     assert result.success is True
     assert result.iterations == 4
-    assert len(provider.prompts) == 8
+    assert len(provider.prompts) == 9

@@ -139,9 +139,9 @@ class TestDailyLog:
 
         path = memory_root._daily_log_path(date.today())
         content = path.read_text(encoding="utf-8")
-        assert "..." in content
-        # Should not contain full 1000 chars
-        assert len(content) < 800
+        assert "…" in content
+        # Should not contain full 1000 chars (now truncated to 80 chars)
+        assert len(content) < 400
 
     def test_daily_log_path_format(self, memory_root):
         d = date(2026, 3, 9)
@@ -264,6 +264,49 @@ class TestTfIdfSearch:
         memory_root.store_result("Setup pytest", "Configured pytest for project", "gemini", 10.0)
         ctx = memory_root.get_context_for_task("run pytest tests")
         assert ctx  # Should return something (either TF-IDF match or recent fallback)
+
+    def test_cwd_preference_keeps_same_cwd_when_enough(self, memory_root):
+        """When ≥2 same-CWD results above threshold, cross-CWD results are dropped."""
+        from datetime import datetime
+
+        target = "/project/a"
+        other = "/project/b"
+        base = {
+            "provider": "claude",
+            "success": True,
+            "timestamp": datetime.now(),
+        }
+        mock_results = [
+            {**base, "task": "cross task", "summary": "x", "score": 0.9, "cwd": other},
+            {**base, "task": "local task 1", "summary": "y", "score": 0.5, "cwd": target},
+            {**base, "task": "local task 2", "summary": "z", "score": 0.4, "cwd": target},
+        ]
+        with patch.object(memory_root, "search_memory", return_value=mock_results):
+            ctx = memory_root.get_context_for_task("test", cwd=target)
+        assert "local task 1" in ctx
+        assert "local task 2" in ctx
+        assert "cross task" not in ctx
+
+    def test_cwd_preference_mixes_when_one_same_cwd(self, memory_root):
+        """When only 1 same-CWD result, pad with cross-CWD up to MEMORY_TOP_K."""
+        from datetime import datetime
+
+        target = "/project/a"
+        other = "/project/b"
+        base = {
+            "provider": "claude",
+            "success": True,
+            "timestamp": datetime.now(),
+        }
+        mock_results = [
+            {**base, "task": "cross high", "summary": "x", "score": 0.9, "cwd": other},
+            {**base, "task": "local only", "summary": "y", "score": 0.5, "cwd": target},
+            {**base, "task": "cross low", "summary": "z", "score": 0.3, "cwd": other},
+        ]
+        with patch.object(memory_root, "search_memory", return_value=mock_results):
+            ctx = memory_root.get_context_for_task("test", cwd=target)
+        assert "local only" in ctx
+        assert "cross high" in ctx  # padded from cross-CWD
 
 
 class TestToolPromptMemoryLayers:

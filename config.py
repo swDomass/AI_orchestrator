@@ -143,21 +143,17 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     (r"wget\s.*(_TOKEN|_SECRET|_KEY|PASSWORD)", "Exfiltrating secrets via wget"),
 ]
 
-def _build_safety_rules_text() -> str:
-    """Build the prompt-injectable safety rules from SAFETY_DENY_PATTERNS."""
-    lines = ["Safety rules (MUST follow — violations will be blocked):"]
-    for _, desc in SAFETY_DENY_PATTERNS:
-        lines.append(f"- NEVER run: {desc}")
-    lines.extend([
-        "- NEVER delete more than 5 files in a single operation",
-        "- NEVER push to remote repositories unless the task explicitly says to",
-        "- NEVER modify files outside the working directory unless the task explicitly says to",
-        "- Prefer creating new files/branches over overwriting existing ones",
-        "- If unsure whether an action is destructive, skip it and report what you would have done",
-    ])
-    return "\n".join(lines)
-
-SAFETY_RULES = _build_safety_rules_text()
+# Prompt-injectable safety rules: compact 4-liner (full pattern list stays in
+# SAFETY_DENY_PATTERNS for the Claude Code PreToolUse hook — no need to repeat
+# every variant in the prompt).
+SAFETY_RULES = (
+    "Safety rules (MUST follow — violations will be blocked):\n"
+    "- NEVER run: rm -rf, git push --force/-f, git reset --hard, "
+    "git clean -f, DROP TABLE, format/mkfs/diskpart\n"
+    "- NEVER push to remote unless the task explicitly says to\n"
+    "- NEVER modify files outside the working directory unless explicitly asked\n"
+    "- If unsure whether destructive: skip and report what you would have done"
+)
 
 # Safety: track file changes before/after tasks
 TRACK_FILE_CHANGES = True
@@ -271,7 +267,7 @@ QUEUE_DONE_DELETE_DAYS = 7   # delete from erledigt.md after this many days
 PROMPT_BUDGET_TOKENS          = 10_000
 PROMPT_CORE_TOKENS            = 200
 PROMPT_CURATED_MEMORY_TOKENS  = 500    # Layer 1: curated MEMORY.md (always loaded)
-PROMPT_DAILY_LOG_TOKENS       = 1_500  # Layer 2: today + yesterday daily log
+PROMPT_DAILY_LOG_TOKENS       = 500    # Layer 2: today + yesterday daily log (80-char entries)
 PROMPT_MEMORY_TOKENS          = 2_000  # Layer 3: TF-IDF deep search
 PROMPT_WIKILINK_TOKENS        = 3_000
 PROMPT_SKILL_TOKENS           = 2_000

@@ -316,6 +316,17 @@ def get_context_for_task(task_text: str, cwd: Optional[str] = None) -> str:
     # Apply minimum score threshold — only use similarity results if they're meaningful
     results = [r for r in all_results if r["score"] >= MEMORY_MIN_SCORE]
 
+    # CWD preference: if there are same-CWD results, prefer them over cross-project matches.
+    # Only fall through to cross-CWD if same-CWD count is < 2.
+    if cwd and results:
+        same_cwd, cross_cwd = [], []
+        for r in results:
+            (same_cwd if r["cwd"] and _paths_match(cwd, r["cwd"]) else cross_cwd).append(r)
+        if len(same_cwd) >= 2:
+            results = same_cwd
+        elif same_cwd:
+            results = same_cwd + cross_cwd[: MEMORY_TOP_K - len(same_cwd)]
+
     if results:
         log_preview = results[:3]
         logger.info(
@@ -446,10 +457,9 @@ def append_daily_log(
         ts = now.strftime("%H:%M")
         status = "success" if success else "failed"
 
-        # Truncate result for daily log (shorter than full task_results)
-        summary = result[:300].replace("\n", " ").strip()
-        if len(result) > 300:
-            summary += "..."
+        # Daily log: first line only, max 80 chars — keeps log compact for prompt injection
+        first_line = result.partition("\n")[0].strip()
+        summary = (first_line[:80] + "…") if len(first_line) > 80 else first_line
 
         entry = (
             f"\n## {ts} — {task[:120]}\n"

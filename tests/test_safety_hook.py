@@ -11,7 +11,7 @@ import pytest
 
 # Import config patterns
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import SAFETY_DENY_PATTERNS, SAFETY_RULES, _build_safety_rules_text
+from config import SAFETY_DENY_PATTERNS, SAFETY_RULES
 
 # Import hook's check function directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -29,11 +29,6 @@ class TestSafetyDenyPatterns:
         for pat, desc in SAFETY_DENY_PATTERNS:
             compiled = re.compile(pat, re.IGNORECASE)
             assert compiled, f"Pattern failed to compile: {pat} ({desc})"
-
-    def test_safety_rules_text_contains_all_descriptions(self):
-        text = _build_safety_rules_text()
-        for _, desc in SAFETY_DENY_PATTERNS:
-            assert desc in text
 
     def test_safety_rules_is_string(self):
         assert isinstance(SAFETY_RULES, str)

@@ -49,6 +49,20 @@ def test_extract_needs_tags_case_insensitive():
     assert extract_needs_tags("Task #NEEDS:StepA") == ["stepa"]
 
 
+def test_extract_needs_tags_singular_form():
+    """#need: (without trailing 's') must also be accepted."""
+    assert extract_needs_tags("Run migrations #need:db-setup") == ["db-setup"]
+
+
+def test_extract_needs_tags_singular_comma():
+    assert extract_needs_tags("Deploy #need:build,test") == ["build", "test"]
+
+
+def test_strip_removes_need_singular():
+    result = strip_metadata_tags("Run migrations #need:db-setup")
+    assert "#need:" not in result
+
+
 # ---------------------------------------------------------------------------
 # strip_metadata_tags
 # ---------------------------------------------------------------------------

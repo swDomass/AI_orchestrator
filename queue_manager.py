@@ -94,8 +94,8 @@ PASS_PROVIDER_TAG_RE = re.compile(r"(?i)(?<!\S)#pass([12]):(claude|gemini|codex)
 # Matches #id:name — gives a task a unique ID for dependency tracking
 ID_TAG_RE = re.compile(r"(?i)(?<!\S)#id:([\w-]+)(?=\s|$)")
 
-# Matches #needs:name1,name2 — declares task dependencies (comma-separated)
-NEEDS_TAG_RE = re.compile(r"(?i)(?<!\S)#needs:([\w,\-]+)(?=\s|$)")
+# Matches #needs:name1,name2 or #need:name1,name2 — declares task dependencies (comma-separated)
+NEEDS_TAG_RE = re.compile(r"(?i)(?<!\S)#needs?:([\w,\-]+)(?=\s|$)")
 
 # Extract only the markdown body under "## Queue" (until the next H2 heading)
 QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)

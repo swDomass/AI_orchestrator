@@ -557,11 +557,20 @@ def get_daily_context(max_chars: int = 0) -> str:
 _LESSONS_FILE = _MEMORY_ROOT / "lessons.md"
 
 
-def get_lessons_context(tool_name: str | None = None, max_chars: int = 2000) -> str:
-    """Read lessons.md and return entries, optionally filtered by tool name.
+def get_lessons_context(
+    tool_name: str | None = None,
+    cwd: str | None = None,
+    max_chars: int = 2000,
+) -> str:
+    """Read lessons.md and return entries, filtered by tool name and CWD.
 
     Returns relevant lesson entries as a string block for prompt injection.
     Each entry has Pattern + Tool-Hint fields (no Fix field).
+
+    Filtering logic:
+    - Entries with ``| * |`` as project match all CWDs (universal lessons).
+    - Entries with a specific project name match only when CWD contains that name.
+    - tool_name filter applies independently (AND with CWD filter).
     """
     if not _LESSONS_FILE.exists():
         return ""
@@ -589,6 +598,14 @@ def get_lessons_context(tool_name: str | None = None, max_chars: int = 2000) -> 
         # Filter by tool name if specified
         if tool_name and f"| {tool_name} |" not in heading.lower() and tool_name not in heading.lower():
             continue
+        # Filter by CWD: "| * |" = universal, otherwise project name must appear in CWD
+        if cwd:
+            # Extract project field from heading: "## DATE | tool | PROJECT"
+            parts = [p.strip() for p in heading.lstrip("#").strip().split("|")]
+            if len(parts) >= 3:
+                project = parts[2]
+                if project != "*" and project.lower() not in cwd.lower():
+                    continue
         entries.append(f"{heading}\n{body}")
 
     if not entries:
@@ -639,28 +656,35 @@ def search_lessons(query: str, max_results: int = 3) -> str:
     return "\n\n".join(matches) if matches else ""
 
 
+_LESSON_DEDUP_THRESHOLD = 0.45  # TF-IDF similarity above this = duplicate
+
+
 def append_lesson(
     tool_name: str,
     cwd: str,
     pattern: str,
     tool_hint: str,
+    universal: bool = False,
 ) -> bool:
     """Append a new lesson entry to lessons.md.
 
     Called by create_lesson_from_loop() when a tool loop takes >1 iteration.
-    Skips entries without a real project name (empty cwd) and deduplicates
-    by pattern fingerprint to prevent spam from repeated identical loops.
+    Deduplicates by TF-IDF similarity against existing patterns.
+    Uses ``*`` as project when ``universal=True`` (pattern is not project-specific).
     Returns True on success.
     """
     try:
         _ensure_dirs()
         today = datetime.now().strftime("%Y-%m-%d")
-        project = Path(cwd).name if cwd else ""
 
-        # Skip entries without a real project name — cwd="." yields name=""
-        if not project or project in (".", "unknown"):
-            logger.debug("Lesson skipped: no real project name for cwd=%r", cwd)
-            return False
+        if universal:
+            project = "*"
+        else:
+            project = Path(cwd).name if cwd else ""
+            # Skip entries without a real project name
+            if not project or project in (".", "unknown"):
+                logger.debug("Lesson skipped: no real project name for cwd=%r", cwd)
+                return False
 
         entry = (
             f"\n## {today} | {tool_name} | {project}\n"
@@ -668,17 +692,31 @@ def append_lesson(
             f"- **Tool-Hint:** {tool_hint}\n"
         )
 
+        new_tokens = _tokenize(pattern)
+
         with _lessons_lock:
-            # Dedup: skip if the same pattern fingerprint already exists in the file
-            pattern_fp = pattern[:120]
             if _LESSONS_FILE.exists():
                 try:
                     content = _LESSONS_FILE.read_text(encoding="utf-8")
-                    if pattern_fp in content:
-                        logger.debug("Lesson skipped (duplicate pattern): %s | %s", tool_name, project)
-                        return False
                 except OSError as e:
                     logger.debug("Lesson dedup read failed (writing anyway): %s", e)
+                    content = ""
+
+                # Semantic dedup: check TF-IDF similarity against existing patterns
+                if content:
+                    existing = re.findall(
+                        r"^\- \*\*Pattern:\*\*\s*(.+)$", content, re.MULTILINE
+                    )
+                    for ex_pattern in existing:
+                        ex_tokens = _tokenize(ex_pattern)
+                        sim = _tfidf_sim(new_tokens, ex_tokens)
+                        if sim >= _LESSON_DEDUP_THRESHOLD:
+                            logger.debug(
+                                "Lesson skipped (similar %.2f): %s",
+                                sim, pattern[:80],
+                            )
+                            return False
+
                 with open(_LESSONS_FILE, "a", encoding="utf-8") as f:
                     f.write(entry)
             else:
@@ -699,8 +737,11 @@ Analyze the following tool execution history and extract a generalized 'Lesson L
 Identify the root cause of issues encountered (repeated failures, loops) and the key patterns
 that eventually led to success.
 
-Avoid project-specific details like specific filenames, line numbers, or variable names
-unless they represent a generic pattern (e.g. 'unquoted paths in shell').
+Rules:
+- Avoid project-specific details (filenames, line numbers, variable names).
+- Keep Pattern to 1-2 sentences, Tool-Hint to 2-3 sentences. Be concise.
+- Set Universal to YES if the pattern applies to any codebase (not just this project).
+  Set to NO only if it depends on project-specific tech/domain.
 
 ORIGINAL TASK:
 {task}
@@ -708,9 +749,10 @@ ORIGINAL TASK:
 EXECUTION HISTORY:
 {history}
 
-Output exactly in this format:
+Output exactly in this format (3 lines, no extras):
 Pattern: [Generalized description of the problem/pattern encountered]
 Tool-Hint: [Concise advice for an AI agent to handle this better next time]
+Universal: [YES or NO]
 """
 
 
@@ -759,15 +801,17 @@ def create_lesson_from_loop(
         output = result.output.strip()
         pattern_match = re.search(r"^Pattern:\s*(.+)$", output, re.MULTILINE | re.IGNORECASE)
         hint_match = re.search(r"^Tool-Hint:\s*(.+)$", output, re.MULTILINE | re.IGNORECASE)
-        
+        universal_match = re.search(r"^Universal:\s*(YES|NO)\b", output, re.MULTILINE | re.IGNORECASE)
+
         if not pattern_match or not hint_match:
             logger.debug("Lesson summarizer output format mismatch")
             return False
-            
+
         pattern = pattern_match.group(1).strip()
         tool_hint = hint_match.group(1).strip()
-        
-        return append_lesson(tool_name, cwd or ".", pattern, tool_hint)
+        universal = bool(universal_match and universal_match.group(1).upper() == "YES")
+
+        return append_lesson(tool_name, cwd or ".", pattern, tool_hint, universal=universal)
     except Exception as e:
         logger.warning("create_lesson_from_loop failed: %s", e)
         return False

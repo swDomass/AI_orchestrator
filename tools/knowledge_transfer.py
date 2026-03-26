@@ -359,7 +359,7 @@ class KnowledgeTransferTool(BaseTool):
         else:
             print("  [knowledge-transfer] Thema: auto-discovery")
 
-        system_prompt = _build_system_prompt(provider.name, memory_context)
+        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         total_in = total_out = 0
 
         # ── Phase 0: Vault-Scan ──────────────────────────────────────────────

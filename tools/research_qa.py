@@ -436,7 +436,7 @@ class ResearchQATool(BaseTool):
         print(f"  [research-qa] Starte Research & Fragen-Analyse")
 
         rqa_dir = Path(cwd or ".") / RQA_DIR
-        system_prompt = _build_system_prompt(provider.name, memory_context)
+        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         all_outputs: list[str] = []
 
         discovery_timeout = timeout or TOOL_RQA_DISCOVERY_TIMEOUT_SEC

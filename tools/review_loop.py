@@ -127,7 +127,7 @@ class ReviewLoopTool(BaseTool):
     ) -> ToolResult:
         print(f"  [review-loop] Starte iterativen Review/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
-        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name)
+        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
         seen_signatures: set[tuple[str, ...]] = set()
         last_findings_tuple: tuple[str, ...] = ()

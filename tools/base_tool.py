@@ -68,6 +68,7 @@ def _build_system_prompt(
     provider_name: str,
     memory_context: str = "",
     tool_name: str | None = None,
+    cwd: str | None = None,
 ) -> str:
     """Assemble system prompt with layered memory context for tool workflows."""
     prompt = get_system_prompt(provider_name)
@@ -95,7 +96,7 @@ def _build_system_prompt(
 
         # Layer 4: Lessons learned
         try:
-            lessons = memory_module.get_lessons_context(tool_name=tool_name)
+            lessons = memory_module.get_lessons_context(tool_name=tool_name, cwd=cwd)
             if lessons:
                 prompt += f"\n\n## Gelernte Lektionen (Best Practices)\n{lessons}"
         except (OSError, ValueError) as exc:

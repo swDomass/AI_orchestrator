@@ -84,7 +84,7 @@ class TestLoopTool(BaseTool):
     ) -> ToolResult:
         print(f"  [test-loop] Starte iterativen Test/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
 
-        system_prompt = _build_system_prompt(provider.name, memory_context)
+        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         test_prompt = f"{system_prompt}\n\n{task}\n\n{_TEST_PROMPT_BODY}"
         all_outputs: list[str] = []
         last_failures: str = ""

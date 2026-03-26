@@ -472,6 +472,7 @@ class CriticalReviewTool(BaseTool):
             provider.name,
             memory_context=memory_context,
             tool_name=self.name,
+            cwd=cwd,
         )
 
         review_prompt = (
@@ -536,6 +537,7 @@ class CriticalReviewTool(BaseTool):
             pass2_provider.name,
             memory_context=memory_context,
             tool_name=self.name,
+            cwd=cwd,
         )
 
         pass1_for_injection = result1.output
@@ -603,6 +605,7 @@ class CriticalReviewTool(BaseTool):
                     provider.name,
                     memory_context=memory_context,
                     tool_name=self.name,
+                    cwd=cwd,
                 )
 
                 # Truncate review outputs for synthesis prompt

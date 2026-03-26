@@ -345,10 +345,11 @@ Rate limits (anti-spam):
 
 ## Memory, Heartbeat, SOUL.md
 
-- **Memory (`memory.py`)** — Three-layer architecture:
+- **Memory (`memory.py`)** — Four-layer architecture:
   1. **Curated (`MEMORY.md`)**: Long-term patterns, conventions, decisions. Always in prompt.
   2. **Daily Logs (`daily/`)**: Append-only log for today + yesterday (temporal locality).
   3. **TF-IDF Deep Search (`task_results/`)**: Keyword matching + temporal decay over all past tasks.
+  4. **Lessons Learned (`lessons.md`)**: LLM-summarized patterns from multi-iteration tool loops. CWD-filtered injection (universal `*` entries always, project-specific only when CWD matches). Semantic dedup via TF-IDF similarity at write time.
   - Top-K relevant memories are intelligently injected into the prompt.
   - Auto-archival after 180 days.
 
@@ -397,7 +398,7 @@ Default port: `8411` (configurable via `DASHBOARD_PORT`).
 |---|---|---|
 | Core (task + safety) | ~200 tokens | `config.py` / `SOUL.md` |
 | Curated Memory (L1) | ~500 tokens | `MEMORY.md` |
-| Daily Log (L2) | ~1500 tokens | `daily/` |
+| Daily Log (L2) | ~500 tokens | `daily/` |
 | TF-IDF Memory (L3) | ~2000 tokens | `memory.py` |
 | Wikilink context | ~3000 tokens | `queue_manager.py` |
 | Skill prompt | ~2000 tokens | `SKILL.md` body (only with `#tool:`) |
@@ -457,7 +458,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~607 tests, ~9 s)
+# Run all tests (~674 tests, ~6s)
 python -m pytest tests/ -q
 
 # Run a single test file

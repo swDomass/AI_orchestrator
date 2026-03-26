@@ -257,7 +257,7 @@ class DevLoopTool(BaseTool):
         print(f"  [dev-loop] Starte Dev-Loop (max {TOOL_MAX_ITERATIONS} Iterationen)")
 
         dev_loop_dir = Path(cwd or ".") / DEV_LOOP_DIR
-        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name)
+        system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         all_outputs: list[str] = []
         seen_quality_signatures: set[tuple[str, ...]] = set()
         last_quality_tuple: tuple[str, ...] = ()

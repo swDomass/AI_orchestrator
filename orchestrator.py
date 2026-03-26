@@ -590,10 +590,11 @@ def _execute_tool_task(
         )
 
 
-def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) -> bool:
+def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) -> bool | None:
     """
     Process all open tasks in the queue once.
-    Returns True if all tasks were completed, False if stopped early.
+    Returns True if all tasks were completed, False if stopped early,
+    None if all tasks were blocked by dependencies (#needs:).
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
@@ -1133,6 +1134,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         print("\n[DRY-RUN] Keine Tasks ausgeführt.")
         return True
 
+    # All tasks blocked by #needs: dependencies — signal caller to wait longer
+    if eligible == 0 and blocked_count > 0:
+        print(f"\nAlle {blocked_count} Task(s) blockiert (warte auf Abhängigkeiten).")
+        return None
+
     remaining = read_queue()
     if not remaining:
         print("\n✅ Alle Tasks erledigt!")
@@ -1245,9 +1251,15 @@ def run_watch(dry_run: bool = False) -> None:
             except Exception:
                 pass
 
-            if done:
+            if done is True:
                 print("\nQueue abgearbeitet. Warte auf neue Tasks...")
                 time.sleep(60)
+                continue
+
+            if done is None:
+                # All tasks blocked by #needs: dependencies — wait like idle queue
+                print(f"\nAlle Tasks blockiert. Prüfe erneut in {fmt_time(SLEEP_POLL_INTERVAL)}...")
+                time.sleep(SLEEP_POLL_INTERVAL)
                 continue
 
             print("\nPrüfe Reset-Zeiten...")

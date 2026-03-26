@@ -161,6 +161,7 @@ class SecurityAuditTool(BaseTool):
             provider.name,
             memory_context=memory_context,
             tool_name=self.name,
+            cwd=cwd,
         )
 
         audit_prompt = system_prompt + "\n\n" + _AUDIT_PROMPT.replace("{task}", task)

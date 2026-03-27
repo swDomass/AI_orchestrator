@@ -10,6 +10,7 @@ import re
 
 from tools.base_tool import BaseTool
 from tools.critical_review import CriticalReviewTool
+from tools.deep_security_audit import DeepSecurityAuditTool
 from tools.dev_loop import DevLoopTool
 from tools.knowledge_transfer import KnowledgeTransferTool
 from tools.research_qa import ResearchQATool
@@ -28,6 +29,7 @@ _TOOLS: dict[str, BaseTool] = {
     "knowledge-transfer": KnowledgeTransferTool(),
     "critical-review": CriticalReviewTool(),
     "security-audit": SecurityAuditTool(),
+    "deep-security-audit": DeepSecurityAuditTool(),
 }
 
 

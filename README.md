@@ -10,7 +10,7 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 - Capacity checking via `cclimits` (with local JSONL fallback on HTTP 429)
 - Retry handling on rate limits / provider failures
 - Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*` tags
-- Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `critical-review`, `knowledge-transfer`
+- Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `deep-security-audit`, `critical-review`, `knowledge-transfer`
 - Skills / `SKILL.md` discovery with requirements gating
 - Memory (TF-IDF + temporal decay) for recurring tasks
 - Execution profiles (provider order, allowed skills, timeout, policy overrides)
@@ -103,6 +103,8 @@ The queue is read from Markdown. Open tasks are standard checkbox lines:
 - [ ] Architecture audit #tool:critical-review cwd:D:\projects\app
 - [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:D:\projects\app
 - [ ] Security audit #tool:security-audit cwd:D:\projects\app
+- [ ] Deep security audit #tool:deep-security-audit cwd:D:\projects\app
+- [ ] Deep audit (no fix) #tool:deep-security-audit #no-fix cwd:D:\projects\app
 ```
 
 The orchestrator automatically appends `## Results` and `## Log` sections to each task.
@@ -169,6 +171,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | `knowledge-transfer` | Cross-domain knowledge transfer: Vault expertise → industry applications (via web search) → Obsidian idea note. |
 | `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:gemini`. Output in `{cwd}/docs/critical-review-*.md`. |
 | `security-audit` | Two-phase workflow: Audit (read-only) → Fix + pytest. Scans for hardcoded secrets, command injection, path traversal, unsafe deserialization, SSRF, and more. Output in `{cwd}/docs/security-audit-*.md`. |
+| `deep-security-audit` | Multi-agent deep audit: 6 expert personas (pentester, architect, SAST, supply chain, data privacy, forensics) + CISO synthesis + optional fix. `#no-fix` skips fix phase. Output in `{cwd}/docs/deep-security-audit-*.md`. |
 
 ```bash
 python orchestrator.py --list-tools

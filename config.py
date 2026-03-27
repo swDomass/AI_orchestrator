@@ -232,6 +232,13 @@ TOOL_CR_MAX_PLAN_CHARS = 50_000          # max plan file content injected into p
 # Security-Audit timeouts
 TOOL_SA_AUDIT_TIMEOUT_SEC  = 2_400  # 40 min: read-only vulnerability scan (Phase 1)
 
+# Deep-Security-Audit timeouts (multi-agent)
+TOOL_DSA_AGENT_TIMEOUT_SEC        = 1_800  # 30 min per expert agent (6 agents)
+TOOL_DSA_SYNTHESIS_TIMEOUT_SEC    = 2_400  # 40 min: CISO synthesis of all findings
+TOOL_DSA_FIX_TIMEOUT_SEC          = 3_600  # 60 min: fix implementation
+TOOL_DSA_MAX_AGENT_OUTPUT_CHARS   = 15_000  # max per-agent output injected into synthesis
+TOOL_DSA_MAX_TOTAL_INJECT_CHARS   = 80_000  # max combined output for synthesis prompt
+
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file

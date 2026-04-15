@@ -556,12 +556,25 @@ class CriticalReviewTool(BaseTool):
                 .replace("{plan_section}", plan_section)
         )
 
-        result2 = pass2_provider.run(
-            adversarial_prompt,
-            cwd=str(cwd_path),
-            timeout=pass2_timeout,
-            read_only=True,
+        # Apply model pin for pass2 provider if task has a matching model tag.
+        # (Primary provider already has _forced_model set by orchestrator; pass2
+        # may be a different provider and needs its own resolution.)
+        from queue_manager import extract_model_tag
+        from config import model_id_for_provider as _model_id_for_provider
+        pass2_model_id = _model_id_for_provider(
+            extract_model_tag(task), pass2_provider.name
         )
+        pass2_prev_model = getattr(pass2_provider, "_forced_model", None)
+        setattr(pass2_provider, "_forced_model", pass2_model_id)
+        try:
+            result2 = pass2_provider.run(
+                adversarial_prompt,
+                cwd=str(cwd_path),
+                timeout=pass2_timeout,
+                read_only=True,
+            )
+        finally:
+            setattr(pass2_provider, "_forced_model", pass2_prev_model)
 
         total_input_tokens += result2.input_tokens
         total_output_tokens += result2.output_tokens

@@ -36,9 +36,10 @@ from datetime import datetime, timedelta
 from logging_setup import setup_logging
 
 from config import (
-    CLAUDE_MODEL_ALIASES,
     GIT_AUTO_STASH,
     MAX_RETRIES_PER_PROVIDER,
+    is_known_model_tag,
+    model_id_for_provider,
     PROMPT_CURATED_MEMORY_TOKENS,
     PROMPT_DAILY_LOG_TOKENS,
     PROMPT_MEMORY_TOKENS,
@@ -677,8 +678,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         tool_name = extract_tool_tag(task)
 
         model_tag = extract_model_tag(task)
-        model_id = CLAUDE_MODEL_ALIASES.get(model_tag) if model_tag else None
-        if model_tag and model_id is None:
+        if model_tag and not is_known_model_tag(model_tag):
             _log.warning("Unknown model tag #%s — ignored, using default model", model_tag)
 
         # Strict mode: when provider/model is explicitly specified, no fallback
@@ -723,8 +723,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             print(f"  [timeout] {fmt_time(timeout)}")
         if tool_name:
             print(f"  [tool] {tool_name}")
-        if model_id:
-            print(f"  [model] #{model_tag} → {model_id}")
+        if model_tag:
+            print(f"  [model-tag] #{model_tag}")
 
         # --- Feature 10: detect #shutdown tag ---
         task_has_shutdown = extract_shutdown_tag(task)
@@ -897,10 +897,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  → Provider: {provider.name}")
                 if not tried_providers:
                     notify_task_started(task, provider.name)
-                previous_forced_model = None
-                if provider.name == "claude":
-                    previous_forced_model = getattr(provider, "_forced_model", None)
-                    setattr(provider, "_forced_model", model_id)
+                model_id = model_id_for_provider(model_tag, provider.name)
+                previous_forced_model = getattr(provider, "_forced_model", None)
+                setattr(provider, "_forced_model", model_id)
                 try:
                     outcome = _execute_tool_task(
                         task,
@@ -913,8 +912,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         memory_context=memory_context,
                     )
                 finally:
-                    if provider.name == "claude":
-                        setattr(provider, "_forced_model", previous_forced_model)
+                    setattr(provider, "_forced_model", previous_forced_model)
 
                 if outcome.success or outcome.finalized:
                     break
@@ -1029,10 +1027,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             print(f"  → Provider: {provider.name}")
             if not tried_providers:
                 notify_task_started(task, provider.name)
-            previous_forced_model = None
-            if provider.name == "claude":
-                previous_forced_model = getattr(provider, "_forced_model", None)
-                setattr(provider, "_forced_model", model_id)
+            model_id = model_id_for_provider(model_tag, provider.name)
+            previous_forced_model = getattr(provider, "_forced_model", None)
+            setattr(provider, "_forced_model", model_id)
             try:
                 prompt = _build_prompt(task, provider.name, memory_context=memory_context)
                 start_time = time.time()
@@ -1040,8 +1037,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     provider, task, prompt, cwd, timeout, pause_event=pause_event
                 )
             finally:
-                if provider.name == "claude":
-                    setattr(provider, "_forced_model", previous_forced_model)
+                setattr(provider, "_forced_model", previous_forced_model)
 
             # Track estimated usage for 429 capacity estimation
             _task_duration = time.time() - start_time

@@ -56,3 +56,75 @@ def test_gemini_read_only_uses_default_approval_mode(monkeypatch):
     assert "--approval-mode" in cmd
     assert cmd[cmd.index("--approval-mode") + 1] == "default"
     assert "--yolo" not in cmd
+
+
+def test_gemini_forced_model_appends_model_flag(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
+
+    monkeypatch.setattr("providers.gemini.subprocess.run", fake_run)
+
+    provider = GeminiProvider()
+    provider._forced_model = "gemini-3-flash-preview"
+    try:
+        provider.run("inspect")
+    finally:
+        provider._forced_model = None
+
+    cmd = calls[0][0]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gemini-3-flash-preview"
+
+
+def test_gemini_no_forced_model_omits_model_flag(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
+
+    monkeypatch.setattr("providers.gemini.subprocess.run", fake_run)
+
+    GeminiProvider().run("inspect")
+
+    cmd = calls[0][0]
+    assert "--model" not in cmd
+
+
+def test_codex_forced_model_appends_model_flag(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
+
+    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+
+    provider = CodexProvider()
+    provider._forced_model = "gpt-5.4-mini"
+    try:
+        provider.run("inspect")
+    finally:
+        provider._forced_model = None
+
+    cmd = calls[0][0]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.4-mini"
+
+
+def test_codex_no_forced_model_omits_model_flag(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
+
+    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+
+    CodexProvider().run("inspect")
+
+    cmd = calls[0][0]
+    assert "--model" not in cmd

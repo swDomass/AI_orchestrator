@@ -28,7 +28,9 @@ class SubTask:
     cwd: str | None
     tool_name: str | None
     timeout: int
-    forced_model: str | None = None
+    # Alias key (e.g. 'claude_haiku', 'gemini_flash') — resolved to a model ID
+    # per-provider at execution time via config.model_id_for_provider().
+    model_tag: str | None = None
 
 
 @dataclass
@@ -43,7 +45,7 @@ class SubTaskResult:
 def _parse_subtask(text: str) -> SubTask:
     """Extract metadata from a subtask line."""
     from queue_manager import extract_cwd, extract_timeout, extract_model_tag
-    from config import TASK_TIMEOUT_SEC, CLAUDE_MODEL_ALIASES
+    from config import TASK_TIMEOUT_SEC
 
     # Detect forced provider from #claude / #gemini / #codex tags
     from dispatcher import _TAG_MAP, _TAG_RE_BY_PROVIDER
@@ -61,7 +63,6 @@ def _parse_subtask(text: str) -> SubTask:
     cwd = extract_cwd(text)
     timeout = extract_timeout(text, default=TASK_TIMEOUT_SEC)
     model_tag = extract_model_tag(text)
-    forced_model = CLAUDE_MODEL_ALIASES.get(model_tag) if model_tag else None
 
     return SubTask(
         text=text,
@@ -69,7 +70,7 @@ def _parse_subtask(text: str) -> SubTask:
         cwd=cwd,
         tool_name=tool_name,
         timeout=timeout,
-        forced_model=forced_model,
+        model_tag=model_tag,
     )
 
 
@@ -113,10 +114,10 @@ def _run_single_subtask(
         )
 
     logger.debug("parallel: subtask %d → provider %s, tool %s", idx, provider.name, subtask.tool_name)
-    previous_forced_model = None
-    if provider.name == "claude":
-        previous_forced_model = getattr(provider, "_forced_model", None)
-        setattr(provider, "_forced_model", subtask.forced_model)
+    from config import model_id_for_provider
+    model_id = model_id_for_provider(subtask.model_tag, provider.name)
+    previous_forced_model = getattr(provider, "_forced_model", None)
+    setattr(provider, "_forced_model", model_id)
 
     try:
         # Tool-based subtask
@@ -168,8 +169,7 @@ def _run_single_subtask(
             error=result.error if not result.success else "",
         )
     finally:
-        if provider.name == "claude":
-            setattr(provider, "_forced_model", previous_forced_model)
+        setattr(provider, "_forced_model", previous_forced_model)
 
 
 def _group_join_timeout_sec(group: list[tuple[int, SubTask]]) -> int:
@@ -197,10 +197,8 @@ def run_parallel(
     subtasks = [_parse_subtask(t) for t in subtask_texts]
     try:
         from queue_manager import extract_cwd, has_cwd_tag, extract_model_tag
-        from config import CLAUDE_MODEL_ALIASES
         parent_cwd = extract_cwd(parent_task)
         parent_model_tag = extract_model_tag(parent_task)
-        parent_forced_model = CLAUDE_MODEL_ALIASES.get(parent_model_tag) if parent_model_tag else None
         if parent_cwd:
             subtasks = [
                 replace(st, cwd=parent_cwd)
@@ -208,10 +206,10 @@ def run_parallel(
                 else st
                 for st in subtasks
             ]
-        if parent_forced_model:
+        if parent_model_tag:
             subtasks = [
-                replace(st, forced_model=parent_forced_model)
-                if st.forced_model is None
+                replace(st, model_tag=parent_model_tag)
+                if st.model_tag is None
                 else st
                 for st in subtasks
             ]

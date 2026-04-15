@@ -18,14 +18,17 @@ from providers.base import BaseProvider
 from providers import ClaudeProvider, GeminiProvider, CodexProvider
 
 # Tag in task text to force a specific provider.
-# Model-specific tags (#claude_haiku etc.) also select Claude as provider.
+# Model-specific tags also select their owning provider.
 _TAG_MAP = {
     "#claude":        "claude",
     "#claude_haiku":  "claude",
     "#claude_sonnet": "claude",
     "#claude_opus":   "claude",
     "#gemini":        "gemini",
+    "#gemini_pro":    "gemini",
+    "#gemini_flash":  "gemini",
     "#codex":         "codex",
+    "#codex_mini":    "codex",
 }
 
 _TAG_RE_BY_PROVIDER = {

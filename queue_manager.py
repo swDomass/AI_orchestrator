@@ -85,8 +85,13 @@ SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
 # Matches #parallel tag
 PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
 
-# Matches Claude model selection tags: #claude_haiku, #claude_sonnet, #claude_opus
-MODEL_TAG_RE = re.compile(r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus))(?![\w-])")
+# Matches model selection tags across all providers:
+#   Claude: #claude_haiku, #claude_sonnet, #claude_opus
+#   Gemini: #gemini_pro, #gemini_flash
+#   Codex:  #codex_mini
+MODEL_TAG_RE = re.compile(
+    r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus)|gemini_(?:pro|flash)|codex_mini)(?![\w-])"
+)
 
 # Matches #pass1:<provider> and #pass2:<provider> for cross-provider tool support
 PASS_PROVIDER_TAG_RE = re.compile(r"(?i)(?<!\S)#pass([12]):(claude|gemini|codex)(?=\s|$)")
@@ -490,9 +495,12 @@ def extract_shutdown_tag(task: str) -> bool:
 
 
 def extract_model_tag(task: str) -> str | None:
-    """Extract Claude model tag (#claude_haiku, #claude_sonnet, #claude_opus).
+    """Extract a model alias tag for any provider.
 
-    Returns the alias key (e.g. 'claude_haiku') or None.
+    Supported tags: #claude_haiku/_sonnet/_opus, #gemini_pro/_flash, #codex_mini.
+    Returns the lowercased alias key (e.g. 'gemini_flash') or None.
+    Resolution to a full model ID happens via config.model_id_for_provider(),
+    which enforces that a tag only applies to its owning provider.
     """
     m = MODEL_TAG_RE.search(task)
     return m.group(1).lower() if m else None

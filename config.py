@@ -301,13 +301,47 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
     "01_Tasks/01_Projekte",
 ]
 
-# --- Claude Model Selection ---
-# Maps task tag aliases to full Claude CLI model IDs.
+# --- Model Selection ---
+# Maps task tag aliases to full CLI model IDs, per provider.
+# Tags are provider-bound: #claude_opus only applies to claude, not to gemini on fallback.
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
     "claude_sonnet": "claude-sonnet-4-6",
     "claude_opus":   "claude-opus-4-6",
 }
+GEMINI_MODEL_ALIASES: dict[str, str] = {
+    "gemini_pro":   "gemini-3-pro-preview",
+    "gemini_flash": "gemini-3-flash-preview",
+}
+CODEX_MODEL_ALIASES: dict[str, str] = {
+    "codex_mini": "gpt-5.4-mini",
+}
+_MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
+    "claude": CLAUDE_MODEL_ALIASES,
+    "gemini": GEMINI_MODEL_ALIASES,
+    "codex":  CODEX_MODEL_ALIASES,
+}
+
+
+def model_id_for_provider(model_tag: str | None, provider_name: str) -> str | None:
+    """Resolve a model alias tag to a full CLI model ID, scoped to its owning provider.
+
+    Returns None if model_tag is falsy or does not belong to provider_name.
+    Example: model_id_for_provider("claude_opus", "gemini") -> None (prevents
+    accidentally forcing a Claude model ID on Gemini during provider fallback).
+    """
+    if not model_tag:
+        return None
+    return _MODEL_ALIASES_BY_PROVIDER.get(provider_name, {}).get(model_tag)
+
+
+def is_known_model_tag(model_tag: str | None) -> bool:
+    """Return True if model_tag matches any provider's alias table."""
+    if not model_tag:
+        return False
+    return any(model_tag in aliases for aliases in _MODEL_ALIASES_BY_PROVIDER.values())
+
+
 # Model used by the usage suggester for LLM autonomy assessment (cheap + fast)
 USAGE_SUGGEST_CLAUDE_MODEL = CLAUDE_MODEL_ALIASES["claude_haiku"]
 

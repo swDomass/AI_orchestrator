@@ -86,6 +86,23 @@ def test_extract_model_tag_rejects_suffix_word_characters():
     assert queue_manager.extract_model_tag("Fix bug #claude_haiku_extra") is None
 
 
+def test_extract_model_tag_matches_gemini_pro():
+    assert queue_manager.extract_model_tag("Review #gemini_pro") == "gemini_pro"
+
+
+def test_extract_model_tag_matches_gemini_flash():
+    assert queue_manager.extract_model_tag("Iterate #gemini_flash") == "gemini_flash"
+
+
+def test_extract_model_tag_matches_codex_mini():
+    assert queue_manager.extract_model_tag("Run #codex_mini") == "codex_mini"
+
+
+def test_extract_model_tag_provider_only_tags_return_none():
+    assert queue_manager.extract_model_tag("Run #gemini now") is None
+    assert queue_manager.extract_model_tag("Run #codex now") is None
+
+
 def test_extract_cwd_stops_before_non_metadata_hashtag(tmp_path, monkeypatch):
     project_dir = tmp_path / "project"
     project_dir.mkdir()

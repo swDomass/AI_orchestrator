@@ -23,7 +23,7 @@ def test_parse_subtask(tmp_path, monkeypatch):
     assert st.tool_name == "review-loop"
     assert Path(st.cwd).resolve() == d.resolve()
     assert st.timeout == 300
-    assert st.forced_model == "claude-haiku-4-5-20251001"
+    assert st.model_tag == "claude_haiku"
 
 def test_parse_subtask_defaults():
     text = "Review project X"
@@ -169,7 +169,7 @@ def test_run_parallel_inherits_parent_forced_model_for_subtasks_without_model(mo
         parallel_runner_module,
         "_run_single_subtask",
         lambda subtask, idx, limits, memory_context, pause_event, profile=None: (
-            seen_models.append(subtask.forced_model),
+            seen_models.append(subtask.model_tag),
             SubTaskResult(text=subtask.text, provider_name="mock", success=True, output="ok")
         )[1],
     )
@@ -200,7 +200,7 @@ def test_run_parallel_inherits_parent_forced_model_for_subtasks_without_model(mo
         AllLimits(),
     )
 
-    assert seen_models == ["claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"]
+    assert seen_models == ["claude_haiku", "claude_haiku"]
 
 
 def test_run_parallel_continues_group_after_subtask_exception(monkeypatch):
@@ -268,7 +268,7 @@ def test_run_single_subtask_applies_forced_claude_model(monkeypatch):
         cwd=None,
         tool_name=None,
         timeout=30,
-        forced_model="claude-haiku-4-5-20251001",
+        model_tag="claude_haiku",
     )
 
     seen_models = []

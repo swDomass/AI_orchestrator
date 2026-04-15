@@ -83,3 +83,30 @@ def test_profile_provider_order():
     provider = select_provider("Fix bug", limits, profile=profile)
     assert provider is not None
     assert provider.name == "codex"
+
+
+def test_gemini_flash_tag_selects_gemini():
+    limits = _make_limits()
+    provider = select_provider("Iterate #gemini_flash", limits)
+    assert provider is not None
+    assert provider.name == "gemini"
+
+
+def test_gemini_pro_tag_selects_gemini():
+    limits = _make_limits()
+    provider = select_provider("Review #gemini_pro", limits)
+    assert provider is not None
+    assert provider.name == "gemini"
+
+
+def test_codex_mini_tag_selects_codex():
+    limits = _make_limits()
+    provider = select_provider("Run #codex_mini", limits)
+    assert provider is not None
+    assert provider.name == "codex"
+
+
+def test_has_explicit_provider_tag_detects_new_model_tags():
+    assert has_explicit_provider_tag("Do thing #gemini_flash") is True
+    assert has_explicit_provider_tag("Do thing #gemini_pro") is True
+    assert has_explicit_provider_tag("Do thing #codex_mini") is True

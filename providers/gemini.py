@@ -2,7 +2,8 @@
 
 Runs gemini with --yolo (auto-approve all tools) in non-interactive mode.
 Uses Google OAuth subscription auth - no API key needed.
-Gemini CLI decides internally which model tier to use (Flash / Pro / etc.).
+By default Gemini CLI picks the tier internally; use --model (via _forced_model)
+to pin to a specific model ID (e.g. gemini-3-pro-preview, gemini-3-flash-preview).
 """
 
 import shutil
@@ -24,13 +25,19 @@ class GeminiProvider(BaseProvider):
         timeout: int = TASK_TIMEOUT_SEC,
         read_only: bool = False,
     ) -> RunResult:
-        print(f"  [gemini] Führe Task aus...")
+        model_label = self._forced_model
+        if model_label:
+            print(f"  [gemini → {model_label}] Führe Task aus...")
+        else:
+            print(f"  [gemini] Führe Task aus...")
         try:
             cmd = [
                 _GEMINI_CMD,
                 "--prompt", "",
                 "--output-format", "text",
             ]
+            if model_label:
+                cmd.extend(["--model", model_label])
             if read_only:
                 # In non-interactive mode, default approval excludes shell/edit/write tools.
                 cmd.extend(["--approval-mode", "default"])

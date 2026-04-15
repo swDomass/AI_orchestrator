@@ -115,6 +115,8 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 |---|---|---|
 | Force provider | `#claude`, `#gemini`, `#codex` | `- [ ] Task #codex` |
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
+| Gemini model | `#gemini_pro`, `#gemini_flash` | `- [ ] Iterate #gemini_flash` |
+| Codex model | `#codex_mini` | `- [ ] Run #codex_mini` |
 | Run tool | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
 | Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
 | Working directory | `cwd:<path>` | `cwd:D:\projects\repo` |
@@ -278,6 +280,53 @@ Pass 3 — Synthesis (only when plan file referenced)
 ```
 
 Plan files can be referenced as file paths (`docs/plan.md`) or wikilinks (`[[MyPlan]]`).
+
+## Best Practice: Full Dev-Loop Workflow
+
+A battle-tested 8-step queue pattern for implementing a plan end-to-end with cost-optimized model tiering. Strong models (Opus) handle value creation and final validation; cheaper tiers (`codex_mini`, `codex`) do the iterative cleanup; Gemini runs strictly read-only as a second opinion.
+
+**Recommendation:** keep plans small (one feature / one phase per plan file) and apply this flow per plan. For multi-phase changes, split the plan file into several smaller ones — one commit per plan is cleaner than one commit for many phases.
+
+```markdown
+- [ ] Implement docs\plan-XXX.md. dont commit the changes! #id:ID1 #tool:dev-loop #claude_opus cwd:<repo>
+
+- [ ] security-audit of the uncommitted changes. dont commit the changes! #id:ID2 #need:ID1 #tool:security-audit #claude_opus cwd:<repo>
+
+- [ ] use your simplify skill for the uncommitted changes. dont commit the changes! #id:ID3 #need:ID2 #claude_sonnet cwd:<repo>
+
+- [ ] Review-fix loop for the uncommitted changes. dont commit the changes! #tool:review-loop #id:ID4 #need:ID3 #codex_mini cwd:<repo>
+
+- [ ] Review-fix loop for the uncommitted changes. dont commit the changes! #tool:review-loop #id:ID5 #need:ID4 #codex cwd:<repo>
+
+- [ ] Critical review (read-only) of the uncommitted changes against docs\plan-XXX.md #tool:critical-review #pass1:gemini #pass2:claude #gemini_pro #id:ID6 #need:ID5 cwd:<repo>
+
+- [ ] Review-fix loop for the uncommitted changes. Also incorporate findings from the most recent critical-review report in docs/. dont commit the changes! #tool:review-loop #id:ID7 #need:ID6 #claude_opus cwd:<repo>
+
+- [ ] 1. check the uncommitted changes. 2. update all docs in the repo and the Obsidian Project. 3. commit it. #need:ID7 #claude_haiku cwd:<repo>
+```
+
+### Why this tiering
+
+| Step | Model | Rationale |
+|---|---|---|
+| 1. dev-loop | `#claude_opus` | Core value creation; bad code here inflates every downstream step |
+| 2. security-audit | `#claude_opus` | Finds subtle exploit chains; cheaper tiers miss logic flaws |
+| 3. simplify | `#claude_sonnet` | Refactoring is a bounded task |
+| 4. review-loop (pass A) | `#codex_mini` | Cheap first pass — obvious bugs, unused imports, trivial wins |
+| 5. review-loop (pass B) | `#codex` (gpt-5.4) | Mid-tier — structural issues, missing coverage |
+| 6. critical-review | `#gemini_pro` + `#pass2:claude` | Independent second opinion, strictly read-only — zero risk of broken code |
+| 7. review-loop (final) | `#claude_opus` | Final validator; integrates critical-review findings. If Opus finds nothing here, the code is genuinely clean |
+| 8. commit | `#claude_haiku` | Trivial — diff + doc sync + single commit. Escalate to `#claude_sonnet` if the plan spans multiple commits |
+
+### Variants
+
+- **Minimal** (trivial changes): dev-loop → review-loop `#codex_mini` → review-loop `#claude_opus` → commit `#claude_haiku`
+- **Security-critical**: swap step 2 for `#tool:deep-security-audit` (6-agent deep scan)
+- **Multi-commit plans**: raise step 8 to `#claude_sonnet` and instruct it to split via `git add -p`
+
+### Gemini caveat
+
+Gemini is included **only** in step 6 as `#tool:critical-review`, which is read-only and produces a report file. Do not use Gemini in `dev-loop` or `review-loop` — in write mode it has shown unreliable adherence to task specs.
 
 ## Skills (`SKILL.md`)
 

@@ -223,6 +223,10 @@ class TelegramListener:
             from shutdown import cancel_shutdown, shutdown_pending as _sp
             if _sp.is_set():
                 cancel_shutdown()
+                # If it's a command, let it proceed to command handling.
+                # If it's just plain text, return early to avoid it being sent to AI chat.
+                if not parsed_command:
+                    return
         except Exception:
             pass
 

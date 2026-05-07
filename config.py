@@ -307,11 +307,11 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
     "claude_sonnet": "claude-sonnet-4-6",
-    "claude_opus":   "claude-opus-4-6",
+    "claude_opus":   "claude-opus-4-7",
 }
 GEMINI_MODEL_ALIASES: dict[str, str] = {
-    "gemini_pro":   "gemini-3-pro-preview",
-    "gemini_flash": "gemini-3-flash-preview",
+    "gemini_pro":   "gemini-3.1-pro",
+    "gemini_flash": "gemini-3.1-flash",
 }
 CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex_mini": "gpt-5.4-mini",

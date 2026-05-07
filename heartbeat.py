@@ -635,22 +635,26 @@ def start_heartbeat_thread(
     queue_read_fn: Callable,
     stop_event: threading.Event,
     poll_sec: int = 60,
+    pause_event: Optional[threading.Event] = None,
 ) -> threading.Thread:
     """Start a daemon thread that calls heartbeat.run_due() every *poll_sec* seconds.
 
     This ensures scheduled checks (log-capacity, usage-suggest, etc.) fire on time
-    even when the main thread is blocked for hours inside a long-running task.
+    even when the main thread is blocked for hours inside a long-running task.  
     The thread is safe to run alongside the existing run_due() calls in the main loop
-    because HeartbeatRunner.run_due() is protected by a non-blocking lock.
+    because HeartbeatRunner.run_due() is protected by a non-blocking lock.      
     """
     def _loop() -> None:
         while not stop_event.wait(timeout=poll_sec):
             try:
+                # Honour pause_event if provided
+                if pause_event and pause_event.is_set():
+                    continue
                 heartbeat.run_due(queue_read_fn)
             except Exception:
-                logger.debug("heartbeat bg thread error", exc_info=True)
+                logger.debug("heartbeat bg thread error", exc_info=True)        
 
-    t = threading.Thread(target=_loop, name="heartbeat-bg", daemon=True)
+    t = threading.Thread(target=_loop, name="heartbeat-bg", daemon=True)        
     t.start()
-    logger.debug("Heartbeat background thread started (poll=%ds)", poll_sec)
+    logger.debug("Heartbeat background thread started (poll=%ds)", poll_sec)    
     return t

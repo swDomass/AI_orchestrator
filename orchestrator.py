@@ -1191,7 +1191,7 @@ def run_watch(dry_run: bool = False) -> None:
     # usage-suggest, check-limits, etc.) fire on time even when the main thread
     # is blocked for hours inside a long-running task.
     _hb_stop = threading.Event()
-    start_heartbeat_thread(heartbeat, read_queue, _hb_stop)
+    start_heartbeat_thread(heartbeat, read_queue, _hb_stop, pause_event=pause_event)
 
     def _cleanup():
         listener.stop()
@@ -1215,7 +1215,8 @@ def run_watch(dry_run: bool = False) -> None:
                     if _sp.is_set() and not pause_event.is_set():
                         print("\n[shutdown] Queue leer + #shutdown gesetzt → Countdown startet")
                         execute_shutdown(cleanup_cb=_cleanup)
-                        return
+                        # No return here! Continue the loop so we can resume if cancelled.
+                        continue
                 except Exception:
                     pass
 
@@ -1243,7 +1244,8 @@ def run_watch(dry_run: bool = False) -> None:
                 if _sp.is_set() and not pause_event.is_set():
                     print("\n[shutdown] #shutdown gesetzt → Countdown startet")
                     execute_shutdown(cleanup_cb=_cleanup)
-                    return
+                    # No return here!
+                    continue
             except Exception:
                 pass
 

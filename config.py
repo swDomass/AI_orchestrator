@@ -333,12 +333,19 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_sonnet": "claude-sonnet-4-6",
     "claude_opus":   "claude-opus-4-7",
 }
+# Gemini: Code Assist tier exposes preview IDs only (verified via cclimits --json).
+# gemini-3.1-flash (non-lite) does not exist; flash maps to the 3-Flash preview.
 GEMINI_MODEL_ALIASES: dict[str, str] = {
     "gemini_pro":        "gemini-3.1-pro-preview",
     "gemini_flash":      "gemini-3-flash-preview",
     "gemini_flash_lite": "gemini-3.1-flash-lite-preview",
 }
+# Codex: gpt-5.5 is the current flagship (April 2026, ChatGPT-auth only — falls
+# back to gpt-5.4 if not yet rolled out for the account). gpt-5.4 stays as the
+# stable default; gpt-5.4-mini is the cheap variant for subagents/lighter tasks.
 CODEX_MODEL_ALIASES: dict[str, str] = {
+    "codex_5":    "gpt-5.5",
+    "codex_5_4":  "gpt-5.4",
     "codex_mini": "gpt-5.4-mini",
 }
 _MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {

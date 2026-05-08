@@ -218,19 +218,20 @@ class TelegramListener:
         if not text:
             return
 
+        parsed_command = _parse_command(text)
+
         # Cancel any pending shutdown on ANY incoming message
         try:
             from shutdown import cancel_shutdown, shutdown_pending as _sp
             if _sp.is_set():
                 cancel_shutdown()
+                send_message("✋ Shutdown abgebrochen.")
                 # If it's a command, let it proceed to command handling.
                 # If it's just plain text, return early to avoid it being sent to AI chat.
                 if not parsed_command:
                     return
         except Exception:
             pass
-
-        parsed_command = _parse_command(text)
 
         # Detect #shutdown in plain text (not a command)
         if not parsed_command and _SHUTDOWN_TAG_RE.search(text):

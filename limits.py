@@ -34,10 +34,18 @@ _GEMINI_CMD = f"gemini{_CMD_SUFFIX}"
 
 # Background refresh intervals — the daemon thread owns all cclimits calls so
 # get_limits() never blocks after the first call.
-_BG_POLL_AVAILABLE_SEC = 90   # refresh every 90 s when capacity is available
-_BG_POLL_IDLE_SEC      = 600  # refresh every 10 min when queue is empty (no tasks pending)
-_BG_POLL_ERROR_SEC     = 30   # initial retry after errors (thread backs off up to 90 s)
-_BG_POLL_429_SEC       = 300  # back off when cclimits itself gets rate-limited (5 min)
+_BG_POLL_AVAILABLE_SEC = 300   # refresh every 5 min when capacity is available + queue active.
+                               # set_queue_idle(False) already wakes the thread before the first
+                               # task in a batch, and rate_limit errors trigger force_refresh, so
+                               # this interval only needs to cover within-batch drift between
+                               # consecutive tasks in run_once. 5 min keeps drift well under the
+                               # MIN_CAPACITY_PERCENT=10% threshold.
+_BG_POLL_IDLE_SEC      = 3600  # refresh once per hour when queue is empty — set_queue_idle(False)
+                               # wakes the thread on task arrival so the cache is fresh before
+                               # the next task starts; the hourly poll only keeps the dashboard
+                               # capacity-log warm during long idle periods.
+_BG_POLL_ERROR_SEC     = 30    # initial retry after errors (thread backs off up to 90 s)
+_BG_POLL_429_SEC       = 300   # back off when cclimits itself gets rate-limited (5 min)
 _429_MAX_BASE_AGE_SEC  = 3600 # 1h maximum age for a 429 base snapshot
 _CCLIMITS_TIMEOUT_SEC = 15
 _CCLIMITS_429_RETRY_TIMEOUT_SEC = 5
@@ -64,6 +72,7 @@ _bg_thread_lock = threading.Lock()
 _bg_wake  = threading.Event()   # poke to interrupt the thread's sleep early
 _cache_ready = threading.Event() # set after the first successful cache population
 _queue_idle = threading.Event()  # set when queue is empty → longer poll interval
+_paused     = threading.Event()  # set while orchestrator is paused → bg thread skips refreshes
 
 # HTTP 429 estimation state — tracks estimated provider usage when cclimits
 # itself is rate-limited and real capacity data is unavailable.
@@ -962,6 +971,13 @@ def _bg_refresh_loop() -> None:
             # that happens during refresh/scheduling is still observed by wait().
             _bg_wake.clear()
 
+            # Skip refreshes while the orchestrator is paused. Wake-up events
+            # (set_paused(False) / force_refresh) still interrupt the wait so the
+            # next real fetch happens immediately on resume.
+            if _paused.is_set():
+                _bg_wake.wait(timeout=_BG_POLL_IDLE_SEC)
+                continue
+
             # Single lock acquisition: check skip and read result atomically.
             with _limits_cache_lock:
                 cached = _limits_cache
@@ -1091,6 +1107,23 @@ def is_cached_provider_available(provider_name: str) -> bool:
     """
     p = _get_cached_provider(provider_name)
     return p.available if p is not None else True
+
+
+def set_paused(paused: bool) -> None:
+    """Pause/resume the background cclimits-refresh thread.
+
+    While paused, the bg thread skips all cclimits calls so we don't burn the
+    monitoring API quota or trigger 429s while the user has explicitly paused
+    the orchestrator. Resume wakes the thread immediately to refresh the cache
+    before the next task runs.
+    """
+    if paused:
+        _paused.set()
+    else:
+        was_paused = _paused.is_set()
+        _paused.clear()
+        if was_paused:
+            _bg_wake.set()   # wake immediately so resume sees fresh limits
 
 
 def set_queue_idle(idle: bool) -> None:

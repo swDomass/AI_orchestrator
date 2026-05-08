@@ -340,6 +340,47 @@ def test_pause_resume_cycle_toggles_event_correctly(mock_send):
 
 
 # ---------------------------------------------------------------------------
+# Shutdown cancellation — plain text must NOT trigger AI chat
+# ---------------------------------------------------------------------------
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_plain_text_during_pending_shutdown_cancels_without_ai_chat(mock_send):
+    """Regression: parsed_command must be defined before the shutdown check.
+
+    Before the fix, a NameError was silently swallowed by try/except, the
+    early-return never fired, and plain text was forwarded to AI chat after
+    cancelling the shutdown.
+    """
+    import shutdown
+    shutdown.shutdown_pending.set()
+    try:
+        listener, _ = _make_listener()
+        with patch.object(listener, "_handle_chat") as mock_chat:
+            listener._handle_message(_msg("ich will nichts mehr"))
+            mock_chat.assert_not_called()
+    finally:
+        shutdown.shutdown_pending.clear()
+        shutdown.shutdown_cancel.clear()
+    assert not shutdown.shutdown_pending.is_set()
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_command_during_pending_shutdown_still_runs_command(mock_send):
+    """Commands sent while shutdown is pending must still execute (not be swallowed)."""
+    import shutdown
+    shutdown.shutdown_pending.set()
+    try:
+        listener, pause_event = _make_listener()
+        listener._handle_message(_msg("/pause"))
+        assert pause_event.is_set()  # /pause was actually processed
+    finally:
+        shutdown.shutdown_pending.clear()
+        shutdown.shutdown_cancel.clear()
+
+
+# ---------------------------------------------------------------------------
 # AI chat — happy path
 # ---------------------------------------------------------------------------
 

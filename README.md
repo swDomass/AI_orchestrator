@@ -80,6 +80,27 @@ python orchestrator.py
 python orchestrator.py --watch
 ```
 
+### Crash-Resistant Watchdog (Windows)
+
+For long-running unattended operation, use the PowerShell watchdog wrapper. It restarts the orchestrator on crashes with exponential backoff and sends a Telegram alert on every restart. Works on both Windows PowerShell 5.1 and PowerShell 7+:
+
+```powershell
+# Foreground (visible console)
+pwsh -File run_orchestrator.ps1
+# Or, if you only have Windows PowerShell:
+powershell.exe -File run_orchestrator.ps1
+
+# Background — survives terminal close
+Start-Process pwsh -ArgumentList "-File run_orchestrator.ps1" -WindowStyle Hidden
+```
+
+Behaviour:
+- Exit 0 (Ctrl+C, `#shutdown`) ends the loop cleanly
+- Non-zero exit → restart with backoff (10 s → 5 min cap)
+- ≥5 crashes / 10 min → 30 min cooldown + Telegram alert
+- All restarts logged to `logs/watchdog.log` (rotated at 10 MB → `watchdog.log.1`)
+- Telegram credentials read directly from `.env` (no Python helper); URL-encodes the token, strips UTF-8 BOM, honors `# inline comments` per Python's dotenv rules
+
 ## CLI Commands
 
 ```bash
@@ -119,8 +140,8 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 |---|---|---|
 | Force provider | `#claude`, `#gemini`, `#codex` | `- [ ] Task #codex` |
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
-| Gemini model | `#gemini_pro`, `#gemini_flash` | `- [ ] Iterate #gemini_flash` |
-| Codex model | `#codex_mini` | `- [ ] Run #codex_mini` |
+| Gemini model | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
+| Codex model | `#codex_5` (gpt-5.5), `#codex_5_4` (gpt-5.4), `#codex_mini` (gpt-5.4-mini) | `- [ ] Run #codex_mini` |
 | Run tool | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
 | Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
 | Working directory | `cwd:<path>` | `cwd:D:\projects\repo` |
@@ -415,7 +436,10 @@ Rate limits (anti-spam):
   - Auto-archival after 180 days.
 
 - **Heartbeat (`heartbeat.py`)** — Proactive checks in `--watch` mode, configured via `<vault>/99_System/AI/HEARTBEAT.md`.
-  - 9 built-in handlers: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `log-capacity`, `summarize`, `stale-branch`, `usage-suggest`, `session-cleanup`
+  - 10 built-in handlers: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `log-capacity`, `summarize`, `stale-branch`, `usage-suggest`, `session-cleanup`, `model-check`
+  - Sections support `## Every N minutes/hours/days` and `## Daily (after HH:MM)` — so a monthly check is just `## Every 30 days`.
+  - `model-check` (recommended monthly): CLI-probes every entry in `CLAUDE_MODEL_ALIASES`/`GEMINI_MODEL_ALIASES`/`CODEX_MODEL_ALIASES` to detect dead IDs (skips providers currently in cooldown), then asks the best available LLM with today's date as anchor whether newer IDs are known. Telegram notification only fires on findings; LLM-call failures surface as `⚠️ LLM-Check failed: …` instead of being silently swallowed.
+  - **Persistent state**: items with interval ≥ 1 day record their last run in `logs/heartbeat-state.json`, so a `## Every 30 days` check does NOT fire on every `--watch` restart.
   - `session-cleanup` deletes orchestrator-created Claude session JSONL files in `~/.claude/projects/**` older than `ORCH_SESSION_RETENTION_DAYS` — uses sidecar whitelist (`logs/orchestrator-sessions.jsonl`) to NEVER touch interactive Claude Code sessions.
   - Mtime-cached config — changes to `HEARTBEAT.md` take effect immediately (no restart).
   - Runs in a **daemon thread** (60s poll) so scheduled checks fire on time even during long-running tasks.
@@ -470,7 +494,7 @@ Default port: `8411` (configurable via `DASHBOARD_PORT`).
 
 ## Doctor (`--doctor`)
 
-`python orchestrator.py --doctor` runs 15+ checks:
+`python orchestrator.py --doctor` runs 16+ checks:
 
 - Provider CLIs (`claude`, `gemini`, `codex`)
 - `git`, `cclimits`
@@ -483,6 +507,7 @@ Default port: `8411` (configurable via `DASHBOARD_PORT`).
 - Profiles directory + validation
 - Policy file
 - Provider limits (via `cclimits`)
+- **Model IDs** — CLI-pings every entry in `CLAUDE/GEMINI/CODEX_MODEL_ALIASES` concurrently (~5–10 s). FAIL on rejected IDs (unknown/deprecated), WARN on transient probe errors, PASS when every alias responds live. The deeper LLM-based "are there newer IDs?" heuristic runs only in the monthly heartbeat `model-check`, not here.
 
 With `--fix` (optionally `--yes`) simple problems are auto-created/repaired.
 
@@ -522,7 +547,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~770 tests, ~7s)
+# Run all tests (~805 tests, ~12s)
 python -m pytest tests/ -q
 
 # Run a single test file

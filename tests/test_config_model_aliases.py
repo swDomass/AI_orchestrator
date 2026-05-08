@@ -23,6 +23,8 @@ def test_gemini_tags_resolve_for_gemini():
 
 def test_codex_tags_resolve_for_codex():
     assert model_id_for_provider("codex_mini", "codex") == "gpt-5.4-mini"
+    assert model_id_for_provider("codex_5", "codex") == "gpt-5.5"
+    assert model_id_for_provider("codex_5_4", "codex") == "gpt-5.4"
 
 
 def test_cross_provider_mismatch_returns_none():
@@ -64,3 +66,5 @@ def test_gemini_aliases_match_verified_preview_ids():
 
 def test_codex_aliases_match_verified_model_cache():
     assert CODEX_MODEL_ALIASES["codex_mini"] == "gpt-5.4-mini"
+    assert CODEX_MODEL_ALIASES["codex_5"] == "gpt-5.5"
+    assert CODEX_MODEL_ALIASES["codex_5_4"] == "gpt-5.4"

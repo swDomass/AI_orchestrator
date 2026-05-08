@@ -404,6 +404,184 @@ def _check_usage_suggest(queue_read_fn: Callable) -> Optional[str]:
         return None
 
 
+# Transient = "could not verify, but ID is probably alive". Covers:
+# - typed errors from providers (rate_limit, timeout, unreachable, session_missing)
+# - raw stderr variants ("rate limit" with space, "429")
+# - auth/credential errors → CLI lost OAuth, not a model issue (P2-4 from review)
+_PROBE_TRANSIENT_KEYWORDS = (
+    "rate_limit", "rate limit", "timeout", "timed out",
+    "unreachable", "session_missing", "429",
+    "auth", "login", "credential", "expired", "token",
+)
+# Dead = CLI explicitly rejected the model ID. Narrow keywords to avoid
+# false positives (e.g. "unsupported encoding" should NOT count as dead).
+_PROBE_DEAD_KEYWORDS = (
+    "model not found", "unknown model", "model is deprecated",
+    "invalid model", "model not supported", "no such model",
+    "modell nicht gefunden", "modell nicht unterstützt",  # German variants
+    "404",
+)
+
+
+def _probe_model(provider_name: str, model_id: str, timeout_sec: int = 30) -> tuple[bool, str]:
+    """Send a minimal ping to verify the model ID is still served by the provider CLI.
+
+    Returns (alive, detail). detail is empty when alive=True with no caveat;
+    on alive=False it contains the raw provider error. Transient errors
+    (rate limit, timeout, auth-expired) return alive=True with a "transient"
+    detail so the caller can warn but not flag the ID as dead.
+
+    Skips probing entirely when the provider is in cooldown — the cooldown
+    indicates a recent failure, probing now would just stack another error.
+    """
+    try:
+        from dispatcher import get_provider_by_name
+    except ImportError:
+        return True, "dispatcher unavailable — skipped"
+
+    provider = get_provider_by_name(provider_name)
+    if provider is None:
+        return True, f"provider '{provider_name}' not initialised"
+
+    if provider.is_cooling_down():
+        return True, f"transient (provider in cooldown — {provider.cooldown_remaining_str()})"
+
+    previous = getattr(provider, "_forced_model", None)
+    setattr(provider, "_forced_model", model_id)
+    try:
+        result = provider.run("ping", timeout=timeout_sec, read_only=True)
+    except Exception as exc:
+        return True, f"transient probe error: {exc}"
+    finally:
+        setattr(provider, "_forced_model", previous)
+
+    if result.success:
+        return True, ""
+
+    err = (result.error or "").lower()
+    # Order matters: dead-keywords are more specific than transient ones, so if
+    # an error contains BOTH (e.g. "rate limit on requested model"), we want
+    # the dead-classification only when the dead-keyword is the model-rejection
+    # phrase. Currently dead phrases all include "model" + qualifier, making
+    # them unambiguous against transient single-word matches.
+    if any(kw in err for kw in _PROBE_DEAD_KEYWORDS):
+        return False, result.error[:200]
+
+    if any(kw in err for kw in _PROBE_TRANSIENT_KEYWORDS):
+        return True, f"transient ({result.error})"
+
+    # Unknown error class — surface it but don't flag as dead
+    return True, f"unclear ({result.error[:120]})"
+
+
+def _llm_check_for_newer_models() -> str:
+    """Ask the best available provider whether the current aliases are stale.
+
+    Cheap heuristic — runs a single short prompt against the highest-priority
+    available provider. Output is plain text suggestions; never raises.
+
+    Returns:
+        ""                   — no provider available, "OK" response, or no relevant info
+        "⚠️ LLM-Check failed: <error>" — call attempted but failed (visible to user)
+        "<text>"             — actual suggestions to forward to Telegram
+    """
+    try:
+        from datetime import date
+        from config import (
+            CLAUDE_MODEL_ALIASES,
+            CODEX_MODEL_ALIASES,
+            GEMINI_MODEL_ALIASES,
+        )
+        from dispatcher import select_provider
+        from limits import get_limits
+    except ImportError:
+        return ""
+
+    try:
+        limits = get_limits()
+        provider = select_provider("model-update-check", limits, tool_name=None)
+        if provider is None:
+            return ""
+
+        ids_block = []
+        for label, mapping in (
+            ("Claude", CLAUDE_MODEL_ALIASES),
+            ("Gemini", GEMINI_MODEL_ALIASES),
+            ("Codex",  CODEX_MODEL_ALIASES),
+        ):
+            for tag, model_id in mapping.items():
+                ids_block.append(f"  - {label}/{tag} = {model_id}")
+
+        prompt = (
+            f"Stand: {date.today().isoformat()}.\n"
+            "Du prüfst eine Liste von KI-Modell-IDs auf Aktualität. "
+            "Antworte NUR mit konkret bekannten Migrationen oder Empfehlungen — "
+            "keine Spekulation, keine 'könnte sein'-Hinweise. "
+            "Wenn alle IDs aktuell wirken, antworte EXAKT mit der zwei Zeichen 'OK' "
+            "(ohne weitere Wörter, ohne Punkt).\n\n"
+            "Hinterlegte IDs:\n" + "\n".join(ids_block) + "\n\n"
+            "Format pro Eintrag (nur falls relevant): "
+            "`<provider>/<tag>: <alte-id> → <neue-id> (<Grund/Quelle>)`"
+        )
+        result = provider.run(prompt, timeout=120, read_only=True)
+        if not result.success:
+            return f"⚠️ LLM-Check failed via {provider.name}: {result.error or 'unknown error'}"
+        text = (result.output or "").strip()
+        # Strict equality — "Okay, here are…" must NOT count as OK.
+        if text.upper().rstrip(".").strip() == "OK":
+            return ""
+        # Truncate to keep Telegram message readable
+        return text[:1500]
+    except Exception as exc:
+        logger.debug("LLM model-check failed: %s", exc)
+        return f"⚠️ LLM-Check failed: {exc}"
+
+
+def _check_model_updates() -> Optional[str]:
+    """Verify all configured model aliases are still alive (CLI probe) and ask
+    an LLM whether newer IDs are available. Designed for monthly heartbeat.
+
+    Returns a Telegram-formatted summary on findings, or None when everything
+    is current (no notification → no spam).
+    """
+    try:
+        from config import (
+            CLAUDE_MODEL_ALIASES,
+            CODEX_MODEL_ALIASES,
+            GEMINI_MODEL_ALIASES,
+        )
+    except ImportError:
+        return None
+
+    dead: list[str] = []
+    flaky: list[str] = []
+
+    for label, mapping in (
+        ("claude", CLAUDE_MODEL_ALIASES),
+        ("gemini", GEMINI_MODEL_ALIASES),
+        ("codex",  CODEX_MODEL_ALIASES),
+    ):
+        for tag, model_id in mapping.items():
+            alive, detail = _probe_model(label, model_id)
+            if not alive:
+                dead.append(f"❌ {label}/{tag} ({model_id}) — {detail}")
+            elif detail and not detail.startswith("transient"):
+                # Probe completed but with non-transient warning
+                flaky.append(f"⚠️ {label}/{tag} ({model_id}) — {detail}")
+
+    suggestions = _llm_check_for_newer_models()
+
+    parts: list[str] = []
+    if dead:
+        parts.append("**Tote Model-IDs (Update nötig):**\n" + "\n".join(dead))
+    if flaky:
+        parts.append("**Auffällige IDs (manuell prüfen):**\n" + "\n".join(flaky))
+    if suggestions:
+        parts.append("**LLM-Hinweise zu möglichen neueren IDs:**\n" + suggestions)
+
+    return "\n\n".join(parts) if parts else None
+
+
 def _check_stale_branches() -> Optional[str]:
     """Warn about branches with last commit >HEARTBEAT_GIT_STALE_DAYS days old."""
     results: list[str] = []
@@ -462,6 +640,7 @@ HANDLER_KEYS: list[tuple[str, str]] = [
     ("stale branch",     "_check_stale_branches"),
     ("usage-suggest",    "_check_usage_suggest"),
     ("session-cleanup",  "_check_session_cleanup"),
+    ("model-check",      "_check_model_updates"),
 ]
 
 
@@ -477,7 +656,7 @@ def _match_handler_key(label: str) -> str:
 # ── HEARTBEAT.md parser ───────────────────────────────────────────────────────
 
 _INTERVAL_RE = re.compile(
-    r"^##\s+Every\s+(\d+)\s+(minutes?|hours?)\s*$", re.IGNORECASE
+    r"^##\s+Every\s+(\d+)\s+(minutes?|hours?|days?)\s*$", re.IGNORECASE
 )
 _DAILY_RE = re.compile(
     r"^##\s+Daily.*?(\d{1,2}):(\d{2})", re.IGNORECASE
@@ -493,13 +672,23 @@ def _parse_heartbeat_md(content: str) -> list[HeartbeatItem]:
     is_daily = False
 
     for line in content.splitlines():
-        # Section heading: ## Every N minutes/hours
+        # Section heading: ## Every N minutes/hours/days
         m = _INTERVAL_RE.match(line)
         if m:
             n = int(m.group(1))
             unit = m.group(2).lower()
             if "hour" in unit:
                 n *= 60
+            elif "day" in unit:
+                n *= 1440  # 24 * 60
+            # Skip nonsensical "Every 0 X" sections — without this the items
+            # underneath would inherit interval_min=0 and be treated as daily,
+            # which is almost certainly NOT what the user meant.
+            if n <= 0:
+                logger.warning("HEARTBEAT.md: ignoring section '%s' (interval must be > 0)", line.strip())
+                current_interval_min = -1   # sentinel — items with this are dropped
+                is_daily = False
+                continue
             current_interval_min = n
             is_daily = False
             continue
@@ -517,6 +706,9 @@ def _parse_heartbeat_md(content: str) -> list[HeartbeatItem]:
         # Task item: - [ ] description
         m = _ITEM_RE.match(line)
         if m:
+            # Drop items in invalid sections (current_interval_min == -1)
+            if current_interval_min == -1 and not is_daily:
+                continue
             label = m.group(1).strip()
             handler_key = _match_handler_key(label)
             items.append(HeartbeatItem(
@@ -529,6 +721,43 @@ def _parse_heartbeat_md(content: str) -> list[HeartbeatItem]:
     return items
 
 
+# Items with interval >= this threshold persist their last_run timestamp
+# across orchestrator restarts. Without this, a `## Every 30 days` item would
+# run on every --watch restart (which can cost real LLM tokens). Short-interval
+# items are not persisted because they run frequently anyway and the persistence
+# I/O would dominate.
+_PERSIST_INTERVAL_THRESHOLD_MIN = 1440  # 1 day
+
+# State file lives next to the orchestrator; intentionally NOT in the vault.
+_HEARTBEAT_STATE_FILE = Path(__file__).parent / "logs" / "heartbeat-state.json"
+
+
+def _load_heartbeat_state() -> dict:
+    """Load persisted last_run timestamps for long-interval items.
+
+    Returns: {label: {"last_run": iso8601, "last_run_date": iso8601-date}} or {}.
+    Tolerates missing/corrupt file — never raises.
+    """
+    if not _HEARTBEAT_STATE_FILE.exists():
+        return {}
+    try:
+        import json
+        return json.loads(_HEARTBEAT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("heartbeat-state.json unreadable, ignoring: %s", e)
+        return {}
+
+
+def _save_heartbeat_state(state: dict) -> None:
+    """Persist long-interval last_run state. Best-effort — never raises."""
+    try:
+        import json
+        _HEARTBEAT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HEARTBEAT_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug("heartbeat-state.json write failed: %s", e)
+
+
 # ── HeartbeatRunner ───────────────────────────────────────────────────────────
 
 class HeartbeatRunner:
@@ -539,6 +768,49 @@ class HeartbeatRunner:
         self._mtime: float = 0.0
         self._lock = threading.Lock()  # prevents concurrent run_due() calls
         self._reload_if_changed()
+        self._restore_persistent_state()
+
+    def _is_persistent(self, item: HeartbeatItem) -> bool:
+        """True for items whose last_run survives orchestrator restarts.
+
+        Daily items (interval_min == 0) and long-interval items (>= 1 day)
+        qualify. Short intervals stay in-memory only.
+        """
+        return item.interval_min == 0 or item.interval_min >= _PERSIST_INTERVAL_THRESHOLD_MIN
+
+    def _restore_persistent_state(self) -> None:
+        """Hydrate long-interval items' last_run from disk."""
+        state = _load_heartbeat_state()
+        if not state:
+            return
+        for item in self._items:
+            if not self._is_persistent(item):
+                continue
+            entry = state.get(item.label)
+            if not isinstance(entry, dict):
+                continue
+            try:
+                last_run = entry.get("last_run")
+                if last_run:
+                    item.last_run = datetime.fromisoformat(last_run)
+                last_date = entry.get("last_run_date")
+                if last_date:
+                    item.last_run_date = date.fromisoformat(last_date)
+            except (ValueError, TypeError):
+                logger.debug("heartbeat-state: bad entry for '%s'", item.label)
+
+    def _persist_state(self) -> None:
+        """Write current persistent items' last_run to disk."""
+        state: dict = {}
+        for item in self._items:
+            if not self._is_persistent(item) or item.last_run is None:
+                continue
+            entry = {"last_run": item.last_run.isoformat()}
+            if item.last_run_date:
+                entry["last_run_date"] = item.last_run_date.isoformat()
+            state[item.label] = entry
+        if state:
+            _save_heartbeat_state(state)
 
     def _reload_if_changed(self) -> None:
         """Reload HEARTBEAT.md if file has changed since last load."""
@@ -560,6 +832,9 @@ class HeartbeatRunner:
 
             self._items = new_items
             self._mtime = mtime
+            # Restore persistent state for items that didn't survive in-memory
+            # (e.g. user added a new monthly item after the last reload).
+            self._restore_persistent_state()
             logger.debug("HEARTBEAT.md loaded: %d items", len(self._items))
         except Exception as e:
             logger.warning("Failed to load HEARTBEAT.md: %s", e)
@@ -624,12 +899,15 @@ class HeartbeatRunner:
         except Exception:
             send_message = None
 
+        any_persistent_ran = False
         for item in due:
             try:
                 result = self._run_item(item, queue_read_fn, dispatcher)
                 now = datetime.now()
                 item.last_run = now
                 item.last_run_date = now.date()
+                if self._is_persistent(item):
+                    any_persistent_ran = True
 
                 if result:
                     logger.info("Heartbeat [%s]: %s", item.label, result[:1000])
@@ -641,6 +919,10 @@ class HeartbeatRunner:
                             logger.warning("Heartbeat notify failed: %s", e)
             except Exception as e:
                 logger.warning("Heartbeat item '%s' failed: %s", item.label, e)
+
+        # Persist state at most once per run_due() call, only when needed
+        if any_persistent_ran:
+            self._persist_state()
 
     def _run_item(
         self,
@@ -672,6 +954,10 @@ class HeartbeatRunner:
             return _check_stale_branches()
         elif key == "_check_usage_suggest":
             return _check_usage_suggest(queue_read_fn)
+        elif key == "_check_session_cleanup":
+            return _check_session_cleanup()
+        elif key == "_check_model_updates":
+            return _check_model_updates()
         else:
             logger.debug("No handler for heartbeat item: %s", item.label)
             return None

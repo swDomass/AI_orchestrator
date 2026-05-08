@@ -493,6 +493,46 @@ def test_set_queue_idle_false_when_already_active_does_not_wake(monkeypatch):
     assert not fake_wake.is_set()
 
 
+# ── set_paused tests ──────────────────────────────────────────────────────────
+
+def test_set_paused_true_sets_event_without_waking(monkeypatch):
+    fake_paused = threading.Event()
+    fake_wake = threading.Event()
+    monkeypatch.setattr(limits, "_paused", fake_paused)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+
+    limits.set_paused(True)
+
+    assert fake_paused.is_set()
+    assert not fake_wake.is_set()  # don't wake — we want the thread to stay quiet
+
+
+def test_set_paused_false_after_pause_wakes_thread(monkeypatch):
+    """Resume must wake the bg thread so the cache is fresh before the next task."""
+    fake_paused = threading.Event()
+    fake_paused.set()  # was paused
+    fake_wake = threading.Event()
+    monkeypatch.setattr(limits, "_paused", fake_paused)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+
+    limits.set_paused(False)
+
+    assert not fake_paused.is_set()
+    assert fake_wake.is_set()
+
+
+def test_set_paused_false_when_not_paused_does_not_wake(monkeypatch):
+    fake_paused = threading.Event()  # not set
+    fake_wake = threading.Event()
+    monkeypatch.setattr(limits, "_paused", fake_paused)
+    monkeypatch.setattr(limits, "_bg_wake", fake_wake)
+
+    limits.set_paused(False)
+
+    assert not fake_paused.is_set()
+    assert not fake_wake.is_set()
+
+
 def test_get_limits_returns_cached_result_without_extra_call(monkeypatch):
     """With a populated cache, get_limits() returns immediately without calling _get_limits_fresh."""
     call_count = {"n": 0}

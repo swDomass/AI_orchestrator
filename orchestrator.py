@@ -52,7 +52,7 @@ from config import (
     get_system_prompt,
 )
 from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag
-from limits import get_limits, set_queue_idle, AllLimits, report_estimated_usage, estimate_task_usage_pct
+from limits import get_limits, set_queue_idle, set_paused, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
     notify_error,
     notify_providers_exhausted,
@@ -1214,8 +1214,12 @@ def run_watch(dry_run: bool = False) -> None:
             # Honour /pause command from Telegram
             if pause_event.is_set():
                 print("\n[pause] Orchestrator pausiert. Warte auf /resume...")
-                while pause_event.is_set():
-                    time.sleep(5)
+                set_paused(True)   # stop bg cclimits polling while paused
+                try:
+                    while pause_event.is_set():
+                        time.sleep(5)
+                finally:
+                    set_paused(False)   # resume → bg thread refreshes immediately
                 print("[pause] Fortgesetzt.")
                 continue
 

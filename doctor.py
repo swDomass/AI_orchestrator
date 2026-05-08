@@ -385,6 +385,74 @@ def check_policy_file() -> CheckResult:
         return CheckResult(WARN, "Policy file", f"check failed: {e}")
 
 
+def check_model_aliases() -> CheckResult:
+    """CLI-probe every entry in CLAUDE/GEMINI/CODEX_MODEL_ALIASES.
+
+    Cheap definitive check — the LLM Phase B from the heartbeat is intentionally
+    NOT included here so `--doctor` stays fast and side-effect-free. Verdict:
+    - PASS: all model IDs respond to a minimal ping.
+    - WARN: one or more transient probe errors (rate-limit, timeout) — could not verify.
+    - FAIL: at least one ID was rejected as unknown/deprecated by its provider CLI.
+
+    Probes run concurrently (ThreadPoolExecutor) — `_forced_model` is
+    threading.local on the provider singletons, so per-thread model
+    selection is safe.
+    """
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from config import (
+            CLAUDE_MODEL_ALIASES,
+            CODEX_MODEL_ALIASES,
+            GEMINI_MODEL_ALIASES,
+        )
+        from heartbeat import _probe_model
+    except ImportError as e:
+        return CheckResult(WARN, "Model IDs", f"import failed: {e}")
+
+    probes: list[tuple[str, str, str]] = []  # (provider, tag, model_id)
+    for provider, mapping in (
+        ("claude", CLAUDE_MODEL_ALIASES),
+        ("gemini", GEMINI_MODEL_ALIASES),
+        ("codex",  CODEX_MODEL_ALIASES),
+    ):
+        for tag, model_id in mapping.items():
+            probes.append((provider, tag, model_id))
+
+    total = len(probes)
+    dead: list[str] = []
+    transient: list[str] = []
+
+    def _run_probe(item: tuple[str, str, str]) -> tuple[str, str, bool, str]:
+        provider, tag, model_id = item
+        try:
+            alive, detail = _probe_model(provider, model_id, timeout_sec=20)
+            return tag, model_id, alive, detail
+        except Exception as e:
+            return tag, model_id, True, f"transient probe error: {e}"
+
+    # max_workers=total caps at the actual number of probes; subprocess I/O
+    # dominates so the GIL is a non-issue.
+    with ThreadPoolExecutor(max_workers=max(1, total)) as pool:
+        for tag, model_id, alive, detail in pool.map(_run_probe, probes):
+            if not alive:
+                dead.append(f"{tag} → {model_id}: {detail}")
+            elif detail and detail.startswith("transient"):
+                transient.append(f"{tag} ({model_id})")
+
+    if dead:
+        msg = f"{len(dead)}/{total} dead — " + "; ".join(dead[:3])
+        if len(dead) > 3:
+            msg += f"; +{len(dead) - 3} more"
+        return CheckResult(
+            FAIL, "Model IDs", msg,
+            fix_hint="Update config.py CLAUDE/GEMINI/CODEX_MODEL_ALIASES with current IDs from each provider's docs",
+        )
+    if transient:
+        msg = f"{total - len(transient)}/{total} verified, {len(transient)} unverified (transient errors)"
+        return CheckResult(WARN, "Model IDs", msg)
+    return CheckResult(PASS, "Model IDs", f"{total} aliases verified live via CLI ping")
+
+
 def check_skills() -> CheckResult:
     try:
         from skills.discovery import discover_skills
@@ -443,6 +511,7 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_heartbeat_file(),
         check_profiles(),
         check_policy_file(),
+        check_model_aliases(),
     ]
 
     any_fail = False

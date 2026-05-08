@@ -21,7 +21,7 @@ from config import (
 from limits import is_cached_provider_available
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _make_capacity_exhausted_result
+from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, _build_system_prompt, _make_capacity_exhausted_result
 
 # Matches priority findings like: - [P1] Some issue
 FINDING_RE = re.compile(r"^\s*-\s+\[P[1-3]\]\s+.+", re.MULTILINE)
@@ -71,16 +71,24 @@ Output format (strict):
 - If no findings (or no uncommitted changes): output exactly: `No P1/P2/P3 findings.`
 """
 
-_FIX_PROMPT_BODY = """
-You are fixing issues found by a code review (iteration {iteration}).
+# Fix prompt is split into a STABLE prefix (cached across iterations) and a
+# VOLATILE suffix (iteration-specific findings + lessons hint). Anthropic
+# prompt cache matches the longest identical prefix → keeping the stable
+# part in front maximises cross-iteration cache hits.
+_FIX_PROMPT_STABLE = """
+You are fixing issues found by a code review.
 
 Task:
 - Fix ALL P1, P2, and P3 issues listed below.
 - Apply changes directly to the files.
 - Run validation/tests if feasible.
 - Summarize what was fixed.
+"""
 
-Review findings:
+_FIX_PROMPT_VOLATILE = """
+Iteration: {iteration}
+
+Review findings (must all be addressed):
 {findings}
 {lessons_hint}"""
 
@@ -137,8 +145,21 @@ class ReviewLoopTool(BaseTool):
         fix_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
         verification_timeout = timeout or TOOL_VERIFICATION_TIMEOUT_SEC
 
-        total_input_tokens = 0
-        total_output_tokens = 0
+        tokens = TokenCounter()
+
+        # Phase B: optional shared session across review→fix iterations.
+        # cap=5 triggers a rollover; the next review prompt is independent
+        # (always reads `git diff` fresh), so a fresh session continues cleanly.
+        sess = SessionContext.create(provider, tool_name=self.name, cwd=cwd, cap=5)
+        first_call = True
+
+        def _session_kwargs() -> dict:
+            nonlocal first_call
+            if not sess.enabled:
+                return {}
+            kw = sess.first_call_kwargs() if first_call else sess.resume_kwargs()
+            first_call = False
+            return kw
 
         # Load lessons for fix-prompt injection
         try:
@@ -153,16 +174,29 @@ class ReviewLoopTool(BaseTool):
             if not is_cached_provider_available(provider.name):
                 msg = f"Provider nicht verfügbar — Suspend nach Iteration {iteration - 1}"
                 print(f"  [review-loop] ⏸ {msg}")
-                return _make_capacity_exhausted_result(msg, "\n\n".join(all_outputs), iteration - 1, total_input_tokens, total_output_tokens)
+                return _make_capacity_exhausted_result(
+                    msg, "\n\n".join(all_outputs), iteration - 1, **tokens.as_kwargs(),
+                )
 
             # Step 1: Review
             review_result = provider.run(
                 review_prompt,
                 cwd=cwd,
                 timeout=review_timeout,
+                read_only=True,  # safe-by-CLI: review must not edit files
+                **_session_kwargs(),
             )
-            total_input_tokens += review_result.input_tokens
-            total_output_tokens += review_result.output_tokens
+            # Fallback: session lost between calls (e.g. cleanup race) — reset.
+            if not review_result.success and review_result.error == "session_missing":
+                print("  [review-loop] ⚠️ Session missing — Fallback auf fresh session")
+                sess.rollover(self.name, cwd)
+                first_call = True
+                review_result = provider.run(
+                    review_prompt, cwd=cwd, timeout=review_timeout,
+                    read_only=True,
+                    **_session_kwargs(),
+                )
+            tokens.add(review_result)
 
             if not review_result.success:
                 msg = f"Review fehlgeschlagen: {review_result.error}"
@@ -175,8 +209,7 @@ class ReviewLoopTool(BaseTool):
                     error=msg,
                     error_code=review_result.error,
                     retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             all_outputs.append(f"--- Review {iteration} ---\n{review_result.output}")
@@ -196,8 +229,7 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             print(f"  [review-loop] {len(findings)} Findings gefunden")
@@ -218,9 +250,19 @@ class ReviewLoopTool(BaseTool):
                         verify_prompt,
                         cwd=cwd,
                         timeout=verification_timeout,
+                        read_only=True,  # verification must not edit files
+                        **_session_kwargs(),
                     )
-                    total_input_tokens += verify_result.input_tokens
-                    total_output_tokens += verify_result.output_tokens
+                    if not verify_result.success and verify_result.error == "session_missing":
+                        print("  [review-loop] ⚠️ Session missing in Verification — Fallback")
+                        sess.rollover(self.name, cwd)
+                        first_call = True
+                        verify_result = provider.run(
+                            verify_prompt, cwd=cwd, timeout=verification_timeout,
+                            read_only=True,
+                            **_session_kwargs(),
+                        )
+                    tokens.add(verify_result)
 
                     if verify_result.success:
                         all_outputs.append(
@@ -247,8 +289,7 @@ class ReviewLoopTool(BaseTool):
                     success=True,
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             # Check for repeated findings (infinite loop detection)
@@ -262,8 +303,7 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
             seen_signatures.add(signature)
             last_findings_tuple = signature
@@ -289,9 +329,11 @@ class ReviewLoopTool(BaseTool):
                 except (ImportError, OSError, ValueError):
                     pass
 
+            # Stable prefix (cached) + volatile suffix (iteration-specific).
             fix_prompt = (
                 f"{system_prompt}\n\n"
-                + _FIX_PROMPT_BODY.format(
+                + _FIX_PROMPT_STABLE
+                + _FIX_PROMPT_VOLATILE.format(
                     iteration=iteration,
                     findings=findings_text,
                     lessons_hint=lessons_hint,
@@ -302,9 +344,17 @@ class ReviewLoopTool(BaseTool):
                 fix_prompt,
                 cwd=cwd,
                 timeout=fix_timeout,
+                **_session_kwargs(),
             )
-            total_input_tokens += fix_result.input_tokens
-            total_output_tokens += fix_result.output_tokens
+            if not fix_result.success and fix_result.error == "session_missing":
+                print("  [review-loop] ⚠️ Session missing in Fix — Fallback")
+                sess.rollover(self.name, cwd)
+                first_call = True
+                fix_result = provider.run(
+                    fix_prompt, cwd=cwd, timeout=fix_timeout,
+                    **_session_kwargs(),
+                )
+            tokens.add(fix_result)
 
             if not fix_result.success:
                 msg = f"Fix fehlgeschlagen in Iteration {iteration}: {fix_result.error}"
@@ -317,12 +367,23 @@ class ReviewLoopTool(BaseTool):
                     error=msg,
                     error_code=fix_result.error,
                     retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
             print(f"  [review-loop] Fix durchgeführt. Starte Re-Review...")
+
+            # Phase B: rollover session every cap iterations to bound conversation
+            # length. Review prompt always reads `git diff` fresh, so a fresh
+            # session continues without loss.
+            sess.bump()
+            if sess.needs_rollover():
+                print(
+                    f"  [review-loop] Session-Rollover nach {sess.iteration_count} "
+                    f"Iterationen (cap={sess.cap})"
+                )
+                sess.rollover(self.name, cwd)
+                first_call = True
 
             # Small pause between iterations
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
@@ -336,6 +397,5 @@ class ReviewLoopTool(BaseTool):
             output="\n\n".join(all_outputs),
             iterations=TOOL_MAX_ITERATIONS,
             error=msg,
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens,
+            **tokens.as_kwargs(),
         )

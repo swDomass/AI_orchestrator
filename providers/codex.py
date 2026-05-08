@@ -39,6 +39,8 @@ class CodexProvider(BaseProvider):
         cwd: str | None = None,
         timeout: int = TASK_TIMEOUT_SEC,
         read_only: bool = False,
+        session_id: str | None = None,  # accepted but ignored (supports_sessions=False)
+        resume: bool = False,            # accepted but ignored
     ) -> RunResult:
         model_label = self._forced_model
         if model_label:

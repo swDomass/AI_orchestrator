@@ -40,7 +40,7 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | # | Feature | Status |
 |---|---------|--------|
 | 10 | Tool policy layering (global > profile > task) | DONE |
-| 11 | Session management (context per task) | backlog |
+| 11 | Session management (Claude `--session-id` / `--resume` across tool phases) | DONE (opt-in via `CLAUDE_SESSION_ENABLED`) |
 | 12 | Optional Docker sandbox | backlog |
 | 13 | Dashboard / web UI | DONE |
 | 14 | Plugin system (runtime-loadable handlers) | backlog |

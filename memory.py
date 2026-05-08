@@ -209,8 +209,16 @@ def store_result(
     cwd: Optional[str] = None,
     *,
     success: bool = True,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
 ) -> Optional[Path]:
     """Write a task result to memory/task_results/.
+
+    Token fields are written into the frontmatter for billing analytics
+    (analytics.py reads them). Default 0 keeps backward compatibility for
+    callers that don't track tokens (e.g. parallel aggregation).
 
     Returns the path written, or None on error.
     """
@@ -227,6 +235,10 @@ def store_result(
             f"duration_sec: {duration_sec:.1f}\n"
             f"timestamp: {ts}\n"
             f"success: {str(success).lower()}\n"
+            f"input_tokens: {input_tokens}\n"
+            f"output_tokens: {output_tokens}\n"
+            f"cache_creation_input_tokens: {cache_creation_input_tokens}\n"
+            f"cache_read_input_tokens: {cache_read_input_tokens}\n"
             f"---\n\n"
         )
 

@@ -149,6 +149,14 @@ class SecurityAuditTool(BaseTool):
         # ------------------------------------------------------------------ #
         # Phase 1 — Audit (read-only)                                         #
         # ------------------------------------------------------------------ #
+        # NOTE on Phase B (sessions): security-audit Phase 1 is a SINGLE
+        # subprocess call — there is no second call within Phase 1 that could
+        # benefit from --resume. Phase 2 (fix) intentionally runs in a fresh
+        # subprocess because it consumes Phase 1's output as injected text
+        # rather than as conversation history. The Phase A static-prompt-prefix
+        # cache (--exclude-dynamic-system-prompt-sections) already captures the
+        # cross-task cache reuse here. Session-based optimisation would only
+        # become relevant if Phase 1 were sub-divided into multiple calls.
         if not is_cached_provider_available(provider.name):
             msg = "Provider nicht verfügbar — Security Audit abgebrochen"
             print(f"  [security-audit] ⏸ {msg}")

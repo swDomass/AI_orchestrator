@@ -36,6 +36,10 @@ class TaskRecord:
     timestamp: datetime
     success: bool
     source: str  # "task_results" | "archive"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,12 @@ def _parse_task_file(path: Path, source: str = "task_results") -> Optional[TaskR
         except OSError:
             return None
 
+    def _int(field: str) -> int:
+        try:
+            return int(meta.get(field, 0) or 0)
+        except (ValueError, TypeError):
+            return 0
+
     return TaskRecord(
         task=meta.get("task", ""),
         provider=meta.get("provider", ""),
@@ -103,6 +113,10 @@ def _parse_task_file(path: Path, source: str = "task_results") -> Optional[TaskR
         timestamp=ts,
         success=meta.get("success", "true").lower() not in ("false", "0"),
         source=source,
+        input_tokens=_int("input_tokens"),
+        output_tokens=_int("output_tokens"),
+        cache_creation_input_tokens=_int("cache_creation_input_tokens"),
+        cache_read_input_tokens=_int("cache_read_input_tokens"),
     )
 
 
@@ -365,6 +379,53 @@ def _avg_duration(records: list[TaskRecord]) -> float:
     return round(sum(durations) / len(durations), 1)
 
 
+# Anthropic billing weights — billing only, NOT used for 5h/7d quota estimation.
+# Source: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+# Output tokens cost ~5× input tokens (3× to 5× depending on model — averaged).
+_BILLING_WEIGHT_INPUT          = 1.0
+_BILLING_WEIGHT_CACHE_CREATION = 1.25
+_BILLING_WEIGHT_CACHE_READ     = 0.1
+_BILLING_WEIGHT_OUTPUT         = 5.0
+
+
+def _billing_cost_units(records: list[TaskRecord]) -> dict[str, float]:
+    """Aggregate weighted billing-token-units across records (NOT $ — relative cost).
+
+    Used for cost-trend visualization on the dashboard. Quota tracking
+    (5h/7d) does NOT use these weights — see limits.py.
+    """
+    inp = sum(r.input_tokens for r in records)
+    out = sum(r.output_tokens for r in records)
+    cc = sum(r.cache_creation_input_tokens for r in records)
+    cr = sum(r.cache_read_input_tokens for r in records)
+    weighted = (
+        inp * _BILLING_WEIGHT_INPUT
+        + cc * _BILLING_WEIGHT_CACHE_CREATION
+        + cr * _BILLING_WEIGHT_CACHE_READ
+        + out * _BILLING_WEIGHT_OUTPUT
+    )
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_creation_input_tokens": cc,
+        "cache_read_input_tokens": cr,
+        "weighted_units": round(weighted, 1),
+    }
+
+
+def _cache_hit_rate(records: list[TaskRecord]) -> float:
+    """Cache hit rate as percentage of total INPUT path (cache_read /
+    (input + cache_creation + cache_read)). Range 0-100. Higher is better.
+    """
+    cc = sum(r.cache_creation_input_tokens for r in records)
+    cr = sum(r.cache_read_input_tokens for r in records)
+    inp = sum(r.input_tokens for r in records)
+    total = inp + cc + cr
+    if total == 0:
+        return 0.0
+    return round(cr / total * 100, 1)
+
+
 def _limits_timeline(
     snapshots: list[LimitSnapshot],
     hours: int = 7 * 24,
@@ -495,6 +556,10 @@ def get_dashboard_data(days: int = 7) -> dict:
     cutoff_24h = datetime.now() - timedelta(hours=24)
     suggest_today = sum(1 for e in suggest_events if e.timestamp >= cutoff_24h)
 
+    # Window cutoff for "recent" billing/cache stats (last `days` days).
+    cutoff_window = datetime.now() - timedelta(days=days)
+    recent_records = [r for r in records if r.timestamp >= cutoff_window]
+
     data = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "total_tasks": len(records),
@@ -508,6 +573,12 @@ def get_dashboard_data(days: int = 7) -> dict:
         "recent_events": _recent_events(error_lines, queue_events, suggest_events),
         "usage_suggest_today": suggest_today,
         "session": session,
+        # Billing analytics — weighted token cost + cache-hit-rate (last `days` days).
+        # NOT used for quota gates (see limits.py for the quota path).
+        "billing_recent": _billing_cost_units(recent_records),
+        "billing_total":  _billing_cost_units(records),
+        "cache_hit_rate_recent": _cache_hit_rate(recent_records),
+        "cache_hit_rate_total":  _cache_hit_rate(records),
     }
 
     _cache["data"] = data

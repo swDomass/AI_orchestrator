@@ -11,12 +11,13 @@ from tools.dev_loop import DevLoopTool, _parse_resolution
 class _ScriptedProvider:
     """Returns pre-scripted outputs in order."""
     name = "claude"
+    supports_sessions = False
 
     def __init__(self, outputs: list[str]):
         self._outputs = list(outputs)
         self.prompts: list[str] = []
 
-    def run(self, task: str, cwd: str | None = None, timeout: int = 0) -> RunResult:
+    def run(self, task: str, cwd: str | None = None, timeout: int = 0, **kwargs) -> RunResult:
         self.prompts.append(task)
         if not self._outputs:
             return RunResult(success=False, error="no scripted output left")
@@ -59,41 +60,40 @@ def test_parse_resolution_earliest_match_wins():
 def test_dev_loop_succeeds_in_one_iteration(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "## Problem Analysis\nBug found.\n## Relevant Files\nauth.py\n## Implementation Plan\nFix it.",  # research
-        "## Implementation Plan\n1. Fix the auth bug.",                                                    # plan
-        "Fixed the bug in auth.py.",                                                                       # execution
-        "No P1/P2/P3 findings.",                                                                           # quality review
-        "RESOLVED: Bug is fixed.",                                                                         # resolution review
+        "## Problem Analysis\nBug found.\n## Relevant Files\nauth.py\n## Implementation Plan\n1. Fix the auth bug.",  # research+plan merged
+        "Fixed the bug in auth.py.",                                                                                    # execution
+        "No P1/P2/P3 findings.",                                                                                        # quality review
+        "RESOLVED: Bug is fixed.",                                                                                      # resolution review
     ])
     tool = DevLoopTool()
     result = tool.run("Fix login bug", provider, cwd=str(tmp_path))
 
     assert result.success is True
     assert result.iterations == 1
-    assert len(provider.prompts) == 5
+    assert len(provider.prompts) == 4
 
 
-def test_dev_loop_writes_research_file(monkeypatch, tmp_path):
+def test_dev_loop_writes_research_and_plan_file(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "## Problem Analysis\nFound it.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nFound it.\n## Implementation Plan\n1. Fix it.",
         "Fixed.",
         "No P1/P2/P3 findings.",
         "RESOLVED: done.",
     ])
     DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
 
-    research_file = tmp_path / ".dev-loop" / "research.md"
-    assert research_file.exists()
-    assert "Found it." in research_file.read_text(encoding="utf-8")
+    rp_file = tmp_path / ".dev-loop" / "research-and-plan.md"
+    assert rp_file.exists()
+    content = rp_file.read_text(encoding="utf-8")
+    assert "Found it." in content
+    assert "Fix it." in content
 
 
 def test_dev_loop_writes_round_file(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research output.",
-        "## Implementation Plan\n1. Do it.",
+        "## Problem Analysis\nResearch output.\n## Implementation Plan\n1. Do it.",
         "Execution output.",
         "No P1/P2/P3 findings.",
         "RESOLVED: task solved.",
@@ -110,8 +110,7 @@ def test_dev_loop_writes_round_file(monkeypatch, tmp_path):
 def test_dev_loop_writes_summary_on_success(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Execution.",
         "No P1/P2/P3 findings.",
         "RESOLVED: done.",
@@ -128,8 +127,7 @@ def test_dev_loop_writes_summary_on_success(monkeypatch, tmp_path):
 def test_dev_loop_retries_on_quality_failure(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",                                    # research
-        "## Implementation Plan\n1. Fix it.",           # plan
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",  # research+plan merged
         "First attempt.",                               # execution iter 1
         "- [P1] Null pointer in auth.py",               # quality review iter 1 — fail
         "RESOLVED: task done.",                         # resolution review iter 1
@@ -149,8 +147,7 @@ def test_dev_loop_retries_on_quality_failure(monkeypatch, tmp_path):
 def test_dev_loop_retries_on_resolution_partial(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Partial fix.",
         "No P1/P2/P3 findings.",           # quality ok
         "PARTIAL: logout not fixed yet.",  # resolution fail
@@ -167,8 +164,7 @@ def test_dev_loop_retries_on_resolution_partial(monkeypatch, tmp_path):
 def test_dev_loop_previous_reviews_passed_to_execution(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Bad impl.",
         "- [P2] Missing error handling",
         "PARTIAL: logout not fixed.",
@@ -180,8 +176,8 @@ def test_dev_loop_previous_reviews_passed_to_execution(monkeypatch, tmp_path):
     tool.run("Fix bug", provider, cwd=str(tmp_path))
 
     # Second execution prompt must contain both previous reviews
-    # prompts: research(0), plan(1), exec1(2), qual1(3), res1(4), exec2(5)
-    exec_prompt_iter2 = provider.prompts[5]
+    # prompts: research+plan(0), exec1(1), qual1(2), res1(3), exec2(4)
+    exec_prompt_iter2 = provider.prompts[4]
     assert "QUALITY REVIEW" in exec_prompt_iter2
     assert "Missing error handling" in exec_prompt_iter2
     assert "RESOLUTION REVIEW" in exec_prompt_iter2
@@ -193,8 +189,7 @@ def test_dev_loop_previous_reviews_passed_to_execution(monkeypatch, tmp_path):
 def test_dev_loop_p3_only_quality_does_not_block(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Do it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Do it.",
         "Implementation.",
         "- [P3] Minor naming issue in utils.py",  # P3 only → non-blocking
         "RESOLVED: done.",
@@ -212,7 +207,8 @@ def test_dev_loop_fails_on_research_error(monkeypatch, tmp_path):
 
     class _FailResearch:
         name = "claude"
-        def run(self, task, cwd=None, timeout=0):
+        supports_sessions = False
+        def run(self, task, cwd=None, timeout=0, **kwargs):
             return RunResult(success=False, error="timeout")
 
     result = DevLoopTool().run("Fix bug", _FailResearch(), cwd=str(tmp_path))
@@ -229,11 +225,15 @@ def test_dev_loop_fails_on_execution_error(monkeypatch, tmp_path):
 
     class _FailExec:
         name = "claude"
+        supports_sessions = False
         _calls = 0
-        def run(self, task, cwd=None, timeout=0):
+        def run(self, task, cwd=None, timeout=0, **kwargs):
             self._calls += 1
-            if self._calls <= 2:  # research + plan
-                return RunResult(success=True, output="Research output." if self._calls == 1 else "## Implementation Plan\n1. Fix it.")
+            if self._calls == 1:  # research+plan merged
+                return RunResult(
+                    success=True,
+                    output="## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+                )
             return RunResult(success=False, error="exec error")
 
     result = DevLoopTool().run("Fix bug", _FailExec(), cwd=str(tmp_path))
@@ -248,8 +248,7 @@ def test_dev_loop_detects_infinite_loop(monkeypatch, tmp_path):
     _patch(monkeypatch)
     # Same P1 finding twice → infinite loop detection
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Attempt 1.",
         "- [P1] Missing auth check",  # quality iter 1
         "RESOLVED: done.",
@@ -266,8 +265,7 @@ def test_dev_loop_detects_infinite_loop(monkeypatch, tmp_path):
 def test_dev_loop_fails_on_invalid_quality_review_output(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Implementation.",
         "Looks good overall.",  # invalid quality format
     ])
@@ -281,8 +279,7 @@ def test_dev_loop_fails_on_invalid_quality_review_output(monkeypatch, tmp_path):
 def test_dev_loop_fails_on_invalid_resolution_review_output(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Implementation.",
         "No P1/P2/P3 findings.",
         "Looks solved to me.",  # invalid resolution format
@@ -297,8 +294,7 @@ def test_dev_loop_fails_on_invalid_resolution_review_output(monkeypatch, tmp_pat
 def test_dev_loop_detects_repeated_resolution_feedback(monkeypatch, tmp_path):
     _patch(monkeypatch)
     provider = _ScriptedProvider([
-        "Research.",
-        "## Implementation Plan\n1. Fix it.",
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
         "Attempt 1.",
         "No P1/P2/P3 findings.",
         "PARTIAL: logout flow is still missing.",
@@ -320,14 +316,16 @@ def test_dev_loop_respects_max_iterations(monkeypatch, tmp_path):
 
     class _AlwaysFailing:
         name = "claude"
-        def run(self, task, cwd=None, timeout=0):
+        supports_sessions = False
+        def run(self, task, cwd=None, timeout=0, **kwargs):
             call_count[0] += 1
             n = call_count[0]
             if n == 1:
-                return RunResult(success=True, output="Research.")
-            if n == 2:
-                return RunResult(success=True, output="## Implementation Plan\n1. Fix it.")
-            adj = n - 2  # 1-based iteration cycle index
+                return RunResult(
+                    success=True,
+                    output="## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+                )
+            adj = n - 1  # 1-based iteration cycle index (research+plan eaten)
             phase = (adj - 1) % 3  # 0=exec, 1=quality, 2=resolution
             if phase == 0:  # execution
                 return RunResult(success=True, output=f"Attempt {n}.")

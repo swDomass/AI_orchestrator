@@ -204,51 +204,74 @@ def test_multiple_providers_concurrent_no_cross_contamination():
 # ---------------------------------------------------------------------------
 
 def test_parse_json_response_extracts_tokens():
-    """Valid JSON with usage data → output text + token counts."""
+    """Valid JSON with usage data → output text + token counts including cache fields."""
     import json
     data = {
         "type": "result",
         "subtype": "success",
         "result": "Hello world",
-        "usage": {"input_tokens": 5000, "output_tokens": 1200},
+        "usage": {
+            "input_tokens": 5000,
+            "output_tokens": 1200,
+            "cache_creation_input_tokens": 42051,
+            "cache_read_input_tokens": 24425,
+        },
     }
-    output, inp, out = ClaudeProvider._parse_json_response(json.dumps(data))
+    output, tokens = ClaudeProvider._parse_json_response(json.dumps(data))
     assert output == "Hello world"
-    assert inp == 5000
-    assert out == 1200
+    assert tokens["input_tokens"] == 5000
+    assert tokens["output_tokens"] == 1200
+    assert tokens["cache_creation_input_tokens"] == 42051
+    assert tokens["cache_read_input_tokens"] == 24425
 
 
 def test_parse_json_response_missing_usage():
     """JSON without usage field → tokens default to 0."""
     import json
     data = {"type": "result", "result": "ok"}
-    output, inp, out = ClaudeProvider._parse_json_response(json.dumps(data))
+    output, tokens = ClaudeProvider._parse_json_response(json.dumps(data))
     assert output == "ok"
-    assert inp == 0
-    assert out == 0
+    assert tokens == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
 
 
 def test_parse_json_response_plain_text_fallback():
     """Non-JSON stdout → returned as-is with 0 tokens."""
-    output, inp, out = ClaudeProvider._parse_json_response("plain text output")
+    output, tokens = ClaudeProvider._parse_json_response("plain text output")
     assert output == "plain text output"
-    assert inp == 0
-    assert out == 0
+    assert all(v == 0 for v in tokens.values())
 
 
 def test_parse_json_response_empty_string():
-    output, inp, out = ClaudeProvider._parse_json_response("")
+    output, tokens = ClaudeProvider._parse_json_response("")
     assert output == ""
-    assert inp == 0
-    assert out == 0
+    assert all(v == 0 for v in tokens.values())
 
 
 def test_parse_json_response_malformed_json():
     """Broken JSON → falls back to raw string."""
-    output, inp, out = ClaudeProvider._parse_json_response('{"broken')
+    output, tokens = ClaudeProvider._parse_json_response('{"broken')
     assert output == '{"broken'
-    assert inp == 0
-    assert out == 0
+    assert all(v == 0 for v in tokens.values())
+
+
+def test_parse_json_response_partial_cache_fields():
+    """Older JSON with only input/output_tokens → cache fields default to 0."""
+    import json
+    data = {
+        "type": "result",
+        "result": "ok",
+        "usage": {"input_tokens": 100, "output_tokens": 50},
+    }
+    output, tokens = ClaudeProvider._parse_json_response(json.dumps(data))
+    assert tokens["input_tokens"] == 100
+    assert tokens["output_tokens"] == 50
+    assert tokens["cache_creation_input_tokens"] == 0
+    assert tokens["cache_read_input_tokens"] == 0
 
 
 def test_claude_run_returns_tokens_from_json(monkeypatch):

@@ -348,6 +348,98 @@ class TestGetCurrentLimits:
         assert result["claude"]["remaining_pct"] == pytest.approx(5.0)
 
 
+class TestBillingAnalytics:
+    """Tests for cache-aware billing analytics (Phase A2)."""
+
+    def _make_record(self, **kwargs):
+        from analytics import TaskRecord
+        defaults = dict(
+            task="t", provider="claude", cwd="", duration_sec=1.0,
+            timestamp=datetime.now(), success=True, source="task_results",
+            input_tokens=0, output_tokens=0,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        )
+        defaults.update(kwargs)
+        return TaskRecord(**defaults)
+
+    def test_parse_token_fields_from_frontmatter(self, tmp_path):
+        from analytics import _parse_task_file
+        content = (
+            "---\n"
+            'task: "t"\n'
+            "provider: claude\n"
+            "cwd: /d/test\n"
+            "duration_sec: 1.0\n"
+            "timestamp: 2026-05-08T10:00:00\n"
+            "success: true\n"
+            "input_tokens: 100\n"
+            "output_tokens: 50\n"
+            "cache_creation_input_tokens: 5000\n"
+            "cache_read_input_tokens: 25000\n"
+            "---\n\n"
+            "Result."
+        )
+        (tmp_path / "t.md").write_text(content, encoding="utf-8")
+        rec = _parse_task_file(tmp_path / "t.md")
+        assert rec is not None
+        assert rec.input_tokens == 100
+        assert rec.output_tokens == 50
+        assert rec.cache_creation_input_tokens == 5000
+        assert rec.cache_read_input_tokens == 25000
+
+    def test_parse_missing_token_fields_default_zero(self, tmp_path):
+        # Old-format frontmatter without token fields → zeros (backward compat).
+        from analytics import _parse_task_file
+        _write_task_file(tmp_path, "old.md")
+        rec = _parse_task_file(tmp_path / "old.md")
+        assert rec is not None
+        assert rec.input_tokens == 0
+        assert rec.cache_creation_input_tokens == 0
+        assert rec.cache_read_input_tokens == 0
+
+    def test_billing_cost_units_weighted_sum(self):
+        from analytics import _billing_cost_units
+        records = [
+            self._make_record(input_tokens=100, output_tokens=50,
+                              cache_creation_input_tokens=1000,
+                              cache_read_input_tokens=10000),
+            self._make_record(input_tokens=200, output_tokens=20,
+                              cache_creation_input_tokens=0,
+                              cache_read_input_tokens=5000),
+        ]
+        result = _billing_cost_units(records)
+        # Weights: input×1, cache_creation×1.25, cache_read×0.1, output×5
+        # = 300×1 + 1000×1.25 + 15000×0.1 + 70×5 = 300+1250+1500+350 = 3400
+        assert result["weighted_units"] == 3400.0
+        assert result["input_tokens"] == 300
+        assert result["cache_read_input_tokens"] == 15000
+
+    def test_billing_cost_units_empty(self):
+        from analytics import _billing_cost_units
+        result = _billing_cost_units([])
+        assert result["weighted_units"] == 0
+        assert result["input_tokens"] == 0
+
+    def test_cache_hit_rate_calculation(self):
+        from analytics import _cache_hit_rate
+        records = [
+            # 100 fresh input + 1000 cache_creation + 10000 cache_read → 10000 / 11100 ≈ 90.1%
+            self._make_record(input_tokens=100, cache_creation_input_tokens=1000,
+                              cache_read_input_tokens=10000),
+        ]
+        rate = _cache_hit_rate(records)
+        assert rate == pytest.approx(90.1, abs=0.5)
+
+    def test_cache_hit_rate_no_cache(self):
+        from analytics import _cache_hit_rate
+        records = [self._make_record(input_tokens=100)]
+        assert _cache_hit_rate(records) == 0.0
+
+    def test_cache_hit_rate_empty(self):
+        from analytics import _cache_hit_rate
+        assert _cache_hit_rate([]) == 0.0
+
+
 class TestCache:
     def test_cache_returns_same_object(self, tmp_path):
         from analytics import get_dashboard_data, _cache

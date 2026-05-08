@@ -17,20 +17,45 @@ _CLAUDE_CMD = shutil.which("claude") or "claude"
 
 class ClaudeProvider(BaseProvider):
     name = "claude"
+    supports_sessions = True
 
     @staticmethod
-    def _build_command(read_only: bool) -> list[str]:
+    def _build_command(
+        read_only: bool,
+        session_id: str | None = None,
+        resume: bool = False,
+    ) -> list[str]:
         cmd = [
             _CLAUDE_CMD,
             "--print",
             "--output-format", "json",
+            # Move per-machine sections (cwd, env, git status) from system-prompt
+            # into the first user message → static system-prompt → Anthropic prompt
+            # cache hits across sequential subprocess calls (1h TTL).
+            "--exclude-dynamic-system-prompt-sections",
         ]
+        # Session flags: --session-id starts a NEW session with the given UUID;
+        # --resume continues an EXISTING session. Caller must track state.
+        # If CLAUDE_SESSION_ENABLED is False, session_id is silently ignored.
+        from config import CLAUDE_SESSION_ENABLED
+        if session_id and CLAUDE_SESSION_ENABLED:
+            if resume:
+                cmd.extend(["--resume", session_id])
+            else:
+                cmd.extend(["--session-id", session_id])
         if read_only:
-            cmd.extend(["--allowedTools", "Read,Glob,Grep"])
+            # Task is included so read-only multi-agent flows (deep-security-audit
+            # _run_subagent_mode style) can fan out to subagents even without
+            # write permissions. Task subagents inherit the parent's tool scope.
+            cmd.extend(["--allowedTools", "Read,Glob,Grep,Task"])
         else:
             cmd.extend([
                 "--dangerously-skip-permissions",
-                "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
+                # Task is required for tools that orchestrate via Claude's
+                # internal subagent system (deep-security-audit subagent-mode).
+                # Without it, the master prompt's "spawn 6 Task subagents in
+                # parallel" silently degrades to monolithic single-perspective.
+                "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep,Task",
             ])
         return cmd
 
@@ -40,13 +65,15 @@ class ClaudeProvider(BaseProvider):
         cwd: str | None = None,
         timeout: int = TASK_TIMEOUT_SEC,
         read_only: bool = False,
+        session_id: str | None = None,
+        resume: bool = False,
     ) -> RunResult:
         model_label = self._forced_model
         if model_label:
             print(f"  [claude → {model_label}] Führe Task aus...")
         else:
             print(f"  [claude] Führe Task aus...")
-        cmd = self._build_command(read_only=read_only)
+        cmd = self._build_command(read_only=read_only, session_id=session_id, resume=resume)
         if self._forced_model:
             cmd.extend(["--model", self._forced_model])
         try:
@@ -66,25 +93,28 @@ class ClaudeProvider(BaseProvider):
             stderr = (result.stderr or "").strip()
 
             # Try parsing JSON output for token counts
-            output, input_tokens, output_tokens = self._parse_json_response(stdout)
+            output, tokens = self._parse_json_response(stdout)
             json_payload = self._extract_json_payload(stdout)
 
             if result.returncode == 0 and output and self._is_success_output(
                 output=output,
                 json_payload=json_payload,
             ):
-                return RunResult(
-                    success=True, output=output,
-                    input_tokens=input_tokens, output_tokens=output_tokens,
-                )
+                return RunResult(success=True, output=output, **tokens)
 
             combined = (output + stderr).lower()
+            # Typed error: --resume against a non-existent UUID errors with this
+            # exact phrase. Tools should fall back to a fresh session + state inject.
+            if "no conversation found with session id" in combined:
+                return RunResult(success=False, error="session_missing", **tokens)
             if any(kw in combined for kw in ("rate limit", "usage limit", "quota", "overloaded")):
-                return RunResult(success=False, error="rate_limit",
-                                 input_tokens=input_tokens, output_tokens=output_tokens)
+                return RunResult(success=False, error="rate_limit", **tokens)
 
-            return RunResult(success=False, error=stderr or output or "empty output",
-                             input_tokens=input_tokens, output_tokens=output_tokens)
+            return RunResult(
+                success=False,
+                error=stderr or output or "empty output",
+                **tokens,
+            )
 
         except subprocess.TimeoutExpired:
             return RunResult(success=False, error="timeout")
@@ -125,18 +155,26 @@ class ClaudeProvider(BaseProvider):
         return isinstance(result, str) and bool(result.strip())
 
     @staticmethod
-    def _parse_json_response(stdout: str) -> tuple[str, int, int]:
+    def _parse_json_response(stdout: str) -> tuple[str, dict[str, int]]:
         """Parse Claude CLI JSON response.
 
-        Returns (output_text, input_tokens, output_tokens).
-        Falls back to (stdout, 0, 0) if not valid JSON.
+        Returns (output_text, token_dict). Token dict keys match RunResult fields:
+            input_tokens, output_tokens,
+            cache_creation_input_tokens, cache_read_input_tokens.
+        Falls back to (stdout, all-zero dict) if not valid JSON.
         """
+        zero = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
         if not stdout:
-            return stdout, 0, 0
+            return stdout, dict(zero)
 
         data = ClaudeProvider._extract_json_payload(stdout)
         if data is None:
-            return stdout, 0, 0
+            return stdout, dict(zero)
 
         # Re-serialize parsed JSON so structured errors do not re-include CLI noise.
         json_str = json.dumps(data)
@@ -145,8 +183,7 @@ class ClaudeProvider(BaseProvider):
         usage = data.get("usage", {})
         if not isinstance(usage, dict):
             usage = {}
-        return (
-            output,
-            usage.get("input_tokens", 0),
-            usage.get("output_tokens", 0),
-        )
+        tokens = {
+            key: int(usage.get(key, 0) or 0) for key in zero
+        }
+        return output, tokens

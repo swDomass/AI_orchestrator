@@ -537,7 +537,11 @@ def _execute_tool_task(
                     output=tool_result.output,
                 )
             memory_module.store_result(
-                task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True
+                task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True,
+                input_tokens=tool_result.input_tokens,
+                output_tokens=tool_result.output_tokens,
+                cache_creation_input_tokens=tool_result.cache_creation_input_tokens,
+                cache_read_input_tokens=tool_result.cache_read_input_tokens,
             )
             append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
             notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
@@ -579,6 +583,10 @@ def _execute_tool_task(
             memory_module.store_result(
                 task, tool_result.output or tool_result.error, provider_tool,
                 _tool_duration, cwd=cwd, success=False,
+                input_tokens=tool_result.input_tokens,
+                output_tokens=tool_result.output_tokens,
+                cache_creation_input_tokens=tool_result.cache_creation_input_tokens,
+                cache_read_input_tokens=tool_result.cache_read_input_tokens,
             )
             append_log(f"Tool {tool.name} Fehler: {tool_result.error}")
             notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
@@ -1071,7 +1079,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 ):
                     return False
                 memory_module.store_result(
-                    task, result.output, provider.name, duration, cwd=cwd, success=True
+                    task, result.output, provider.name, duration, cwd=cwd, success=True,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cache_creation_input_tokens=result.cache_creation_input_tokens,
+                    cache_read_input_tokens=result.cache_read_input_tokens,
                 )
                 append_log(f"Task erledigt via {provider.name}: {task[:60]}")
                 notify_task_done(task, provider.name, result.output, change_summary=change_summary)

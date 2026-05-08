@@ -472,6 +472,234 @@ class DeepSecurityAuditTool(BaseTool):
         memory_context: str = "",
         **kwargs,
     ) -> ToolResult:
+        # Phase C: capability switch. When the provider supports Claude's
+        # internal Task-tool subagents AND the session feature flag is on,
+        # delegate the 6 personas + CISO synthesis to a single subprocess
+        # that fans out via Task internally — fewer subprocess calls, full
+        # cache reuse, parallel persona execution. Otherwise: stay on
+        # today's sequential-subprocess path (still works fine).
+        from config import CLAUDE_SESSION_ENABLED
+        if getattr(provider, "supports_sessions", False) and CLAUDE_SESSION_ENABLED:
+            return self._run_subagent_mode(task, provider, cwd, timeout, memory_context)
+        return self._run_sequential_mode(task, provider, cwd, timeout, memory_context)
+
+    def _run_subagent_mode(
+        self,
+        task: str,
+        provider: BaseProvider,
+        cwd: str | None,
+        timeout: int | None,
+        memory_context: str,
+    ) -> ToolResult:
+        """Single-subprocess mode: Claude internally spawns 6 personas as
+        Task-tool subagents in parallel, writes per-agent reports + the
+        combined CISO synthesis. Phase 8 (fix) runs in a separate fresh
+        subprocess as before — fix is a write-phase that benefits from a
+        clean read of just-written audit files rather than from session
+        sharing.
+        """
+        cwd_path = Path(cwd) if cwd else Path(".")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        docs_dir = cwd_path / "docs"
+        do_fix = _wants_fix(task)
+        clean_task = _clean_tags(task)
+        master_timeout = timeout or (TOOL_DSA_SYNTHESIS_TIMEOUT_SEC + TOOL_DSA_AGENT_TIMEOUT_SEC)
+        fix_timeout = timeout or TOOL_DSA_FIX_TIMEOUT_SEC
+
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_cache_creation = 0
+        total_cache_read = 0
+
+        if not is_cached_provider_available(provider.name):
+            msg = "Provider nicht verfügbar — Deep Security Audit abgebrochen"
+            print(f"  [deep-security-audit] ⏸ {msg}")
+            return _make_capacity_exhausted_result(msg, "", 0, 0, 0)
+
+        notify_tool_progress(self.name, 1, 2, "Phase 1/2: 6-Persona Audit + CISO-Synthesis (parallele Subagents)...")
+        print(f"  [deep-security-audit] Subagent-Mode: 1 Master-Subprocess mit 6 parallelen Personas")
+
+        system_prompt = _build_system_prompt(
+            provider.name,
+            memory_context=memory_context,
+            tool_name=self.name,
+            cwd=cwd,
+        )
+
+        # Build agent block listing for the master prompt
+        agent_block_lines: list[str] = []
+        for idx, agent in enumerate(_AGENTS, 1):
+            agent_block_lines.append(
+                f"### Persona {idx}: {agent.title}\n"
+                f"**Key (for filename):** `{agent.key}`\n\n"
+                f"{agent.persona}\n\n"
+                f"**Checklist:**\n{agent.checklist}\n"
+            )
+        agents_block = "\n---\n\n".join(agent_block_lines)
+
+        master_prompt = (
+            system_prompt
+            + "\n\n## Role: Multi-Agent Security Audit Orchestrator (CISO)\n\n"
+            + "You will perform a deep security audit by spawning 6 expert subagents in "
+              "PARALLEL via the Task tool, then synthesizing their findings as the CISO.\n\n"
+            + f"## Audit Scope\n\n{clean_task}\n\n"
+            + "## Step 1: Spawn 6 subagents in PARALLEL\n\n"
+            + "Issue a single message containing 6 Task tool calls (one per persona below). "
+              "Each subagent gets the full persona prompt + checklist as its task. Use "
+              "`subagent_type=\"general-purpose\"` and `description=\"<short persona name>\"`. "
+              "Each subagent must produce findings in the structured format described below "
+              "and return them as its final message.\n\n"
+            + "## Personas\n\n"
+            + agents_block
+            + "\n\n## Step 2: After all 6 subagents complete\n\n"
+            + "Save each subagent's full output as a separate file in this exact location:\n\n"
+            + f"  `{docs_dir}/deep-security-audit-{timestamp}-<persona-key>.md`\n\n"
+            + "Use the `Write` tool. Persona keys: " + ", ".join(a.key for a in _AGENTS) + "\n\n"
+            + "## Step 3: CISO Synthesis\n\n"
+            + "Now act as CISO. Read all 6 reports. Produce a combined synthesis file:\n\n"
+            + f"  `{docs_dir}/deep-security-audit-{timestamp}.md`\n\n"
+            + "Synthesis sections (REQUIRED):\n"
+            + "- **Executive Summary** (3-5 sentences for management)\n"
+            + "- **Cross-Validated Critical Findings** (where ≥2 personas agreed)\n"
+            + "- **Attack Chain Analysis** (multi-step exploitation paths combining findings)\n"
+            + "- **Prioritized Remediation Roadmap** (Immediate / Short-term / Medium-term)\n"
+            + "- **Systemic Recommendations**\n"
+            + "- **Dissenting Opinions**\n\n"
+            + "## Output Format for each finding (used by all personas)\n\n"
+            + "```\n"
+            + "### [SEVERITY-N] Short Title\n"
+            + "- **File:** path/to/file.py:line\n"
+            + "- **CWE:** CWE-XXX (if applicable)\n"
+            + "- **Attack vector:** concrete exploitation, one sentence\n"
+            + "- **Evidence:** `relevant code snippet`\n"
+            + "- **Fix:** exact change required\n"
+            + "- **Confidence:** HIGH/MEDIUM/LOW\n"
+            + "```\n\n"
+            + "## Output Format for your final response\n\n"
+            + "After all files are written, your final assistant message should be a brief "
+              "(< 500 words) executive summary referencing the synthesis file path. "
+              "The full reports live in the files you wrote.\n\n"
+            + "## Hard Rules\n"
+            + "- All persona analysis is READ-ONLY. No file modifications during audit.\n"
+            + "- Spawn personas in PARALLEL (single message, 6 Task calls).\n"
+            + "- One subagent failure must NOT abort the others — note the failure in the synthesis.\n"
+            + "- Write output files via the Write tool, not just in your response.\n"
+        )
+
+        master_result = provider.run(
+            master_prompt,
+            cwd=str(cwd_path),
+            timeout=master_timeout,
+            # Audit phase needs Read+Glob+Grep only; Write tool is enabled for the
+            # report files (which are tool-output, not source-code mutation).
+            read_only=False,
+        )
+        total_input_tokens += master_result.input_tokens
+        total_output_tokens += master_result.output_tokens
+        total_cache_creation += master_result.cache_creation_input_tokens
+        total_cache_read += master_result.cache_read_input_tokens
+
+        if not master_result.success:
+            msg = f"Audit-Master fehlgeschlagen: {master_result.error}"
+            print(f"  [deep-security-audit] {msg}")
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False,
+                output=master_result.output,
+                iterations=1,
+                error=msg,
+                error_code=master_result.error,
+                retryable=master_result.error in ("rate_limit", "timeout", "session_missing"),
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_creation_input_tokens=total_cache_creation,
+                cache_read_input_tokens=total_cache_read,
+            )
+
+        synthesis_path = docs_dir / f"deep-security-audit-{timestamp}.md"
+        synthesis_text = master_result.output
+        if synthesis_path.exists():
+            try:
+                synthesis_text = synthesis_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
+        print(f"  [deep-security-audit] Audit + Synthesis abgeschlossen → {synthesis_path}")
+
+        # ── Phase 2: Fix (optional, fresh subprocess) ────────────────
+        if not do_fix:
+            notify_tool_done(self.name, 1, True, f"Audit gespeichert: {synthesis_path.name}")
+            return ToolResult(
+                success=True,
+                output=master_result.output,
+                iterations=1,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_creation_input_tokens=total_cache_creation,
+                cache_read_input_tokens=total_cache_read,
+            )
+
+        if not is_cached_provider_available(provider.name):
+            msg = (
+                f"Provider erschöpft — Audit gespeichert ({synthesis_path.name}), "
+                "Fixes noch ausstehend"
+            )
+            print(f"  [deep-security-audit] ⏸ {msg}")
+            return _make_capacity_exhausted_result(
+                msg, master_result.output, 1,
+                total_input_tokens, total_output_tokens,
+                total_cache_creation, total_cache_read,
+            )
+
+        notify_tool_progress(self.name, 2, 2, "Phase 2/2: Fixes werden implementiert...")
+        print(f"  [deep-security-audit] Phase 2: Fixes implementieren...")
+
+        fix_prompt = system_prompt + "\n\n" + _FIX_PROMPT.format(
+            task=clean_task,
+            synthesis_output=synthesis_text,
+        )
+        fix_result = provider.run(fix_prompt, cwd=str(cwd_path), timeout=fix_timeout)
+        total_input_tokens += fix_result.input_tokens
+        total_output_tokens += fix_result.output_tokens
+        total_cache_creation += fix_result.cache_creation_input_tokens
+        total_cache_read += fix_result.cache_read_input_tokens
+
+        if fix_result.error:
+            print(f"  [deep-security-audit] ⚠ Fix-Phase Fehler: {fix_result.error}")
+            return ToolResult(
+                success=False,
+                output=master_result.output + "\n\n--- FIX ERROR ---\n" + fix_result.error,
+                iterations=2,
+                error=fix_result.error,
+                error_code=fix_result.error_code,
+                retryable=fix_result.retryable,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_creation_input_tokens=total_cache_creation,
+                cache_read_input_tokens=total_cache_read,
+            )
+
+        notify_tool_done(self.name, 2, True, f"Audit + Fixes done: {synthesis_path.name}")
+        return ToolResult(
+            success=True,
+            output=master_result.output + "\n\n--- FIXES ---\n" + fix_result.output,
+            iterations=2,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cache_creation_input_tokens=total_cache_creation,
+            cache_read_input_tokens=total_cache_read,
+        )
+
+    def _run_sequential_mode(
+        self,
+        task: str,
+        provider: BaseProvider,
+        cwd: str | None,
+        timeout: int | None,
+        memory_context: str,
+    ) -> ToolResult:
+        """Original 6-subprocess sequential path. Preserved for non-Claude
+        providers and as the fallback when CLAUDE_SESSION_ENABLED is off."""
         cwd_path = Path(cwd) if cwd else Path(".")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         docs_dir = cwd_path / "docs"

@@ -19,6 +19,8 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 - Heartbeat + Doctor (monitoring / onboarding checks)
 - Analytics web dashboard (Chart.js, port 8411)
 - `SOUL.md` as central prompt/personality configuration
+- **Anthropic prompt-cache optimization**: static system-prompt (cwd/git-status moved to first user message via `--exclude-dynamic-system-prompt-sections`), stable prompt prefixes, billing analytics with cache-hit-rate
+- **Optional Claude session reuse** (`CLAUDE_SESSION_ENABLED=true`): `dev-loop`, `review-loop`, same-provider `critical-review`, and `deep-security-audit` share Claude `--session-id`/`--resume` across phases for cross-call cache hits
 
 ## Requirements
 
@@ -60,6 +62,8 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `CLAUDE_PLAN` | No | — | Claude subscription plan for local 429 fallback: `pro`, `max5`, `max20`, `custom` |
 | `DASHBOARD_PORT` | No | `8411` | Port for the analytics web dashboard |
 | `TELEGRAM_MAX_TASK_LENGTH` | No | `500` | Max characters for `/task` command |
+| `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
+| `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
 
 See `.env.example` for a complete annotated template.
 
@@ -182,35 +186,40 @@ python orchestrator.py --list-tools
 ## Dev-Loop (`#tool:dev-loop`)
 
 ```
-Phase 1 — Research
+Phase 1 — Research + Plan  (merged into ONE subprocess call)
   Reads relevant code, understands the problem/feature,
-  creates a concrete implementation plan.
+  AND produces the implementation plan in the same response.
   Web search only if local sources are insufficient.
-  → Saved to {cwd}/.dev-loop/research.md
+  → Saved to {cwd}/.dev-loop/research-and-plan.md
+  → State persisted under phase=research_and_plan_done for capacity-resume.
 
 Phase 2 — Execution
-  Implements the solution based on the research plan.
+  Implements the solution based on the merged research+plan output.
   On iteration > 1: includes findings from both prior reviews.
 
-Phase 3a — Code Quality Review  (P1/P2/P3)
+Phase 3a — Code Quality Review  (P1/P2/P3, read-only)
   Checks: Correctness, Clean, Secure, Performant, Maintainable,
           Testable, Robust, Documented, Compliant.
   P1/P2 = blocking | P3 = non-blocking
+  Re-reads `git diff` fresh — does NOT trust pinned context.
 
-Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED)
+Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED, read-only)
   Checks only: Does the code solve the original task 100%?
-  Ignores code quality entirely.
+  Ignores code quality entirely. Re-reads `git diff` fresh.
 
 → Both reviews must pass → loop ends, no auto-push.
 → Per-iteration output in {cwd}/.dev-loop/round-NNN.md
 → Final summary: {cwd}/.dev-loop/summary.md
 ```
 
+**Phase B opt-in**: When `CLAUDE_SESSION_ENABLED=true`, all phases share a Claude session (`--session-id` / `--resume`) for cross-call prompt-cache hits. Iteration cap of 5 per session triggers a rollover to a fresh UUID; explicit findings re-injection in the exec prompt makes the rollover seamless.
+
 **Timeout configuration (`config.py`):**
 
 | Constant | Default | Phase |
 |---|---|---|
-| `TOOL_DEV_RESEARCH_TIMEOUT_SEC` | 3600 (60 min) | Research |
+| `TOOL_DEV_RESEARCH_TIMEOUT_SEC` | 3600 (60 min) | Research portion of merged Phase 1 |
+| `TOOL_DEV_PLAN_TIMEOUT_SEC` | 1800 (30 min) | Plan portion of merged Phase 1 (added to research timeout) |
 | `TOOL_DEV_EXEC_TIMEOUT_SEC` | 7200 (2 h) | Execution |
 | `TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC` | 3600 (60 min) | Quality Review |
 | `TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC` | 1800 (30 min) | Resolution Review |
@@ -298,7 +307,7 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 
 - [ ] Review-fix loop for the uncommitted changes. dont commit the changes! #tool:review-loop #id:ID5 #need:ID4 #codex cwd:<repo>
 
-- [ ] Critical review (read-only) of the uncommitted changes against docs\plan-XXX.md #tool:critical-review #pass1:gemini #pass2:claude #gemini_pro #id:ID6 #need:ID5 cwd:<repo>
+- [ ] Critical review (read-only) of the uncommitted changes against docs\plan-XXX.md #tool:critical-review #pass1:gemini #pass2:claude #gemini_flash #id:ID6 #need:ID5 cwd:<repo>
 
 - [ ] Review-fix loop for the uncommitted changes. Also incorporate findings from the most recent critical-review report in docs/. dont commit the changes! #tool:review-loop #id:ID7 #need:ID6 #claude_opus cwd:<repo>
 
@@ -314,7 +323,7 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 | 3. simplify | `#claude_sonnet` | Refactoring is a bounded task |
 | 4. review-loop (pass A) | `#codex_mini` | Cheap first pass — obvious bugs, unused imports, trivial wins |
 | 5. review-loop (pass B) | `#codex` (gpt-5.4) | Mid-tier — structural issues, missing coverage |
-| 6. critical-review | `#gemini_pro` + `#pass2:claude` | Independent second opinion, strictly read-only — zero risk of broken code |
+| 6. critical-review | `#gemini_flash` + `#pass2:claude` | Independent second opinion, strictly read-only — zero risk of broken code |
 | 7. review-loop (final) | `#claude_opus` | Final validator; integrates critical-review findings. If Opus finds nothing here, the code is genuinely clean |
 | 8. commit | `#claude_haiku` | Trivial — diff + doc sync + single commit. Escalate to `#claude_sonnet` if the plan spans multiple commits |
 
@@ -397,16 +406,17 @@ Rate limits (anti-spam):
 
 ## Memory, Heartbeat, SOUL.md
 
-- **Memory (`memory.py`)** — Four-layer architecture:
-  1. **Curated (`MEMORY.md`)**: Long-term patterns, conventions, decisions. Always in prompt.
-  2. **Daily Logs (`daily/`)**: Append-only log for today + yesterday (temporal locality).
-  3. **TF-IDF Deep Search (`task_results/`)**: Keyword matching + temporal decay over all past tasks.
-  4. **Lessons Learned (`lessons.md`)**: LLM-summarized patterns from multi-iteration tool loops. CWD-filtered injection (universal `*` entries always, project-specific only when CWD matches). Semantic dedup via TF-IDF similarity at write time.
+- **Memory (`memory.py`)** — Four-layer architecture, ordered for max prompt-cache reuse:
+  1. **Curated (`MEMORY.md`)**: Long-term patterns, conventions, decisions. Always in prompt. (Most static.)
+  2. **Lessons Learned (`lessons.md`)**: LLM-summarized patterns from multi-iteration tool loops. CWD-filtered injection (universal `*` entries always, project-specific only when CWD matches). Semantic dedup via TF-IDF similarity at write time. (Stable per tool+cwd.)
+  3. **Daily Logs (`daily/`)**: Append-only log for today + yesterday (temporal locality). (Grows during the day — placed AFTER lessons so daily growth doesn't break the cache prefix for tool reruns.)
+  4. **TF-IDF Deep Search (`task_results/`)**: Keyword matching + temporal decay over all past tasks. (Most volatile — task-specific.)
   - Top-K relevant memories are intelligently injected into the prompt.
   - Auto-archival after 180 days.
 
 - **Heartbeat (`heartbeat.py`)** — Proactive checks in `--watch` mode, configured via `<vault>/99_System/AI/HEARTBEAT.md`.
-  - 7 built-in handlers: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `summarize`, `stale-branch`, `usage-suggest`
+  - 9 built-in handlers: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `log-capacity`, `summarize`, `stale-branch`, `usage-suggest`, `session-cleanup`
+  - `session-cleanup` deletes orchestrator-created Claude session JSONL files in `~/.claude/projects/**` older than `ORCH_SESSION_RETENTION_DAYS` — uses sidecar whitelist (`logs/orchestrator-sessions.jsonl`) to NEVER touch interactive Claude Code sessions.
   - Mtime-cached config — changes to `HEARTBEAT.md` take effect immediately (no restart).
   - Runs in a **daemon thread** (60s poll) so scheduled checks fire on time even during long-running tasks.
 
@@ -433,6 +443,7 @@ Dashboard sections:
 - **Provider capacity** (48h / 7d / 30d): three timeline charts
 - **Recent events**: error lines from logs + queue events
 - **Session stats**: live data for the current `--watch` session
+- **Billing analytics**: weighted token cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and cache hit rate from Claude prompt cache. Quota gating uses ONLY `input + output` — cache fields are billing-only.
 
 Default port: `8411` (configurable via `DASHBOARD_PORT`).
 
@@ -450,11 +461,12 @@ Default port: `8411` (configurable via `DASHBOARD_PORT`).
 |---|---|---|
 | Core (task + safety) | ~200 tokens | `config.py` / `SOUL.md` |
 | Curated Memory (L1) | ~500 tokens | `MEMORY.md` |
-| Daily Log (L2) | ~500 tokens | `daily/` |
-| TF-IDF Memory (L3) | ~2000 tokens | `memory.py` |
-| Wikilink context | ~3000 tokens | `queue_manager.py` |
+| Lessons (L2) | ~1000 tokens | `lessons.md` (cwd-filtered) |
+| Daily Log (L3) | ~500 tokens | `daily/` |
+| TF-IDF Memory (L4) | ~2000 tokens | `memory.py` |
+| Wikilink context | ~1500 tokens | `queue_manager.py` |
 | Skill prompt | ~2000 tokens | `SKILL.md` body (only with `#tool:`) |
-| **Total** | **~10 000 tokens** | |
+| **Total** | **~7 500 tokens** | (under `PROMPT_BUDGET_TOKENS=10000`) |
 
 ## Doctor (`--doctor`)
 
@@ -510,7 +522,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~674 tests, ~6s)
+# Run all tests (~770 tests, ~7s)
 python -m pytest tests/ -q
 
 # Run a single test file

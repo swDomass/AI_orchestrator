@@ -36,6 +36,7 @@ from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
 from tools.base_tool import (
     BaseTool,
+    SessionContext,
     ToolResult,
     _build_system_prompt,
     _make_capacity_exhausted_result,
@@ -438,6 +439,34 @@ class CriticalReviewTool(BaseTool):
         total_input_tokens = 0
         total_output_tokens = 0
 
+        # Phase C2: capability switch — sessions only when ALL passes use the
+        # same provider (cross-provider mode keeps the explicit injection path
+        # which is the actual mechanism, see CLAUDE.md "critical-review keeps
+        # cross-provider"). For same-provider runs, the 3 passes share a
+        # session → cache hits across the full chain. cap=20 means no rollover
+        # within a typical 3-pass run.
+        from config import CLAUDE_SESSION_ENABLED
+        pass2_name = pass_providers.get(2) or provider.name
+        same_provider_chain = (
+            pass2_name == provider.name
+            and getattr(provider, "supports_sessions", False)
+            and CLAUDE_SESSION_ENABLED
+        )
+        sess = (
+            SessionContext.create(provider, tool_name=self.name, cwd=cwd, cap=20)
+            if same_provider_chain
+            else None
+        )
+        cr_first_call = True
+
+        def _cr_session_kwargs() -> dict:
+            nonlocal cr_first_call
+            if sess is None or not sess.enabled:
+                return {}
+            kw = sess.first_call_kwargs() if cr_first_call else sess.resume_kwargs()
+            cr_first_call = False
+            return kw
+
         # ── Resolve plan file ────────────────────────────────────────
 
         plan_path, plan_ref = _resolve_plan_file(task, cwd_path)
@@ -488,7 +517,17 @@ class CriticalReviewTool(BaseTool):
             cwd=str(cwd_path),
             timeout=pass1_timeout,
             read_only=True,
+            **_cr_session_kwargs(),
         )
+        if not result1.success and result1.error == "session_missing":
+            print("  [critical-review] ⚠️ Session missing in Pass 1 — Fallback")
+            if sess is not None:
+                sess.rollover(self.name, cwd)
+            cr_first_call = True
+            result1 = provider.run(
+                review_prompt, cwd=str(cwd_path), timeout=pass1_timeout,
+                read_only=True, **_cr_session_kwargs(),
+            )
 
         total_input_tokens += result1.input_tokens
         total_output_tokens += result1.output_tokens
@@ -540,18 +579,34 @@ class CriticalReviewTool(BaseTool):
             cwd=cwd,
         )
 
-        pass1_for_injection = result1.output
-        if len(pass1_for_injection) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
-            pass1_for_injection = (
-                pass1_for_injection[:TOOL_CR_PASS1_MAX_INJECT_CHARS]
-                + "\n\n...[Pass 1 output truncated]"
+        # In session mode (same-provider chain), Pass 1's full output already
+        # lives in the conversation history — re-injecting it as text would
+        # make Pass 2 see Pass 1 twice and weaken the adversarial challenge.
+        # In stateless mode (cross-provider), the inject IS the only signal.
+        same_pass2_session = (
+            pass2_provider.name == provider.name
+            and sess is not None
+            and sess.enabled
+        )
+        if same_pass2_session:
+            pass1_inject_block = (
+                "_(Pass 1's full output is in your conversation history above. "
+                "Read it there — do not expect a re-injection.)_"
             )
+        else:
+            pass1_for_injection = result1.output
+            if len(pass1_for_injection) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
+                pass1_for_injection = (
+                    pass1_for_injection[:TOOL_CR_PASS1_MAX_INJECT_CHARS]
+                    + "\n\n...[Pass 1 output truncated]"
+                )
+            pass1_inject_block = pass1_for_injection
 
         adversarial_prompt = (
             system_prompt2
             + "\n\n"
             + _ADVERSARIAL_PROMPT
-                .replace("{pass1_output}", pass1_for_injection)
+                .replace("{pass1_output}", pass1_inject_block)
                 .replace("{task}", task)
                 .replace("{plan_section}", plan_section)
         )
@@ -567,12 +622,31 @@ class CriticalReviewTool(BaseTool):
         pass2_prev_model = getattr(pass2_provider, "_forced_model", None)
         setattr(pass2_provider, "_forced_model", pass2_model_id)
         try:
+            # Sessions only apply when pass2 is the same provider instance
+            # (cross-provider runs use the explicit-injection mechanism).
+            same_pass2 = pass2_provider.name == provider.name
+            pass2_kw = _cr_session_kwargs() if same_pass2 else {}
             result2 = pass2_provider.run(
                 adversarial_prompt,
                 cwd=str(cwd_path),
                 timeout=pass2_timeout,
                 read_only=True,
+                **pass2_kw,
             )
+            # Session-missing fallback only meaningful in same-provider mode.
+            if (
+                same_pass2
+                and not result2.success
+                and result2.error == "session_missing"
+            ):
+                print("  [critical-review] ⚠️ Session missing in Pass 2 — Fallback")
+                if sess is not None:
+                    sess.rollover(self.name, cwd)
+                cr_first_call = True
+                result2 = pass2_provider.run(
+                    adversarial_prompt, cwd=str(cwd_path), timeout=pass2_timeout,
+                    read_only=True, **_cr_session_kwargs(),
+                )
         finally:
             setattr(pass2_provider, "_forced_model", pass2_prev_model)
 
@@ -621,13 +695,26 @@ class CriticalReviewTool(BaseTool):
                     cwd=cwd,
                 )
 
-                # Truncate review outputs for synthesis prompt
-                p1_for_synth = result1.output
-                if len(p1_for_synth) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
-                    p1_for_synth = p1_for_synth[:TOOL_CR_PASS1_MAX_INJECT_CHARS] + "\n...[truncated]"
-                p2_for_synth = result2.output
-                if len(p2_for_synth) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
-                    p2_for_synth = p2_for_synth[:TOOL_CR_PASS1_MAX_INJECT_CHARS] + "\n...[truncated]"
+                # In session mode, Pass 1 + Pass 2 are already in the
+                # conversation history → skip the explicit inject (avoids
+                # the same double-context bug as Pass 2).
+                same_synth_session = (
+                    sess is not None and sess.enabled and same_pass2
+                )
+                if same_synth_session:
+                    p1_for_synth = (
+                        "_(Pass 1's output is in your conversation history above.)_"
+                    )
+                    p2_for_synth = (
+                        "_(Pass 2's adversarial review is in your conversation history above.)_"
+                    )
+                else:
+                    p1_for_synth = result1.output
+                    if len(p1_for_synth) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
+                        p1_for_synth = p1_for_synth[:TOOL_CR_PASS1_MAX_INJECT_CHARS] + "\n...[truncated]"
+                    p2_for_synth = result2.output
+                    if len(p2_for_synth) > TOOL_CR_PASS1_MAX_INJECT_CHARS:
+                        p2_for_synth = p2_for_synth[:TOOL_CR_PASS1_MAX_INJECT_CHARS] + "\n...[truncated]"
 
                 synthesis_prompt = (
                     system_prompt3
@@ -643,7 +730,17 @@ class CriticalReviewTool(BaseTool):
                     cwd=str(cwd_path),
                     timeout=pass3_timeout,
                     read_only=True,
+                    **_cr_session_kwargs(),
                 )
+                if not result3.success and result3.error == "session_missing":
+                    print("  [critical-review] ⚠️ Session missing in Pass 3 — Fallback")
+                    if sess is not None:
+                        sess.rollover(self.name, cwd)
+                    cr_first_call = True
+                    result3 = provider.run(
+                        synthesis_prompt, cwd=str(cwd_path), timeout=pass3_timeout,
+                        read_only=True, **_cr_session_kwargs(),
+                    )
 
                 total_input_tokens += result3.input_tokens
                 total_output_tokens += result3.output_tokens

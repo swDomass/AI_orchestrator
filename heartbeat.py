@@ -23,6 +23,7 @@ Built-in handlers matched by case-insensitive substring in item label:
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -126,6 +127,51 @@ def _check_git_status() -> Optional[str]:
             pass
 
     return "\n\n".join(results) if results else None
+
+
+def _check_session_cleanup() -> Optional[str]:
+    """Delete orchestrator-created Claude session JSONL files older than
+    ``ORCH_SESSION_RETENTION_DAYS`` from ``~/.claude/projects/**``.
+
+    Uses the sidecar registry (``logs/orchestrator-sessions.jsonl``) as a
+    whitelist — interactive Claude Code sessions in the same cwd are NEVER
+    touched because they're not in the registry. Only registry entries that
+    match an actual file on disk get deleted; registry entries with no file
+    are pruned silently (file may have been manually cleaned).
+    """
+    try:
+        from session_registry import prune_old
+        from config import ORCH_SESSION_RETENTION_DAYS
+    except ImportError:
+        return None
+
+    kept, expired = prune_old(ORCH_SESSION_RETENTION_DAYS)
+    if not expired:
+        return None
+
+    projects_dir = Path(os.path.expanduser("~/.claude/projects"))
+    deleted: list[str] = []
+    failed: list[str] = []
+    if projects_dir.exists():
+        for entry in expired:
+            uuid = entry.get("uuid")
+            if not uuid:
+                continue
+            # Glob across all project subdirs since the encoded cwd path differs.
+            matches = list(projects_dir.glob(f"**/{uuid}.jsonl"))
+            for match in matches:
+                try:
+                    match.unlink()
+                    deleted.append(uuid)
+                except OSError as exc:
+                    failed.append(f"{uuid}: {exc}")
+
+    msg_parts: list[str] = []
+    if deleted:
+        msg_parts.append(f"Session-Cleanup: {len(deleted)} alte Sessions gelöscht")
+    if failed:
+        msg_parts.append(f"Fehler beim Löschen: {len(failed)} ({'; '.join(failed[:3])})")
+    return " | ".join(msg_parts) if msg_parts else None
 
 
 def _check_disk_space() -> Optional[str]:
@@ -407,14 +453,15 @@ def _check_stale_branches() -> Optional[str]:
 # ── Handler dispatch table ────────────────────────────────────────────────────
 
 HANDLER_KEYS: list[tuple[str, str]] = [
-    ("queue",         "_check_queue_idle"),
-    ("git status",    "_check_git_status"),
-    ("disk space",    "_check_disk_space"),
-    ("check-limits",  "_check_limits"),
-    ("log-capacity",  "_log_capacity"),
-    ("summarize",     "_check_task_summary"),
-    ("stale branch",  "_check_stale_branches"),
-    ("usage-suggest", "_check_usage_suggest"),
+    ("queue",            "_check_queue_idle"),
+    ("git status",       "_check_git_status"),
+    ("disk space",       "_check_disk_space"),
+    ("check-limits",     "_check_limits"),
+    ("log-capacity",     "_log_capacity"),
+    ("summarize",        "_check_task_summary"),
+    ("stale branch",     "_check_stale_branches"),
+    ("usage-suggest",    "_check_usage_suggest"),
+    ("session-cleanup",  "_check_session_cleanup"),
 ]
 
 

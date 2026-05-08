@@ -65,6 +65,25 @@ def _parse_int_env(key: str, default: int) -> int:
         return default
 
 
+def _parse_bool_env(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Feature flag — opt-in for Claude --session-id/--resume across tool phases.
+# Default OFF: tools fall back to today's stateless subprocess behaviour. Toggle
+# in .env (CLAUDE_SESSION_ENABLED=true) to enable; toggle off for instant rollback.
+CLAUDE_SESSION_ENABLED = _parse_bool_env("CLAUDE_SESSION_ENABLED", False)
+
+# Retention window for orchestrator-created Claude session JSONL files in
+# ~/.claude/projects/**. Heartbeat session-cleanup deletes only sessions that
+# appear in our sidecar registry (logs/orchestrator-sessions.jsonl) AND are
+# older than this — interactive Claude Code sessions stay untouched.
+ORCH_SESSION_RETENTION_DAYS = _parse_int_env("ORCH_SESSION_RETENTION_DAYS", 14)
+
+
 # Minimum remaining capacity to consider a provider usable (percent)
 # Override via .env: MIN_CAPACITY_PERCENT=15
 MIN_CAPACITY_PERCENT = _parse_int_env("MIN_CAPACITY_PERCENT", 10)
@@ -264,6 +283,11 @@ CAPACITY_LOG_RETENTION_DAYS = 90  # entries older than this are pruned
 
 # --- Queue Event Log (replaces ## Log section in agent-queue.md) ---
 QUEUE_EVENTS_LOG_FILE           = Path(__file__).parent / "logs" / "queue-events.log"
+
+# Sidecar registry of Claude session UUIDs created by the orchestrator. Used by
+# the heartbeat session-cleanup handler as a whitelist so we never touch
+# interactive Claude Code sessions in the same project directory.
+ORCH_SESSION_REGISTRY = Path(__file__).parent / "logs" / "orchestrator-sessions.jsonl"
 QUEUE_EVENTS_LOG_RETENTION_DAYS = 30   # prune log entries older than this
 
 # --- Queue Cleanup (erledigt.md) ---
@@ -276,7 +300,7 @@ PROMPT_CORE_TOKENS            = 200
 PROMPT_CURATED_MEMORY_TOKENS  = 500    # Layer 1: curated MEMORY.md (always loaded)
 PROMPT_DAILY_LOG_TOKENS       = 500    # Layer 2: today + yesterday daily log (80-char entries)
 PROMPT_MEMORY_TOKENS          = 2_000  # Layer 3: TF-IDF deep search
-PROMPT_WIKILINK_TOKENS        = 3_000
+PROMPT_WIKILINK_TOKENS        = 1_500
 PROMPT_SKILL_TOKENS           = 2_000
 
 # --- Profiles ---
@@ -310,8 +334,9 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_opus":   "claude-opus-4-7",
 }
 GEMINI_MODEL_ALIASES: dict[str, str] = {
-    "gemini_pro":   "gemini-3.1-pro",
-    "gemini_flash": "gemini-3.1-flash",
+    "gemini_pro":        "gemini-3.1-pro-preview",
+    "gemini_flash":      "gemini-3-flash-preview",
+    "gemini_flash_lite": "gemini-3.1-flash-lite-preview",
 }
 CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex_mini": "gpt-5.4-mini",

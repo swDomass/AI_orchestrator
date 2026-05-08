@@ -34,7 +34,7 @@ from config import (
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
+from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
 from tools.review_loop import _is_no_findings_output, _parse_findings
 
 DEV_LOOP_DIR = ".dev-loop"
@@ -103,9 +103,9 @@ def _parse_resolution(text: str) -> str:
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
-_RESEARCH_PROMPT = """\
-You are a Research Agent. Analyze the codebase to understand what needs to be \
-done for the following task.
+_RESEARCH_AND_PLAN_PROMPT = """\
+You are a Research+Planning Agent. In a single response, analyze the codebase \
+AND produce a concrete implementation plan.
 
 TASK: {task}
 
@@ -116,8 +116,9 @@ the requirements for the new feature.
 3. Search the web ONLY if you cannot determine required library APIs, \
 error meanings, or documentation from the local codebase alone.
 4. Identify all files that need to be changed or created.
+5. Then immediately produce a concrete plan based on your findings.
 
-Output format (required sections):
+Output format (REQUIRED — all sections must be present):
 
 ## Problem Analysis
 [Clear description of the issue / feature to build]
@@ -125,23 +126,8 @@ Output format (required sections):
 ## Relevant Files
 [Files that need to be changed or created, with brief reason for each]
 
-## Implementation Plan
-[Concrete step-by-step plan for the Execution Agent]
-
 ## Dependencies & Edge Cases
-[External libs, API changes, error handling concerns, edge cases]
-"""
-
-_PLAN_PROMPT = """\
-You are a Planning Agent. Based on the research findings, create a concrete \
-implementation plan.
-
-ORIGINAL TASK: {task}
-
-RESEARCH FINDINGS:
-{research}
-
-Create a plan with these sections:
+[External libs, API changes, error handling, edge cases discovered]
 
 ## Implementation Plan
 1. Files to create or modify (exact paths)
@@ -152,9 +138,34 @@ Create a plan with these sections:
 - How to verify the changes work
 - Which tests to run or create
 
-## Risks & Edge Cases
-- What could go wrong
-- Edge cases to handle
+## Risks
+- What could go wrong with this implementation
+"""
+
+_RESEARCH_ONLY_PROMPT = """\
+You are a Research Agent. Analyze the codebase to understand what needs to be \
+done for the following task. Do NOT produce an implementation plan — only the \
+research findings.
+
+TASK: {task}
+
+Steps:
+1. Explore relevant files (git status, directory listing, read key files).
+2. Understand the current code structure and root cause / requirements.
+3. Search the web ONLY if you cannot determine required library APIs from the \
+local codebase.
+4. Identify all files that need to be changed or created.
+
+Output format (required sections):
+
+## Problem Analysis
+[Clear description of the issue / feature to build]
+
+## Relevant Files
+[Files that need to be changed or created, with brief reason for each]
+
+## Dependencies & Edge Cases
+[External libs, API changes, error handling concerns, edge cases]
 """
 
 _EXECUTION_PROMPT = """\
@@ -163,14 +174,11 @@ findings and implementation plan below.
 
 ORIGINAL TASK: {task}
 
-RESEARCH FINDINGS:
-{research}
-
-IMPLEMENTATION PLAN:
-{plan}
+RESEARCH AND PLAN:
+{research_and_plan}
 {review_context}
 Instructions:
-- Implement the solution exactly as laid out in the implementation plan.
+- Implement the solution exactly as laid out in the Implementation Plan section above.
 - Fix ALL issues raised in previous reviews (listed above, if any).
 - Apply changes directly to the files.
 - Run existing tests if feasible.
@@ -184,6 +192,13 @@ the current git working tree.
 
 ORIGINAL TASK: {task}
 
+CRITICAL — Read the working tree FRESH:
+- Files have been modified by an Execute-phase agent BEFORE you. Any cwd or
+  git-status info pinned earlier in this conversation is STALE.
+- BEFORE you analyze, run `git diff --no-ext-diff`, `git status --porcelain`,
+  and `git ls-files --others --exclude-standard` to see the CURRENT state.
+- Re-Read every file you analyze — do not rely on prior tool-call results.
+
 Review these aspects:
 - Correctness: Does the code do what it's supposed to?
 - Clean: Readable, well-structured, no dead code or commented-out blocks?
@@ -195,8 +210,6 @@ Review these aspects:
 - Documented: Public APIs have docstrings where appropriate?
 - Compliant: Follows existing project conventions and style?
 
-Inspect changes via: git diff, git status --porcelain, \
-git ls-files --others --exclude-standard.
 Do NOT modify any files.
 Ignore the `.dev-loop/` directory — it contains tool metadata.
 
@@ -213,8 +226,13 @@ original task.
 
 ORIGINAL TASK: {task}
 
+CRITICAL — Read the working tree FRESH:
+- Files were just modified by the Execute-phase agent. Any cwd or git-status
+  info pinned earlier in this conversation is STALE.
+- BEFORE you decide, run `git diff --no-ext-diff` and `git status --porcelain`
+  to see the CURRENT state. Re-Read changed files.
+
 Instructions:
-- Use git diff / git status to inspect what was actually changed.
 - Focus ONLY on whether the task requirements are fully met.
 - Do NOT evaluate code quality — that is handled by a separate agent.
 - Do NOT modify any files.
@@ -263,14 +281,35 @@ class DevLoopTool(BaseTool):
         last_quality_tuple: tuple[str, ...] = ()
         seen_review_signatures: set[tuple[tuple[str, ...], str, str]] = set()
 
-        research_timeout = timeout or TOOL_DEV_RESEARCH_TIMEOUT_SEC
-        plan_timeout = timeout or TOOL_DEV_PLAN_TIMEOUT_SEC
+        # Research+Plan are merged into a single subprocess call (saves ~42 k
+        # cache_creation tokens vs. the prior two-call pattern). Skip-mode
+        # still runs research-only because there is no plan to produce.
+        research_plan_timeout = (
+            timeout or (TOOL_DEV_RESEARCH_TIMEOUT_SEC + TOOL_DEV_PLAN_TIMEOUT_SEC)
+        )
         exec_timeout = timeout or TOOL_DEV_EXEC_TIMEOUT_SEC
         quality_timeout = timeout or TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC
         resolution_timeout = timeout or TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC
 
-        total_input_tokens = 0
-        total_output_tokens = 0
+        tokens = TokenCounter()
+
+        # Phase B: optional shared session across phases (Anthropic prompt cache).
+        # When enabled, all subprocess calls within this run share conversation
+        # history. cap=5 triggers a fresh session every 5 iterations to keep the
+        # Conversation-history bounded; explicit findings re-injection in the
+        # exec prompt (review_context) makes the rollover continuation seamless.
+        sess = SessionContext.create(provider, tool_name=self.name, cwd=cwd, cap=5)
+        first_call = True  # tracks whether next provider.run() should use session_id (start) or resume
+
+        def _session_kwargs() -> dict:
+            """Return session kwargs for the next provider.run() call and flip
+            ``first_call`` so subsequent calls resume the same session."""
+            nonlocal first_call
+            if not sess.enabled:
+                return {}
+            kw = sess.first_call_kwargs() if first_call else sess.resume_kwargs()
+            first_call = False
+            return kw
 
         # Load memory module for lessons
         try:
@@ -278,29 +317,46 @@ class DevLoopTool(BaseTool):
         except (ImportError, OSError):
             memory_module = None
 
-        # ── Phase 1: Research ─────────────────────────────────────────────────
+        # ── Phase 1: Research+Plan (merged) ──────────────────────────────────
+        plan_approval_mode = self._get_plan_approval_mode()
+        merged_phase = plan_approval_mode != "skip"
+
         t_hash = _task_hash(task)
         cached_state = _load_state(cwd, t_hash) if cwd else None
+        cache_phase = "research_and_plan_done" if merged_phase else "research_done"
 
-        if cached_state and cached_state.get("phase") == "research_done":
-            print(f"  [dev-loop] Research aus Cache geladen (task_hash={t_hash})")
-            research_output = cached_state["research_output"]
-            all_outputs.append(f"--- Research (cached) ---\n{research_output}")
+        if cached_state and cached_state.get("phase") == cache_phase:
+            print(f"  [dev-loop] Research+Plan aus Cache geladen (task_hash={t_hash})")
+            research_and_plan = cached_state["research_and_plan"]
+            all_outputs.append(f"--- Research+Plan (cached) ---\n{research_and_plan}")
         else:
-            # Capacity guard before expensive research phase
             if not is_cached_provider_available(provider.name):
-                msg = "Provider nicht verfügbar — Suspend vor Research-Phase"
+                msg = "Provider nicht verfügbar — Suspend vor Research+Plan-Phase"
                 print(f"  [dev-loop] ⏸ {msg}")
-                return _make_capacity_exhausted_result(msg, "", 0, total_input_tokens, total_output_tokens)
+                return _make_capacity_exhausted_result(
+                    msg, "", 0, **tokens.as_kwargs(),
+                )
 
-            print("  [dev-loop] === Phase 1: RESEARCH ===")
-            research_prompt = system_prompt + "\n\n" + _RESEARCH_PROMPT.format(task=task)
-            research_result = provider.run(research_prompt, cwd=cwd, timeout=research_timeout)
-            total_input_tokens += research_result.input_tokens
-            total_output_tokens += research_result.output_tokens
+            phase_label = "RESEARCH+PLAN" if merged_phase else "RESEARCH"
+            print(f"  [dev-loop] === Phase 1: {phase_label} ===")
+            template = _RESEARCH_AND_PLAN_PROMPT if merged_phase else _RESEARCH_ONLY_PROMPT
+            rp_prompt = system_prompt + "\n\n" + template.format(task=task)
+            rp_result = provider.run(
+                rp_prompt, cwd=cwd, timeout=research_plan_timeout,
+                **_session_kwargs(),
+            )
+            if not rp_result.success and rp_result.error == "session_missing":
+                print("  [dev-loop] ⚠️ Session missing in Research+Plan — Fallback")
+                sess.rollover(self.name, cwd)
+                first_call = True
+                rp_result = provider.run(
+                    rp_prompt, cwd=cwd, timeout=research_plan_timeout,
+                    **_session_kwargs(),
+                )
+            tokens.add(rp_result)
 
-            if not research_result.success:
-                msg = f"Research fehlgeschlagen: {research_result.error}"
+            if not rp_result.success:
+                msg = f"Research+Plan-Phase fehlgeschlagen: {rp_result.error}"
                 print(f"  [dev-loop] {msg}")
                 notify_tool_done(self.name, 0, False, msg)
                 return ToolResult(
@@ -308,74 +364,35 @@ class DevLoopTool(BaseTool):
                     output="",
                     iterations=0,
                     error=msg,
-                    error_code=research_result.error,
+                    error_code=rp_result.error,
                     retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
-            research_output = research_result.output.strip()
-            all_outputs.append(f"--- Research ---\n{research_output}")
+            research_and_plan = rp_result.output.strip()
+            all_outputs.append(f"--- Research+Plan ---\n{research_and_plan}")
             _write_tool_file(
                 dev_loop_dir,
-                "research.md",
-                f"# Dev-Loop Research\n\nTask: {task}\n\n{research_output}\n",
+                "research-and-plan.md",
+                f"# Dev-Loop Research+Plan\n\nTask: {task}\n\n{research_and_plan}\n",
             )
-            print(f"  [dev-loop] Research abgeschlossen → {dev_loop_dir / 'research.md'}")
+            print(f"  [dev-loop] Research+Plan abgeschlossen → {dev_loop_dir / 'research-and-plan.md'}")
 
-            # Persist research so a capacity-exhausted retry can skip this phase
+            # Persist so a capacity-exhausted retry can skip this phase
             if cwd:
                 _save_state(cwd, {
                     "tool": "dev-loop",
                     "task_hash": t_hash,
-                    "phase": "research_done",
-                    "research_output": research_output,
+                    "phase": cache_phase,
+                    "research_and_plan": research_and_plan,
                 })
 
-        # ── Phase 1.5: Plan ───────────────────────────────────────────────────
-        plan_approval_mode = self._get_plan_approval_mode()
-        plan_output = ""
-
-        if plan_approval_mode != "skip":
-            print("  [dev-loop] === Phase 1.5: PLAN ===")
-            plan_prompt = system_prompt + "\n\n" + _PLAN_PROMPT.format(
-                task=task,
-                research=research_output,
-            )
-            plan_result = provider.run(plan_prompt, cwd=cwd, timeout=plan_timeout)
-            total_input_tokens += plan_result.input_tokens
-            total_output_tokens += plan_result.output_tokens
-
-            if not plan_result.success:
-                msg = f"Plan-Phase fehlgeschlagen: {plan_result.error}"
-                print(f"  [dev-loop] {msg}")
-                notify_tool_done(self.name, 0, False, msg)
-                return ToolResult(
-                    success=False,
-                    output="\n\n".join(all_outputs),
-                    iterations=0,
-                    error=msg,
-                    error_code=plan_result.error,
-                    retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
-                )
-
-            plan_output = plan_result.output.strip()
-            all_outputs.append(f"--- Plan ---\n{plan_output}")
-            _write_tool_file(
-                dev_loop_dir,
-                "plan.md",
-                f"# Dev-Loop Plan\n\nTask: {task}\n\n{plan_output}\n",
-            )
-            print(f"  [dev-loop] Plan erstellt → {dev_loop_dir / 'plan.md'}")
-
-            # Telegram approval if configured
-            if plan_approval_mode == "approve":
+            # Telegram approval if configured (only if plan is part of output)
+            if merged_phase and plan_approval_mode == "approve":
                 try:
                     from notifier import request_approval
                     approved = request_approval(
-                        f"Dev-Loop Plan fuer: {task[:100]}\n\n{plan_output[:500]}",
+                        f"Dev-Loop Plan fuer: {task[:100]}\n\n{research_and_plan[:500]}",
                         timeout=600,
                     )
                     if not approved:
@@ -387,8 +404,7 @@ class DevLoopTool(BaseTool):
                             output="\n\n".join(all_outputs),
                             iterations=0,
                             error=msg,
-                            input_tokens=total_input_tokens,
-                            output_tokens=total_output_tokens,
+                            **tokens.as_kwargs(),
                         )
                 except (ImportError, OSError, ValueError) as exc:
                     print(f"  [dev-loop] Plan-Approval uebersprungen (Fehler: {exc})")
@@ -406,7 +422,9 @@ class DevLoopTool(BaseTool):
             if not is_cached_provider_available(provider.name):
                 msg = f"Provider nicht verfügbar — Suspend nach Iteration {iteration - 1}"
                 print(f"  [dev-loop] ⏸ {msg}")
-                return _make_capacity_exhausted_result(msg, "\n\n".join(all_outputs), iteration - 1, total_input_tokens, total_output_tokens)
+                return _make_capacity_exhausted_result(
+                    msg, "\n\n".join(all_outputs), iteration - 1, **tokens.as_kwargs(),
+                )
 
             # Build review context for execution prompt (empty on first iteration)
             review_context = ""
@@ -442,16 +460,28 @@ class DevLoopTool(BaseTool):
 
             exec_prompt = system_prompt + "\n\n" + _EXECUTION_PROMPT.format(
                 task=task,
-                research=research_output,
-                plan=plan_output or "(no plan generated)",
+                research_and_plan=research_and_plan,
                 review_context=review_context,
             )
             notify_tool_progress(
                 self.name, iteration, TOOL_MAX_ITERATIONS, "Implementierung läuft..."
             )
-            exec_result = provider.run(exec_prompt, cwd=cwd, timeout=exec_timeout)
-            total_input_tokens += exec_result.input_tokens
-            total_output_tokens += exec_result.output_tokens
+            exec_result = provider.run(
+                exec_prompt, cwd=cwd, timeout=exec_timeout,
+                **_session_kwargs(),
+            )
+            # Fallback: session was lost (e.g. cleanup deleted JSONL between calls).
+            # Start a fresh session and retry once with the same prompt — the
+            # explicit review_context inject keeps the model in sync.
+            if not exec_result.success and exec_result.error == "session_missing":
+                print("  [dev-loop] ⚠️ Session missing — Fallback auf fresh session")
+                sess.rollover(self.name, cwd)
+                first_call = True
+                exec_result = provider.run(
+                    exec_prompt, cwd=cwd, timeout=exec_timeout,
+                    **_session_kwargs(),
+                )
+            tokens.add(exec_result)
 
             if not exec_result.success:
                 msg = f"Execution fehlgeschlagen in Iteration {iteration}: {exec_result.error}"
@@ -464,8 +494,7 @@ class DevLoopTool(BaseTool):
                     error=msg,
                     error_code=exec_result.error,
                     retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             exec_output = exec_result.output.strip()
@@ -475,9 +504,21 @@ class DevLoopTool(BaseTool):
             # ── Phase 3a: Code Quality Review ────────────────────────────────
             print(f"  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: QUALITY REVIEW ===")
             quality_prompt = system_prompt + "\n\n" + _QUALITY_REVIEW_PROMPT.format(task=task)
-            quality_result = provider.run(quality_prompt, cwd=cwd, timeout=quality_timeout)
-            total_input_tokens += quality_result.input_tokens
-            total_output_tokens += quality_result.output_tokens
+            quality_result = provider.run(
+                quality_prompt, cwd=cwd, timeout=quality_timeout,
+                read_only=True,  # safe-by-CLI: review must not edit files
+                **_session_kwargs(),
+            )
+            if not quality_result.success and quality_result.error == "session_missing":
+                print("  [dev-loop] ⚠️ Session missing in Quality-Review — Fallback")
+                sess.rollover(self.name, cwd)
+                first_call = True
+                quality_result = provider.run(
+                    quality_prompt, cwd=cwd, timeout=quality_timeout,
+                    read_only=True,
+                    **_session_kwargs(),
+                )
+            tokens.add(quality_result)
 
             if not quality_result.success:
                 msg = f"Quality-Review fehlgeschlagen in Iteration {iteration}: {quality_result.error}"
@@ -490,8 +531,7 @@ class DevLoopTool(BaseTool):
                     error=msg,
                     error_code=quality_result.error,
                     retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             quality_output = quality_result.output.strip()
@@ -510,8 +550,7 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
             # P3-only findings are non-blocking; only P1/P2 block progress
             blocking_findings = [f for f in quality_findings if not f.startswith("- [P3]")]
@@ -521,9 +560,21 @@ class DevLoopTool(BaseTool):
             # ── Phase 3b: Resolution Review ───────────────────────────────────
             print(f"  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: RESOLUTION REVIEW ===")
             resolution_prompt = system_prompt + "\n\n" + _RESOLUTION_REVIEW_PROMPT.format(task=task)
-            resolution_result = provider.run(resolution_prompt, cwd=cwd, timeout=resolution_timeout)
-            total_input_tokens += resolution_result.input_tokens
-            total_output_tokens += resolution_result.output_tokens
+            resolution_result = provider.run(
+                resolution_prompt, cwd=cwd, timeout=resolution_timeout,
+                read_only=True,  # safe-by-CLI: review must not edit files
+                **_session_kwargs(),
+            )
+            if not resolution_result.success and resolution_result.error == "session_missing":
+                print("  [dev-loop] ⚠️ Session missing in Resolution-Review — Fallback")
+                sess.rollover(self.name, cwd)
+                first_call = True
+                resolution_result = provider.run(
+                    resolution_prompt, cwd=cwd, timeout=resolution_timeout,
+                    read_only=True,
+                    **_session_kwargs(),
+                )
+            tokens.add(resolution_result)
 
             if not resolution_result.success:
                 msg = f"Resolution-Review fehlgeschlagen in Iteration {iteration}: {resolution_result.error}"
@@ -536,8 +587,7 @@ class DevLoopTool(BaseTool):
                     error=msg,
                     error_code=resolution_result.error,
                     retryable=True,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             resolution_output = resolution_result.output.strip()
@@ -555,8 +605,7 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
             resolution_ok = resolution_status == "RESOLVED"
 
@@ -613,8 +662,7 @@ class DevLoopTool(BaseTool):
                     success=True,
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
 
             # ── Infinite loop detection (same quality findings twice) ──────────
@@ -632,8 +680,7 @@ class DevLoopTool(BaseTool):
                         output="\n\n".join(all_outputs),
                         iterations=iteration,
                         error=msg,
-                        input_tokens=total_input_tokens,
-                        output_tokens=total_output_tokens,
+                        **tokens.as_kwargs(),
                     )
                 seen_quality_signatures.add(sig)
                 last_quality_tuple = sig
@@ -651,14 +698,27 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
+                    **tokens.as_kwargs(),
                 )
             seen_review_signatures.add(review_sig)
 
             # Store context for next execution
             previous_quality_findings = blocking_findings
             previous_resolution_output = resolution_output if not resolution_ok else ""
+
+            # Phase B: rollover session every cap iterations to bound conversation
+            # length. The next iteration's exec prompt will inject prev findings
+            # via review_context, so the model resumes seamlessly even though
+            # the new session has no Anthropic-side history.
+            sess.bump()
+            if sess.needs_rollover():
+                print(
+                    f"  [dev-loop] Session-Rollover nach {sess.iteration_count} "
+                    f"Iterationen (cap={sess.cap})"
+                )
+                sess.rollover(self.name, cwd)
+                first_call = True
+
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
         # Max iterations reached
@@ -670,6 +730,5 @@ class DevLoopTool(BaseTool):
             output="\n\n".join(all_outputs),
             iterations=TOOL_MAX_ITERATIONS,
             error=msg,
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens,
+            **tokens.as_kwargs(),
         )

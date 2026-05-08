@@ -17,7 +17,8 @@ def test_claude_tags_resolve_for_claude():
 
 def test_gemini_tags_resolve_for_gemini():
     assert model_id_for_provider("gemini_flash", "gemini") == "gemini-3-flash-preview"
-    assert model_id_for_provider("gemini_pro", "gemini") == "gemini-3-pro-preview"
+    assert model_id_for_provider("gemini_pro", "gemini") == "gemini-3.1-pro-preview"
+    assert model_id_for_provider("gemini_flash_lite", "gemini") == "gemini-3.1-flash-lite-preview"
 
 
 def test_codex_tags_resolve_for_codex():
@@ -53,8 +54,12 @@ def test_is_known_model_tag_rejects_unknown():
 
 
 def test_gemini_aliases_match_verified_preview_ids():
-    assert GEMINI_MODEL_ALIASES["gemini_pro"] == "gemini-3-pro-preview"
+    # Verified against `cclimits --json` (2026-05-08): user's Gemini Code Assist tier
+    # exposes gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-3.1-flash-lite-preview.
+    # gemini-3.1-flash (non-lite) does not exist, so gemini_flash maps to 3.0.
+    assert GEMINI_MODEL_ALIASES["gemini_pro"] == "gemini-3.1-pro-preview"
     assert GEMINI_MODEL_ALIASES["gemini_flash"] == "gemini-3-flash-preview"
+    assert GEMINI_MODEL_ALIASES["gemini_flash_lite"] == "gemini-3.1-flash-lite-preview"
 
 
 def test_codex_aliases_match_verified_model_cache():

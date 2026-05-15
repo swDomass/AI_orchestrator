@@ -5,8 +5,12 @@ They run iterative loops (review→fix→recheck) and report progress.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+import json
 import logging
+import time
+import uuid
 from pathlib import Path
 
 from config import get_system_prompt
@@ -144,6 +148,76 @@ class TokenCounter:
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "cache_read_input_tokens": self.cache_read_input_tokens,
         }
+
+
+@dataclass
+class ToolTracer:
+    """Structured JSONL action trace for a single tool run.
+
+    One line per event in {cwd}/.{tool_name}/traces/{run_id}.jsonl. Disabled
+    silently when cwd is None or directory creation fails — tools must never
+    break because tracing is unavailable.
+
+    Usage:
+        tracer = ToolTracer.create(self.name, cwd)
+        tracer.emit("run_start", task=task[:200], provider=provider.name)
+        # ... at each phase / subprocess boundary:
+        tracer.emit("subprocess_call", phase="agent_pentester", prompt_chars=len(p))
+        result = provider.run(...)
+        tracer.emit("subprocess_result", phase="agent_pentester",
+                    success=not result.error,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens)
+        tracer.emit("run_end", success=tool_result.success)
+
+    Suggested action vocabulary (open-ended — `details` accepts any kwargs):
+        run_start / run_end
+        phase_start / phase_end                         (details: phase=...)
+        iteration_start / iteration_end                 (details: iteration=N)
+        subprocess_call / subprocess_result             (details: phase, tokens)
+        session_rollover                                (details: old_uuid, new_uuid)
+        capacity_exhausted                              (details: phase, agent)
+        roundtable_start / roundtable_persona_*         (deep-security-audit)
+    """
+    tool_name: str
+    run_id: str
+    trace_file: Path | None = None  # None when disabled
+    start_time: float = field(default_factory=time.time)
+
+    @classmethod
+    def create(cls, tool_name: str, cwd: str | None) -> "ToolTracer":
+        """Build a tracer for a tool run. Allocates a UUID and the trace file
+        path. If cwd is missing or the directory cannot be created, the tracer
+        becomes a silent no-op (emit() returns immediately).
+        """
+        run_id = str(uuid.uuid4())
+        trace_file: Path | None = None
+        if cwd:
+            try:
+                trace_dir = Path(cwd) / f".{tool_name}" / "traces"
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                trace_file = trace_dir / f"{run_id}.jsonl"
+            except OSError as exc:
+                logger.warning("Tool trace setup failed for %s: %s", tool_name, exc)
+        return cls(tool_name=tool_name, run_id=run_id, trace_file=trace_file)
+
+    def emit(self, action: str, **details) -> None:
+        """Append one JSON line to the trace file. Never raises."""
+        if not self.trace_file:
+            return
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "elapsed_sec": round(time.time() - self.start_time, 3),
+            "run_id": self.run_id,
+            "tool": self.tool_name,
+            "action": action,
+            "details": details,
+        }
+        try:
+            with self.trace_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning("Tool trace write failed for %s: %s", self.tool_name, exc)
 
 
 def _make_capacity_exhausted_result(

@@ -34,7 +34,7 @@ from config import (
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
+from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
 from tools.review_loop import _is_no_findings_output, _parse_findings
 
 DEV_LOOP_DIR = ".dev-loop"
@@ -273,6 +273,10 @@ class DevLoopTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         print(f"  [dev-loop] Starte Dev-Loop (max {TOOL_MAX_ITERATIONS} Iterationen)")
+
+        tracer = ToolTracer.create(self.name, cwd)
+        tracer.emit("run_start", task=task[:200], provider=provider.name,
+                    max_iterations=TOOL_MAX_ITERATIONS)
 
         dev_loop_dir = Path(cwd or ".") / DEV_LOOP_DIR
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
@@ -654,6 +658,7 @@ class DevLoopTool(BaseTool):
                         self.name, task, all_outputs, provider, cwd=cwd
                     )
 
+                tracer.emit("run_end", success=True, iterations=iteration)
                 notify_tool_done(self.name, iteration, True, msg)
 
                 if cwd:
@@ -724,6 +729,7 @@ class DevLoopTool(BaseTool):
         # Max iterations reached
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht. Reviews noch nicht vollstaendig bestanden."
         print(f"  [dev-loop] {msg}")
+        tracer.emit("run_end", success=False, reason="max_iterations", iterations=TOOL_MAX_ITERATIONS)
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)
         return ToolResult(
             success=False,

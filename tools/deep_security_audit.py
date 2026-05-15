@@ -9,15 +9,21 @@ Multi-perspective security analysis with specialized agents:
   5. Data & Privacy Analyst — secrets management, PII, encryption
   6. Forensics / IR Specialist — logging, audit trails, tamper resistance
 
+Phase 6.5 (optional): Round-Table dialogue — each persona reviews the others'
+findings and contributes Agreements/Rebuttals/Extensions/Gaps. Opt-in via
+#roundtable tag. Adds 6 extra subprocess calls but improves CISO synthesis
+quality on conflicting findings.
 Phase 7: CISO synthesis — dedup, cross-validate, prioritized remediation plan
 Phase 8: Fix implementation (optional, skip with #no-fix tag)
 
 Output written to {cwd}/docs/deep-security-audit-YYYYMMDD-HHMMSS.md
+Structured action trace: {cwd}/.deep-security-audit/traces/<run_id>.jsonl
 
 Usage in queue:
     - [ ] Deep security audit #tool:deep-security-audit cwd:/d/projekt
     - [ ] Audit uncommitted changes #tool:deep-security-audit #no-fix cwd:/d/proj
     - [ ] Full audit with fix #tool:deep-security-audit cwd:/d/proj
+    - [ ] Audit with cross-expert dialog #tool:deep-security-audit #roundtable cwd:/d/proj
 """
 
 import re
@@ -38,6 +44,7 @@ from providers.base import BaseProvider
 from tools.base_tool import (
     BaseTool,
     ToolResult,
+    ToolTracer,
     _build_system_prompt,
     _make_capacity_exhausted_result,
     _make_report_header,
@@ -47,6 +54,7 @@ from tools.base_tool import (
 # ── Tag detection ───────────────────────────────────────────────────
 
 _NO_FIX_RE = re.compile(r"(?i)(?<!\S)#no-fix(?=\s|$)")
+_ROUNDTABLE_RE = re.compile(r"(?i)(?<!\S)#roundtable(?=\s|$)")
 
 
 def _wants_fix(task: str) -> bool:
@@ -54,9 +62,16 @@ def _wants_fix(task: str) -> bool:
     return not _NO_FIX_RE.search(task)
 
 
+def _wants_roundtable(task: str) -> bool:
+    """Return True if task contains #roundtable tag (opt-in)."""
+    return bool(_ROUNDTABLE_RE.search(task))
+
+
 def _clean_tags(task: str) -> str:
     """Remove deep-security-audit-specific tags from task text."""
-    return " ".join(_NO_FIX_RE.sub("", task).split())
+    cleaned = _NO_FIX_RE.sub("", task)
+    cleaned = _ROUNDTABLE_RE.sub("", cleaned)
+    return " ".join(cleaned.split())
 
 
 # ── Agent Definitions ───────────────────────────────────────────────
@@ -376,7 +391,7 @@ from 6 specialized experts. Your job is NOT to repeat their findings. Your job i
 ## Expert Reports
 
 {agent_reports}
-
+{roundtable_block}
 ---
 
 ## Output Format (mandatory)
@@ -414,6 +429,62 @@ Architectural or process changes beyond individual fixes.
 
 ### Dissenting Opinions
 Where experts disagreed — and your resolution of the disagreement.
+
+## Task context: {task}
+""".strip()
+
+# ── Round-Table Dialogue Prompt ─────────────────────────────────────
+
+_ROUNDTABLE_PROMPT = """
+## Role: {agent_title} — Round-Table Dialogue Phase
+
+You previously submitted your independent security audit. Now you are
+participating in a round-table discussion with 5 other experts. They have
+shared their findings with you. Your job:
+
+1. **AGREE**: Which findings from other experts do you ENDORSE? Where does
+   another expert see something you missed but find valid?
+2. **REBUT**: Which findings do you DISAGREE with? State why — wrong threat
+   model, false positive, mitigated by a trust boundary, theoretical not
+   exploitable, etc. Be specific.
+3. **EXTEND**: Where can you ADD CONTEXT another expert lacked? E.g. Pen-Tester
+   found bug X — Architect adds "but X is behind trust boundary Y, so impact
+   is limited" or "X chains with Z from Code-Auditor for CRITICAL escalation".
+4. **GAPS**: What did NOBODY find but is obvious to you now after seeing the
+   other reports?
+
+You may NOT repeat your own original findings (they remain in record).
+Be CONCISE — only contribute where you have substantive input. This is a
+read-only analysis phase. Do NOT modify any files.
+
+---
+
+## Your Original Findings (recap)
+{own_findings}
+
+---
+
+## Findings from Other Experts
+{other_findings}
+
+---
+
+## Output Format (mandatory)
+
+### Agreements
+- **[Finding ID/Title from Expert X]**: One-sentence endorsement + (optional) added evidence.
+
+### Rebuttals
+- **[Finding ID/Title from Expert X]**: Why you disagree. Specific reasoning.
+
+### Extensions / Attack-Chain Links
+- **[Finding A] + [Finding B]**: How they combine, escalated severity.
+
+### Gaps
+- **[New Finding]**: What everyone missed. File:line, attack vector, fix.
+
+If you have nothing substantive to add in a category, write "_None._" — do
+NOT pad.
 
 ## Task context: {task}
 """.strip()
@@ -478,9 +549,22 @@ class DeepSecurityAuditTool(BaseTool):
         # that fans out via Task internally — fewer subprocess calls, full
         # cache reuse, parallel persona execution. Otherwise: stay on
         # today's sequential-subprocess path (still works fine).
+        #
+        # Round-Table forces sequential mode: the dialogue needs per-persona
+        # subprocesses with explicit cross-persona context injection. The
+        # subagent path runs all 6 personas inside a single conversation
+        # without that injection step.
         from config import CLAUDE_SESSION_ENABLED
-        if getattr(provider, "supports_sessions", False) and CLAUDE_SESSION_ENABLED:
+        wants_rt = _wants_roundtable(task)
+        use_subagent = (
+            getattr(provider, "supports_sessions", False)
+            and CLAUDE_SESSION_ENABLED
+            and not wants_rt
+        )
+        if use_subagent:
             return self._run_subagent_mode(task, provider, cwd, timeout, memory_context)
+        if wants_rt and getattr(provider, "supports_sessions", False) and CLAUDE_SESSION_ENABLED:
+            print("  [deep-security-audit] ℹ #roundtable → falling back to sequential mode")
         return self._run_sequential_mode(task, provider, cwd, timeout, memory_context)
 
     def _run_subagent_mode(
@@ -511,9 +595,20 @@ class DeepSecurityAuditTool(BaseTool):
         total_cache_creation = 0
         total_cache_read = 0
 
+        tracer = ToolTracer.create(self.name, cwd)
+        tracer.emit(
+            "run_start",
+            mode="subagent",
+            task=clean_task[:200],
+            provider=provider.name,
+            do_fix=do_fix,
+        )
+
         if not is_cached_provider_available(provider.name):
             msg = "Provider nicht verfügbar — Deep Security Audit abgebrochen"
             print(f"  [deep-security-audit] ⏸ {msg}")
+            tracer.emit("capacity_exhausted", phase="master")
+            tracer.emit("run_end", success=False, reason="capacity_exhausted_master")
             return _make_capacity_exhausted_result(msg, "", 0, 0, 0)
 
         notify_tool_progress(self.name, 1, 2, "Phase 1/2: 6-Persona Audit + CISO-Synthesis (parallele Subagents)...")
@@ -586,6 +681,13 @@ class DeepSecurityAuditTool(BaseTool):
             + "- Write output files via the Write tool, not just in your response.\n"
         )
 
+        tracer.emit(
+            "subprocess_call",
+            phase="master_audit",
+            provider=provider.name,
+            prompt_chars=len(master_prompt),
+            read_only=False,
+        )
         master_result = provider.run(
             master_prompt,
             cwd=str(cwd_path),
@@ -593,6 +695,15 @@ class DeepSecurityAuditTool(BaseTool):
             # Audit phase needs Read+Glob+Grep only; Write tool is enabled for the
             # report files (which are tool-output, not source-code mutation).
             read_only=False,
+        )
+        tracer.emit(
+            "subprocess_result",
+            phase="master_audit",
+            success=master_result.success,
+            input_tokens=master_result.input_tokens,
+            output_tokens=master_result.output_tokens,
+            cache_creation=master_result.cache_creation_input_tokens,
+            cache_read=master_result.cache_read_input_tokens,
         )
         total_input_tokens += master_result.input_tokens
         total_output_tokens += master_result.output_tokens
@@ -602,6 +713,7 @@ class DeepSecurityAuditTool(BaseTool):
         if not master_result.success:
             msg = f"Audit-Master fehlgeschlagen: {master_result.error}"
             print(f"  [deep-security-audit] {msg}")
+            tracer.emit("run_end", success=False, reason="master_failed", error=str(master_result.error)[:200])
             notify_tool_done(self.name, 1, False, msg)
             return ToolResult(
                 success=False,
@@ -628,6 +740,7 @@ class DeepSecurityAuditTool(BaseTool):
 
         # ── Phase 2: Fix (optional, fresh subprocess) ────────────────
         if not do_fix:
+            tracer.emit("run_end", success=True, mode="subagent", do_fix=False)
             notify_tool_done(self.name, 1, True, f"Audit gespeichert: {synthesis_path.name}")
             return ToolResult(
                 success=True,
@@ -645,6 +758,8 @@ class DeepSecurityAuditTool(BaseTool):
                 "Fixes noch ausstehend"
             )
             print(f"  [deep-security-audit] ⏸ {msg}")
+            tracer.emit("capacity_exhausted", phase="fix")
+            tracer.emit("run_end", success=False, reason="capacity_exhausted_fix")
             return _make_capacity_exhausted_result(
                 msg, master_result.output, 1,
                 total_input_tokens, total_output_tokens,
@@ -658,14 +773,31 @@ class DeepSecurityAuditTool(BaseTool):
             task=clean_task,
             synthesis_output=synthesis_text,
         )
+        tracer.emit(
+            "subprocess_call",
+            phase="fix",
+            provider=provider.name,
+            prompt_chars=len(fix_prompt),
+            read_only=False,
+        )
         fix_result = provider.run(fix_prompt, cwd=str(cwd_path), timeout=fix_timeout)
         total_input_tokens += fix_result.input_tokens
         total_output_tokens += fix_result.output_tokens
         total_cache_creation += fix_result.cache_creation_input_tokens
         total_cache_read += fix_result.cache_read_input_tokens
+        tracer.emit(
+            "subprocess_result",
+            phase="fix",
+            success=not fix_result.error,
+            input_tokens=fix_result.input_tokens,
+            output_tokens=fix_result.output_tokens,
+            cache_creation=fix_result.cache_creation_input_tokens,
+            cache_read=fix_result.cache_read_input_tokens,
+        )
 
         if fix_result.error:
             print(f"  [deep-security-audit] ⚠ Fix-Phase Fehler: {fix_result.error}")
+            tracer.emit("run_end", success=False, reason="fix_failed", error=str(fix_result.error)[:200])
             return ToolResult(
                 success=False,
                 output=master_result.output + "\n\n--- FIX ERROR ---\n" + fix_result.error,
@@ -679,6 +811,7 @@ class DeepSecurityAuditTool(BaseTool):
                 cache_read_input_tokens=total_cache_read,
             )
 
+        tracer.emit("run_end", success=True, mode="subagent", do_fix=True)
         notify_tool_done(self.name, 2, True, f"Audit + Fixes done: {synthesis_path.name}")
         return ToolResult(
             success=True,
@@ -699,20 +832,41 @@ class DeepSecurityAuditTool(BaseTool):
         memory_context: str,
     ) -> ToolResult:
         """Original 6-subprocess sequential path. Preserved for non-Claude
-        providers and as the fallback when CLAUDE_SESSION_ENABLED is off."""
+        providers and as the fallback when CLAUDE_SESSION_ENABLED is off.
+        Also activated when #roundtable is set (round-table needs explicit
+        per-persona context injection between subprocesses)."""
         cwd_path = Path(cwd) if cwd else Path(".")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         docs_dir = cwd_path / "docs"
         do_fix = _wants_fix(task)
+        do_roundtable = _wants_roundtable(task)
         clean_task = _clean_tags(task)
         agent_timeout = timeout or TOOL_DSA_AGENT_TIMEOUT_SEC
 
+        tracer = ToolTracer.create(self.name, cwd)
+        tracer.emit(
+            "run_start",
+            mode="sequential",
+            task=clean_task[:200],
+            provider=provider.name,
+            do_fix=do_fix,
+            roundtable=do_roundtable,
+        )
+
         total_input_tokens = 0
         total_output_tokens = 0
+        total_cache_creation = 0
+        total_cache_read = 0
         total_agents = len(_AGENTS)
-        total_phases = total_agents + 1 + (1 if do_fix else 0)  # agents + synthesis + fix
+        total_phases = (
+            total_agents
+            + (1 if do_roundtable else 0)
+            + 1
+            + (1 if do_fix else 0)
+        )  # agents + (roundtable) + synthesis + (fix)
 
         agent_outputs: dict[str, str] = {}
+        roundtable_outputs: dict[str, str] = {}
 
         # ── Phase 1-6: Expert Agents (read-only) ─────────────────────
 
@@ -723,14 +877,18 @@ class DeepSecurityAuditTool(BaseTool):
                     f"({agent.title}) — bisherige Ergebnisse gespeichert"
                 )
                 print(f"  [deep-security-audit] \u23f8 {msg}")
+                tracer.emit("capacity_exhausted", phase="agents", agent=agent.key, idx=idx)
                 if agent_outputs:
                     self._save_partial(docs_dir, timestamp, clean_task, provider, cwd_path, agent_outputs)
+                tracer.emit("run_end", success=False, reason="capacity_exhausted", iterations=idx - 1)
                 return _make_capacity_exhausted_result(
                     msg,
                     self._format_partial(agent_outputs),
                     idx - 1,
                     total_input_tokens,
                     total_output_tokens,
+                    total_cache_creation,
+                    total_cache_read,
                 )
 
             notify_tool_progress(
@@ -738,6 +896,7 @@ class DeepSecurityAuditTool(BaseTool):
                 f"Agent {idx}/{total_agents}: {agent.title}...",
             )
             print(f"  [deep-security-audit] Agent {idx}/{total_agents}: {agent.title} ...")
+            tracer.emit("phase_start", phase=f"agent_{agent.key}", idx=idx, title=agent.title)
 
             system_prompt = _build_system_prompt(
                 provider.name,
@@ -766,6 +925,13 @@ class DeepSecurityAuditTool(BaseTool):
                   "Do NOT modify any files. This is a read-only analysis."
             )
 
+            tracer.emit(
+                "subprocess_call",
+                phase=f"agent_{agent.key}",
+                provider=provider.name,
+                prompt_chars=len(agent_prompt),
+                read_only=True,
+            )
             result = provider.run(
                 agent_prompt,
                 cwd=str(cwd_path),
@@ -775,10 +941,24 @@ class DeepSecurityAuditTool(BaseTool):
 
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
+            total_cache_creation += result.cache_creation_input_tokens
+            total_cache_read += result.cache_read_input_tokens
+
+            tracer.emit(
+                "subprocess_result",
+                phase=f"agent_{agent.key}",
+                success=not result.error,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cache_creation=result.cache_creation_input_tokens,
+                cache_read=result.cache_read_input_tokens,
+                output_chars=len(result.output) if not result.error else 0,
+            )
 
             if result.error:
                 print(f"  [deep-security-audit] \u26a0 Agent {agent.key} Fehler: {result.error}")
                 agent_outputs[agent.key] = f"[FEHLER: {result.error}]"
+                tracer.emit("phase_end", phase=f"agent_{agent.key}", success=False, error=result.error[:200])
                 # Continue with remaining agents — partial results are still valuable
                 continue
 
@@ -795,12 +975,50 @@ class DeepSecurityAuditTool(BaseTool):
                 timestamp, clean_task, provider.name, cwd_path,
             )
             _write_tool_file(docs_dir, agent_filename, agent_header + result.output)
+            tracer.emit("phase_end", phase=f"agent_{agent.key}", success=True, output_chars=len(result.output))
+
+        # ── Phase 6.5: Round-Table Dialogue (optional, opt-in) ───────
+
+        if do_roundtable:
+            tracer.emit("phase_start", phase="roundtable")
+            (rt_outputs, rt_in, rt_out, rt_cc, rt_cr, rt_err) = self._run_roundtable_phase(
+                agent_outputs=agent_outputs,
+                clean_task=clean_task,
+                provider=provider,
+                cwd_path=cwd_path,
+                cwd=cwd,
+                timestamp=timestamp,
+                memory_context=memory_context,
+                agent_timeout=agent_timeout,
+                docs_dir=docs_dir,
+                tracer=tracer,
+            )
+            total_input_tokens += rt_in
+            total_output_tokens += rt_out
+            total_cache_creation += rt_cc
+            total_cache_read += rt_cr
+            if rt_err:
+                tracer.emit("phase_end", phase="roundtable", success=False, error=rt_err[:200])
+                self._save_partial(docs_dir, timestamp, clean_task, provider, cwd_path, agent_outputs)
+                tracer.emit("run_end", success=False, reason="roundtable_capacity")
+                return _make_capacity_exhausted_result(
+                    rt_err,
+                    self._format_partial(agent_outputs),
+                    total_agents,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_creation,
+                    total_cache_read,
+                )
+            roundtable_outputs = rt_outputs
+            tracer.emit("phase_end", phase="roundtable", success=True, responses=len(roundtable_outputs))
 
         # ── Phase 7: CISO Synthesis ──────────────────────────────────
 
         if all(v.startswith("[FEHLER") for v in agent_outputs.values()):
             msg = "Alle Agenten fehlgeschlagen \u2014 keine Synthese m\u00f6glich"
             print(f"  [deep-security-audit] \u2717 {msg}")
+            tracer.emit("run_end", success=False, reason="all_agents_failed", iterations=total_agents)
             return ToolResult(
                 success=False,
                 output=self._format_partial(agent_outputs),
@@ -808,21 +1026,27 @@ class DeepSecurityAuditTool(BaseTool):
                 error=msg,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cache_creation_input_tokens=total_cache_creation,
+                cache_read_input_tokens=total_cache_read,
             )
 
         if not is_cached_provider_available(provider.name):
             msg = "Provider nicht verfügbar für CISO-Synthese — Agenten-Reports gespeichert"
             print(f"  [deep-security-audit] \u23f8 {msg}")
+            tracer.emit("capacity_exhausted", phase="synthesis")
             self._save_partial(docs_dir, timestamp, clean_task, provider, cwd_path, agent_outputs)
+            tracer.emit("run_end", success=False, reason="capacity_exhausted_synthesis")
             return _make_capacity_exhausted_result(
                 msg,
                 self._format_partial(agent_outputs),
                 total_agents,
                 total_input_tokens,
                 total_output_tokens,
+                total_cache_creation,
+                total_cache_read,
             )
 
-        synthesis_phase = total_agents + 1
+        synthesis_phase = total_agents + (1 if do_roundtable else 0) + 1
         notify_tool_progress(
             self.name, synthesis_phase, total_phases,
             "CISO-Synthese: Konsolidierung aller Findings...",
@@ -854,13 +1078,45 @@ class DeepSecurityAuditTool(BaseTool):
 
         agent_reports_block = "\n\n---\n\n".join(report_parts)
 
+        # Build round-table block (only when Phase 6.5 ran).
+        if roundtable_outputs:
+            rt_parts = []
+            for agent in _AGENTS:
+                out = roundtable_outputs.get(agent.key, "")
+                if not out or out.startswith("[skipped") or out.startswith("[FEHLER"):
+                    continue
+                if len(out) > TOOL_DSA_MAX_AGENT_OUTPUT_CHARS:
+                    out = out[:TOOL_DSA_MAX_AGENT_OUTPUT_CHARS] + "\n\n...[truncated]"
+                rt_parts.append(f"### {agent.title} — Round-Table Response\n\n{out}")
+            if rt_parts:
+                roundtable_block = (
+                    "\n---\n\n## Round-Table Dialogue\n\n"
+                    "After the independent audits, each expert reviewed the others' findings "
+                    "and contributed Agreements/Rebuttals/Extensions/Gaps. Weight these "
+                    "responses HEAVILY in your synthesis — they reflect cross-expert "
+                    "validation:\n\n"
+                    + "\n\n---\n\n".join(rt_parts)
+                )
+            else:
+                roundtable_block = ""
+        else:
+            roundtable_block = ""
+
         synthesis_prompt = (
             system_prompt + "\n\n"
             + _CISO_SYNTHESIS_PROMPT
                 .replace("{agent_reports}", agent_reports_block)
+                .replace("{roundtable_block}", roundtable_block)
                 .replace("{task}", clean_task)
         )
 
+        tracer.emit(
+            "subprocess_call",
+            phase="synthesis",
+            provider=provider.name,
+            prompt_chars=len(synthesis_prompt),
+            read_only=True,
+        )
         synthesis_result = provider.run(
             synthesis_prompt,
             cwd=str(cwd_path),
@@ -870,9 +1126,22 @@ class DeepSecurityAuditTool(BaseTool):
 
         total_input_tokens += synthesis_result.input_tokens
         total_output_tokens += synthesis_result.output_tokens
+        total_cache_creation += synthesis_result.cache_creation_input_tokens
+        total_cache_read += synthesis_result.cache_read_input_tokens
+
+        tracer.emit(
+            "subprocess_result",
+            phase="synthesis",
+            success=not synthesis_result.error,
+            input_tokens=synthesis_result.input_tokens,
+            output_tokens=synthesis_result.output_tokens,
+            cache_creation=synthesis_result.cache_creation_input_tokens,
+            cache_read=synthesis_result.cache_read_input_tokens,
+        )
 
         if synthesis_result.error:
             print(f"  [deep-security-audit] \u2717 Synthese Fehler: {synthesis_result.error}")
+            tracer.emit("run_end", success=False, reason="synthesis_failed", error=synthesis_result.error[:200])
             self._save_partial(docs_dir, timestamp, clean_task, provider, cwd_path, agent_outputs)
             return ToolResult(
                 success=False,
@@ -883,6 +1152,8 @@ class DeepSecurityAuditTool(BaseTool):
                 retryable=getattr(synthesis_result, "retryable", False),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cache_creation_input_tokens=total_cache_creation,
+                cache_read_input_tokens=total_cache_read,
             )
 
         synthesis_output = synthesis_result.output
@@ -899,16 +1170,20 @@ class DeepSecurityAuditTool(BaseTool):
             if not is_cached_provider_available(provider.name):
                 msg = "Provider nicht verfügbar für Fix-Phase — Audit-Report gespeichert"
                 print(f"  [deep-security-audit] \u23f8 {msg}")
+                tracer.emit("capacity_exhausted", phase="fix")
                 # Save audit without fixes and signal retry
                 report = self._build_combined_report(
                     timestamp, clean_task, provider, cwd_path,
                     agent_outputs, synthesis_output, "",
+                    roundtable_outputs=roundtable_outputs,
                 )
                 filename = f"deep-security-audit-{timestamp}-audit-only.md"
                 _write_tool_file(docs_dir, filename, report)
+                tracer.emit("run_end", success=False, reason="capacity_exhausted_fix")
                 return _make_capacity_exhausted_result(
                     msg, synthesis_output, synthesis_phase,
                     total_input_tokens, total_output_tokens,
+                    total_cache_creation, total_cache_read,
                 )
 
             notify_tool_progress(self.name, fix_phase, total_phases, "Fix-Implementierung...")
@@ -933,6 +1208,13 @@ class DeepSecurityAuditTool(BaseTool):
                     .replace("{synthesis_output}", synth_for_fix)
             )
 
+            tracer.emit(
+                "subprocess_call",
+                phase="fix",
+                provider=provider.name,
+                prompt_chars=len(fix_prompt_text),
+                read_only=False,
+            )
             fix_result = provider.run(
                 fix_prompt_text,
                 cwd=str(cwd_path),
@@ -941,8 +1223,20 @@ class DeepSecurityAuditTool(BaseTool):
 
             total_input_tokens += fix_result.input_tokens
             total_output_tokens += fix_result.output_tokens
+            total_cache_creation += fix_result.cache_creation_input_tokens
+            total_cache_read += fix_result.cache_read_input_tokens
             fix_output = fix_result.output
             fix_phase_ran = True
+
+            tracer.emit(
+                "subprocess_result",
+                phase="fix",
+                success=not fix_result.error,
+                input_tokens=fix_result.input_tokens,
+                output_tokens=fix_result.output_tokens,
+                cache_creation=fix_result.cache_creation_input_tokens,
+                cache_read=fix_result.cache_read_input_tokens,
+            )
 
             if fix_result.error:
                 fix_error = fix_result.error
@@ -955,12 +1249,18 @@ class DeepSecurityAuditTool(BaseTool):
         report = self._build_combined_report(
             timestamp, clean_task, provider, cwd_path,
             agent_outputs, synthesis_output, fix_output,
+            roundtable_outputs=roundtable_outputs,
         )
         filename = f"deep-security-audit-{timestamp}.md"
         _write_tool_file(docs_dir, filename, report)
         print(f"  [deep-security-audit] \u2713 Report: {docs_dir / filename}")
 
-        iterations = total_agents + 1 + (1 if fix_phase_ran else 0)
+        iterations = (
+            total_agents
+            + (1 if roundtable_outputs else 0)
+            + 1
+            + (1 if fix_phase_ran else 0)
+        )
         success = not fix_error
         output_summary = f"Report: docs/{filename}"
 
@@ -975,6 +1275,8 @@ class DeepSecurityAuditTool(BaseTool):
         fix_error_code = getattr(fix_result, "error_code", "") if fix_phase_ran else ""
         fix_retryable = getattr(fix_result, "retryable", False) if fix_phase_ran else False
 
+        tracer.emit("run_end", success=success, iterations=iterations, has_roundtable=bool(roundtable_outputs))
+
         return ToolResult(
             success=success,
             output=f"{output_summary}\n\n{synthesis_output}",
@@ -984,9 +1286,134 @@ class DeepSecurityAuditTool(BaseTool):
             retryable=fix_retryable,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            cache_creation_input_tokens=total_cache_creation,
+            cache_read_input_tokens=total_cache_read,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────
+
+    def _run_roundtable_phase(
+        self,
+        *,
+        agent_outputs: dict,
+        clean_task: str,
+        provider: BaseProvider,
+        cwd_path: Path,
+        cwd: str | None,
+        timestamp: str,
+        memory_context: str,
+        agent_timeout: int,
+        docs_dir: Path,
+        tracer: ToolTracer,
+    ) -> tuple[dict, int, int, int, int, str | None]:
+        """Phase 6.5: each persona reads the other 5' findings and contributes
+        Agreements/Rebuttals/Extensions/Gaps. Returns:
+            (roundtable_outputs, in_tok, out_tok, cache_creation, cache_read,
+             capacity_error_msg or None).
+        Skips a persona whose original audit failed.
+        """
+        rt_outputs: dict = {}
+        in_tok = out_tok = cc_tok = cr_tok = 0
+        total = len(_AGENTS)
+
+        for idx, agent in enumerate(_AGENTS, 1):
+            if not is_cached_provider_available(provider.name):
+                tracer.emit("capacity_exhausted", phase="roundtable", agent=agent.key, idx=idx)
+                return (rt_outputs, in_tok, out_tok, cc_tok, cr_tok,
+                        f"Provider nicht verfügbar bei Round-Table Persona {idx}/{total}")
+
+            own = agent_outputs.get(agent.key, "[no findings]")
+            if own.startswith("[FEHLER"):
+                rt_outputs[agent.key] = "[skipped — original audit failed]"
+                continue
+
+            other_parts: list = []
+            total_chars = 0
+            for peer in _AGENTS:
+                if peer.key == agent.key:
+                    continue
+                peer_out = agent_outputs.get(peer.key, "")
+                if not peer_out or peer_out.startswith("[FEHLER"):
+                    continue
+                if len(peer_out) > TOOL_DSA_MAX_AGENT_OUTPUT_CHARS:
+                    peer_out = peer_out[:TOOL_DSA_MAX_AGENT_OUTPUT_CHARS] + "\n\n...[truncated]"
+                section = f"### {peer.title}\n\n{peer_out}"
+                if total_chars + len(section) > TOOL_DSA_MAX_TOTAL_INJECT_CHARS:
+                    break
+                other_parts.append(section)
+                total_chars += len(section)
+            other_block = "\n\n---\n\n".join(other_parts)
+
+            own_truncated = own
+            if len(own_truncated) > TOOL_DSA_MAX_AGENT_OUTPUT_CHARS:
+                own_truncated = own_truncated[:TOOL_DSA_MAX_AGENT_OUTPUT_CHARS] + "\n\n...[truncated]"
+
+            system_prompt = _build_system_prompt(
+                provider.name,
+                memory_context=memory_context,
+                tool_name=self.name,
+                cwd=cwd,
+            )
+
+            rt_prompt = (
+                system_prompt + "\n\n"
+                + _ROUNDTABLE_PROMPT
+                    .replace("{agent_title}", agent.title)
+                    .replace("{own_findings}", own_truncated)
+                    .replace("{other_findings}", other_block)
+                    .replace("{task}", clean_task)
+            )
+
+            notify_tool_progress(
+                self.name, idx, total,
+                f"Round-Table {idx}/{total}: {agent.title}...",
+            )
+            print(f"  [deep-security-audit] Round-Table {idx}/{total}: {agent.title} ...")
+            tracer.emit(
+                "subprocess_call",
+                phase=f"roundtable_{agent.key}",
+                provider=provider.name,
+                prompt_chars=len(rt_prompt),
+                read_only=True,
+            )
+
+            result = provider.run(
+                rt_prompt,
+                cwd=str(cwd_path),
+                timeout=agent_timeout,
+                read_only=True,
+            )
+
+            in_tok += result.input_tokens
+            out_tok += result.output_tokens
+            cc_tok += result.cache_creation_input_tokens
+            cr_tok += result.cache_read_input_tokens
+
+            tracer.emit(
+                "subprocess_result",
+                phase=f"roundtable_{agent.key}",
+                success=not result.error,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cache_creation=result.cache_creation_input_tokens,
+                cache_read=result.cache_read_input_tokens,
+                output_chars=len(result.output) if not result.error else 0,
+            )
+
+            if result.error:
+                rt_outputs[agent.key] = f"[FEHLER: {result.error}]"
+                continue
+
+            rt_outputs[agent.key] = result.output
+
+            rt_filename = f"deep-security-audit-{timestamp}-roundtable-{agent.key}.md"
+            rt_header = _make_report_header(
+                f"Deep Security Audit — Round-Table — {agent.title}",
+                timestamp, clean_task, provider.name, cwd_path,
+            )
+            _write_tool_file(docs_dir, rt_filename, rt_header + result.output)
+
+        return (rt_outputs, in_tok, out_tok, cc_tok, cr_tok, None)
 
     def _build_combined_report(
         self,
@@ -997,6 +1424,7 @@ class DeepSecurityAuditTool(BaseTool):
         agent_outputs: dict[str, str],
         synthesis: str,
         fix_output: str,
+        roundtable_outputs: dict[str, str] | None = None,
     ) -> str:
         header = _make_report_header(
             "Deep Security Audit (Multi-Agent)",
@@ -1009,6 +1437,16 @@ class DeepSecurityAuditTool(BaseTool):
         for agent in _AGENTS:
             output = agent_outputs.get(agent.key, "[nicht ausgeführt]")
             parts.append(f"## {agent.title}\n\n{output}\n")
+
+        # Round-Table responses
+        if roundtable_outputs:
+            rt_lines = ["\n---\n\n# Round-Table Dialogue\n"]
+            for agent in _AGENTS:
+                resp = roundtable_outputs.get(agent.key)
+                if resp and not resp.startswith("[skipped") and not resp.startswith("[FEHLER"):
+                    rt_lines.append(f"## {agent.title}\n\n{resp}\n")
+            if len(rt_lines) > 1:
+                parts.append("\n".join(rt_lines))
 
         # Synthesis
         parts.append("\n---\n\n# CISO Synthesis\n\n" + synthesis + "\n")

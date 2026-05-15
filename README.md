@@ -133,6 +133,7 @@ The queue is read from Markdown. Open tasks are standard checkbox lines:
 - [ ] Security audit #tool:security-audit cwd:D:\projects\app
 - [ ] Deep security audit #tool:deep-security-audit cwd:D:\projects\app
 - [ ] Deep audit (no fix) #tool:deep-security-audit #no-fix cwd:D:\projects\app
+- [ ] Deep audit with cross-expert dialog #tool:deep-security-audit #roundtable cwd:D:\projects\app
 ```
 
 The orchestrator automatically appends `## Results` and `## Log` sections to each task.
@@ -202,7 +203,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | `knowledge-transfer` | Cross-domain knowledge transfer: Vault expertise → industry applications (via web search) → Obsidian idea note. |
 | `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:gemini`. Output in `{cwd}/docs/critical-review-*.md`. |
 | `security-audit` | Two-phase workflow: Audit (read-only) → Fix + pytest. Scans for hardcoded secrets, command injection, path traversal, unsafe deserialization, SSRF, and more. Output in `{cwd}/docs/security-audit-*.md`. |
-| `deep-security-audit` | Multi-agent deep audit: 6 expert personas (pentester, architect, SAST, supply chain, data privacy, forensics) + CISO synthesis + optional fix. `#no-fix` skips fix phase. Output in `{cwd}/docs/deep-security-audit-*.md`. |
+| `deep-security-audit` | Multi-agent deep audit: 6 expert personas (pentester, architect, SAST, supply chain, data privacy, forensics) + CISO synthesis + optional fix. `#no-fix` skips fix phase. `#roundtable` inserts a Phase 6.5 dialogue where each persona reviews the others' findings (~6 extra subprocess calls, more robust CISO synthesis on conflicting findings). Output in `{cwd}/docs/deep-security-audit-*.md`. Structured action trace at `{cwd}/.deep-security-audit/traces/<run_id>.jsonl`. |
 
 ```bash
 python orchestrator.py --list-tools

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from config import CAPACITY_LOG_FILE, LOG_FILE, QUEUE_EVENTS_LOG_FILE, QUEUE_FILE, VAULT_PATH
+from config import ALLOWED_CWD_ROOTS, CAPACITY_LOG_FILE, LOG_FILE, QUEUE_EVENTS_LOG_FILE, QUEUE_FILE, VAULT_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,21 @@ class UsageSuggestEvent:
     timestamp: datetime
     event_type: str   # "picked" | "declined" | "timeout" | "suppressed" | "no_suggestions" | "result" | "info"
     detail: str       # raw message tail
+
+
+@dataclass(frozen=True)
+class ToolTraceEvent:
+    """One event from a tool's JSONL action trace.
+
+    See tools/base_tool.py::ToolTracer for the writer side. Schema is open via
+    ``details`` so we don't need to bump the dataclass when tools add fields.
+    """
+    timestamp: datetime
+    elapsed_sec: float
+    run_id: str
+    tool: str
+    action: str
+    details: tuple  # frozen-friendly: tuple of (k, v) pairs from the JSON dict
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -516,6 +531,129 @@ def _get_current_limits() -> dict:
         return {}
 
 
+def _parse_tool_traces(
+    allowed_roots: list[Path],
+    *,
+    max_age_days: int = 30,
+    max_events_per_file: int = 1000,
+) -> list[ToolTraceEvent]:
+    """Glob ``<root>/**/.<tool>/traces/*.jsonl`` over the allowed CWD roots
+    and parse JSONL events. Falls back to no-op when roots are empty (test
+    isolation: never traverses an unscoped filesystem).
+
+    Skips files older than ``max_age_days`` to bound memory. Caps the number
+    of events read per trace file.
+    """
+    import json as _json
+
+    if not allowed_roots:
+        return []
+
+    events: list[ToolTraceEvent] = []
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    cutoff_ts = cutoff.timestamp()
+
+    for root in allowed_roots:
+        if not root.exists():
+            continue
+        # Each tool writes to .<tool_name>/traces/*.jsonl in its CWD.
+        # Glob the pattern broadly — tool subdirs start with "." so they're
+        # not crawled by default; we explicitly traverse them here.
+        try:
+            for trace_file in root.glob("**/.*/traces/*.jsonl"):
+                try:
+                    if trace_file.stat().st_mtime < cutoff_ts:
+                        continue
+                    lines = trace_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if len(lines) > max_events_per_file:
+                        lines = lines[-max_events_per_file:]
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = _json.loads(line)
+                        except _json.JSONDecodeError:
+                            continue
+                        ts_raw = entry.get("ts")
+                        if not ts_raw:
+                            continue
+                        try:
+                            ts = datetime.fromisoformat(ts_raw)
+                        except (TypeError, ValueError):
+                            continue
+                        events.append(ToolTraceEvent(
+                            timestamp=ts,
+                            elapsed_sec=float(entry.get("elapsed_sec", 0)),
+                            run_id=str(entry.get("run_id", "")),
+                            tool=str(entry.get("tool", "")),
+                            action=str(entry.get("action", "")),
+                            details=tuple(sorted((entry.get("details") or {}).items())),
+                        ))
+                except OSError:
+                    continue
+        except OSError as exc:
+            logger.warning("Tool trace glob failed for %s: %s", root, exc)
+
+    events.sort(key=lambda e: e.timestamp)
+    return events
+
+
+def _tool_trace_stats(events: list[ToolTraceEvent]) -> dict:
+    """Aggregate trace events per tool.
+
+    Returns a dict keyed by tool name:
+        {tool: {runs, completed_runs, success_runs, avg_duration_sec, total_events}}
+
+    A run is "completed" when its run_id has a run_end event; "success" when
+    that run_end has details.success == True.
+    """
+    by_run: dict[str, dict] = {}  # run_id → metadata accumulator
+    by_tool_total: dict[str, int] = {}  # tool → total event count
+
+    for ev in events:
+        by_tool_total[ev.tool] = by_tool_total.get(ev.tool, 0) + 1
+        r = by_run.setdefault(ev.run_id, {
+            "tool": ev.tool,
+            "start_ts": None, "end_ts": None,
+            "success": None, "events": 0,
+        })
+        r["events"] += 1
+        if ev.action == "run_start" and r["start_ts"] is None:
+            r["start_ts"] = ev.timestamp
+        elif ev.action == "run_end":
+            r["end_ts"] = ev.timestamp
+            details_dict = dict(ev.details)
+            r["success"] = bool(details_dict.get("success", False))
+
+    per_tool: dict[str, dict] = {}
+    for run_id, r in by_run.items():
+        tool = r["tool"]
+        bucket = per_tool.setdefault(tool, {
+            "runs": 0, "completed_runs": 0, "success_runs": 0,
+            "durations": [], "total_events": 0,
+        })
+        bucket["runs"] += 1
+        bucket["total_events"] += r["events"]
+        if r["end_ts"] is not None and r["start_ts"] is not None:
+            bucket["completed_runs"] += 1
+            bucket["durations"].append((r["end_ts"] - r["start_ts"]).total_seconds())
+            if r["success"]:
+                bucket["success_runs"] += 1
+
+    out: dict[str, dict] = {}
+    for tool, b in per_tool.items():
+        avg = sum(b["durations"]) / len(b["durations"]) if b["durations"] else 0.0
+        out[tool] = {
+            "runs": b["runs"],
+            "completed_runs": b["completed_runs"],
+            "success_runs": b["success_runs"],
+            "avg_duration_sec": round(avg, 1),
+            "total_events": b["total_events"],
+        }
+    return out
+
+
 def get_dashboard_data(days: int = 7) -> dict:
     """Single entry-point: aggregate all data sources into a dict.
 
@@ -548,6 +686,8 @@ def get_dashboard_data(days: int = 7) -> dict:
         snapshots.sort(key=lambda s: s.timestamp)
     queue_events = _parse_queue_log(QUEUE_EVENTS_LOG_FILE)
     session = _parse_session_stats()
+    tool_trace_events = _parse_tool_traces(ALLOWED_CWD_ROOTS, max_age_days=max(days * 2, 30))
+    tool_trace_stats = _tool_trace_stats(tool_trace_events)
 
     # Aggregate
     tpd_labels, tpd_values = _tasks_per_day(records, days=days)
@@ -579,6 +719,9 @@ def get_dashboard_data(days: int = 7) -> dict:
         "billing_total":  _billing_cost_units(records),
         "cache_hit_rate_recent": _cache_hit_rate(recent_records),
         "cache_hit_rate_total":  _cache_hit_rate(records),
+        # Tool action traces — per-tool run counts, success rate, avg duration.
+        # Populated by tools/base_tool.py::ToolTracer (one JSONL file per run).
+        "tool_trace_stats": tool_trace_stats,
     }
 
     _cache["data"] = data

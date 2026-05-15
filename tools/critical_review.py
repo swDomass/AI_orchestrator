@@ -38,6 +38,7 @@ from tools.base_tool import (
     BaseTool,
     SessionContext,
     ToolResult,
+    ToolTracer,
     _build_system_prompt,
     _make_capacity_exhausted_result,
     _make_report_header,
@@ -432,6 +433,14 @@ class CriticalReviewTool(BaseTool):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         docs_dir = cwd_path / "docs"
 
+        tracer = ToolTracer.create(self.name, cwd)
+        tracer.emit(
+            "run_start",
+            task=task[:200],
+            provider=provider.name,
+            pass2_provider=pass_providers.get(2) or provider.name,
+        )
+
         pass1_timeout = timeout or TOOL_CR_PASS1_TIMEOUT_SEC
         pass2_timeout = timeout or TOOL_CR_PASS2_TIMEOUT_SEC
         pass3_timeout = timeout or TOOL_CR_PASS3_TIMEOUT_SEC
@@ -797,6 +806,7 @@ class CriticalReviewTool(BaseTool):
         if v2_path:
             output_parts.append(f"Verbesserter Plan: {v2_path}")
 
+        tracer.emit("run_end", success=True, iterations=iterations)
         notify_tool_done(
             self.name, iterations, True,
             " | ".join(output_parts),

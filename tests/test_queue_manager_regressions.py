@@ -120,6 +120,23 @@ def test_malformed_timeout_suffix_is_rejected_without_partial_strip():
     assert queue_manager.strip_metadata_tags(task) == "Run checks #timeout:10ms"
 
 
+def test_extract_second_opinion_alias_returns_lowercased_value():
+    task = "Review changes #tool:review-loop #second_opinion:Or_GLM cwd:/d/proj"
+    assert queue_manager.extract_second_opinion_alias(task) == "or_glm"
+
+
+def test_extract_second_opinion_alias_returns_none_when_absent():
+    assert queue_manager.extract_second_opinion_alias("Plain task #tool:review-loop") is None
+
+
+def test_strip_metadata_tags_removes_second_opinion():
+    task = "Review changes #tool:review-loop #second_opinion:or_kimi cwd:/d/proj"
+    stripped = queue_manager.strip_metadata_tags(task)
+    assert "#second_opinion" not in stripped
+    assert "or_kimi" not in stripped
+    assert "Review changes" in stripped
+
+
 def test_mark_done_handles_backslashes_in_task_text(mock_queue_file):
     task = r"Fix path handling in C:\proj\file.py"
     mock_queue_file.write_text(f"## Queue\n- [ ] {task}\n", encoding="utf-8")

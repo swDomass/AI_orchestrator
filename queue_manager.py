@@ -96,6 +96,11 @@ MODEL_TAG_RE = re.compile(
 # Matches #pass1:<provider> and #pass2:<provider> for cross-provider tool support
 PASS_PROVIDER_TAG_RE = re.compile(r"(?i)(?<!\S)#pass([12]):(claude|gemini|codex)(?=\s|$)")
 
+# Matches #second_opinion:<alias> — opt-in second-opinion provider for review-loop.
+# Value is a model alias (e.g. or_glm, or_minimax_free, claude_opus) or a bare
+# provider name (openrouter, claude, gemini, codex). Resolution happens in the tool.
+SECOND_OPINION_TAG_RE = re.compile(r"(?i)(?<!\S)#second_opinion:([A-Za-z0-9_]+)(?=\s|$)")
+
 # Matches #id:name — gives a task a unique ID for dependency tracking
 ID_TAG_RE = re.compile(r"(?i)(?<!\S)#id:([\w-]+)(?=\s|$)")
 
@@ -527,6 +532,17 @@ def extract_pass_providers(task: str) -> dict[int, str]:
     return result
 
 
+def extract_second_opinion_alias(task: str) -> str | None:
+    """Extract the raw alias value from #second_opinion:<alias>.
+
+    Returns the lowercased alias (e.g. 'or_glm', 'claude_opus', 'openrouter')
+    or None. The tool resolves the alias to a (provider, model_id) pair —
+    queue_manager stays decoupled from provider/model alias tables.
+    """
+    m = SECOND_OPINION_TAG_RE.search(task)
+    return m.group(1).lower() if m else None
+
+
 def extract_id_tag(task: str) -> str | None:
     """Extract #id:<name> from task text. Returns lowercased name or None."""
     m = ID_TAG_RE.search(task)
@@ -556,6 +572,7 @@ def strip_metadata_tags(task: str) -> str:
     task = ID_TAG_RE.sub("", task)
     task = NEEDS_TAG_RE.sub("", task)
     task = PASS_PROVIDER_TAG_RE.sub("", task)
+    task = SECOND_OPINION_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 

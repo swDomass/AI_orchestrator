@@ -9,19 +9,26 @@ Usage in queue:
 """
 
 import re
+import subprocess
 import time
 
 from config import (
+    CLAUDE_MODEL_ALIASES,
+    CODEX_MODEL_ALIASES,
+    GEMINI_MODEL_ALIASES,
+    OPENROUTER_MODEL_ALIASES,
     TOOL_MAX_ITERATIONS,
     TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_FIX_TIMEOUT_SEC,
     TOOL_INTER_STEP_SLEEP_SEC,
+    TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS,
+    TOOL_RL_SECOND_OPINION_TIMEOUT_SEC,
     TOOL_VERIFICATION_TIMEOUT_SEC,
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider
-from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, _build_system_prompt, _make_capacity_exhausted_result
+from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result
 
 # Matches priority findings like: - [P1] Some issue
 FINDING_RE = re.compile(r"^\s*-\s+\[P[1-3]\]\s+.+", re.MULTILINE)
@@ -92,6 +99,125 @@ Review findings (must all be addressed):
 {findings}
 {lessons_hint}"""
 
+# Second-opinion prompt — sent to a non-agentic LLM (typically OpenRouter) that
+# cannot navigate the codebase itself. The git diff is pre-loaded and injected.
+# The model is told what the primary reviewer already found so it can focus on
+# what was missed, not duplicate work.
+_SECOND_OPINION_PROMPT = """\
+You are providing a SECOND OPINION on a code review.
+
+A primary reviewer has already reviewed the uncommitted changes below and
+listed their findings. Your job: identify ADDITIONAL P1/P2/P3 issues the
+primary reviewer MISSED. Do not restate findings they already found.
+
+Focus on: correctness, security, crashes, edge cases, hidden coupling,
+subtle bugs the primary reviewer might overlook.
+
+== UNCOMMITTED DIFF ==
+{diff}
+
+== PRIMARY REVIEWER FINDINGS ==
+{primary_findings}
+
+== OUTPUT FORMAT (strict) ==
+- One bullet per additional finding: `- [P1] ...`, `- [P2] ...`, `- [P3] ...`
+- Include file paths and line numbers where possible.
+- If the primary reviewer covered everything, output exactly: `No P1/P2/P3 findings.`
+- Do NOT modify any files. Do NOT restate findings already listed above.
+"""
+
+
+# Maps alias → owning provider. Used to resolve #second_opinion:<alias> tags.
+# Bare provider names (without underscore) map to themselves with no model
+# override → default CLI model.
+_SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "gemini", "codex"}
+
+
+def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None] | None:
+    """Resolve a #second_opinion:<alias> value to (provider, model_id | None).
+
+    Returns None when:
+      - alias is falsy
+      - alias is unknown (not a model alias and not a bare provider name)
+      - the resolved provider is not registered (e.g. OpenRouter without API key)
+
+    The caller logs a warning and skips the second-opinion phase on None.
+    """
+    if not alias:
+        return None
+
+    if alias in OPENROUTER_MODEL_ALIASES:
+        provider_name, model_id = "openrouter", alias
+    elif alias in CLAUDE_MODEL_ALIASES:
+        provider_name, model_id = "claude", alias
+    elif alias in GEMINI_MODEL_ALIASES:
+        provider_name, model_id = "gemini", alias
+    elif alias in CODEX_MODEL_ALIASES:
+        provider_name, model_id = "codex", alias
+    elif alias in _SECOND_OPINION_BARE_PROVIDERS:
+        provider_name, model_id = alias, None
+    else:
+        return None
+
+    from dispatcher import get_provider_by_name
+    provider = get_provider_by_name(provider_name)
+    if provider is None:
+        return None
+    return provider, model_id
+
+
+def _load_git_diff(cwd: str | None, max_chars: int) -> str | None:
+    """Capture uncommitted diff + status for second-opinion injection.
+
+    Returns None when:
+      - cwd is None
+      - git is not available / cwd is not a repo
+      - the combined output exceeds max_chars (too large to inject safely)
+    """
+    if not cwd:
+        return None
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=30, check=False,
+            encoding="utf-8", errors="replace",
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if diff.returncode != 0 and status.returncode != 0:
+        return None
+
+    parts: list[str] = []
+    if status.stdout.strip():
+        parts.append("=== git status --porcelain ===\n" + status.stdout.strip())
+    if diff.stdout.strip():
+        parts.append("=== git diff HEAD ===\n" + diff.stdout)
+    if not parts:
+        return None
+
+    combined = "\n\n".join(parts)
+    if len(combined) > max_chars:
+        return None
+    return combined
+
+
+def _merge_findings(primary: list[str], extra: list[str]) -> list[str]:
+    """Union with exact-string dedup, preserving order: primary first, then new."""
+    seen = set(primary)
+    merged = list(primary)
+    for item in extra:
+        if item not in seen:
+            merged.append(item)
+            seen.add(item)
+    return merged
+
+
 _VERIFICATION_PROMPT_BODY = """
 Final verification of the review/fix cycle.
 
@@ -134,6 +260,24 @@ class ReviewLoopTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         print(f"  [review-loop] Starte iterativen Review/Fix-Loop (max {TOOL_MAX_ITERATIONS}x)")
+
+        # Second-opinion: opt-in via #second_opinion:<alias> tag in the queue.
+        # Resolved by the orchestrator and passed as kwarg; we re-resolve here as
+        # fallback so that direct unit tests can pass the alias instead.
+        second_opinion_alias: str | None = kwargs.get("second_opinion_alias")
+        second_opinion: tuple[BaseProvider, str | None] | None = kwargs.get("second_opinion")
+        if second_opinion is None and second_opinion_alias:
+            second_opinion = _resolve_second_opinion(second_opinion_alias)
+            if second_opinion is None:
+                print(
+                    f"  [review-loop] ⚠️ Second-Opinion alias '{second_opinion_alias}' "
+                    f"unbekannt oder Provider nicht konfiguriert — wird übersprungen"
+                )
+
+        tracer = ToolTracer.create(self.name, cwd)
+        tracer.emit("run_start", task=task[:200], provider=provider.name,
+                    max_iterations=TOOL_MAX_ITERATIONS,
+                    second_opinion=second_opinion[0].name if second_opinion else None)
 
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
@@ -238,6 +382,90 @@ class ReviewLoopTool(BaseTool):
             if len(findings) > 5:
                 print(f"    ... und {len(findings) - 5} weitere")
 
+            # Second-opinion phase (iteration 1 only, opt-in).
+            # Runs after the primary review to catch missed P1/P2/P3 issues.
+            # Failures (cooldown, diff fetch, parse) are non-fatal — we log and
+            # continue with the primary findings only.
+            if iteration == 1 and second_opinion is not None:
+                so_provider, so_model_id = second_opinion
+                if not is_cached_provider_available(so_provider.name):
+                    print(
+                        f"  [review-loop] Second-Opinion ({so_provider.name}) "
+                        f"nicht verfügbar — übersprungen"
+                    )
+                else:
+                    diff_text = _load_git_diff(
+                        cwd, TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS
+                    )
+                    if diff_text is None:
+                        print(
+                            f"  [review-loop] Second-Opinion: git-Diff nicht "
+                            f"verfügbar oder zu groß (> "
+                            f"{TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS} chars) — "
+                            f"übersprungen"
+                        )
+                    else:
+                        print(
+                            f"  [review-loop] === SECOND OPINION "
+                            f"({so_provider.name}"
+                            f"{':' + so_model_id if so_model_id else ''}) ==="
+                        )
+                        so_prompt = _SECOND_OPINION_PROMPT.format(
+                            diff=diff_text,
+                            primary_findings=(
+                                "\n".join(findings) if findings else "(none)"
+                            ),
+                        )
+                        prev_model = getattr(so_provider, "_forced_model", None)
+                        if so_model_id is not None:
+                            so_provider._forced_model = so_model_id
+                        try:
+                            so_result = so_provider.run(
+                                so_prompt,
+                                cwd=cwd,
+                                timeout=TOOL_RL_SECOND_OPINION_TIMEOUT_SEC,
+                                read_only=True,
+                            )
+                        finally:
+                            so_provider._forced_model = prev_model
+                        tokens.add(so_result)
+
+                        if not so_result.success:
+                            print(
+                                f"  [review-loop] Second-Opinion fehlgeschlagen: "
+                                f"{so_result.error} — wird ignoriert"
+                            )
+                        else:
+                            extra = _parse_findings(so_result.output.strip())
+                            so_no_findings = _is_no_findings_output(
+                                so_result.output.strip()
+                            )
+                            all_outputs.append(
+                                f"--- Second Opinion ({so_provider.name}) ---\n"
+                                f"{so_result.output}"
+                            )
+                            if extra:
+                                merged = _merge_findings(findings, extra)
+                                new_count = len(merged) - len(findings)
+                                findings = merged
+                                # Any new finding invalidates the no_findings shortcut.
+                                if new_count > 0:
+                                    no_findings = False
+                                print(
+                                    f"  [review-loop] Second-Opinion: "
+                                    f"{new_count} zusätzliche Findings"
+                                )
+                            elif so_no_findings:
+                                print(
+                                    f"  [review-loop] Second-Opinion bestätigt: "
+                                    f"keine zusätzlichen Findings"
+                                )
+                            else:
+                                print(
+                                    f"  [review-loop] Second-Opinion-Output "
+                                    f"ohne parsbare Findings — ignoriert"
+                                )
+
             # No findings → run verification phase, then success
             if no_findings:
                 # Verification phase (configurable via policy.yaml)
@@ -284,6 +512,7 @@ class ReviewLoopTool(BaseTool):
                         self.name, task, all_outputs, provider, cwd=cwd
                     )
 
+                tracer.emit("run_end", success=True, iterations=iteration)
                 notify_tool_done(self.name, iteration, True, msg)
                 return ToolResult(
                     success=True,
@@ -391,6 +620,7 @@ class ReviewLoopTool(BaseTool):
         # Max iterations reached
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht. Noch Findings offen."
         print(f"  [review-loop] ⚠️ {msg}")
+        tracer.emit("run_end", success=False, reason="max_iterations", iterations=TOOL_MAX_ITERATIONS)
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)
         return ToolResult(
             success=False,

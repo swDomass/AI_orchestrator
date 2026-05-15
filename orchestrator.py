@@ -74,6 +74,7 @@ from queue_manager import (
     extract_pass_providers,
     extract_preapproved_actions,
     extract_profile_tag,
+    extract_second_opinion_alias,
     extract_shutdown_tag,
     extract_timeout,
     finalize_task_with_result,
@@ -495,10 +496,14 @@ def _execute_tool_task(
     clean_task = strip_metadata_tags(task)
     # Extract pass-provider tags from raw task (before strip removes them)
     pass_providers = extract_pass_providers(task)
+    # Second-opinion (review-loop opt-in): pass raw alias; the tool resolves
+    # it via dispatcher.get_provider_by_name so other tools stay unaffected.
+    second_opinion_alias = extract_second_opinion_alias(task)
     _tool_start = time.time()
     tool_result = tool.run(
         clean_task, provider, cwd=cwd, timeout=timeout,
         memory_context=memory_context, pass_providers=pass_providers,
+        second_opinion_alias=second_opinion_alias,
     )
     _tool_duration = time.time() - _tool_start
 

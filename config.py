@@ -239,6 +239,10 @@ TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC = 1_800  # 30 min: Issue Resolution Revie
 # Review-Loop verification phase timeout
 TOOL_VERIFICATION_TIMEOUT_SEC          =   600  # 10 min: Final verification after no findings
 
+# Review-Loop second-opinion (opt-in via #second_opinion:<alias> tag)
+TOOL_RL_SECOND_OPINION_TIMEOUT_SEC     =   600  # 10 min: single non-agentic LLM call
+TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS  = 30_000  # cap on git-diff chars injected (≈7-8k tokens)
+
 # Research-QA timeouts (Discovery → Analysis → Questions)
 TOOL_RQA_DISCOVERY_TIMEOUT_SEC = 1_200  # 20 min: Codebase exploration
 TOOL_RQA_ANALYSIS_TIMEOUT_SEC  = 1_200  # 20 min: Deep analysis

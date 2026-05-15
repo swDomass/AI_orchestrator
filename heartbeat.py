@@ -491,23 +491,20 @@ def _llm_check_for_newer_models() -> str:
             CLAUDE_MODEL_ALIASES,
             CODEX_MODEL_ALIASES,
             GEMINI_MODEL_ALIASES,
+            OPENROUTER_MODEL_ALIASES,
         )
-        from dispatcher import select_provider
+        from dispatcher import get_provider_by_name, select_provider
         from limits import get_limits
     except ImportError:
         return ""
 
     try:
-        limits = get_limits()
-        provider = select_provider("model-update-check", limits, tool_name=None)
-        if provider is None:
-            return ""
-
         ids_block = []
         for label, mapping in (
-            ("Claude", CLAUDE_MODEL_ALIASES),
-            ("Gemini", GEMINI_MODEL_ALIASES),
-            ("Codex",  CODEX_MODEL_ALIASES),
+            ("Claude",     CLAUDE_MODEL_ALIASES),
+            ("Gemini",     GEMINI_MODEL_ALIASES),
+            ("Codex",      CODEX_MODEL_ALIASES),
+            ("OpenRouter", OPENROUTER_MODEL_ALIASES),
         ):
             for tag, model_id in mapping.items():
                 ids_block.append(f"  - {label}/{tag} = {model_id}")
@@ -523,6 +520,27 @@ def _llm_check_for_newer_models() -> str:
             "Format pro Eintrag (nur falls relevant): "
             "`<provider>/<tag>: <alte-id> → <neue-id> (<Grund/Quelle>)`"
         )
+
+        # Tier 1: try OpenRouter (free model — $0/call) if configured.
+        # Falls through to the default chain on any failure.
+        openrouter = get_provider_by_name("openrouter")
+        if openrouter is not None and not openrouter.is_cooling_down():
+            result = openrouter.run(prompt, timeout=120, read_only=True)
+            if result.success:
+                text = (result.output or "").strip()
+                if text.upper().rstrip(".").strip() == "OK":
+                    return ""
+                return text[:1500]
+            logger.debug("OpenRouter model-check failed (%s), falling back", result.error)
+
+        # Tier 2: default fallback chain (Claude/Gemini/Codex).
+        limits = get_limits()
+        provider = select_provider(
+            "model-update-check", limits, tool_name=None, exclude={"openrouter"}
+        )
+        if provider is None:
+            return ""
+
         result = provider.run(prompt, timeout=120, read_only=True)
         if not result.success:
             return f"⚠️ LLM-Check failed via {provider.name}: {result.error or 'unknown error'}"

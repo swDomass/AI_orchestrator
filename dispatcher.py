@@ -13,12 +13,15 @@ A provider is skipped if:
 
 import re
 
+import config
 from limits import AllLimits
 from providers.base import BaseProvider
-from providers import ClaudeProvider, GeminiProvider, CodexProvider
+from providers import ClaudeProvider, GeminiProvider, CodexProvider, OpenRouterProvider
 
 # Tag in task text to force a specific provider.
 # Model-specific tags also select their owning provider.
+# OpenRouter tags only resolve when OPENROUTER_API_KEY is set (see _providers
+# below); without a key, a tagged task falls through to the default chain.
 _TAG_MAP = {
     "#claude":            "claude",
     "#claude_haiku":      "claude",
@@ -32,6 +35,16 @@ _TAG_MAP = {
     "#codex_5":           "codex",
     "#codex_5_4":         "codex",
     "#codex_mini":        "codex",
+    "#openrouter":        "openrouter",
+    "#or_minimax_free":   "openrouter",
+    "#or_deepseek_free":  "openrouter",
+    "#or_qwen_free":      "openrouter",
+    "#or_nemotron_free":  "openrouter",
+    "#or_glm":            "openrouter",
+    "#or_kimi":           "openrouter",
+    "#or_qwen":           "openrouter",
+    "#or_deepseek":       "openrouter",
+    "#or_minimax":        "openrouter",
 }
 
 _TAG_RE_BY_PROVIDER = {
@@ -39,18 +52,28 @@ _TAG_RE_BY_PROVIDER = {
     for tag in _TAG_MAP
 }
 
-# Singleton provider instances (carry cooldown state across calls)
+# Singleton provider instances (carry cooldown state across calls).
+# OpenRouter is registered conditionally: without an API key, tagged tasks
+# fall through to the default chain (Claude/Gemini/Codex) automatically.
 _providers: dict[str, BaseProvider] = {
     "claude": ClaudeProvider(),
     "gemini": GeminiProvider(),
     "codex": CodexProvider(),
 }
+if config.OPENROUTER_API_KEY:
+    _providers["openrouter"] = OpenRouterProvider()
 
-# Priority order
+# Priority order — OpenRouter is intentionally absent so it NEVER enters the
+# default fallback chain. Activation requires an explicit #openrouter/#or_* tag.
 _PRIORITY = ["claude", "gemini", "codex"]
 
 
 def _limits_ok(name: str, limits: AllLimits) -> bool:
+    # OpenRouter is pay-per-token and has no subscription quota tracked by
+    # cclimits — treat it as always available. Rate-limit recovery happens
+    # via the provider's own cooldown on HTTP 429.
+    if name == "openrouter":
+        return True
     return getattr(limits, name).available
 
 
@@ -77,16 +100,20 @@ def select_provider(
     If a profile is given, its provider order overrides the default priority.
     If tool_name is given, allowed providers are filtered via PolicyEngine.
     """
-    # Check for explicit provider tag
+    # Check for explicit provider tag.
+    # Use .get() because some tagged providers (currently: openrouter) are only
+    # registered when their API key is configured — without it, the tag resolves
+    # to None and the task falls through to the default chain.
     task_lower = task.lower()
     forced = None
     if force_name and force_name in _providers:
         forced = _providers[force_name]
     else:
-        forced = next(
-            (_providers[v] for tag, v in _TAG_MAP.items() if _TAG_RE_BY_PROVIDER[tag].search(task_lower)),
-            None
-        )
+        for tag, provider_name in _TAG_MAP.items():
+            if _TAG_RE_BY_PROVIDER[tag].search(task_lower):
+                forced = _providers.get(provider_name)
+                if forced is not None:
+                    break
 
     # Tool Policy Layering: filter allowed providers for this tool
     allowed_by_policy = None

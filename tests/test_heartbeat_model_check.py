@@ -1,6 +1,8 @@
 """Tests for the monthly model-update heartbeat check."""
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import heartbeat
 from heartbeat import (
     _check_model_updates,
@@ -9,6 +11,16 @@ from heartbeat import (
     _probe_model,
 )
 from providers.base import RunResult
+
+
+@pytest.fixture(autouse=True)
+def _disable_openrouter_tier(monkeypatch):
+    """Ensure tests do not accidentally make real HTTP calls if the user's
+    environment has OPENROUTER_API_KEY set. _llm_check_for_newer_models tries
+    OpenRouter first when configured — neutralise it so existing assertions
+    that mock dispatcher.select_provider still drive the outcome.
+    """
+    monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
 
 
 # ── _INTERVAL_RE: 'days' support ──────────────────────────────────────────────
@@ -224,6 +236,85 @@ def test_llm_check_returns_warning_on_provider_failure(monkeypatch):
     out = _llm_check_for_newer_models()
     assert out.startswith("⚠️")
     assert "rate_limit" in out
+
+
+def test_llm_check_prefers_openrouter_when_available(monkeypatch):
+    """Tier 1: when OpenRouter is configured, it is used first; native chain is skipped."""
+    openrouter = _fake_provider(success=True)
+    openrouter.run.return_value = RunResult(success=True, output="OK")
+    openrouter.name = "openrouter"
+    openrouter.is_cooling_down = lambda: False
+
+    # Override the autouse fixture for this test only
+    monkeypatch.setattr("dispatcher.get_provider_by_name",
+                        lambda name: openrouter if name == "openrouter" else None)
+
+    # If the code falls through to tier 2, select_provider would be called.
+    # Track it to verify we did NOT fall through.
+    select_calls = []
+    monkeypatch.setattr("dispatcher.select_provider",
+                        lambda *a, **kw: select_calls.append(kw) or None)
+    monkeypatch.setattr("limits.get_limits", lambda: MagicMock())
+
+    assert _llm_check_for_newer_models() == ""
+    openrouter.run.assert_called_once()
+    assert select_calls == [], "select_provider should not be called when OpenRouter succeeds"
+
+
+def test_llm_check_falls_back_when_openrouter_fails(monkeypatch):
+    """Tier 2: OpenRouter failure falls through to the default chain."""
+    openrouter = _fake_provider(success=False, error="rate_limit")
+    openrouter.name = "openrouter"
+    openrouter.is_cooling_down = lambda: False
+
+    fallback = _fake_provider(success=True)
+    fallback.run.return_value = RunResult(success=True, output="OK")
+
+    monkeypatch.setattr("dispatcher.get_provider_by_name",
+                        lambda name: openrouter if name == "openrouter" else None)
+    monkeypatch.setattr("dispatcher.select_provider", lambda *a, **kw: fallback)
+    monkeypatch.setattr("limits.get_limits", lambda: MagicMock())
+
+    assert _llm_check_for_newer_models() == ""
+    openrouter.run.assert_called_once()
+    fallback.run.assert_called_once()
+
+
+def test_llm_check_skips_openrouter_when_cooling_down(monkeypatch):
+    """A cooling-down OpenRouter is bypassed without a call attempt."""
+    openrouter = _fake_provider(success=True)
+    openrouter.name = "openrouter"
+    openrouter.is_cooling_down = lambda: True  # cooling down
+
+    fallback = _fake_provider(success=True)
+    fallback.run.return_value = RunResult(success=True, output="OK")
+
+    monkeypatch.setattr("dispatcher.get_provider_by_name",
+                        lambda name: openrouter if name == "openrouter" else None)
+    monkeypatch.setattr("dispatcher.select_provider", lambda *a, **kw: fallback)
+    monkeypatch.setattr("limits.get_limits", lambda: MagicMock())
+
+    assert _llm_check_for_newer_models() == ""
+    openrouter.run.assert_not_called()
+    fallback.run.assert_called_once()
+
+
+def test_llm_check_prompt_includes_openrouter_aliases(monkeypatch):
+    """Drift-detection: the prompt must enumerate OpenRouter aliases too."""
+    p = _fake_provider(success=True)
+    captured: dict = {}
+
+    def _capture_run(prompt, **kwargs):
+        captured["prompt"] = prompt
+        return RunResult(success=True, output="OK")
+
+    p.run.side_effect = _capture_run
+    monkeypatch.setattr("dispatcher.select_provider", lambda *a, **kw: p)
+    monkeypatch.setattr("limits.get_limits", lambda: MagicMock())
+
+    _llm_check_for_newer_models()
+    assert "OpenRouter/or_minimax_free" in captured["prompt"]
+    assert "OpenRouter/or_glm" in captured["prompt"]
 
 
 def test_llm_check_includes_date_anchor_in_prompt(monkeypatch):

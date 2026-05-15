@@ -187,6 +187,15 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "codex": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
 }
 
+# --- OpenRouter (HTTP provider, pay-per-token) ---
+# Activated only when OPENROUTER_API_KEY is set. Never enters the default
+# fallback chain — requires an explicit #openrouter or #or_* tag.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_DEFAULT_MODEL = os.getenv(
+    "OPENROUTER_DEFAULT_MODEL", "minimax/minimax-m2.5:free"
+)
+
 # --- Telegram Notifications ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -348,10 +357,29 @@ CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex_5_4":  "gpt-5.4",
     "codex_mini": "gpt-5.4-mini",
 }
+# OpenRouter aliases: prefix `or_*` so they cannot collide with native CLI tags.
+# Free models for trivial single-call tasks (heartbeat, summaries). Paid flagships
+# from Chinese open-source families for higher-quality non-agentic calls — all at
+# a fraction of Anthropic/Codex pricing. IDs verified against OpenRouter /models
+# API on 2026-05-15.
+OPENROUTER_MODEL_ALIASES: dict[str, str] = {
+    # Free — $0 always (subject to OpenRouter's daily request limits)
+    "or_minimax_free":  "minimax/minimax-m2.5:free",
+    "or_deepseek_free": "deepseek/deepseek-v4-flash:free",
+    "or_qwen_free":     "qwen/qwen3-coder:free",
+    "or_nemotron_free": "nvidia/nemotron-3-super-120b-a12b:free",
+    # Paid flagships — pricing per MTok (prompt / completion)
+    "or_glm":      "z-ai/glm-5",                   # $0.60 / $1.92, 202k ctx
+    "or_kimi":     "moonshotai/kimi-k2.6",         # $0.73 / $3.49, 262k ctx
+    "or_qwen":     "qwen/qwen3-max",               # $0.78 / $3.90, 262k ctx
+    "or_deepseek": "deepseek/deepseek-v4-pro",     # $0.44 / $0.87, 1M ctx
+    "or_minimax":  "minimax/minimax-m2.7",         # $0.28 / $1.20, 196k ctx
+}
 _MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
-    "claude": CLAUDE_MODEL_ALIASES,
-    "gemini": GEMINI_MODEL_ALIASES,
-    "codex":  CODEX_MODEL_ALIASES,
+    "claude":     CLAUDE_MODEL_ALIASES,
+    "gemini":     GEMINI_MODEL_ALIASES,
+    "codex":      CODEX_MODEL_ALIASES,
+    "openrouter": OPENROUTER_MODEL_ALIASES,
 }
 
 

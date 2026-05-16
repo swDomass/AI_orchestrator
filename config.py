@@ -271,6 +271,37 @@ TOOL_DSA_FIX_TIMEOUT_SEC          = 3_600  # 60 min: fix implementation
 TOOL_DSA_MAX_AGENT_OUTPUT_CHARS   = 15_000  # max per-agent output injected into synthesis
 TOOL_DSA_MAX_TOTAL_INJECT_CHARS   = 80_000  # max combined output for synthesis prompt
 
+# --- Scientific-Investigation tool (#tool:scientific-investigation) ---
+# Cross-provider DA bypass (#cross-provider:none) — rate-limited, then PolicyEngine.
+TOOL_SI_BYPASS_LIMIT_PER_30_DAYS = 3
+# Adversarial-citation-search diversity check (Levenshtein min between queries).
+TOOL_SI_ADVERSARIAL_LEVENSHTEIN_MIN = 8
+# Cross-investigation cherry-picking detector (Cosine similarity).
+TOOL_SI_CHERRYPICKING_SIMILARITY_THRESHOLD = 0.7
+# Default not enforcing external norms — LOW-cap fallback when missing.
+TOOL_SI_DISCIPLINE_NORMS_REQUIRED = False
+# Phase 7 engineering-reviewer (cross-provider).
+TOOL_SI_PHASE7_TIMEOUT_SEC = 1_800
+TOOL_SI_PHASE7_MAX_TOKENS = 30_000
+TOOL_SI_PHASE7_MAX_REWORK_ITERATIONS = 3
+# Phase 8 final user-approval gate (Telegram).
+TOOL_SI_APPROVAL_TIMEOUT_HOURS = 24
+# Sub-task dev-loop timeout (Phase 3 execution loop, per sub-task).
+TOOL_SI_SUBTASK_TIMEOUT_SEC = 7_200
+# Pflicht-Prosa-Limitations validation (Phase 4 synthesis).
+TOOL_SI_LIMITATIONS_BLACKLIST = [
+    "nicht relevant", "nicht anwendbar", "vernachlässigbar", "minimal",
+    "nicht zutreffend", "kein einfluss", "ignorierbar", "trivial",
+    "n/a", "entfällt", "nicht der fall",
+]
+TOOL_SI_LIMITATIONS_REQUIRED_CATEGORIES = [
+    "Multi-LLM-Korpus", "Self-Reporting", "Disziplin-Restriktion",
+    "Cross-Investigation-Cherry-Picking", "LLM-Drift",
+]
+TOOL_SI_LIMITATIONS_MIN_SENTENCES_PER_CATEGORY = 2
+# Embedding model used for cherry-picking similarity index (documented in manifest).
+TOOL_SI_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
 # --- Logging ---
 LOG_FILE = Path(__file__).parent / "logs" / "orchestrator.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file

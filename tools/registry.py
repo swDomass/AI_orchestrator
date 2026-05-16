@@ -15,6 +15,7 @@ from tools.dev_loop import DevLoopTool
 from tools.knowledge_transfer import KnowledgeTransferTool
 from tools.research_qa import ResearchQATool
 from tools.review_loop import ReviewLoopTool
+from tools.scientific_investigation import ScientificInvestigationTool
 from tools.security_audit import SecurityAuditTool
 from tools.test_loop import TestLoopTool
 
@@ -30,6 +31,7 @@ _TOOLS: dict[str, BaseTool] = {
     "critical-review": CriticalReviewTool(),
     "security-audit": SecurityAuditTool(),
     "deep-security-audit": DeepSecurityAuditTool(),
+    "scientific-investigation": ScientificInvestigationTool(),
 }
 
 

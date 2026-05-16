@@ -60,6 +60,7 @@ ALLOWED_ENTRY_TYPES = frozenset({
     "crosscheck_tier",
     "investigation_approval",
     "cross_provider_bypass",
+    "persona_allocation",
 })
 
 

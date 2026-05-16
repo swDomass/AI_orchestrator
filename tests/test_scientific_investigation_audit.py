@@ -465,7 +465,7 @@ def test_tool_run_creates_layout(monkeypatch, tmp_path):
     provider = _ScriptedProvider()  # default scripts framing + prereg
     result = tool.run("investigate diffusion bias", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i1_phase05_done"
+    assert result.error_code == "i2_phase1_done"
     docs = list((tmp_path / "docs").glob("scientific-investigation-*"))
     assert len(docs) == 1
     run_dir = docs[0]
@@ -501,16 +501,19 @@ def test_tool_run_records_bypass_in_audit(monkeypatch, tmp_path):
     assert entries[0]["bypass_count_in_window"] == 1
 
 
-def test_tool_run_blocks_when_bypass_over_limit(monkeypatch, tmp_path):
-    """Bypass-over-limit aborts BEFORE Phase 0 runs, so no provider output is needed."""
+def test_tool_run_blocks_when_bypass_over_limit_and_policy_denies(monkeypatch, tmp_path):
+    """Bypass-over-limit routes to PolicyEngine; when denied, run aborts before Phase 0."""
     _patch_notifier(monkeypatch)
     for i in range(3):
         bypass_counter.record_bypass(tmp_path, run_id=f"prior-{i}")
+    fake_engine = __import__("unittest").mock.MagicMock()
+    fake_engine.request_approval.return_value = "denied"
+    monkeypatch.setattr("policy.get_engine", lambda: fake_engine)
     tool = ScientificInvestigationTool()
     provider = _ScriptedProvider(outputs=[])  # would fail if Phase 0 reached it
     result = tool.run("investigate #cross-provider:none", provider, cwd=str(tmp_path))
     assert result.success is False
-    assert result.error_code == "bypass_over_limit"
+    assert result.error_code == "policy_denied"
 
 
 def test_tool_run_resume_reuses_run_id(monkeypatch, tmp_path):

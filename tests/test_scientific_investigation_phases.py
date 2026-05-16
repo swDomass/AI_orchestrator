@@ -587,8 +587,10 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
     provider = _ScriptedProvider([_good_framing_yaml(), _good_prereg_yaml()])
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i1_phase05_done"
-    assert result.iterations == 1
+    # I2 reaches phase 1 (persona-allocation) on the same provider/code path,
+    # so the canonical post-Phase-0.5 outcome is now i2_phase1_done.
+    assert result.error_code == "i2_phase1_done"
+    assert result.iterations == 2
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "plan.md").is_file()
     assert (run_dir / "audit" / "approvals.jsonl").is_file()
@@ -596,7 +598,7 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
         (tmp_path / ".scientific-investigation").glob("*/state.json")
     )
     state = json.loads(state_path.read_text("utf-8"))
-    assert state["phase"] == "phase05_done"
+    assert state["phase"] == "phase1_persona_allocation_done"
     assert state["rigor_cap"] is None  # norm_reference present → no LOW cap
 
 

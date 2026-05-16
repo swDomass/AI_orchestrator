@@ -60,6 +60,7 @@ from config import (
 )
 from providers.base import BaseProvider
 from tools.crosschecks import audit_trail, similarity_index
+from tools.personas import ALL_PHASE2_PERSONAS, Persona, PersonaAllocation
 from tools.scientific_investigation_approvals import get_manager
 
 logger = logging.getLogger(__name__)
@@ -589,3 +590,119 @@ discipline_warning: {str(prereg.discipline_warning).lower()}
     out = run_dir / "plan.md"
     out.write_text(plan_md, encoding="utf-8")
     return out
+
+
+# ── Phase 1: Persona-Allocation ────────────────────────────────────────────
+
+
+def phase_persona_allocation(
+    primary_provider: BaseProvider,
+    *,
+    run_dir: Path,
+    run_id: str,
+    cross_provider_none: bool,
+    provider_lookup=None,
+) -> list[PersonaAllocation]:
+    """Assign each persona to a concrete provider.
+
+    Allocation rules (Plan §3, §2.1):
+      * Author → primary provider always.
+      * DA → cross-provider if available AND cross_provider_none is False.
+        If cross_provider_none was used, falls back to primary with
+        ``cross_provider_satisfied=False``.
+      * Methodiker → any external provider that is also distinct from DA's
+        choice; falls back to DA's provider, then to primary.
+
+    Each allocation is recorded in the audit trail with type
+    ``persona_allocation`` so later phases (status-tuple, decision-log) can
+    verify cross-provider coverage deterministically.
+
+    ``provider_lookup`` is an optional callable ``(name) -> BaseProvider | None``
+    used in tests to avoid touching the real dispatcher singleton. Defaults
+    to ``dispatcher.get_provider_by_name``.
+    """
+    if provider_lookup is None:
+        from dispatcher import get_provider_by_name as _lookup
+        provider_lookup = _lookup
+
+    primary_name = primary_provider.name
+    # Candidates we'd consider for "cross" — anything other than the primary.
+    # We probe a small static list to avoid pulling in the full dispatcher
+    # priority list (keeps this function testable).
+    candidate_names = ("claude", "gemini", "codex", "openrouter")
+    cross_candidates = [
+        n for n in candidate_names
+        if n != primary_name and provider_lookup(n) is not None
+    ]
+
+    allocations: list[PersonaAllocation] = []
+    for persona in ALL_PHASE2_PERSONAS:
+        if persona.provider_preference == "primary":
+            allocations.append(PersonaAllocation(
+                persona=persona,
+                provider_name=primary_name,
+                cross_provider_satisfied=False,
+            ))
+            continue
+
+        # cross / any_external behave the same when cross_provider_none is
+        # False: pick the first available cross-provider. Distinct from any
+        # already-allocated cross persona.
+        if cross_provider_none:
+            allocations.append(PersonaAllocation(
+                persona=persona,
+                provider_name=primary_name,
+                cross_provider_satisfied=False,
+            ))
+            continue
+
+        already_used = {
+            a.provider_name for a in allocations
+            if a.cross_provider_satisfied
+        }
+        choice = next(
+            (n for n in cross_candidates if n not in already_used),
+            None,
+        )
+        if choice is None and persona.provider_preference == "any_external":
+            # any_external falls back to primary — no cross-coverage possible
+            allocations.append(PersonaAllocation(
+                persona=persona,
+                provider_name=primary_name,
+                cross_provider_satisfied=False,
+            ))
+            continue
+        if choice is None:
+            # Strict "cross" requirement could not be satisfied — degrade to
+            # primary but flag it. Status-tuple will downgrade the run later.
+            allocations.append(PersonaAllocation(
+                persona=persona,
+                provider_name=primary_name,
+                cross_provider_satisfied=False,
+            ))
+            continue
+        allocations.append(PersonaAllocation(
+            persona=persona,
+            provider_name=choice,
+            cross_provider_satisfied=True,
+        ))
+
+    # Audit trail entry per allocation.
+    for alloc in allocations:
+        try:
+            audit_trail.append_audit_entry(run_dir, {
+                "type": "persona_allocation",
+                "run_id": run_id,
+                "role": alloc.persona.role,
+                "name": alloc.persona.name,
+                "provider": alloc.provider_name,
+                "primary_provider": primary_name,
+                "cross_provider_satisfied": alloc.cross_provider_satisfied,
+                "cross_provider_none_tag": cross_provider_none,
+            })
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "audit append failed for persona_allocation %s: %s",
+                alloc.persona.role, exc,
+            )
+    return allocations

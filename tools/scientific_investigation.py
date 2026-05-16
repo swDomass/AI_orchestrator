@@ -51,8 +51,14 @@ from tools.base_tool import (
     ToolTracer,
 )
 from tools.crosschecks import audit_trail, bypass_counter
+from tools.crosschecks.cherrypicking_detector import (
+    build_cherrypicking_block,
+    build_persona_allocation_block,
+    write_decision_log,
+)
 from tools.scientific_investigation_phases import (
     phase_framing,
+    phase_persona_allocation,
     phase_prereg,
     write_plan_md,
 )
@@ -192,7 +198,7 @@ def write_manifest(
         "git_commit_sha": _git_commit_sha(root_cwd),
         "embedding_model": TOOL_SI_EMBEDDING_MODEL,
         "tags": tags.as_audit_dict(),
-        "tool_version": "scientific-investigation/v5/I1",
+        "tool_version": "scientific-investigation/v5/I2",
     }
     out = run_dir / "audit" / "manifest.json"
     atomic_write_state(out, manifest)
@@ -214,6 +220,92 @@ class ScientificInvestigationTool(BaseTool):
     # NOT read_only — this tool writes investigation files, audit-trail entries,
     # and (in later increments) crosscheck code.
     read_only = False
+
+    def _handle_cross_provider_bypass(
+        self,
+        bypass_requested: bool,
+        *,
+        run_dir: Path,
+        root_cwd: Path,
+        run_id: str,
+    ) -> tuple[str, str] | None:
+        """Process a ``#cross-provider:none`` tag.
+
+        Returns ``None`` on success (run may proceed) or
+        ``(error_message, error_code)`` to abort the run. PolicyEngine
+        routing fires only when the rolling 30-day counter is exceeded —
+        normal-cap bypasses are recorded silently.
+        """
+        if not bypass_requested:
+            return None
+
+        if not bypass_counter.is_bypass_over_limit(root_cwd):
+            count = bypass_counter.record_bypass(root_cwd, run_id=run_id)
+            try:
+                audit_trail.append_audit_entry(run_dir, {
+                    "type": "cross_provider_bypass",
+                    "run_id": run_id,
+                    "bypass_count_in_window": count,
+                    "limit": TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
+                    "policy_routed": False,
+                })
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "scientific-investigation: audit append failed for "
+                    "cross_provider_bypass: %s", exc,
+                )
+            return None
+
+        # Over the cap → ask PolicyEngine for explicit user approval.
+        try:
+            from policy import get_engine
+            engine = get_engine()
+        except ImportError as exc:
+            return (
+                f"PolicyEngine-Modul nicht verfügbar — Bypass über Limit "
+                f"({TOOL_SI_BYPASS_LIMIT_PER_30_DAYS}/30d) nicht entscheidbar: {exc}",
+                "policy_unavailable",
+            )
+
+        reasons = [
+            f"Cross-provider bypass over rolling limit "
+            f"({TOOL_SI_BYPASS_LIMIT_PER_30_DAYS}/30d).",
+            f"Run-ID: {run_id}",
+        ]
+        try:
+            response = engine.request_approval(
+                f"scientific-investigation #cross-provider:none for run {run_id}",
+                reasons,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("policy.request_approval failed: %s", exc)
+            response = "denied"
+
+        # Always record the routing event in the audit trail, regardless of
+        # outcome — the audit needs to see WHY a bypass was granted/denied.
+        try:
+            audit_trail.append_audit_entry(run_dir, {
+                "type": "cross_provider_bypass",
+                "run_id": run_id,
+                "bypass_count_in_window": bypass_counter.recent_bypass_count(root_cwd),
+                "limit": TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
+                "policy_routed": True,
+                "policy_response": response,
+            })
+        except (OSError, ValueError) as exc:
+            logger.warning("audit append failed for policy-routed bypass: %s", exc)
+
+        if response != "approved":
+            return (
+                f"#cross-provider:none Bypass von PolicyEngine nicht "
+                f"freigegeben (Antwort={response}). Run {run_id} abgebrochen.",
+                "policy_denied",
+            )
+
+        # Approved by PolicyEngine — record the bypass usage so it counts
+        # against the next window.
+        bypass_counter.record_bypass(root_cwd, run_id=run_id)
+        return None
 
     def run(
         self,
@@ -254,53 +346,22 @@ class ScientificInvestigationTool(BaseTool):
             resume=bool(tags.resume_run_id),
         )
 
-        # Cross-provider bypass: rate-limited at the Engineering-Layer level so
-        # it is enforced uniformly even before the Persona-Allocation phase
-        # exists. PolicyEngine routing is wired up in I2 — for now we record
-        # the attempt and abort with a clear error if the cap is exceeded.
-        bypass_blocked = False
-        if tags.cross_provider_none:
-            if bypass_counter.is_bypass_over_limit(root_cwd):
-                bypass_blocked = True
-                logger.warning(
-                    "scientific-investigation: cross-provider bypass over "
-                    "rolling limit (%d / 30 days) — PolicyEngine routing TODO "
-                    "(I2). Aborting run %s.",
-                    TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
-                    run_id,
-                )
-            else:
-                count = bypass_counter.record_bypass(root_cwd, run_id=run_id)
-                try:
-                    audit_trail.append_audit_entry(
-                        run_dir,
-                        {
-                            "type": "cross_provider_bypass",
-                            "run_id": run_id,
-                            "bypass_count_in_window": count,
-                            "limit": TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
-                        },
-                    )
-                except (OSError, ValueError) as exc:
-                    logger.warning(
-                        "scientific-investigation: audit append failed for "
-                        "cross_provider_bypass: %s", exc,
-                    )
-
-        if bypass_blocked:
-            msg = (
-                f"#cross-provider:none bypass über Limit "
-                f"({TOOL_SI_BYPASS_LIMIT_PER_30_DAYS}/30d) — PolicyEngine-Routing "
-                f"in I2 noch nicht implementiert. Run {run_id} abgebrochen."
-            )
-            tracer.emit("run_end", success=False, reason="bypass_over_limit")
-            notify_tool_done(self.name, 0, False, msg)
+        # Cross-provider bypass: rate-limited at the Engineering-Layer level
+        # (counter), then routed through the existing PolicyEngine when over
+        # the rolling 30-day cap.
+        bypass_outcome = self._handle_cross_provider_bypass(
+            tags.cross_provider_none,
+            run_dir=run_dir,
+            root_cwd=root_cwd,
+            run_id=run_id,
+        )
+        if bypass_outcome is not None:
+            tracer.emit("run_end", success=False, reason=bypass_outcome[1])
+            notify_tool_done(self.name, 0, False, bypass_outcome[0])
             return ToolResult(
-                success=False,
-                output="",
-                iterations=0,
-                error=msg,
-                error_code="bypass_over_limit",
+                success=False, output="", iterations=0,
+                error=bypass_outcome[0],
+                error_code=bypass_outcome[1],
                 retryable=False,
             )
 
@@ -362,12 +423,59 @@ class ScientificInvestigationTool(BaseTool):
             run_dir, task=task, framing=framing, prereg=prereg,
         )
 
-        # Persist run state — used by I2+ phases on resume.
+        # ── Phase 1: Persona-Allocation ────────────────────────────────────
+        tracer.emit("phase_start", phase="persona_allocation")
+        try:
+            allocations = phase_persona_allocation(
+                provider,
+                run_dir=run_dir,
+                run_id=run_id,
+                cross_provider_none=tags.cross_provider_none,
+            )
+        except (RuntimeError, ValueError) as exc:
+            msg = f"Phase 1 (Persona-Allocation) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase1_failed", error=str(exc))
+            notify_tool_done(self.name, 2, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=2, error=msg,
+                error_code="phase1_failed", retryable=False,
+            )
+        tracer.emit(
+            "phase_end", phase="persona_allocation",
+            personas=len(allocations),
+            cross_provider_satisfied=sum(
+                1 for a in allocations if a.cross_provider_satisfied
+            ),
+        )
+
+        # ── Phase 6 (initial decision-log) ─────────────────────────────────
+        # Phase 6 is normally run AFTER synthesis (Plan §1.1 ordering), but
+        # the persona-allocation + cherry-picking blocks are stable from
+        # this point on, so we emit an early decision-log skeleton that
+        # later phases append/overwrite.
+        cherry_block = build_cherrypicking_block(
+            root_cwd, framing_text=framing.framing_text, run_id=run_id,
+        )
+        persona_block = build_persona_allocation_block(allocations)
+        decision_log_path = write_decision_log(
+            run_dir,
+            run_id=run_id,
+            sections=[
+                ("Phase 1: Persona-Allocation", persona_block),
+                ("Phase 6: Cherry-Picking-Detection", cherry_block),
+                ("Phase 7: Engineering-Reviewer-Findings",
+                 "*(Phase 7 — wird in I7 ausgefüllt)*"),
+                ("Phase 8: Investigation-Approval",
+                 "*(Phase 8 — wird in I8 ausgefüllt)*"),
+            ],
+        )
+
+        # Persist run state — used by I3+ phases on resume.
         state_file = state_dir / "state.json"
         atomic_write_state(state_file, {
             "run_id": run_id,
             "ts_slug": ts_slug_value,
-            "phase": "phase05_done",
+            "phase": "phase1_persona_allocation_done",
             "prereg_hash": prereg.prereg_hash,
             "discipline_warning": prereg.discipline_warning,
             "discipline_warning_approved": prereg.discipline_warning_approved,
@@ -382,27 +490,35 @@ class ScientificInvestigationTool(BaseTool):
                 }
                 for t in prereg.thresholds
             ],
+            "personas": [a.as_audit_dict() for a in allocations],
+            "cross_provider_satisfied_count": sum(
+                1 for a in allocations if a.cross_provider_satisfied
+            ),
         })
 
-        # I1 boundary: subsequent phases (1–9) land in I2–I9.
+        # I2 boundary: Phases 2–5, 7, 8 land in I3–I8.
         scaffold_msg = (
-            f"Scientific-Investigation I1 complete (Phases 0 + 0.5).\n"
+            f"Scientific-Investigation I2 complete (Phases 0, 0.5, 1, 6-init).\n"
             f"  run_id:        {run_id}\n"
             f"  plan.md:       {plan_path}\n"
+            f"  decision_log:  {decision_log_path}\n"
             f"  thresholds:    {len(prereg.thresholds)}\n"
             f"  prereg_hash:   {prereg.prereg_hash}\n"
+            f"  personas:      {len(allocations)} "
+            f"(cross-provider: "
+            f"{sum(1 for a in allocations if a.cross_provider_satisfied)})\n"
             f"  rigor_cap:     {'LOW' if prereg.discipline_warning else '(none)'}\n"
             f"  similarity:    {len(framing.similarity_hits)} prior hits ≥ threshold\n"
-            f"NOTE: Phases 1–9 land in increments I2–I9 (see plan v5)."
+            f"NOTE: Phases 2–5, 7, 8 land in increments I3–I8 (see plan v5)."
         )
         logger.info(scaffold_msg)
-        tracer.emit("run_end", success=True, reason="i1_phase05_done")
-        notify_tool_done(self.name, 1, True, "Phase 0 + 0.5 abgeschlossen")
+        tracer.emit("run_end", success=True, reason="i2_phase1_done")
+        notify_tool_done(self.name, 2, True, "Phase 0, 0.5, 1, 6-init abgeschlossen")
         return ToolResult(
             success=True,
             output=scaffold_msg,
-            iterations=1,
+            iterations=2,
             error="",
-            error_code="i1_phase05_done",
+            error_code="i2_phase1_done",
             retryable=False,
         )

@@ -271,6 +271,20 @@ TOOL_DSA_FIX_TIMEOUT_SEC          = 3_600  # 60 min: fix implementation
 TOOL_DSA_MAX_AGENT_OUTPUT_CHARS   = 15_000  # max per-agent output injected into synthesis
 TOOL_DSA_MAX_TOTAL_INJECT_CHARS   = 80_000  # max combined output for synthesis prompt
 
+# Brainstorm tool (multi-persona round-table, domain-aware)
+TOOL_BS_PHASE0_TIMEOUT_SEC                  =    600  # 10 min: topic analysis + persona generation
+TOOL_BS_PERSONA_TIMEOUT_SEC                 =    900  # 15 min: per-persona generation / cross-pollination call
+TOOL_BS_SYNTHESIS_TIMEOUT_SEC               =  1_800  # 30 min: final clustering + ranking
+TOOL_BS_MAX_ITERATIONS                      =      5  # hard cap on convergence loop
+TOOL_BS_CONVERGENCE_THRESHOLD               =   0.20  # <20% new clusters vs. previous round → converged
+TOOL_BS_CLUSTER_SIMILARITY_THRESHOLD        =   0.40  # cosine ≥ X = same cluster (Jaccard-cosine on short texts)
+TOOL_BS_MIN_PERSONAS                        =      4  # min personas the topic-analysis must return
+TOOL_BS_MAX_PERSONAS                        =      6  # max personas the topic-analysis must return
+TOOL_BS_DEFAULT_TOP_N                       =      5  # synthesis: top-N ranked ideas in report
+TOOL_BS_MAX_IDEAS_PER_PERSONA_PER_ROUND     =     10  # cap on ideas any one persona may produce per call
+TOOL_BS_MAX_PEER_CHARS_PER_PERSONA          =  8_000  # truncate one peer's output to this for cross-pollination injection
+TOOL_BS_MAX_TOTAL_INJECT_CHARS              = 50_000  # global cap on peer-context injected into one cross-pollination prompt
+
 # --- Scientific-Investigation tool (#tool:scientific-investigation) ---
 # Cross-provider DA bypass (#cross-provider:none) — rate-limited, then PolicyEngine.
 TOOL_SI_BYPASS_LIMIT_PER_30_DAYS = 3

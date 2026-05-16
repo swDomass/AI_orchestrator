@@ -54,6 +54,10 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 | 22 | Heartbeat background thread (always-on scheduling during long tasks) | DONE |
 | 23 | Dev-loop resilience (capacity guards, research-phase state caching) | DONE |
 | 24 | Robustness hardening (narrow excepts, thread-safety, XSS-safe JS, CORS) | DONE |
+| 25 | Critical-Review Tool (3-pass adversarial review, cross-provider) | DONE |
+| 26 | Deep-Security-Audit Tool (6 expert personas + CISO synthesis + optional Round-Table) | DONE |
+| 27 | Scientific-Investigation Tool (Audit-Trail-Pipeline mit Pre-Registration, Multi-Persona-Review, Status-Tuple) | DONE (Plan v5, I0–I9) |
+| 28 | Brainstorm Tool (domain-aware Personas, iterative Cross-Pollination, TF-IDF-Konvergenz) | DONE |
 
 ## Tier 4 ÔÇö Overkill for Now
 
@@ -984,5 +988,11 @@ SHUTDOWN_COMMAND = ["shutdown", "/s", "/t", "0"] if sys.platform == "win32" \
 
 - [OpenClaw](https://github.com/openclaw/openclaw) ÔÇö Architecture patterns,
   SOUL.md, Skills, Memory, Heartbeat concepts
+- [OpenClaw future ideas](OPENCLAW_FUTURE_IDEAS.md) - candidate operational
+  patterns for secure always-on queue automation
+- [Hermes Agent future ideas](HERMES_AGENT_FUTURE_IDEAS.md) - candidate
+  ideas to borrow without turning AI Orchestrator into a full agent runtime
+- [AI Orchestrator future ideas](AI_ORCHESTRATOR_FUTURE_IDEAS.md) - native
+  reliability and operability ideas for the queue-driven CLI supervisor
 - Existing vault skills: `99_System/AI/Skills/` (11 skills with SKILL.md)
 - Existing tools: `tools/registry.py`, `tools/review_loop.py`, `tools/test_loop.py`

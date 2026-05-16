@@ -9,6 +9,7 @@ Usage in queue file:
 import re
 
 from tools.base_tool import BaseTool
+from tools.brainstorm import BrainstormTool
 from tools.critical_review import CriticalReviewTool
 from tools.deep_security_audit import DeepSecurityAuditTool
 from tools.dev_loop import DevLoopTool
@@ -32,6 +33,7 @@ _TOOLS: dict[str, BaseTool] = {
     "security-audit": SecurityAuditTool(),
     "deep-security-audit": DeepSecurityAuditTool(),
     "scientific-investigation": ScientificInvestigationTool(),
+    "brainstorm": BrainstormTool(),
 }
 
 

@@ -10,7 +10,7 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 - Capacity checking via `cclimits` (with local JSONL fallback on HTTP 429)
 - Retry handling on rate limits / provider failures
 - Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*` tags
-- Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `deep-security-audit`, `critical-review`, `knowledge-transfer`
+- Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `deep-security-audit`, `critical-review`, `knowledge-transfer`, `scientific-investigation`, `brainstorm`
 - Skills / `SKILL.md` discovery with requirements gating
 - Memory (TF-IDF + temporal decay) for recurring tasks
 - Execution profiles (provider order, allowed skills, timeout, policy overrides)
@@ -134,6 +134,8 @@ The queue is read from Markdown. Open tasks are standard checkbox lines:
 - [ ] Deep security audit #tool:deep-security-audit cwd:D:\projects\app
 - [ ] Deep audit (no fix) #tool:deep-security-audit #no-fix cwd:D:\projects\app
 - [ ] Deep audit with cross-expert dialog #tool:deep-security-audit #roundtable cwd:D:\projects\app
+- [ ] Brainstorm pricing strategy #tool:brainstorm cwd:D:\projects\app
+- [ ] Brainstorm with cross-provider personas #tool:brainstorm #cross-provider #top_n:7 cwd:D:\projects\app
 ```
 
 The orchestrator automatically appends `## Results` and `## Log` sections to each task.
@@ -204,6 +206,8 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:gemini`. Output in `{cwd}/docs/critical-review-*.md`. |
 | `security-audit` | Two-phase workflow: Audit (read-only) → Fix + pytest. Scans for hardcoded secrets, command injection, path traversal, unsafe deserialization, SSRF, and more. Output in `{cwd}/docs/security-audit-*.md`. |
 | `deep-security-audit` | Multi-agent deep audit: 6 expert personas (pentester, architect, SAST, supply chain, data privacy, forensics) + CISO synthesis + optional fix. `#no-fix` skips fix phase. `#roundtable` inserts a Phase 6.5 dialogue where each persona reviews the others' findings (~6 extra subprocess calls, more robust CISO synthesis on conflicting findings). Output in `{cwd}/docs/deep-security-audit-*.md`. Structured action trace at `{cwd}/.deep-security-audit/traces/<run_id>.jsonl`. |
+| `scientific-investigation` | Wissenschaftlicher Autopilot mit Audit-Trail. Pipeline (Plan v5, I0–I9): Framing + Pre-Registration → Multi-Persona Review (Author + Devils-Advocate + Methodiker) → Sub-Task-Execution-Loop → Synthesis mit Falsifikations-Tabelle → Mechanical & heuristic check → Engineering-Reviewer Rework → Final Telegram-Approval. Status-Tuple `methodological_rigor=MEDIUM\|LOW` (HIGH strukturell ausgeschlossen). Output in `{cwd}/docs/scientific-investigation-{ts}/` + audit-pack via `scripts/build_audit_pack.py`. |
+| `brainstorm` | Multi-persona Round-Table mit **domain-aware Personas**: LLM analysiert das Thema und wählt 4–6 themenspezifische Personas, die in Cross-Pollination-Runden Ideen produzieren bis Konvergenz (TF-IDF Cluster-Wachstum < 20 %) oder Hard-Cap (5 Iterationen). `#cross-provider` verteilt Personas Round-Robin über alle verfügbaren Provider. Synthesizer ranked Top-N (default 5) mit Pro/Contra/Nächster-Schritt. Output in `{cwd}/docs/brainstorm-*.md`, State + Per-Iteration-Files in `{cwd}/.brainstorm/{ts}/`. |
 
 ```bash
 python orchestrator.py --list-tools
@@ -315,6 +319,71 @@ Pass 3 — Synthesis (only when plan file referenced)
 ```
 
 Plan files can be referenced as file paths (`docs/plan.md`) or wikilinks (`[[MyPlan]]`).
+
+## Brainstorm (`#tool:brainstorm`)
+
+Multi-persona round-table with **domain-aware personas** — the LLM picks 4–6 themenspezifische Rollen (z. B. für Pricing: Daten-Analyst, Boutique-Verkäuferin, Mitbewerber, Braut-Kundin), die in Cross-Pollination-Runden Ideen produzieren und gegenseitig challengen.
+
+```
+Phase 0 — Topic-Analyse + Persona-Generierung
+  LLM analysiert das Thema und schlägt 4–6 unique Personas vor
+  (kebab-case keys, je system_prompt ≥ 100 chars, paarweise distinct).
+  → Sequentielle Validierung in parse_personas (Count, Keys, Prompt-Länge).
+
+Phase 0.5 — Provider-Allocation
+  Default: alle Personas auf Primary-Provider.
+  Mit #cross-provider: Round-Robin über (claude, gemini, codex, openrouter).
+  Degradiert sauber auf primary-only wenn keine Cross-Provider verfügbar.
+
+Phase 1 — Initial Idea Generation
+  Jede Persona unabhängig: bis zu 10 Ideen aus ihrer spezifischen Perspektive.
+  Output pro Persona in {cwd}/.brainstorm/{ts}/iteration-1-{key}.md.
+
+Phase 2 — Cross-Pollination (iterativ)
+  Jede Persona sieht die Ideen der anderen + ihre eigenen,
+  contributes Aufbau-/Synthese-/Challenge-/Gap-Ideen.
+
+K — Konvergenz-Check (deterministisch, kein LLM-Call)
+  TF-IDF Jaccard-Cosine Clustering (Threshold 0.40).
+  Stop wenn neue Cluster < 20 % vom Total. Hard-Cap 5 Iterationen.
+
+Phase 3 — Synthese + Ranking
+  Synthesizer (Primary-Provider) wählt Top-N (default 5)
+  mit Pro/Contra/Nächster-Schritt aus allen Clustern.
+
+→ Final-Report: {cwd}/docs/brainstorm-YYYYMMDD-HHMMSS.md
+→ State + Iterations: {cwd}/.brainstorm/{ts}/
+→ Trace: {cwd}/.brainstorm/traces/<run_id>.jsonl
+```
+
+**Usage examples:**
+
+```md
+# Default: alle Personas auf Primary, 5 Iterationen max
+- [ ] Brainstorm Pricing-Strategie WhiteLady #tool:brainstorm cwd:D:\projects\whitelady
+
+# Cross-provider Diversität: jeder Persona ein anderes LLM
+- [ ] Marketing-Ideen #tool:brainstorm #cross-provider #top_n:7 cwd:D:\projects\whitelady
+
+# Persona-Count und Iter-Cap überschreiben
+- [ ] Feature-Priorisierung #tool:brainstorm #min_personas:5 #max_personas:5 #max_iterations:3 cwd:D:\projects\app
+```
+
+**Tags:**
+
+| Tag | Default | Range | Wirkung |
+|---|---|---|---|
+| `#cross-provider` | off | – | Round-Robin über alle verfügbaren Provider statt primary-only |
+| `#max_iterations:N` | 5 | 1–10 | Hard-Cap auf die Konvergenz-Schleife |
+| `#top_n:N` | 5 | 1–20 | Anzahl Top-Ideen im finalen Ranking |
+| `#min_personas:N` | 4 | 2–10 | Untergrenze Persona-Count (LLM muss ≥ N liefern) |
+| `#max_personas:N` | 6 | 2–10 | Obergrenze Persona-Count (LLM darf ≤ N liefern) |
+
+**Tradeoffs:**
+
+- `#cross-provider` skaliert die Kosten linear mit Persona-Count und Iterationen — Faustregel: 5 Personas × 3 Iter × 2 Phasen = ~30 LLM-Calls quer über alle Provider. Default-off ist bewusst.
+- Konvergenz greift schneller bei thematisch klaren Topics; bei sehr breiten Fragestellungen erreicht der Hard-Cap das Ende des Loops.
+- Empty-Topic (alle Tags entfernt → leerer String) wird vor dem ersten LLM-Call abgefangen (`error_code="empty_topic"`).
 
 ## Best Practice: Full Dev-Loop Workflow
 
@@ -552,7 +621,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~805 tests, ~12s)
+# Run all tests (~1130 tests, ~25 s)
 python -m pytest tests/ -q
 
 # Run a single test file

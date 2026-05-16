@@ -81,7 +81,7 @@ and `OPENCLAW_FUTURE_IDEAS.md`, with critical re-prioritization. Guiding rule:
 | 30 | Replay JSONL (machine-readable run summaries) | M | backlog |
 | 31 | Idempotency Keys (external triggers) | S | DONE |
 | 32 | Telegram Slash-Commands (`/review`, `/dev`, `/security`, `/audit`, `/critique`, `/brainstorm`) | S | DONE |
-| 33 | Cron ÔåÆ Queue (scheduled task creation) | M | backlog |
+| 33 | Schedule tags (`#at:` one-shot, `#every:` recurring) | S | DONE |
 | 34 | Failure Taxonomy (built on #30) | S | backlog |
 | 35 | Preflight Hooks per Tool | M | backlog |
 | 36 | Skill Suggestion (draft-only, pattern-gated) | M | backlog |
@@ -231,38 +231,48 @@ the current dispatch is); add `_build_task_line(template, args)` helper.
 
 ---
 
-### 33. Cron ÔåÆ Queue (Scheduled Task Creation)
+### 33. Schedule Tags (`#at:` + `#every:`) ÔÇö DONE 2026-05-16
 
-**Goal**: Recurring jobs land in the queue, not bypassing it. Re-uses all
-policy/provider/approval machinery.
+**Original goal**: Recurring/scheduled tasks land in the queue, not bypassing it.
 
-**Config**: new `schedules.yaml` next to `policy.yaml`:
-```yaml
-- name: nightly-review
-  cron: "0 22 * * *"
-  task: "Review today's changes"
-  cwd:  D:\programmieren\privat_python\AI_orchestrator
-  tags: ["#tool:review-loop"]
-  idempotency_bucket: day      # day | hour | exact
-```
+**Key insight during implementation**: a separate scheduler module is overkill.
+The existing **retry primitive** (`<!-- retry: ... -->` annotation +
+`_retry_is_due()` filter) already gates "this task line becomes active at time T".
+Cron IS retry with a future timestamp. So both schedule tags layer onto that
+primitive instead of introducing new persistence or a tick loop.
 
-**Scope**:
-- New module `scheduler.py` ÔÇö pure-Python cron parser (stdlib only ÔÇö no `croniter`)
-- Tick from the heartbeat loop (already runs every poll)
-- On match: build queue line, apply #31 idempotency (key = name + bucket_ts),
-  append to queue, log to `logs/scheduler.jsonl`
-- Heartbeat and Scheduler are distinct: **heartbeat = health checks** (in-process,
-  no queue mutation), **scheduler = task creation** (queue mutation, full pipeline)
+**Implementation** (final scope, queue_manager.py only):
 
-**Out of scope**:
-- Direct execution from cron without going through queue.
-- Distributed scheduling, lock-leader election, cluster-safe ÔÇö this is single-host.
+- **`#at:<timestamp>` ÔÇö one-time future start**. Accepts `YYYY-MM-DDTHH:MM`,
+  `YYYY-MM-DD HH:MM`, or `HH:MM` (closest-day interpretation). `read_queue_items()`
+  filters the task out until the timestamp is reached. No file mutation: the
+  tag stays in the task line until first fire, then disappears with the `[x]`
+  mark. Retry-annotation always wins over `#at:` (transient retry is the active
+  timing signal).
 
-**Dependency**: requires #31 (idempotency) so a missed/replayed tick doesn't
-double-queue.
+- **`#every:<duration>` ÔÇö recurring schedule**. Units `s|m|h|d`. Examples
+  `#every:30m`, `#every:24h`, `#every:7d`. On successful completion,
+  `_completion_replacement()` rewrites the line as open with a fresh
+  `<!-- retry: now+duration -->` annotation instead of `[x]`. Stale `#at:` tags
+  are stripped on the same rewrite. Failure path (transient retry) keeps
+  working unchanged ÔÇö on the eventual success, the schedule resumes.
 
-**Implementation hooks**: `scheduler.py` + `schedules.yaml`. Hook one tick call
-into `heartbeat.HeartbeatRunner.run_due()` epilogue.
+- **Composability**: `#at:2026-05-17T22:00 #every:24h` = first fire at 22:00,
+  then daily.
+
+- **Linter**: malformed `#at:` and `#every:` values are flagged as errors.
+
+**Why no `schedules.yaml` and no `scheduler.py`**:
+- Queue file stays the single source of truth (Obsidian-native editing)
+- Idempotency naturally guaranteed: one line = one recurring schedule
+- Missed runs replay automatically on next poll (retry time is in the past
+  ÔÇö task becomes due immediately, which is the right behaviour for
+  maintenance jobs)
+- ~80 LOC total instead of 250+ for a separate scheduler
+
+**Implementation hooks**: `queue_manager.py` (regex tags + extract helpers +
+`_completion_replacement` + 3-line filter extension in `read_queue_items`),
+`queue_linter.py` (two validators). No new modules. No heartbeat changes.
 
 ---
 

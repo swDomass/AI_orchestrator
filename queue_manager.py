@@ -107,6 +107,17 @@ ID_TAG_RE = re.compile(r"(?i)(?<!\S)#id:([\w-]+)(?=\s|$)")
 # Matches #needs:name1,name2 or #need:name1,name2 — declares task dependencies (comma-separated)
 NEEDS_TAG_RE = re.compile(r"(?i)(?<!\S)#needs?:([\w,\-]+)(?=\s|$)")
 
+# Matches #at:<timestamp> — one-time future start. Reuses the retry-due primitive.
+# Accepts the same forms _retry_is_due() understands: full ISO (YYYY-MM-DDTHH:MM
+# or YYYY-MM-DD HH:MM) and legacy HH:MM (closest-day interpretation).
+AT_TAG_RE = re.compile(
+    r"(?i)(?<!\S)#at:(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\d{2}:\d{2})(?=\s|$)"
+)
+
+# Matches #every:<duration> — recurring schedule. Duration units: s, m, h, d.
+# Examples: #every:30m, #every:24h, #every:7d.
+EVERY_TAG_RE = re.compile(r"(?i)(?<!\S)#every:(\d+)([smhd])(?=\s|$)")
+
 # Extract only the markdown body under "## Queue" (until the next H2 heading)
 QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)
 
@@ -557,6 +568,31 @@ def extract_needs_tags(task: str) -> list[str]:
     return [dep.strip().lower() for dep in m.group(1).split(",") if dep.strip()]
 
 
+def extract_at_tag(task: str) -> str | None:
+    """Extract #at:<timestamp> from task text. Returns the raw timestamp string or None.
+
+    The timestamp is in the same form _retry_is_due() understands, so the same
+    primitive decides when the task becomes due. #at: is purely syntactic sugar
+    for a one-time future start.
+    """
+    m = AT_TAG_RE.search(task)
+    return m.group(1) if m else None
+
+
+def extract_every_tag(task: str) -> int | None:
+    """Extract #every:<duration> from task text. Returns duration in seconds, or None.
+
+    Supported units: s (seconds), m (minutes), h (hours), d (days).
+    Examples: #every:30m → 1800, #every:24h → 86400, #every:7d → 604800.
+    """
+    m = EVERY_TAG_RE.search(task)
+    if not m:
+        return None
+    val = int(m.group(1))
+    unit_seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return val * unit_seconds[m.group(2).lower()]
+
+
 def strip_metadata_tags(task: str) -> str:
     """Remove routing/metadata tags before sending the task text to a provider."""
     task = CWD_RE.sub("", task)
@@ -573,6 +609,8 @@ def strip_metadata_tags(task: str) -> str:
     task = NEEDS_TAG_RE.sub("", task)
     task = PASS_PROVIDER_TAG_RE.sub("", task)
     task = SECOND_OPINION_TAG_RE.sub("", task)
+    task = AT_TAG_RE.sub("", task)
+    task = EVERY_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 
@@ -739,7 +777,17 @@ def read_queue_items() -> list[QueueTask]:
         if retry_match and not _retry_is_due(retry_match.group(1)):
             continue
 
-        task_text = m.group(1).strip()
+        task_text_raw = m.group(1).strip()
+
+        # `#at:<timestamp>` — one-time future start. Reuses the retry-due primitive.
+        # If a retry-annotation is already present, it wins (active timing signal).
+        # Otherwise, an unmet #at: filters the task out of this poll.
+        if not retry_match:
+            at_match = AT_TAG_RE.search(task_text_raw)
+            if at_match and not _retry_is_due(at_match.group(1)):
+                continue
+
+        task_text = task_text_raw
 
         # Collect indented subtask lines for #parallel tasks
         subtask_lines: tuple[str, ...] = ()
@@ -885,6 +933,23 @@ def _replace_open_task_line(
     return "".join(lines)
 
 
+def _completion_replacement(task_text: str, done_replacement: str) -> str:
+    """Return the rewrite for a successfully completed task.
+
+    Normal case: returns `done_replacement` (a `- [x] ...` line).
+    `#every:<duration>` case: returns `- [ ] <task> <!-- retry: now+duration -->`,
+    so the task stays in the queue and fires again on schedule. The `#at:` tag
+    (if any) is stripped — it served its purpose on the first fire.
+    """
+    every_sec = extract_every_tag(task_text)
+    if every_sec is None:
+        return done_replacement
+    next_retry = datetime.now() + timedelta(seconds=every_sec)
+    cleaned = AT_TAG_RE.sub("", task_text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return f"- [ ] {cleaned} <!-- retry: {next_retry.strftime('%Y-%m-%d %H:%M')} -->"
+
+
 def mark_done(
     task_text: str,
     provider: str,
@@ -892,9 +957,18 @@ def mark_done(
     line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
 ) -> bool:
-    """Mark a task as completed in the queue file."""
+    """Mark a task as completed in the queue file.
+
+    For `#every:` tasks, the line is rewritten as an open task with a new retry
+    annotation (= now + duration) instead of being marked `[x]`. This implements
+    recurring schedules on top of the existing retry primitive — see
+    `_completion_replacement`.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    replacement = f"- [x] {task_text} ✅ {now} ({provider})"
+    replacement = _completion_replacement(
+        task_text,
+        f"- [x] {task_text} ✅ {now} ({provider})",
+    )
 
     def update(content: str) -> str | None:
         if line_no is not None:
@@ -971,9 +1045,16 @@ def finalize_task_with_result(
     subtasks: tuple[str, ...] | None = None,
 ) -> bool:
     """Atomically mark a task done in one queue update.
-    Result is stored in memory/task_results/, not in the queue file."""
+    Result is stored in memory/task_results/, not in the queue file.
+
+    For `#every:` tasks, the line is rewritten as an open task with a new retry
+    annotation instead of `[x]` — see `_completion_replacement`.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    done_replacement = f"- [x] {task_text} ✅ {now} ({provider})"
+    done_replacement = _completion_replacement(
+        task_text,
+        f"- [x] {task_text} ✅ {now} ({provider})",
+    )
 
     def update(content: str) -> str | None:
         if line_no is not None:

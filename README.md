@@ -174,6 +174,8 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Parallel task | `#parallel` | Parent task with indented subtasks |
 | Task ID | `#id:<name>` | `- [ ] Build backend #id:build` |
 | Task dependency | `#needs:<id1,id2>` | `- [ ] Test #needs:build` |
+| One-time schedule | `#at:<timestamp>` | `- [ ] Review #at:2026-05-17T22:00` |
+| Recurring schedule | `#every:<duration>` | `- [ ] Daily review #every:24h` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
 | Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:gemini` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
@@ -203,6 +205,23 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 - Blocked tasks are **not removed** from the queue — they stay open and are re-checked each cycle.
 - The queue header shows `(N runnable, M blocked)` when blocked tasks are present.
 - `[-]` (failed) tasks also unblock dependents — the downstream task decides how to handle failure.
+
+### Schedules (`#at:` / `#every:`)
+
+```md
+- [ ] One-time review tonight #at:2026-05-17T22:00 #tool:review-loop cwd:D:\proj
+- [ ] Daily review #every:24h #tool:review-loop cwd:D:\proj
+- [ ] First at 22:00, then weekly #at:2026-05-17T22:00 #every:7d cwd:D:\proj
+```
+
+Both schedule tags reuse the existing retry primitive — no separate scheduler.
+
+- **`#at:<timestamp>`** delays the task until the given time. Formats: `YYYY-MM-DDTHH:MM`, `YYYY-MM-DD HH:MM`, or `HH:MM` (closest-day interpretation). After first fire, the task is marked `[x]` like any other one-shot.
+- **`#every:<duration>`** turns the task into a recurring schedule. Units: `s|m|h|d`. On successful completion, the line is rewritten as open with a new `<!-- retry: now+duration -->` annotation instead of `[x]` — it fires again on schedule. Stale `#at:` tags are stripped on this rewrite.
+- **Combine them** for "first fire at time T, then every D": `#at:2026-05-17T22:00 #every:24h` = first run at 22:00, then daily.
+- **Pause / remove** a recurring schedule = edit the queue file (delete the line, comment it out, or mark `[x]` manually).
+- **Missed runs replay automatically**: if the orchestrator was off when a schedule was due, the retry time is in the past on next start — the task runs immediately.
+- **Validated by `--lint-queue`**: malformed `#at:` and `#every:` values are flagged as errors.
 
 ### Retry Markers
 
@@ -647,7 +666,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1200 tests, ~35 s)
+# Run all tests (~1230 tests, ~45 s)
 python -m pytest tests/ -q
 
 # Run a single test file

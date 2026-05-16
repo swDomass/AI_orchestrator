@@ -29,7 +29,9 @@ from config import (
     is_known_model_tag,
 )
 from queue_manager import (
+    AT_TAG_RE,
     CWD_RE,
+    EVERY_TAG_RE,
     MODEL_TAG_RE,
     NEEDS_TAG_RE,
     PARALLEL_TAG_RE,
@@ -236,6 +238,8 @@ def _check_task(
     out.extend(_check_duplicate_id(line_no, task_text, open_ids))
     out.extend(_check_needs(line_no, task_text, open_ids, completed_ids))
     out.extend(_check_parallel(line_no, task_text, subtasks))
+    out.extend(_check_at_tag(line_no, task_text))
+    out.extend(_check_every_tag(line_no, task_text))
     return out
 
 
@@ -427,3 +431,38 @@ def _owning_provider_for_alias(alias: str) -> str | None:
         if alias in aliases:
             return provider
     return None
+
+
+def _check_at_tag(line_no: int, task_text: str) -> list[LintFinding]:
+    """`#at:` only accepts forms _retry_is_due() understands. Catch malformed
+    values that look like they're trying to be a schedule but aren't parseable."""
+    # Detect any `#at:<something>` even if it doesn't match the strict regex,
+    # so we can flag the malformed case.
+    permissive = re.search(r"(?i)(?<!\S)#at:(\S+)", task_text)
+    if not permissive:
+        return []
+    strict = AT_TAG_RE.search(task_text)
+    if strict:
+        return []  # well-formed
+    return [LintFinding(
+        LEVEL_ERROR, line_no, task_text,
+        f"#at: erwartet 'YYYY-MM-DDTHH:MM', 'YYYY-MM-DD HH:MM' oder 'HH:MM' "
+        f"(bekam: {permissive.group(1)!r})",
+        code="invalid_at",
+    )]
+
+
+def _check_every_tag(line_no: int, task_text: str) -> list[LintFinding]:
+    """`#every:` must be `<number><s|m|h|d>`."""
+    permissive = re.search(r"(?i)(?<!\S)#every:(\S+)", task_text)
+    if not permissive:
+        return []
+    strict = EVERY_TAG_RE.search(task_text)
+    if strict:
+        return []
+    return [LintFinding(
+        LEVEL_ERROR, line_no, task_text,
+        f"#every: erwartet '<zahl><s|m|h|d>', z.B. '#every:24h' "
+        f"(bekam: {permissive.group(1)!r})",
+        code="invalid_every",
+    )]

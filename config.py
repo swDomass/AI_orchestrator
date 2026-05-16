@@ -280,6 +280,11 @@ TOOL_SI_ADVERSARIAL_LEVENSHTEIN_MIN = 8
 TOOL_SI_CHERRYPICKING_SIMILARITY_THRESHOLD = 0.7
 # Default not enforcing external norms — LOW-cap fallback when missing.
 TOOL_SI_DISCIPLINE_NORMS_REQUIRED = False
+# Phase 0 framing + Phase 0.5 pre-registration timeouts.
+TOOL_SI_PHASE0_TIMEOUT_SEC = 600
+TOOL_SI_PHASE0_5_TIMEOUT_SEC = 900
+# Per-threshold Telegram approval wait. Single threshold blocks for at most this long.
+TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC = 1_800  # 30 min
 # Phase 7 engineering-reviewer (cross-provider).
 TOOL_SI_PHASE7_TIMEOUT_SEC = 1_800
 TOOL_SI_PHASE7_MAX_TOKENS = 30_000

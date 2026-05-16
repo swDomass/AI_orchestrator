@@ -39,6 +39,9 @@ from typing import Any
 from config import (
     TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
     TOOL_SI_EMBEDDING_MODEL,
+    TOOL_SI_PHASE0_TIMEOUT_SEC,
+    TOOL_SI_PHASE0_5_TIMEOUT_SEC,
+    TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC,
 )
 from notifier import notify_tool_done
 from providers.base import BaseProvider
@@ -48,6 +51,11 @@ from tools.base_tool import (
     ToolTracer,
 )
 from tools.crosschecks import audit_trail, bypass_counter
+from tools.scientific_investigation_phases import (
+    phase_framing,
+    phase_prereg,
+    write_plan_md,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +192,7 @@ def write_manifest(
         "git_commit_sha": _git_commit_sha(root_cwd),
         "embedding_model": TOOL_SI_EMBEDDING_MODEL,
         "tags": tags.as_audit_dict(),
-        "tool_version": "scientific-investigation/v5/I0",
+        "tool_version": "scientific-investigation/v5/I1",
     }
     out = run_dir / "audit" / "manifest.json"
     atomic_write_state(out, manifest)
@@ -214,6 +222,9 @@ class ScientificInvestigationTool(BaseTool):
         cwd: str | None = None,
         timeout: int | None = None,
         memory_context: str = "",
+        *,
+        notify_threshold_callable=None,
+        notify_discipline_warning_callable=None,
         **kwargs,
     ) -> ToolResult:
         root_cwd = _resolve_root_cwd(cwd)
@@ -276,9 +287,6 @@ class ScientificInvestigationTool(BaseTool):
                         "cross_provider_bypass: %s", exc,
                     )
 
-        # I0 boundary: real phases are not implemented yet. Return a clear
-        # scaffold result so the orchestrator and tests can verify the layer
-        # without us pretending phases ran.
         if bypass_blocked:
             msg = (
                 f"#cross-provider:none bypass über Limit "
@@ -296,23 +304,105 @@ class ScientificInvestigationTool(BaseTool):
                 retryable=False,
             )
 
+        # ── Phase 0: Framing + Bias-Statement (+ Similarity) ────────────────
+        tracer.emit("phase_start", phase="framing")
+        try:
+            framing = phase_framing(
+                task,
+                provider,
+                run_dir=run_dir,
+                root_cwd=root_cwd,
+                run_id=run_id,
+                timeout_sec=TOOL_SI_PHASE0_TIMEOUT_SEC,
+            )
+        except (RuntimeError, ValueError) as exc:
+            msg = f"Phase 0 (Framing) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase0_failed", error=str(exc))
+            notify_tool_done(self.name, 0, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=0, error=msg,
+                error_code="phase0_failed", retryable=False,
+            )
+        tracer.emit(
+            "phase_end", phase="framing",
+            similarity_hits=len(framing.similarity_hits),
+            discipline=framing.discipline,
+        )
+
+        # ── Phase 0.5: Pre-Registration ────────────────────────────────────
+        tracer.emit("phase_start", phase="prereg")
+        try:
+            prereg = phase_prereg(
+                framing,
+                provider,
+                run_dir=run_dir,
+                run_id=run_id,
+                timeout_sec=TOOL_SI_PHASE0_5_TIMEOUT_SEC,
+                telegram_timeout_sec=TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC,
+                notify_callable=notify_threshold_callable,
+                discipline_warning_callable=notify_discipline_warning_callable,
+            )
+        except (RuntimeError, ValueError) as exc:
+            msg = f"Phase 0.5 (Pre-Registration) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase05_failed", error=str(exc))
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=1, error=msg,
+                error_code="phase05_failed", retryable=False,
+            )
+        tracer.emit(
+            "phase_end", phase="prereg",
+            thresholds=len(prereg.thresholds),
+            discipline_warning=prereg.discipline_warning,
+            prereg_hash=prereg.prereg_hash,
+        )
+
+        # Persist plan.md (combines Phase 0 + Phase 0.5).
+        plan_path = write_plan_md(
+            run_dir, task=task, framing=framing, prereg=prereg,
+        )
+
+        # Persist run state — used by I2+ phases on resume.
+        state_file = state_dir / "state.json"
+        atomic_write_state(state_file, {
+            "run_id": run_id,
+            "ts_slug": ts_slug_value,
+            "phase": "phase05_done",
+            "prereg_hash": prereg.prereg_hash,
+            "discipline_warning": prereg.discipline_warning,
+            "discipline_warning_approved": prereg.discipline_warning_approved,
+            "rigor_cap": "LOW" if prereg.discipline_warning else None,
+            "framing": framing.as_yaml_dict(),
+            "thresholds": [
+                {
+                    "criterion_id": t.criterion_id,
+                    "source": t.source,
+                    "reference": t.reference,
+                    "telegram_msg_id": t.telegram_msg_id,
+                }
+                for t in prereg.thresholds
+            ],
+        })
+
+        # I1 boundary: subsequent phases (1–9) land in I2–I9.
         scaffold_msg = (
-            f"Scientific-Investigation I0 Scaffold initialized.\n"
-            f"  run_id:  {run_id}\n"
-            f"  run_dir: {run_dir}\n"
-            f"  state:   {state_dir}\n"
-            f"  manifest:{manifest_path}\n"
-            f"  tags:    {tags.as_audit_dict()}\n"
-            f"NOTE: Phases 0–9 land in increments I1–I9 (see plan v5)."
+            f"Scientific-Investigation I1 complete (Phases 0 + 0.5).\n"
+            f"  run_id:        {run_id}\n"
+            f"  plan.md:       {plan_path}\n"
+            f"  thresholds:    {len(prereg.thresholds)}\n"
+            f"  prereg_hash:   {prereg.prereg_hash}\n"
+            f"  rigor_cap:     {'LOW' if prereg.discipline_warning else '(none)'}\n"
+            f"  similarity:    {len(framing.similarity_hits)} prior hits ≥ threshold\n"
+            f"NOTE: Phases 1–9 land in increments I2–I9 (see plan v5)."
         )
         logger.info(scaffold_msg)
-        tracer.emit("run_end", success=True, reason="i0_scaffold_only")
-        notify_tool_done(self.name, 0, True, "I0 scaffold only — Phasen pending")
+        tracer.emit("run_end", success=True, reason="i1_phase05_done")
+        notify_tool_done(self.name, 1, True, "Phase 0 + 0.5 abgeschlossen")
         return ToolResult(
             success=True,
             output=scaffold_msg,
-            iterations=0,
+            iterations=1,
             error="",
-            error_code="i0_scaffold_only",
+            error_code="i1_phase05_done",
             retryable=False,
         )

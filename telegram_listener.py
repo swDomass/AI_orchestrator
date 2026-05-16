@@ -269,6 +269,8 @@ class TelegramListener:
                 self._cmd_approve_all(command_args)
             elif command == "/deny":
                 self._cmd_deny()
+            elif command == "/reject":
+                self._cmd_reject(command_args)
             elif command == "/skip":
                 self._cmd_skip()
             elif command == "/pick":
@@ -301,6 +303,7 @@ class TelegramListener:
             "/approve \\[kategorie\\] — Ausstehende Aktion genehmigen\n"
             "/approve\\-all \\<kategorie\\> — Session\\-Freigabe für Kategorie\n"
             "/deny  — Ausstehende Aktion ablehnen\n"
+            "/reject \\<run_id\\> \\[criterion\\] \\[grund\\] — Investigation\\-Approval ablehnen\n"
             "/skip  — Aktion überspringen, Task fortsetzen\n"
             "/pick N — Vorschlag N auswählen \\(1\\-3\\)\n"
             "/decline — Vorschläge ablehnen\n"
@@ -358,6 +361,11 @@ class TelegramListener:
         logger.info("Orchestrator durch Telegram fortgesetzt.")
 
     def _cmd_approve(self, category: str) -> None:
+        # First check whether the args refer to a scientific-investigation
+        # pre-reg / final approval. Manager-handled approvals route directly
+        # to the matching event so the existing PolicyEngine flow is unaffected.
+        if self._route_to_si_manager(category, response="approved"):
+            return
         try:
             from policy import get_engine
             engine = get_engine()
@@ -371,6 +379,67 @@ class TelegramListener:
             send_message("✅ Genehmigt.")
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_reject(self, args: str) -> None:
+        """Reject a scientific-investigation approval (pre-reg threshold or final).
+
+        Format: ``/reject <run_id> [criterion_id] [reason...]``. Falls back to
+        the legacy ``/deny`` semantics (PolicyEngine) when the args don't match
+        a pending SI approval.
+        """
+        if self._route_to_si_manager(args, response="rejected"):
+            return
+        # Fallback — same shape as legacy /deny
+        try:
+            from policy import get_engine
+            engine = get_engine()
+            if not engine.has_pending_approval():
+                send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
+                return
+            engine._respond("denied")
+            send_message("❌ Abgelehnt. Task bleibt in Queue.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _route_to_si_manager(self, args: str, *, response: str) -> bool:
+        """Try to deliver ``response`` to a pending scientific-investigation
+        approval. Returns True iff a pending entry was matched and woken.
+
+        Args format: ``<run_id> [criterion_id] [reason...]``. When
+        ``criterion_id`` is omitted, the Phase 8 sentinel ``__investigation__``
+        is used (final investigation-level approval).
+        """
+        parts = args.strip().split(maxsplit=2)
+        if not parts:
+            return False
+        try:
+            from tools.scientific_investigation_approvals import (
+                INVESTIGATION_CRITERION,
+                get_manager,
+            )
+        except ImportError:
+            return False
+        run_id = parts[0]
+        criterion_id = parts[1] if len(parts) > 1 else INVESTIGATION_CRITERION
+        reason = parts[2] if len(parts) > 2 else ""
+        manager = get_manager()
+        if not manager.has_pending(run_id, criterion_id):
+            return False
+        delivered = manager.respond(
+            run_id=run_id,
+            criterion_id=criterion_id,
+            response=response,
+            approver=str(TELEGRAM_CHAT_ID),
+            reason=reason,
+        )
+        if delivered:
+            label = "Investigation" if criterion_id == INVESTIGATION_CRITERION else criterion_id
+            mark = "✅" if response == "approved" else "❌"
+            send_message(
+                f"{mark} {label} ({run_id[:8]}…) → "
+                f"{_escape_telegram_markdown(response)}."
+            )
+        return delivered
 
     def _cmd_approve_all(self, category: str) -> None:
         cat = category.strip()

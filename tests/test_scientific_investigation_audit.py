@@ -43,15 +43,39 @@ from tools.sub_tool_context import build_sub_env
 
 
 class _ScriptedProvider:
+    """Provider that returns canned outputs in order. Defaults to two I1
+    happy-path responses (framing + prereg) so the tool can complete Phase 0+0.5.
+    """
     name = "claude"
     supports_sessions = False
 
-    def __init__(self):
+    _DEFAULT_FRAMING = """```yaml
+question: precise question about diffusion under load
+hypothesis: bias is below 5% under nominal conditions
+bias_statement: Author wants the bias to be small to validate prior work
+discipline: engineering
+framing_text: engineering investigation about diffusion bias under load with 800K thermal envelope
+```"""
+    _DEFAULT_PREREG = """```yaml
+thresholds:
+  - criterion_id: F1
+    description: Toleranz-Test bei 800K
+    threshold_value: 5%
+    source: norm_reference
+    reference: DIN-EN-60068-2 §4.3 Toleranz 5% bei 800K Umgebung
+```"""
+
+    def __init__(self, outputs: list[str] | None = None):
         self.calls: list[str] = []
+        if outputs is None:
+            outputs = [self._DEFAULT_FRAMING, self._DEFAULT_PREREG]
+        self._outputs = list(outputs)
 
     def run(self, task: str, **kwargs) -> RunResult:
         self.calls.append(task)
-        return RunResult(success=True, output="")
+        if not self._outputs:
+            return RunResult(success=False, error="no scripted output left")
+        return RunResult(success=True, output=self._outputs.pop(0))
 
 
 def _patch_notifier(monkeypatch):
@@ -434,13 +458,14 @@ def test_build_sub_env_uses_os_environ_when_no_base(monkeypatch, tmp_path):
 # ── Tool integration: I0 scaffold ───────────────────────────────────────────
 
 
-def test_tool_i0_scaffold_creates_layout(monkeypatch, tmp_path):
+def test_tool_run_creates_layout(monkeypatch, tmp_path):
+    """Run-isolated layout (draft/, traces/, audit/, state-dir) is created on every run."""
     _patch_notifier(monkeypatch)
     tool = ScientificInvestigationTool()
-    provider = _ScriptedProvider()
+    provider = _ScriptedProvider()  # default scripts framing + prereg
     result = tool.run("investigate diffusion bias", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i0_scaffold_only"
+    assert result.error_code == "i1_phase05_done"
     docs = list((tmp_path / "docs").glob("scientific-investigation-*"))
     assert len(docs) == 1
     run_dir = docs[0]
@@ -452,7 +477,7 @@ def test_tool_i0_scaffold_creates_layout(monkeypatch, tmp_path):
     assert any((d / "sub-tasks").is_dir() for d in state_dirs)
 
 
-def test_tool_i0_manifest_contains_provenance(monkeypatch, tmp_path):
+def test_tool_run_manifest_contains_provenance(monkeypatch, tmp_path):
     _patch_notifier(monkeypatch)
     tool = ScientificInvestigationTool()
     provider = _ScriptedProvider()
@@ -460,12 +485,12 @@ def test_tool_i0_manifest_contains_provenance(monkeypatch, tmp_path):
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     manifest = json.loads((run_dir / "audit" / "manifest.json").read_text("utf-8"))
     assert manifest["provider"] == "claude"
-    assert manifest["tool_version"].startswith("scientific-investigation/v5/I0")
+    assert manifest["tool_version"].startswith("scientific-investigation/v5/")
     assert manifest["tags"]["cross_provider_none"] is True
     assert manifest["embedding_model"]  # populated from config
 
 
-def test_tool_i0_records_bypass_in_audit(monkeypatch, tmp_path):
+def test_tool_run_records_bypass_in_audit(monkeypatch, tmp_path):
     _patch_notifier(monkeypatch)
     tool = ScientificInvestigationTool()
     provider = _ScriptedProvider()
@@ -476,29 +501,27 @@ def test_tool_i0_records_bypass_in_audit(monkeypatch, tmp_path):
     assert entries[0]["bypass_count_in_window"] == 1
 
 
-def test_tool_i0_blocks_when_bypass_over_limit(monkeypatch, tmp_path):
+def test_tool_run_blocks_when_bypass_over_limit(monkeypatch, tmp_path):
+    """Bypass-over-limit aborts BEFORE Phase 0 runs, so no provider output is needed."""
     _patch_notifier(monkeypatch)
-    # Pre-fill the counter with 3 recent bypasses.
     for i in range(3):
         bypass_counter.record_bypass(tmp_path, run_id=f"prior-{i}")
     tool = ScientificInvestigationTool()
-    provider = _ScriptedProvider()
+    provider = _ScriptedProvider(outputs=[])  # would fail if Phase 0 reached it
     result = tool.run("investigate #cross-provider:none", provider, cwd=str(tmp_path))
     assert result.success is False
     assert result.error_code == "bypass_over_limit"
 
 
-def test_tool_i0_resume_reuses_run_id(monkeypatch, tmp_path):
+def test_tool_run_resume_reuses_run_id(monkeypatch, tmp_path):
     _patch_notifier(monkeypatch)
     tool = ScientificInvestigationTool()
     provider = _ScriptedProvider()
-    # Pre-create a state dir for the resume scenario; run should reuse the id.
     target_run_id = "resumed-run-id"
     (tmp_path / ".scientific-investigation" / target_run_id / "sub-tasks").mkdir(
         parents=True,
     )
     tool.run(f"continue work #resume:{target_run_id}", provider, cwd=str(tmp_path))
-    # The state dir for the resumed run must exist (reused, not recreated under new uuid).
     assert (tmp_path / ".scientific-investigation" / target_run_id).is_dir()
 
 

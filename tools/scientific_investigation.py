@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from config import (
+    TOOL_SI_APPROVAL_TIMEOUT_HOURS,
     TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
     TOOL_SI_EMBEDDING_MODEL,
     TOOL_SI_PHASE0_TIMEOUT_SEC,
@@ -64,6 +65,24 @@ from tools.scientific_investigation_phase2 import (
 from tools.scientific_investigation_phase3 import (
     phase_execution_loop,
     write_execution_report_md,
+)
+from tools.scientific_investigation_phase4 import (
+    compute_status_tuple,
+    phase_synthesis,
+)
+from tools.scientific_investigation_phase5 import (
+    phase_heuristic_review,
+    phase_mechanical_falsification_check,
+    write_phase5_report_md,
+)
+from tools.scientific_investigation_phase7 import (
+    phase_engineering_reviewer,
+    write_phase7_report_md,
+)
+from tools.scientific_investigation_phase8 import (
+    Phase8Summary,
+    extract_top_limitations,
+    phase_final_approval,
 )
 from tools.scientific_investigation_phases import (
     phase_framing,
@@ -207,7 +226,7 @@ def write_manifest(
         "git_commit_sha": _git_commit_sha(root_cwd),
         "embedding_model": TOOL_SI_EMBEDDING_MODEL,
         "tags": tags.as_audit_dict(),
-        "tool_version": "scientific-investigation/v5/I4",
+        "tool_version": "scientific-investigation/v5/I9",
     }
     out = run_dir / "audit" / "manifest.json"
     atomic_write_state(out, manifest)
@@ -217,6 +236,24 @@ def write_manifest(
 def _resolve_root_cwd(cwd: str | None) -> Path:
     """Return an absolute Path for the project root CWD."""
     return Path(cwd or ".").resolve()
+
+
+def _aggregate_adversarial_audit(phase3) -> dict[str, bool]:
+    """Reduce per-Sub-Task adversarial reports into the K5 conjunction inputs.
+
+    The Status-Tuple expects a single ``{diversity_pass, tool_call_pass}``
+    dict. We pass IFF every literature_search Sub-Task that ran a real
+    search passes BOTH checks. Sub-Tasks without a search default to True
+    (Plan §0.2 K5 only constrains searches that actually happened).
+    """
+    diversity = True
+    tool_call = True
+    for r in phase3.sub_task_results:
+        if r.adversarial is None:
+            continue
+        diversity = diversity and r.adversarial.diversity.pass_
+        tool_call = tool_call and r.adversarial.tool_calls.pass_
+    return {"diversity_pass": diversity, "tool_call_pass": tool_call}
 
 
 class ScientificInvestigationTool(BaseTool):
@@ -330,6 +367,9 @@ class ScientificInvestigationTool(BaseTool):
         sub_task_executor=None,
         adversarial_query_generator=None,
         adversarial_search_executor=None,
+        phase5a_measurements=None,
+        phase8_notify_callable=None,
+        phase8_timeout_sec=None,
         **kwargs,
     ) -> ToolResult:
         root_cwd = _resolve_root_cwd(cwd)
@@ -532,6 +572,163 @@ class ScientificInvestigationTool(BaseTool):
             run_dir, phase3=phase3,
         )
 
+        # ── Phase 4: Synthesis ─────────────────────────────────────────────
+        tracer.emit("phase_start", phase="synthesis")
+        try:
+            synthesis = phase_synthesis(
+                framing, prereg, phase2, phase3, provider,
+                run_dir=run_dir, run_id=run_id,
+            )
+        except RuntimeError as exc:
+            msg = f"Phase 4 (Synthesis) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase4_failed", error=str(exc))
+            notify_tool_done(self.name, 5, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=5, error=msg,
+                error_code="phase4_failed", retryable=False,
+            )
+        tracer.emit(
+            "phase_end", phase="synthesis",
+            validation_errors=len(synthesis.validation_errors),
+            draft_chars=len(synthesis.proof_md_text),
+        )
+
+        # ── Phase 5a: mechanical falsification check ──────────────────────
+        tracer.emit("phase_start", phase="phase5a")
+        phase5a = phase_mechanical_falsification_check(
+            prereg,
+            run_dir=run_dir, root_cwd=root_cwd, run_id=run_id,
+            measurements=phase5a_measurements,
+        )
+        tracer.emit("phase_end", phase="phase5a",
+                    aggregate_status=phase5a.aggregate_status)
+
+        # ── Phase 5b: heuristic LLM review (cross-provider) ───────────────
+        phase5b_report = None
+        phase5b_provider_name = None
+        if provider_lookup is not None:
+            # Try to pick a cross-provider reviewer; silently skip if none.
+            for candidate in ("openrouter", "gemini", "codex", "claude"):
+                if candidate == provider.name:
+                    continue
+                reviewer = provider_lookup(candidate)
+                if reviewer is not None:
+                    phase5b_provider_name = candidate
+                    try:
+                        phase5b_report = phase_heuristic_review(
+                            synthesis.proof_md_text, phase5a, reviewer,
+                        )
+                    except RuntimeError as exc:
+                        logger.warning("Phase 5b skipped (review failed): %s", exc)
+                    break
+        phase5_md_path = write_phase5_report_md(
+            run_dir, phase5a=phase5a, phase5b=phase5b_report,
+        )
+
+        # ── Phase 7: Engineering-Reviewer (cross-provider, rework loop) ───
+        tracer.emit("phase_start", phase="engineering_reviewer")
+        try:
+            phase5a_dict = {"checks": [c.as_dict() for c in phase5a.checks]}
+            phase5b_findings = list(phase5b_report.findings) if phase5b_report else []
+            phase7 = phase_engineering_reviewer(
+                synthesis.proof_md_text,
+                phase5a_dict,
+                phase5b_findings,
+                provider,
+                run_dir=run_dir, run_id=run_id,
+                explicit_reviewer_name=tags.engineering_reviewer,
+                provider_lookup=provider_lookup,
+            )
+        except RuntimeError as exc:
+            msg = f"Phase 7 (Engineering-Reviewer) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase7_failed", error=str(exc))
+            notify_tool_done(self.name, 7, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=7, error=msg,
+                error_code="phase7_failed", retryable=False,
+            )
+        tracer.emit(
+            "phase_end", phase="engineering_reviewer",
+            status=phase7.status,
+            iterations_used=phase7.iterations_used,
+            cross_provider_satisfied=phase7.cross_provider_satisfied,
+        )
+        # Persist the (potentially reworked) draft.
+        synthesis.draft_path.write_text(phase7.final_proof_md, encoding="utf-8")
+        phase7_md_path = write_phase7_report_md(run_dir, phase7=phase7)
+
+        # ── Phase 8: Final User-Approval Gate ─────────────────────────────
+        cross_provider_da_active = any(
+            a.cross_provider_satisfied for a in allocations
+        ) and not tags.cross_provider_none
+        adversarial_audit = _aggregate_adversarial_audit(phase3)
+        # Pre-compute status BEFORE approval so the Telegram summary shows
+        # what the user is being asked to sign off on. Final tuple updates
+        # with the actual approval result.
+        preview_status = compute_status_tuple(
+            preregistration_thresholds_sources=[
+                {"source": t.source} for t in prereg.thresholds
+            ],
+            crosscheck_tiers_per_subtask=phase3.crosscheck_tiers_per_subtask,
+            adversarial_search_audit=adversarial_audit,
+            cross_provider_da_active=cross_provider_da_active,
+            engineering_reviewer_status=phase7.status,
+            investigation_user_approval="pending",  # not yet
+            criteria_test_status=phase5a.aggregate_status,
+        )
+        top_lims = extract_top_limitations(phase7.final_proof_md, max_count=3)
+        summary = Phase8Summary(
+            question=framing.question,
+            methodological_rigor=preview_status.methodological_rigor,
+            residual_risk=preview_status.residual_risk,
+            evidence_basis=preview_status.evidence_basis,
+            criteria_test_status=preview_status.criteria_test_status,
+            top_limitations=top_lims,
+            draft_path=synthesis.draft_path,
+            run_id=run_id,
+        )
+        tracer.emit("phase_start", phase="final_approval")
+        if phase8_notify_callable is None:
+            # Production default — use notifier.send_message; in test runs the
+            # caller MUST inject a stub or the wait will block on a real
+            # Telegram round-trip.
+            from notifier import send_message as _send
+
+            def _default_notify(text: str) -> str:
+                _send(text)
+                return ""  # notifier doesn't return msg_id today
+
+            phase8_notify_callable = _default_notify
+        approval = phase_final_approval(
+            summary=summary,
+            run_dir=run_dir,
+            run_id=run_id,
+            notify_callable=phase8_notify_callable,
+            timeout_sec=(
+                phase8_timeout_sec
+                if phase8_timeout_sec is not None
+                else TOOL_SI_APPROVAL_TIMEOUT_HOURS * 3600
+            ),
+        )
+        tracer.emit(
+            "phase_end", phase="final_approval",
+            state=approval.state,
+            final_proof_path=str(approval.final_proof_path) if approval.final_proof_path else None,
+        )
+
+        # Final Status-Tuple including the actual approval.
+        final_status = compute_status_tuple(
+            preregistration_thresholds_sources=[
+                {"source": t.source} for t in prereg.thresholds
+            ],
+            crosscheck_tiers_per_subtask=phase3.crosscheck_tiers_per_subtask,
+            adversarial_search_audit=adversarial_audit,
+            cross_provider_da_active=cross_provider_da_active,
+            engineering_reviewer_status=phase7.status,
+            investigation_user_approval=approval.state,
+            criteria_test_status=phase5a.aggregate_status,
+        )
+
         # ── Phase 6 (initial decision-log) ─────────────────────────────────
         # Phase 6 is normally run AFTER synthesis (Plan §1.1 ordering), but
         # the persona-allocation + cherry-picking + Phase-2-summary blocks
@@ -554,6 +751,30 @@ class ScientificInvestigationTool(BaseTool):
             f"**{'ja' if phase3.at_least_one_t2_per_subtask() else 'nein'}**\n"
             f"- Gesamtdauer: **{phase3.total_duration_sec:.1f}s**\n"
         )
+        phase7_summary = (
+            f"- Status: **`{phase7.status}`**\n"
+            f"- Reviewer-Provider: **`{phase7.reviewer_provider_name}`** "
+            f"(cross-provider: "
+            f"{'ja' if phase7.cross_provider_satisfied else 'nein'})\n"
+            f"- Iterationen: **{phase7.iterations_used}**\n"
+            f"- Offene BLOCKER: **{len(phase7.open_blockers())}**\n"
+        )
+        phase8_summary = (
+            f"- State: **`{approval.state}`**\n"
+            f"- Telegram-Msg-ID: `{approval.telegram_msg_id or '(none)'}`\n"
+            f"- Approver: `{approval.approver or '(none)'}`\n"
+            f"- Final-Proof: "
+            f"`{approval.final_proof_path or '(draft only)'}`\n"
+            f"- Reason: {approval.reason or '*(keine)*'}\n"
+        )
+        status_tuple_block = (
+            "| Feld | Wert |\n"
+            "| --- | --- |\n"
+            f"| methodological_rigor | **`{final_status.methodological_rigor}`** |\n"
+            f"| residual_risk | `{final_status.residual_risk}` |\n"
+            f"| evidence_basis | `{final_status.evidence_basis}` |\n"
+            f"| criteria_test_status | `{final_status.criteria_test_status}` |\n"
+        )
         decision_log_path = write_decision_log(
             run_dir,
             run_id=run_id,
@@ -562,19 +783,18 @@ class ScientificInvestigationTool(BaseTool):
                 ("Phase 2: Multi-Persona-Review Summary", phase2_summary),
                 ("Phase 3: Execution Summary", phase3_summary),
                 ("Phase 6: Cherry-Picking-Detection", cherry_block),
-                ("Phase 7: Engineering-Reviewer-Findings",
-                 "*(Phase 7 — wird in I7 ausgefüllt)*"),
-                ("Phase 8: Investigation-Approval",
-                 "*(Phase 8 — wird in I8 ausgefüllt)*"),
+                ("Phase 7: Engineering-Reviewer-Findings", phase7_summary),
+                ("Phase 8: Investigation-Approval", phase8_summary),
+                ("Status-Tuple (final)", status_tuple_block),
             ],
         )
 
-        # Persist run state — used by I5+ phases on resume.
+        # Persist run state — terminal state for the orchestrator's purposes.
         state_file = state_dir / "state.json"
         atomic_write_state(state_file, {
             "run_id": run_id,
             "ts_slug": ts_slug_value,
-            "phase": "phase3_execution_done",
+            "phase": "phase8_done",
             "prereg_hash": prereg.prereg_hash,
             "discipline_warning": prereg.discipline_warning,
             "discipline_warning_approved": prereg.discipline_warning_approved,
@@ -610,41 +830,68 @@ class ScientificInvestigationTool(BaseTool):
                 "total_duration_sec": round(phase3.total_duration_sec, 2),
                 "results": [r.as_audit_dict() for r in phase3.sub_task_results],
             },
+            "phase4_synthesis": {
+                "draft_path": str(synthesis.draft_path),
+                "validation_errors": list(synthesis.validation_errors),
+            },
+            "phase5a_aggregate_status": phase5a.aggregate_status,
+            "phase5b_reviewer_provider": phase5b_provider_name,
+            "phase7": {
+                "status": phase7.status,
+                "iterations_used": phase7.iterations_used,
+                "reviewer_provider": phase7.reviewer_provider_name,
+                "cross_provider_satisfied": phase7.cross_provider_satisfied,
+            },
+            "phase8": {
+                "state": approval.state,
+                "approver": approval.approver,
+                "final_proof_path": (
+                    str(approval.final_proof_path)
+                    if approval.final_proof_path else None
+                ),
+            },
+            "status_tuple": final_status.as_dict(),
         })
 
-        # I4 boundary: Phases 4, 5, 7, 8 land in I5–I8.
+        # Full pipeline completed — orchestrator returns success regardless
+        # of whether MEDIUM was achieved; the Status-Tuple in the decision-
+        # log carries the verdict.
         scaffold_msg = (
-            f"Scientific-Investigation I4 complete (Phases 0, 0.5, 1, 2, 3, 6-init).\n"
-            f"  run_id:        {run_id}\n"
-            f"  plan.md:       {plan_path}\n"
-            f"  invest_plan:   {plan_md_path}\n"
-            f"  findings:      {findings_md_path}\n"
-            f"  execution:     {execution_md_path}\n"
-            f"  decision_log:  {decision_log_path}\n"
-            f"  thresholds:    {len(prereg.thresholds)}\n"
-            f"  prereg_hash:   {prereg.prereg_hash}\n"
-            f"  personas:      {len(allocations)} "
-            f"(cross-provider: "
-            f"{sum(1 for a in allocations if a.cross_provider_satisfied)})\n"
-            f"  sub_tasks:     {len(phase2.plan.sub_tasks)}\n"
-            f"  phase2:        {phase2.iterations_used} iters, "
-            f"converged={phase2.converged}\n"
-            f"  phase3:        "
-            f"{sum(1 for r in phase3.sub_task_results if r.success)}/"
-            f"{len(phase3.sub_task_results)} sub-tasks ok, "
-            f"T2-coverage={phase3.at_least_one_t2_per_subtask()}\n"
-            f"  rigor_cap:     {'LOW' if prereg.discipline_warning else '(none)'}\n"
-            f"  similarity:    {len(framing.similarity_hits)} prior hits ≥ threshold\n"
-            f"NOTE: Phases 4, 5, 7, 8 land in increments I5–I8 (see plan v5)."
+            f"Scientific-Investigation complete.\n"
+            f"  run_id:               {run_id}\n"
+            f"  plan.md:              {plan_path}\n"
+            f"  investigation_plan:   {plan_md_path}\n"
+            f"  review_findings:      {findings_md_path}\n"
+            f"  execution_report:     {execution_md_path}\n"
+            f"  phase5_report:        {phase5_md_path}\n"
+            f"  phase7_report:        {phase7_md_path}\n"
+            f"  decision_log:         {decision_log_path}\n"
+            f"  proof (state):        "
+            f"{approval.final_proof_path or synthesis.draft_path}\n"
+            f"  status:\n"
+            f"    methodological_rigor: {final_status.methodological_rigor}\n"
+            f"    residual_risk:        {final_status.residual_risk}\n"
+            f"    evidence_basis:       {final_status.evidence_basis}\n"
+            f"    criteria_test_status: {final_status.criteria_test_status}\n"
+            f"  approval:             {approval.state}\n"
+            f"  phase7:               {phase7.status} "
+            f"({phase7.iterations_used} iter)\n"
+            f"  rigor_cap:            "
+            f"{'LOW' if prereg.discipline_warning else '(none)'}"
         )
         logger.info(scaffold_msg)
-        tracer.emit("run_end", success=True, reason="i4_phase3_done")
-        notify_tool_done(self.name, 4, True, "Phase 0, 0.5, 1, 2, 3, 6-init abgeschlossen")
+        tracer.emit("run_end", success=True, reason="pipeline_complete",
+                    status_tuple=final_status.as_dict())
+        notify_tool_done(
+            self.name, 8, True,
+            f"Investigation abgeschlossen — rigor={final_status.methodological_rigor}, "
+            f"approval={approval.state}",
+        )
         return ToolResult(
             success=True,
             output=scaffold_msg,
-            iterations=4,
+            iterations=8,
             error="",
-            error_code="i4_phase3_done",
+            error_code="pipeline_complete",
             retryable=False,
         )

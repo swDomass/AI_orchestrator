@@ -400,8 +400,8 @@ def test_write_execution_report_md_renders_status(tmp_path):
 # ── Tool-level integration: I4 happy path ──────────────────────────────────
 
 
-def test_tool_run_i4_reaches_phase3_done(monkeypatch, tmp_path):
-    """Imports inside the test to use the audit-test fixture's stub executor."""
+def test_tool_run_full_pipeline_reaches_phase8(monkeypatch, tmp_path):
+    """Imports inside the test to use the audit-test fixture's stubs."""
     import tests.test_scientific_investigation_audit as audit_test_module
 
     audit_test_module._patch_notifier(monkeypatch)
@@ -409,13 +409,13 @@ def test_tool_run_i4_reaches_phase3_done(monkeypatch, tmp_path):
     provider = audit_test_module._ScriptedProvider()
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i4_phase3_done"
-    assert result.iterations == 4
+    assert result.error_code == "pipeline_complete"
+    assert result.iterations == 8
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "execution_report.md").is_file()
     state = json.loads(
         next((tmp_path / ".scientific-investigation").glob("*/state.json"))
         .read_text("utf-8")
     )
-    assert state["phase"] == "phase3_execution_done"
+    assert state["phase"] == "phase8_done"
     assert state["phase3"]["sub_tasks_run"] == 1

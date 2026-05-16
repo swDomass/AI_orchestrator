@@ -83,6 +83,28 @@ def _patch_notifier(monkeypatch):
     monkeypatch.setattr(
         "tools.scientific_investigation_phase3.default_devloop_executor", _stub,
     )
+    monkeypatch.setattr(
+        "tools.scientific_investigation_phase4.validate_synthesis_output",
+        lambda _text: [],
+    )
+    from tools.scientific_investigation_phase8 import Phase8Result as _P8R
+
+    def _approve_immediately(*, summary, run_dir, run_id, notify_callable, timeout_sec):
+        draft = summary.draft_path
+        final = run_dir / "proof.md"
+        if draft.exists():
+            try:
+                draft.replace(final)
+            except OSError:
+                final = None
+        else:
+            final = None
+        return _P8R(state="approved", telegram_msg_id="stub-msg-id",
+                    approver="stub-user", reason="", final_proof_path=final)
+
+    monkeypatch.setattr(
+        "tools.scientific_investigation.phase_final_approval", _approve_immediately,
+    )
 
 
 def _good_framing_yaml(question="Is X true?", framing_text="Engineering eval of X"):
@@ -597,7 +619,8 @@ def test_write_plan_md_includes_discipline_warning_block(tmp_path):
 def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
     _patch_notifier(monkeypatch)
     tool = ScientificInvestigationTool()
-    # I3 needs framing + prereg + author plan + DA review + Methodiker review
+    # Full pipeline needs 7 LLM outputs: framing, prereg, author plan,
+    # DA review, Methodiker review, Phase-4 synthesis, Phase-7 review.
     provider = _ScriptedProvider([
         _good_framing_yaml(),
         _good_prereg_yaml(),
@@ -605,13 +628,15 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
         "addresses_criteria: [F1]\n    type: data_analysis\n    expected_output: o\n```",
         "```yaml\nfindings: []\n```",
         "```yaml\nfindings: []\n```",
+        "# Investigation Proof\n\nStub synthesis.\n",
+        "```yaml\nfindings: []\n```",
     ])
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    # I4 reaches phase 3 (execution-loop) end-to-end. _patch_notifier installs
-    # a stub Phase-3 executor so the sub-tasks run instantly.
-    assert result.error_code == "i4_phase3_done"
-    assert result.iterations == 4
+    # Full pipeline runs end-to-end. _patch_notifier installs stubs for
+    # Phase-3 executor + Phase-4 validator + Phase-8 approval.
+    assert result.error_code == "pipeline_complete"
+    assert result.iterations == 8
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "plan.md").is_file()
     assert (run_dir / "audit" / "approvals.jsonl").is_file()
@@ -619,7 +644,7 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
         (tmp_path / ".scientific-investigation").glob("*/state.json")
     )
     state = json.loads(state_path.read_text("utf-8"))
-    assert state["phase"] == "phase3_execution_done"
+    assert state["phase"] == "phase8_done"
     assert state["rigor_cap"] is None  # norm_reference present → no LOW cap
 
 

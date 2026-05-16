@@ -77,6 +77,15 @@ _DEFAULT_METHODIKER_REVIEW_YAML = """```yaml
 findings: []
 ```"""
 
+# Phase 4 synthesis — body is irrelevant because tests stub the substantive
+# validator; only "non-empty" matters.
+_DEFAULT_SYNTHESIS_MD = "# Investigation Proof\n\nStub synthesis from scripted provider.\n"
+
+# Phase 7 reviewer — empty findings list ⇒ status=passed in one iteration.
+_DEFAULT_ENG_REVIEW_YAML = """```yaml
+findings: []
+```"""
+
 
 class _ScriptedProvider:
     """Provider that returns canned outputs in order. Defaults to the full
@@ -95,6 +104,8 @@ class _ScriptedProvider:
                 _DEFAULT_AUTHOR_PLAN_YAML,
                 _DEFAULT_DA_REVIEW_YAML,
                 _DEFAULT_METHODIKER_REVIEW_YAML,
+                _DEFAULT_SYNTHESIS_MD,
+                _DEFAULT_ENG_REVIEW_YAML,
             ]
         self._outputs = list(outputs)
 
@@ -132,6 +143,39 @@ def _patch_notifier(monkeypatch):
     monkeypatch.setattr(
         "tools.scientific_investigation_phase3.default_devloop_executor",
         _stub_executor,
+    )
+
+    # Phase 4 LLM call: scripted via the provider's queue. But the substantive
+    # validator would reject the canned text — so we no-op the validator here
+    # and let dedicated phase4 tests exercise it directly.
+    monkeypatch.setattr(
+        "tools.scientific_investigation_phase4.validate_synthesis_output",
+        lambda _text: [],
+    )
+
+    # Phase 8 — short-circuit the telegram-approval round-trip so the tool
+    # returns instead of blocking on the manager event.
+    from tools.scientific_investigation_phase8 import Phase8Result as _P8R
+
+    def _approve_immediately(*, summary, run_dir, run_id, notify_callable, timeout_sec):
+        # Move draft → proof.md to mirror the real "approved" branch.
+        draft = summary.draft_path
+        final = run_dir / "proof.md"
+        if draft.exists():
+            try:
+                draft.replace(final)
+            except OSError:
+                final = None
+        else:
+            final = None
+        return _P8R(
+            state="approved", telegram_msg_id="stub-msg-id",
+            approver="stub-user", reason="", final_proof_path=final,
+        )
+
+    monkeypatch.setattr(
+        "tools.scientific_investigation.phase_final_approval",
+        _approve_immediately,
     )
 
 
@@ -515,7 +559,7 @@ def test_tool_run_creates_layout(monkeypatch, tmp_path):
     provider = _ScriptedProvider()  # default scripts framing + prereg
     result = tool.run("investigate diffusion bias", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i4_phase3_done"
+    assert result.error_code == "pipeline_complete"
     docs = list((tmp_path / "docs").glob("scientific-investigation-*"))
     assert len(docs) == 1
     run_dir = docs[0]

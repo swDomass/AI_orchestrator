@@ -287,6 +287,9 @@ TOOL_SI_PHASE0_5_TIMEOUT_SEC = 900
 TOOL_SI_PHASE2_AUTHOR_TIMEOUT_SEC = 1_800   # 30 min — initial + rework plan write
 TOOL_SI_PHASE2_REVIEW_TIMEOUT_SEC = 1_200   # 20 min — per-persona review
 TOOL_SI_PHASE2_MAX_ITERATIONS = 3           # max rework loops before forced exit
+# Phase 4 synthesis + Phase 5b heuristic review.
+TOOL_SI_PHASE4_TIMEOUT_SEC = 2_400          # 40 min — proof.md draft writing
+TOOL_SI_PHASE5B_TIMEOUT_SEC = 1_200         # 20 min — cross-provider heuristic review
 # Per-threshold Telegram approval wait. Single threshold blocks for at most this long.
 TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC = 1_800  # 30 min
 # Phase 7 engineering-reviewer (cross-provider).

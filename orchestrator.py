@@ -1338,7 +1338,13 @@ def main() -> None:
                         help="Auto-fixe Probleme (mit --doctor)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Nicht-interaktiver Fix (mit --doctor --fix)")
+    parser.add_argument("--lint-queue", action="store_true",
+                        help="Validiert agent-queue.md ohne Ausführung")
     args = parser.parse_args()
+
+    if args.lint_queue:
+        from queue_linter import run_lint
+        sys.exit(run_lint())
 
     if args.doctor:
         from doctor import run_doctor

@@ -69,6 +69,371 @@ per-task pre-approval tags, and smart grouping. See Feature #9 for full design.
 
 ---
 
+## Tier 5 ÔÇö Next Wave (2026-05-16)
+
+Synthesized from `AI_ORCHESTRATOR_FUTURE_IDEAS.md`, `HERMES_AGENT_FUTURE_IDEAS.md`,
+and `OPENCLAW_FUTURE_IDEAS.md`, with critical re-prioritization. Guiding rule:
+**every item must strengthen the supervisor, not pull the orchestrator toward agency.**
+
+| # | Feature | Effort | Status |
+|---|---------|--------|--------|
+| 29 | Queue Linter (`--lint-queue`) | S | DONE |
+| 30 | Replay JSONL (machine-readable run summaries) | M | backlog |
+| 31 | Idempotency Keys (external triggers) | S | DONE |
+| 32 | Telegram Slash-Commands (`/review`, `/dev`, `/security`, `/audit`, `/critique`, `/brainstorm`) | S | DONE |
+| 33 | Cron ÔåÆ Queue (scheduled task creation) | M | backlog |
+| 34 | Failure Taxonomy (built on #30) | S | backlog |
+| 35 | Preflight Hooks per Tool | M | backlog |
+| 36 | Skill Suggestion (draft-only, pattern-gated) | M | backlog |
+| 37 | Progressive Skill Loading | M | backlog |
+| 38 | Queue Healing (auto-unblock + Telegram-ask) | M | backlog |
+
+**Effort legend**: S = ~1 day, M = 2-5 days, L = >1 week.
+
+---
+
+### 29. Queue Linter (`--lint-queue`)
+
+**Goal**: Catch bad queue entries before they reach a provider. Pure-validation
+pass, zero LLM calls, prints findings + exits with non-zero on errors.
+
+**Scope**:
+- Invalid `cwd:` (missing, not in `ALLOWED_CWD_ROOTS`, parent-escape, non-existent)
+- Unknown `#tool:<name>` ÔÇö check against `tools/registry.py`
+- Unknown model alias (`#claude_xxx`, `#gemini_xxx`, `#codex_xxx`, `#or_xxx`) via
+  `config.is_known_model_tag`
+- Cross-provider model leakage (`#claude_opus` on a task already tagged `#gemini`)
+- Duplicate `#id:` values within the open part of the queue
+- `#needs:` references unknown IDs (warning, not error ÔÇö the dep may resolve later)
+- `#openrouter` / `#or_*` tag without `OPENROUTER_API_KEY` configured
+- `#parallel` with single subtask or with subtasks sharing CWD without `cwd:`
+- Tool/profile compatibility (e.g. `#tool:deep-security-audit` + `#agent:readonly`)
+
+**Out of scope**:
+- LLM-based semantic checks ÔÇö linter must stay offline and instant.
+- "Will this task succeed?" prediction ÔÇö that's the cost forecast (deferred).
+
+**Implementation hooks**: new module `queue_linter.py`, reuse
+`queue_manager.read_queue_items()` parsing path. Exit code 0 ok, 1 warnings,
+2 errors. Wire into `doctor.py` as one extra check.
+
+**Verification**: corrupt every category in a test queue, assert each is flagged.
+
+---
+
+### 30. Replay JSONL (Machine-Readable Run Summaries)
+
+**Goal**: Every task run produces one JSONL line in `logs/runs.jsonl` that's
+sufficient to (a) re-execute the same task deterministically, (b) classify
+failures, (c) feed analytics that today scrape `logs/orchestrator.log`.
+
+**Schema** (one line per run):
+```json
+{
+  "run_id": "uuid",
+  "ts_start": "2026-05-16T12:34:56Z",
+  "ts_end":   "2026-05-16T12:48:12Z",
+  "task_text": "...",
+  "task_id":   "...",
+  "cwd":       "D:/programmieren/...",
+  "provider":  "claude",
+  "model":     "claude-opus-4-7",
+  "tool":      "dev-loop",
+  "profile":   "default",
+  "prompt_hash": "sha256:abc...",
+  "tokens": { "input": 1234, "output": 567,
+              "cache_creation": 8901, "cache_read": 23456 },
+  "duration_sec": 796,
+  "exit_status": "ok | retry | error | blocked",
+  "error_code":  null,
+  "retry_count": 0,
+  "needs_satisfied_by": ["task-id-1", "task-id-2"],
+  "log_refs": ["logs/orchestrator.log:12345-12678"]
+}
+```
+
+**Scope**:
+- Append after every `mark_done` / `mark_retry` / `finalize` (success and failure)
+- `prompt_hash` over the *built* prompt (system + injected context + task text)
+- Reuse the four token fields from `RunResult` (already present)
+- 30-day rotation, archive to `logs/runs-archive/{YYYY-MM}.jsonl.gz`
+
+**Out of scope**:
+- Full prompt/output text in the JSONL ÔÇö that bloats the file and duplicates
+  the existing per-task `.md` results in the vault. Store path/offset only.
+- Replay execution itself ÔÇö schema first, replay command later.
+
+**Why first**: it's the data substrate for failure taxonomy (#34), cost forecast,
+provider learning, and "explain why task X failed". Without this everything else
+is heuristic scraping.
+
+**Implementation hooks**: new `replay.py` with `append_run(record)`, hook into
+`orchestrator.run_once()` at the same points where `mark_done` is called.
+
+---
+
+### 31. Idempotency Keys (External Triggers)
+
+**Goal**: Prevent duplicate queue items when Telegram retries, watchdog restarts
+mid-write, or future webhooks/cron fire twice.
+
+**Scope**:
+- `idempotency_key = sha256(source + payload_canonicalized + bucket_ts)` where
+  `bucket_ts` is the trigger's natural granularity (Telegram message_id, cron
+  scheduled-time, webhook delivery-id)
+- New JSONL `logs/idempotency.jsonl` ÔÇö append `{key, queued_at, task_text_hash}`
+- Before appending to the queue: check membership, drop duplicates silently
+  (log + Telegram-info), keep the first
+- Retention: 30 days
+
+**Out of scope**:
+- Cryptographic signing of triggers ÔÇö that's a trust-layer item, separate.
+- Deduping queue-internal retries ÔÇö those are handled by `mark_retry` already.
+
+**Why before cron/webhooks**: ANY external trigger without this becomes a
+duplicate-amplifier the first time the watchdog restarts mid-flight.
+
+**Implementation hooks**: new `idempotency.py`. Wire into `telegram_listener.py`
+`/task` handler immediately (covers today's only external trigger). Cron and
+webhooks hook in the same place when they land.
+
+---
+
+### 32. Telegram Slash-Commands
+
+**Goal**: Frictionless task creation from the phone. Each command expands to a
+fully-formed queue entry with the right `#tool:` tag and `cwd:`.
+
+**Commands**:
+| Command | Expands to |
+|---|---|
+| `/review <cwd>` | `- [ ] Review pending changes in <cwd> cwd:<cwd> #tool:review-loop` |
+| `/dev <task...> cwd:<cwd>` | `- [ ] <task> cwd:<cwd> #tool:dev-loop` |
+| `/security <cwd>` | `- [ ] Security scan <cwd> cwd:<cwd> #tool:security-audit` |
+| `/audit <cwd>` | `- [ ] Deep security audit <cwd> cwd:<cwd> #tool:deep-security-audit` |
+| `/critique <plan.md>` | `- [ ] Critical review of <plan.md> cwd:<vault-cwd> #tool:critical-review` |
+| `/brainstorm <topic>` | `- [ ] Brainstorm: <topic> cwd:<vault-cwd> #tool:brainstorm` |
+
+**Scope**:
+- Parse via `telegram_listener.py` `_handle_message`
+- Default cwd: last task's cwd (per-chat memory, RAM only)
+- Validate cwd against `ALLOWED_CWD_ROOTS` BEFORE adding to queue
+- Reply with the literal queue line that was added (so user can see/edit)
+- Apply #31 idempotency at task-add time
+
+**Out of scope**:
+- Tag negotiation ("which model do you want?") ÔÇö add `#claude_opus` etc. in the
+  message itself, no interactive wizard.
+- Slash-commands for queue *control* (`/pause`, `/shutdown` exist already).
+
+**Implementation hooks**: extend `telegram_listener.COMMAND_TABLE` (or whatever
+the current dispatch is); add `_build_task_line(template, args)` helper.
+
+---
+
+### 33. Cron ÔåÆ Queue (Scheduled Task Creation)
+
+**Goal**: Recurring jobs land in the queue, not bypassing it. Re-uses all
+policy/provider/approval machinery.
+
+**Config**: new `schedules.yaml` next to `policy.yaml`:
+```yaml
+- name: nightly-review
+  cron: "0 22 * * *"
+  task: "Review today's changes"
+  cwd:  D:\programmieren\privat_python\AI_orchestrator
+  tags: ["#tool:review-loop"]
+  idempotency_bucket: day      # day | hour | exact
+```
+
+**Scope**:
+- New module `scheduler.py` ÔÇö pure-Python cron parser (stdlib only ÔÇö no `croniter`)
+- Tick from the heartbeat loop (already runs every poll)
+- On match: build queue line, apply #31 idempotency (key = name + bucket_ts),
+  append to queue, log to `logs/scheduler.jsonl`
+- Heartbeat and Scheduler are distinct: **heartbeat = health checks** (in-process,
+  no queue mutation), **scheduler = task creation** (queue mutation, full pipeline)
+
+**Out of scope**:
+- Direct execution from cron without going through queue.
+- Distributed scheduling, lock-leader election, cluster-safe ÔÇö this is single-host.
+
+**Dependency**: requires #31 (idempotency) so a missed/replayed tick doesn't
+double-queue.
+
+**Implementation hooks**: `scheduler.py` + `schedules.yaml`. Hook one tick call
+into `heartbeat.HeartbeatRunner.run_due()` epilogue.
+
+---
+
+### 34. Failure Taxonomy
+
+**Goal**: Stable categories for `exit_status="error"` so we can build smarter
+retries and analytics. Sits on top of #30.
+
+**Initial categories**:
+- `rate_limit` ÔÇö provider quota hit (already typed)
+- `timeout` ÔÇö task timeout exceeded (already typed)
+- `auth_error` ÔÇö credentials missing/expired
+- `provider_unreachable` ÔÇö CLI not found or network down
+- `model_refusal` ÔÇö provider returned refusal text
+- `tool_internal_error` ÔÇö exception in `tools/<name>.py`
+- `cwd_invalid` ÔÇö path outside roots or doesn't exist
+- `policy_denied` ÔÇö PolicyEngine rejected the task
+- `dep_unsatisfied` ÔÇö `#needs:` never resolved (after N polls)
+- `test_failure` ÔÇö dev-loop terminal state with failing tests
+- `unknown` ÔÇö fallback
+
+**Scope**:
+- Classifier reads `runs.jsonl` (#30), returns the category from
+  `error_code` + stderr keywords + tool-specific signals
+- New `taxonomy.py` with `classify(record) ÔåÆ category`
+- Backfill: one-shot script that classifies all existing records
+- Dashboard tile: failures-by-category over time
+
+**Out of scope**:
+- Auto-fix actions per category (that's a separate, riskier feature).
+
+**Dependency**: requires #30 records to classify.
+
+---
+
+### 35. Preflight Hooks per Tool
+
+**Goal**: Deterministic context collection BEFORE the LLM call. Cheaper than
+having the model rediscover basics every iteration.
+
+**Per-tool hooks**:
+| Tool | Preflight collects |
+|---|---|
+| `dev-loop` | `git status`, package-manager detection, test-command detection (`pytest`/`npm test`/etc.), recent test failures (last run) |
+| `review-loop` | `git diff` length, changed file list, file-type histogram |
+| `security-audit` / `deep-security-audit` | dependency manifests (req.txt/package.json/etc.), quick `git grep` for credentials, exposed config files |
+| `critical-review` | plan file size, plan section structure, last-modified |
+| `research-qa` | repo size, language histogram, README presence |
+
+**Scope**:
+- New `preflight.py` with per-tool hook functions returning a bounded
+  Markdown block (cap 2k tokens per hook)
+- `BaseTool.run()` runs the matching hook, injects result as a leading context
+  block in the first phase prompt
+- Hook output cached in `{cwd}/.<tool>/preflight-{ts}.md` for replay
+
+**Out of scope**:
+- Heuristic prioritization across hooks (just inject the matched tool's block).
+- LLM-driven preflight ("ask Claude what's in this repo") ÔÇö that's the
+  research-qa tool's job.
+
+**Risk**: hooks must be FAST (<5s) ÔÇö a slow hook gates every task. Add per-hook
+timeout with graceful skip.
+
+---
+
+### 36. Skill Suggestion (Draft-Only, Pattern-Gated)
+
+**Goal**: Surface candidate `SKILL.md` additions after the orchestrator notices
+a repeated workflow pattern. NEVER auto-activates.
+
+**Gate**:
+- Skill suggestion fires only when the same `(tool, cwd, task-shape)` repeats
+  N >= 3 times within 30 days (from #30 records)
+- `task-shape` = TF-IDF top-5 keywords from the task text (normalized)
+- One suggestion per pattern per 90 days (no spam)
+
+**Flow**:
+1. Heartbeat-Check `skill-suggest` (daily) scans `runs.jsonl`
+2. For each qualifying pattern, build a draft `SKILL.md` via cheap LLM
+   (OpenRouter free model or Gemini Flash) summarizing what the repetitions did
+3. Save to `99_System/AI/Skills-Drafts/<slug>/SKILL.md`
+4. Telegram notification: "Draft skill 'xyz' available (based on 4 dev-loop runs
+   in repo Y). Activate with `/activate-skill xyz`."
+5. Activation moves the draft to `99_System/AI/Skills/<slug>/SKILL.md` after a
+   manual review-and-edit pass
+
+**Out of scope**:
+- Auto-activation ÔÇö never. Drafts are inert until human-moved.
+- Skill *editing* suggestions on existing skills.
+
+**Risk**: skill bloat. Mitigation = the pattern gate (N>=3) + the 90-day cooldown.
+
+---
+
+### 37. Progressive Skill Loading
+
+**Goal**: Reduce prompt overhead by loading only the matched skill's full
+content, while keeping an index of all skill summaries always available.
+
+**Today**: every skill's `SKILL.md` is parsed at startup; matched skill's full
+body goes into the prompt.
+
+**Change**:
+- Build `skills/INDEX.md` at startup ÔÇö one line per skill: `name | description |
+  tags`, ~30 tokens each
+- INDEX always in the prompt (cheap, helps the model self-route in dev-loop
+  meta-decisions)
+- Full SKILL.md body loaded only when the task tag matches (already today's
+  behavior on the *file system* side, but the prompt assembly currently treats
+  matched-skill content as "load whole body")
+- Add a "lazy section" mode: only the SKILL.md sections matching the current
+  phase get injected (e.g. dev-loop's `## Research` phase pulls only the
+  Research section)
+
+**Out of scope**:
+- LLM-driven skill selection at runtime ÔÇö the `#tool:` tag stays authoritative.
+
+**Dependency**: works fine standalone but compounds with #36 (more skills =
+more index pressure).
+
+---
+
+### 38. Queue Healing
+
+**Goal**: When a task is blocked (`#needs:` unsatisfied, dep error, perma-block),
+the orchestrator does NOT just leave it dead in the queue. It proposes an
+unblock action via Telegram and acts on user response.
+
+**Triggers**:
+- Task has been blocked >24h
+- All other tasks completed but this one + its deps remain
+- A `#needs:`-target task is `[-]` (failed) ÔÇö the blocker can never resolve
+
+**Actions** (Telegram-ask):
+- "Unblock task X by treating failed dep Y as done? `/unblock X`"
+- "Drop task X (its dep can never resolve)? `/drop X`"
+- "Retry the failed dep Y? `/retry Y`"
+
+**Out of scope**:
+- Auto-unblocking without confirmation ÔÇö breaks the supervisor model.
+- LLM-driven "smart" dep resolution.
+
+**Dependency**: builds on the existing `#id:` / `#needs:` system (#20) and the
+existing Telegram approval flow (#9).
+
+**Why native AI_orchestrator strength**: this is exactly the kind of feature
+that distinguishes a *supervisor* from a *batch runner*. Dead tasks in queues
+are a real operational pain point that nothing in Hermes/OpenClaw addresses.
+
+---
+
+## Deferred ÔÇö Reconsider Later
+
+| Idea | Source | Why deferred |
+|---|---|---|
+| FTS5 memory backend | Hermes | Current corpus is small; TF-IDF + decay is fast enough. Revisit at >50 MB memory. |
+| Channel adapter layer | Hermes + OpenClaw | YAGNI. Single channel (Telegram) doesn't justify the abstraction. Revisit when Discord/Slack is concretely on the roadmap. |
+| Docker sandbox (general) | OpenClaw | Weeks of work. Revisit only if untrusted code execution becomes a routine use case. Narrow `#sandbox` profile for specific scenarios is acceptable earlier. |
+| Telegram trust/pairing layer | OpenClaw | Over-engineered for single-user. Revisit if multi-user becomes a goal. Command-tiers (lax vs. strict commands) is the cheap subset. |
+| Risk score per task | AI_orchestrator | Folded into #30 (replay record) + #35 (preflight signals). Standalone scoring layer not needed yet. |
+| Task templates | AI_orchestrator | Folded into #32 (slash-commands). Same UX, less infra. |
+| Human review pack | AI_orchestrator | Folded into #30. Replay record + a renderer covers it. |
+| Local knowledge index per repo | AI_orchestrator | Folded into existing memory system + #35 preflight. Revisit if memory recall accuracy drops. |
+| Task cost forecast | AI_orchestrator | Requires #30 data + several months of history. Premature without baseline. |
+| Provider learning | AI_orchestrator | Same as cost forecast ÔÇö needs #30 + history. |
+| Plugin-style tool registration | Hermes | `tools/registry.py` is fine. Plugin discovery is a nice-to-have, not a needs. |
+| Script pre-processing (`#pre:`) | Hermes | Subsumed by #35 preflight hooks (per-tool deterministic context). |
+
+---
+
 ## Recommended Build Order
 
 ```
@@ -76,7 +441,18 @@ Phase 1 (foundations)     ÔåÆ Skills, --doctor, SOUL.md
 Phase 2 (intelligence)    ÔåÆ Memory, Heartbeat, Selective injection
 Phase 3 (power features)  ÔåÆ Profiles, Parallel spawning, Policy layer
 Phase 4 (hardening)       ÔåÆ Docker sandbox, Tool policy, Dashboard
+Phase 5 (reliability)     ÔåÆ Linter (#29), Replay (#30), Idempotency (#31)
+Phase 6 (UX + triggers)   ÔåÆ Slash-commands (#32), Cron (#33), Queue Healing (#38)
+Phase 7 (intelligence v2) ÔÇô Failure taxonomy (#34), Preflight (#35),
+                              Skill suggestion (#36), Progressive loading (#37)
 ```
+
+**Design constraint reaffirmed**: AI_orchestrator remains the supervisor. Every
+Tier-5 item is either a reliability lever (linter, replay, idempotency, taxonomy,
+healing), a UX shortcut into the existing queue (slash, cron), or a cache/cost
+optimization (preflight, progressive loading). The single item that touches
+agency ÔÇö #36 Skill Suggestion ÔÇö is locked behind draft-only + pattern-gating
++ manual activation.
 
 ---
 

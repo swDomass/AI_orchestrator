@@ -116,7 +116,23 @@ python orchestrator.py --dashboard      # Launch analytics dashboard
 python orchestrator.py --doctor         # Validate setup
 python orchestrator.py --doctor --fix   # Auto-fix issues
 python orchestrator.py --doctor --fix --yes
+python orchestrator.py --lint-queue     # Validate agent-queue.md (no execution)
 ```
+
+### `--lint-queue` (offline queue validation)
+
+Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
+
+- Invalid / missing `cwd:` (path doesn't exist or outside `ALLOWED_CWD_ROOTS`)
+- Unknown `#tool:<name>`
+- Unknown model alias (`#claude_*`, `#gemini_*`, `#codex_*`, `#or_*`)
+- Cross-provider model leakage (`#claude_opus` + explicit `#gemini` = error)
+- Duplicate `#id:` values in the open queue
+- `#needs:` referencing IDs that will never resolve (warning)
+- `#openrouter` / `#or_*` without `OPENROUTER_API_KEY` configured (warning — task falls back to default chain)
+- `#parallel` with 0-1 subtasks (warning) or shared CWD (info)
+
+Exit codes: **0** = clean, **1** = warnings only, **2** = errors. Wire into CI / pre-commit if you have a shared queue file.
 
 ## Queue File Syntax
 
@@ -478,7 +494,13 @@ In `--watch` mode a Telegram long-poll listener starts (when `TELEGRAM_*` env va
 
 | Command | Description |
 |---|---|
-| `/task <text>` | Add task to queue |
+| `/task <text>` | Add free-form task to queue |
+| `/review [cwd]` | Queue `#tool:review-loop` task for `cwd` (or last-cwd) |
+| `/security [cwd]` | Queue `#tool:security-audit` task |
+| `/audit [cwd]` | Queue `#tool:deep-security-audit` task |
+| `/dev <desc> cwd:<path>` | Queue `#tool:dev-loop` task |
+| `/critique <plan.md>` | Queue `#tool:critical-review` task (cwd = parent dir of plan) |
+| `/brainstorm <topic>` | Queue `#tool:brainstorm` task (uses last-cwd) |
 | `/status` | Queue size + provider status |
 | `/limits` | Detailed limits with per-window breakdown |
 | `/pause` / `/resume` | Pause / resume processing |
@@ -490,6 +512,8 @@ In `--watch` mode a Telegram long-poll listener starts (when `TELEGRAM_*` env va
 
 Plain text → AI chat (answered by best available provider).
 `#shutdown` as standalone tag → schedule shutdown.
+
+**Slash tool-commands** (`/review`, `/security`, `/audit`, `/dev`, `/critique`, `/brainstorm`) expand to a queue line with the right `#tool:` tag and run through the full pipeline (provider routing, policy, memory, approvals). Each chat has a RAM-only last-cwd memory: after one explicit `/review D:\foo`, subsequent commands without `cwd:` reuse that path. CWDs are validated against `ALLOWED_CWD_ROOTS` before any task is queued, and duplicate deliveries of the same Telegram message are deduplicated via `idempotency.py`.
 
 Rate limits (anti-spam):
 
@@ -607,6 +631,8 @@ orchestrator.py
   → limits.py              (cclimits wrapper, disk cache, 429 resilience)
   → logging_setup.py       (rotating file logger)
   → doctor.py              (setup validation / --doctor)
+  → queue_linter.py        (offline queue validation / --lint-queue)
+  → idempotency.py         (duplicate-trigger dedup for external sources)
   → config.py              (constants, .env loader, SOUL.md loader)
 ```
 
@@ -621,7 +647,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1130 tests, ~25 s)
+# Run all tests (~1200 tests, ~35 s)
 python -m pytest tests/ -q
 
 # Run a single test file

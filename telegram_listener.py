@@ -17,6 +17,13 @@ Supported commands:
   /pick N            — pick usage suggestion (1-3)
   /decline           — dismiss usage suggestions
   /cancel-shutdown   — cancel pending shutdown countdown
+  /task              — append free-form task to queue
+  /review [cwd]      — queue review-loop task
+  /security [cwd]    — queue security-audit task
+  /audit [cwd]       — queue deep-security-audit task
+  /dev <desc>        — queue dev-loop task
+  /critique <plan>   — queue critical-review task
+  /brainstorm <topic>— queue brainstorm task
 
 Any other text is forwarded to the best available AI provider and the
 response is sent back to the same chat.
@@ -31,6 +38,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 
+import idempotency
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -43,13 +51,63 @@ from config import (
 from dispatcher import select_provider
 from limits import get_limits
 from notifier import send_message
-from queue_manager import append_task, read_queue
+from queue_manager import CWD_RE, append_task, extract_cwd, read_queue
 import memory as memory_module
 
 logger = logging.getLogger("telegram-listener")
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 _SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
+
+
+# ---- Slash command catalog (task-creation commands) ----
+# Layout per entry:
+#   tool_tag:        the #tool:<name> to inject into the queue line
+#   subject_is_cwd:  True = positional arg IS the cwd (e.g. /review D:\foo)
+#                    False = positional arg is description/topic; cwd comes from
+#                    explicit cwd: tag or per-chat last-cwd memory
+#   subject_is_file: True = positional arg is a file path; cwd = parent dir
+#                    (only used for /critique)
+#   template:        Markdown template for the task line. Placeholders:
+#                    {subject} = positional arg (or stripped description)
+_SLASH_TOOL_COMMANDS: dict[str, dict] = {
+    "/review": {
+        "tool_tag": "review-loop",
+        "subject_is_cwd": True,
+        "subject_is_file": False,
+        "template": "Review pending changes in {subject}",
+    },
+    "/security": {
+        "tool_tag": "security-audit",
+        "subject_is_cwd": True,
+        "subject_is_file": False,
+        "template": "Security scan {subject}",
+    },
+    "/audit": {
+        "tool_tag": "deep-security-audit",
+        "subject_is_cwd": True,
+        "subject_is_file": False,
+        "template": "Deep security audit {subject}",
+    },
+    "/dev": {
+        "tool_tag": "dev-loop",
+        "subject_is_cwd": False,
+        "subject_is_file": False,
+        "template": "{subject}",
+    },
+    "/critique": {
+        "tool_tag": "critical-review",
+        "subject_is_cwd": False,
+        "subject_is_file": True,
+        "template": "Critical review of {subject}",
+    },
+    "/brainstorm": {
+        "tool_tag": "brainstorm",
+        "subject_is_cwd": False,
+        "subject_is_file": False,
+        "template": "Brainstorm: {subject}",
+    },
+}
 
 
 def _fmt_time(seconds: int) -> str:
@@ -101,6 +159,17 @@ def _api_get(method: str, params: dict) -> dict | None:
         return None
 
 
+class _SlashCommandError(Exception):
+    """Raised when a slash command cannot be resolved into a valid task line."""
+
+
+def _validate_cwd(path: str) -> str | None:
+    """Validate a cwd-like path via queue_manager.extract_cwd (which checks
+    existence + ALLOWED_CWD_ROOTS membership). Returns the canonical resolved
+    path or None if invalid."""
+    return extract_cwd(f"x cwd:{path}")
+
+
 class _RateLimiter:
     """Simple sliding-window rate limiter (per-action)."""
 
@@ -142,6 +211,8 @@ class TelegramListener:
         self._cmd_limiter = _RateLimiter(max_calls=20, window_sec=60)
         self._chat_limiter = _RateLimiter(max_calls=5, window_sec=60)
         self._task_limiter = _RateLimiter(max_calls=10, window_sec=60)
+        # Per-chat last-used cwd (RAM only) for slash commands that may omit it.
+        self._last_cwd_per_chat: dict[str, str] = {}
 
     def start(self) -> None:
         if not TELEGRAM_ENABLED:
@@ -251,6 +322,11 @@ class TelegramListener:
                     send_message("ℹ️ Verwendung: `/task Beschreibung des Tasks`")
                 else:
                     self._cmd_add_task(command_args)
+            elif command in _SLASH_TOOL_COMMANDS:
+                if not self._task_limiter.allow():
+                    send_message("⏳ Zu viele Task-Anfragen. Bitte kurz warten.")
+                    return
+                self._cmd_slash_tool(command, command_args, msg)
             elif not self._cmd_limiter.allow():
                 send_message("⏳ Zu viele Befehle. Bitte kurz warten.")
             elif command == "/help":
@@ -292,10 +368,161 @@ class TelegramListener:
     # Commands
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Slash tool-commands (#32 — task creation shortcuts)
+    # ------------------------------------------------------------------
+
+    def _cmd_slash_tool(self, command: str, args: str, msg: dict) -> None:
+        """Translate a slash-command into a queue task line."""
+        spec = _SLASH_TOOL_COMMANDS[command]
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+
+        subject_raw, explicit_cwd = self._extract_subject_and_cwd(args)
+
+        try:
+            cwd, subject = self._resolve_cwd_and_subject(
+                spec=spec,
+                subject_raw=subject_raw,
+                explicit_cwd=explicit_cwd,
+                chat_id=chat_id,
+                command=command,
+            )
+        except _SlashCommandError as e:
+            send_message(f"❌ {_escape_telegram_markdown(str(e))}")
+            return
+
+        # Build the task line. The trailing #tool: tag drives orchestrator routing.
+        task_line = (
+            spec["template"].format(subject=subject)
+            + f" cwd:{cwd} #tool:{spec['tool_tag']}"
+        )
+
+        if len(task_line) > TELEGRAM_MAX_TASK_LENGTH:
+            send_message(f"❌ Task zu lang ({len(task_line)} Zeichen, max {TELEGRAM_MAX_TASK_LENGTH}).")
+            return
+
+        # Idempotency: Telegram message_id is the natural bucket. A redelivered
+        # update (rare with offset-tracking) gets dropped here.
+        message_id = msg.get("message_id")
+        if message_id is not None:
+            new = idempotency.check_and_record(
+                source="telegram_slash",
+                payload=task_line,
+                bucket_ts=message_id,
+            )
+            if not new:
+                send_message("ℹ️ Task wurde bereits verarbeitet (Duplikat ignoriert).")
+                return
+
+        if not append_task(task_line):
+            send_message("❌ Task konnte nicht zur Queue hinzugefügt werden (Schreibfehler).")
+            logger.error("Slash-Task konnte nicht gespeichert werden: %s", task_line[:80])
+            return
+
+        # Remember the cwd for this chat — enables `/review` (no args) next time.
+        self._last_cwd_per_chat[chat_id] = cwd
+
+        safe = task_line[:200].replace("`", "'")
+        send_message(f"✅ Task zur Queue hinzugefügt:\n`{safe}`")
+        logger.info("Slash-Task hinzugefügt (%s): %s", command, task_line[:80])
+
+    def _extract_subject_and_cwd(self, args: str) -> tuple[str, str | None]:
+        """Split args into (subject, explicit_cwd). Explicit cwd: tag wins."""
+        cwd_match = CWD_RE.search(args)
+        if not cwd_match:
+            return args.strip(), None
+        explicit_cwd = (cwd_match.group(1) or cwd_match.group(2) or "").strip()
+        subject = CWD_RE.sub("", args).strip()
+        return subject, explicit_cwd
+
+    def _resolve_cwd_and_subject(
+        self,
+        *,
+        spec: dict,
+        subject_raw: str,
+        explicit_cwd: str | None,
+        chat_id: str,
+        command: str,
+    ) -> tuple[str, str]:
+        """Resolve cwd and final subject for the slash command. Raises _SlashCommandError."""
+        cwd: str | None = None
+        subject = subject_raw
+
+        # Priority 1: explicit cwd: tag wins over everything else.
+        if explicit_cwd:
+            cwd = _validate_cwd(explicit_cwd)
+            if not cwd:
+                raise _SlashCommandError(
+                    f"cwd '{explicit_cwd}' ist ungültig (existiert nicht oder außerhalb ALLOWED_CWD_ROOTS)"
+                )
+            # For description/file-required commands, an empty subject after stripping
+            # cwd: is still a usage error.
+            if not subject and not spec["subject_is_cwd"]:
+                if spec["subject_is_file"]:
+                    raise _SlashCommandError(f"Verwendung: `{command} <plan.md> cwd:<pfad>`")
+                raise _SlashCommandError(f"Verwendung: `{command} <beschreibung> cwd:<pfad>`")
+            # Subject-is-cwd commands with an explicit cwd: tag use the cwd in the template.
+            if spec["subject_is_cwd"]:
+                subject = cwd
+
+        # Priority 2: subject IS the cwd (/review, /security, /audit).
+        elif spec["subject_is_cwd"]:
+            if not subject:
+                # Fall back to per-chat last-cwd
+                cwd = self._last_cwd_per_chat.get(chat_id)
+                if not cwd:
+                    raise _SlashCommandError(
+                        f"Verwendung: `{command} <pfad>` oder vorher `/review <pfad>` für last-cwd."
+                    )
+            else:
+                cwd = _validate_cwd(subject)
+                if not cwd:
+                    raise _SlashCommandError(
+                        f"cwd '{subject}' ist ungültig (existiert nicht oder außerhalb ALLOWED_CWD_ROOTS)"
+                    )
+                # Subject for these commands is the cwd itself — used in template
+                subject = cwd
+
+        # Priority 3: subject is a file path (/critique) — cwd = parent dir.
+        elif spec["subject_is_file"]:
+            if not subject:
+                raise _SlashCommandError(f"Verwendung: `{command} <plan.md>`")
+            from pathlib import Path
+            plan_path = Path(subject)
+            if not plan_path.is_absolute() or not plan_path.exists():
+                raise _SlashCommandError(f"Plan-Datei '{subject}' nicht gefunden (absoluten Pfad angeben)")
+            cwd = _validate_cwd(str(plan_path.parent))
+            if not cwd:
+                raise _SlashCommandError(
+                    f"Verzeichnis der Plan-Datei ist außerhalb ALLOWED_CWD_ROOTS: {plan_path.parent}"
+                )
+
+        # Priority 4: description-only commands (/dev, /brainstorm) — use last-cwd.
+        else:
+            if not subject:
+                raise _SlashCommandError(f"Verwendung: `{command} <beschreibung> cwd:<pfad>`")
+            cwd = self._last_cwd_per_chat.get(chat_id)
+            if not cwd:
+                raise _SlashCommandError(
+                    f"Kein cwd. Setze einen mit `cwd:<pfad>` oder vorher `/review <pfad>` für last-cwd."
+                )
+
+        return cwd, subject
+
+    # ------------------------------------------------------------------
+    # Help
+    # ------------------------------------------------------------------
+
     def _cmd_help(self) -> None:
         send_message(
             "🤖 *AI Orchestrator – Befehle*\n\n"
             "/task \\<beschreibung\\> — Task zur Queue hinzufügen\n"
+            "/review \\[pfad\\] — Review\\-Loop Task einreihen\n"
+            "/security \\[pfad\\] — Security\\-Audit Task einreihen\n"
+            "/audit \\[pfad\\] — Deep\\-Security\\-Audit Task einreihen\n"
+            "/dev \\<desc\\> cwd:\\<pfad\\> — Dev\\-Loop Task einreihen\n"
+            "/critique \\<plan\\.md\\> — Critical\\-Review Task einreihen\n"
+            "/brainstorm \\<topic\\> — Brainstorm Task einreihen\n"
             "/status — Queue\\-Größe \\+ Provider\\-Übersicht\n"
             "/limits — Detaillierte Provider\\-Limits\n"
             "/pause  — Task\\-Verarbeitung pausieren\n"

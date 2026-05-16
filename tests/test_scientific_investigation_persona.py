@@ -53,12 +53,30 @@ thresholds:
     source: norm_reference
     reference: DIN-EN-60068-2 §4.3 Toleranz 5% bei 800K
 ```"""
+    _DEFAULT_AUTHOR_PLAN = """```yaml
+sub_tasks:
+  - sub_id: S1
+    title: Tolerance check
+    description: Run measurement series
+    addresses_criteria: [F1]
+    type: data_analysis
+    expected_output: bias_at_800K
+```"""
+    _DEFAULT_REVIEW_EMPTY = """```yaml
+findings: []
+```"""
 
     def __init__(self, outputs: list[str] | None = None, name: str = "claude"):
         self.name = name
         self.calls: list[str] = []
         if outputs is None:
-            outputs = [self._DEFAULT_FRAMING, self._DEFAULT_PREREG]
+            outputs = [
+                self._DEFAULT_FRAMING,
+                self._DEFAULT_PREREG,
+                self._DEFAULT_AUTHOR_PLAN,
+                self._DEFAULT_REVIEW_EMPTY,
+                self._DEFAULT_REVIEW_EMPTY,
+            ]
         self._outputs = list(outputs)
 
     def run(self, task: str, **kwargs) -> RunResult:
@@ -73,6 +91,7 @@ def _patch_notifier(monkeypatch):
         "tools.scientific_investigation.notify_tool_done",
         lambda *a, **kw: None,
     )
+    monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
 
 
 def _make_lookup(*available_names: str):
@@ -347,15 +366,15 @@ def test_tool_run_i2_creates_decision_log_and_state(monkeypatch, tmp_path):
     provider = _ScriptedProvider()
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i2_phase1_done"
-    assert result.iterations == 2
+    assert result.error_code == "i3_phase2_done"
+    assert result.iterations == 3
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "decision_log.md").is_file()
     state = json.loads(
         next((tmp_path / ".scientific-investigation").glob("*/state.json"))
         .read_text("utf-8")
     )
-    assert state["phase"] == "phase1_persona_allocation_done"
+    assert state["phase"] == "phase2_review_done"
     assert len(state["personas"]) == 3
 
 

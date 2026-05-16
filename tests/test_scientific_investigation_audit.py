@@ -42,21 +42,15 @@ from tools.sub_tool_context import build_sub_env
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-class _ScriptedProvider:
-    """Provider that returns canned outputs in order. Defaults to two I1
-    happy-path responses (framing + prereg) so the tool can complete Phase 0+0.5.
-    """
-    name = "claude"
-    supports_sessions = False
-
-    _DEFAULT_FRAMING = """```yaml
+_DEFAULT_FRAMING_YAML = """```yaml
 question: precise question about diffusion under load
 hypothesis: bias is below 5% under nominal conditions
 bias_statement: Author wants the bias to be small to validate prior work
 discipline: engineering
 framing_text: engineering investigation about diffusion bias under load with 800K thermal envelope
 ```"""
-    _DEFAULT_PREREG = """```yaml
+
+_DEFAULT_PREREG_YAML = """```yaml
 thresholds:
   - criterion_id: F1
     description: Toleranz-Test bei 800K
@@ -65,10 +59,43 @@ thresholds:
     reference: DIN-EN-60068-2 §4.3 Toleranz 5% bei 800K Umgebung
 ```"""
 
+_DEFAULT_AUTHOR_PLAN_YAML = """```yaml
+sub_tasks:
+  - sub_id: S1
+    title: Tolerance check at 800K via measurement series
+    description: Run measurement series and compare against DIN-EN-60068-2 limit
+    addresses_criteria: [F1]
+    type: data_analysis
+    expected_output: bias_at_800K vs DIN limit
+```"""
+
+_DEFAULT_DA_REVIEW_YAML = """```yaml
+findings: []
+```"""
+
+_DEFAULT_METHODIKER_REVIEW_YAML = """```yaml
+findings: []
+```"""
+
+
+class _ScriptedProvider:
+    """Provider that returns canned outputs in order. Defaults to the full
+    I3 happy-path (framing + prereg + author-plan + DA-review + Methodiker-
+    review) so the tool can run end-to-end through Phase 2.
+    """
+    name = "claude"
+    supports_sessions = False
+
     def __init__(self, outputs: list[str] | None = None):
         self.calls: list[str] = []
         if outputs is None:
-            outputs = [self._DEFAULT_FRAMING, self._DEFAULT_PREREG]
+            outputs = [
+                _DEFAULT_FRAMING_YAML,
+                _DEFAULT_PREREG_YAML,
+                _DEFAULT_AUTHOR_PLAN_YAML,
+                _DEFAULT_DA_REVIEW_YAML,
+                _DEFAULT_METHODIKER_REVIEW_YAML,
+            ]
         self._outputs = list(outputs)
 
     def run(self, task: str, **kwargs) -> RunResult:
@@ -79,10 +106,17 @@ thresholds:
 
 
 def _patch_notifier(monkeypatch):
+    """Patch out Telegram + dispatcher so tests stay hermetic.
+
+    Without the dispatcher patch, Phase 1 (allocator) would query the real
+    dispatcher and pick 'gemini' or 'codex' for the cross-provider personas;
+    Phase 2 would then call those for real (or fail trying).
+    """
     monkeypatch.setattr(
         "tools.scientific_investigation.notify_tool_done",
         lambda *a, **kw: None,
     )
+    monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
 
 
 # ── audit_trail: append-only + validation ────────────────────────────────────
@@ -465,7 +499,7 @@ def test_tool_run_creates_layout(monkeypatch, tmp_path):
     provider = _ScriptedProvider()  # default scripts framing + prereg
     result = tool.run("investigate diffusion bias", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i2_phase1_done"
+    assert result.error_code == "i3_phase2_done"
     docs = list((tmp_path / "docs").glob("scientific-investigation-*"))
     assert len(docs) == 1
     run_dir = docs[0]

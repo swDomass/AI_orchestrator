@@ -70,6 +70,7 @@ def _patch_notifier(monkeypatch):
         "tools.scientific_investigation.notify_tool_done",
         lambda *a, **kw: None,
     )
+    monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
 
 
 def _good_framing_yaml(question="Is X true?", framing_text="Engineering eval of X"):
@@ -584,13 +585,20 @@ def test_write_plan_md_includes_discipline_warning_block(tmp_path):
 def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
     _patch_notifier(monkeypatch)
     tool = ScientificInvestigationTool()
-    provider = _ScriptedProvider([_good_framing_yaml(), _good_prereg_yaml()])
+    # I3 needs framing + prereg + author plan + DA review + Methodiker review
+    provider = _ScriptedProvider([
+        _good_framing_yaml(),
+        _good_prereg_yaml(),
+        "```yaml\nsub_tasks:\n  - sub_id: S1\n    title: t\n    description: d\n    "
+        "addresses_criteria: [F1]\n    type: data_analysis\n    expected_output: o\n```",
+        "```yaml\nfindings: []\n```",
+        "```yaml\nfindings: []\n```",
+    ])
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    # I2 reaches phase 1 (persona-allocation) on the same provider/code path,
-    # so the canonical post-Phase-0.5 outcome is now i2_phase1_done.
-    assert result.error_code == "i2_phase1_done"
-    assert result.iterations == 2
+    # I3 reaches phase 2 (multi-persona-review) end-to-end.
+    assert result.error_code == "i3_phase2_done"
+    assert result.iterations == 3
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "plan.md").is_file()
     assert (run_dir / "audit" / "approvals.jsonl").is_file()
@@ -598,7 +606,7 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
         (tmp_path / ".scientific-investigation").glob("*/state.json")
     )
     state = json.loads(state_path.read_text("utf-8"))
-    assert state["phase"] == "phase1_persona_allocation_done"
+    assert state["phase"] == "phase2_review_done"
     assert state["rigor_cap"] is None  # norm_reference present → no LOW cap
 
 

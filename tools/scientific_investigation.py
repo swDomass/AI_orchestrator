@@ -61,6 +61,10 @@ from tools.scientific_investigation_phase2 import (
     write_investigation_plan_md,
     write_review_findings_md,
 )
+from tools.scientific_investigation_phase3 import (
+    phase_execution_loop,
+    write_execution_report_md,
+)
 from tools.scientific_investigation_phases import (
     phase_framing,
     phase_persona_allocation,
@@ -203,7 +207,7 @@ def write_manifest(
         "git_commit_sha": _git_commit_sha(root_cwd),
         "embedding_model": TOOL_SI_EMBEDDING_MODEL,
         "tags": tags.as_audit_dict(),
-        "tool_version": "scientific-investigation/v5/I3",
+        "tool_version": "scientific-investigation/v5/I4",
     }
     out = run_dir / "audit" / "manifest.json"
     atomic_write_state(out, manifest)
@@ -323,6 +327,9 @@ class ScientificInvestigationTool(BaseTool):
         notify_threshold_callable=None,
         notify_discipline_warning_callable=None,
         provider_lookup=None,
+        sub_task_executor=None,
+        adversarial_query_generator=None,
+        adversarial_search_executor=None,
         **kwargs,
     ) -> ToolResult:
         root_cwd = _resolve_root_cwd(cwd)
@@ -493,6 +500,38 @@ class ScientificInvestigationTool(BaseTool):
             findings_by_iteration=phase2.findings_by_iteration,
         )
 
+        # ── Phase 3: Execution-Loop ────────────────────────────────────────
+        tracer.emit("phase_start", phase="execution_loop")
+        try:
+            phase3 = phase_execution_loop(
+                phase2.plan,
+                provider,
+                run_dir=run_dir,
+                root_cwd=root_cwd,
+                run_id=run_id,
+                sub_task_executor=sub_task_executor,
+                adversarial_query_generator=adversarial_query_generator,
+                adversarial_search_executor=adversarial_search_executor,
+            )
+        except (RuntimeError, ValueError) as exc:
+            msg = f"Phase 3 (Execution-Loop) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase3_failed", error=str(exc))
+            notify_tool_done(self.name, 4, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=4, error=msg,
+                error_code="phase3_failed", retryable=False,
+            )
+        tracer.emit(
+            "phase_end", phase="execution_loop",
+            sub_tasks=len(phase3.sub_task_results),
+            successful=sum(1 for r in phase3.sub_task_results if r.success),
+            total_duration_sec=round(phase3.total_duration_sec, 1),
+            at_least_one_t2_per_subtask=phase3.at_least_one_t2_per_subtask(),
+        )
+        execution_md_path = write_execution_report_md(
+            run_dir, phase3=phase3,
+        )
+
         # ── Phase 6 (initial decision-log) ─────────────────────────────────
         # Phase 6 is normally run AFTER synthesis (Plan §1.1 ordering), but
         # the persona-allocation + cherry-picking + Phase-2-summary blocks
@@ -508,12 +547,20 @@ class ScientificInvestigationTool(BaseTool):
             f"- Sub-Tasks: **{len(phase2.plan.sub_tasks)}**\n"
             f"- Findings letzte Iteration: **{len(phase2.latest_findings())}**\n"
         )
+        phase3_summary = (
+            f"- Sub-Tasks ausgeführt: **{len(phase3.sub_task_results)}**\n"
+            f"- Erfolgreich: **{sum(1 for r in phase3.sub_task_results if r.success)}**\n"
+            f"- Mindestens 1×T2 pro Sub-Task: "
+            f"**{'ja' if phase3.at_least_one_t2_per_subtask() else 'nein'}**\n"
+            f"- Gesamtdauer: **{phase3.total_duration_sec:.1f}s**\n"
+        )
         decision_log_path = write_decision_log(
             run_dir,
             run_id=run_id,
             sections=[
                 ("Phase 1: Persona-Allocation", persona_block),
                 ("Phase 2: Multi-Persona-Review Summary", phase2_summary),
+                ("Phase 3: Execution Summary", phase3_summary),
                 ("Phase 6: Cherry-Picking-Detection", cherry_block),
                 ("Phase 7: Engineering-Reviewer-Findings",
                  "*(Phase 7 — wird in I7 ausgefüllt)*"),
@@ -522,12 +569,12 @@ class ScientificInvestigationTool(BaseTool):
             ],
         )
 
-        # Persist run state — used by I4+ phases on resume.
+        # Persist run state — used by I5+ phases on resume.
         state_file = state_dir / "state.json"
         atomic_write_state(state_file, {
             "run_id": run_id,
             "ts_slug": ts_slug_value,
-            "phase": "phase2_review_done",
+            "phase": "phase3_execution_done",
             "prereg_hash": prereg.prereg_hash,
             "discipline_warning": prereg.discipline_warning,
             "discipline_warning_approved": prereg.discipline_warning_approved,
@@ -554,15 +601,25 @@ class ScientificInvestigationTool(BaseTool):
                     1 for f in phase2.latest_findings() if f.severity == "P1"
                 ),
             },
+            "phase3": {
+                "sub_tasks_run": len(phase3.sub_task_results),
+                "sub_tasks_successful": sum(
+                    1 for r in phase3.sub_task_results if r.success
+                ),
+                "at_least_one_t2_per_subtask": phase3.at_least_one_t2_per_subtask(),
+                "total_duration_sec": round(phase3.total_duration_sec, 2),
+                "results": [r.as_audit_dict() for r in phase3.sub_task_results],
+            },
         })
 
-        # I3 boundary: Phases 3–5, 7, 8 land in I4–I8.
+        # I4 boundary: Phases 4, 5, 7, 8 land in I5–I8.
         scaffold_msg = (
-            f"Scientific-Investigation I3 complete (Phases 0, 0.5, 1, 2, 6-init).\n"
+            f"Scientific-Investigation I4 complete (Phases 0, 0.5, 1, 2, 3, 6-init).\n"
             f"  run_id:        {run_id}\n"
             f"  plan.md:       {plan_path}\n"
             f"  invest_plan:   {plan_md_path}\n"
             f"  findings:      {findings_md_path}\n"
+            f"  execution:     {execution_md_path}\n"
             f"  decision_log:  {decision_log_path}\n"
             f"  thresholds:    {len(prereg.thresholds)}\n"
             f"  prereg_hash:   {prereg.prereg_hash}\n"
@@ -572,18 +629,22 @@ class ScientificInvestigationTool(BaseTool):
             f"  sub_tasks:     {len(phase2.plan.sub_tasks)}\n"
             f"  phase2:        {phase2.iterations_used} iters, "
             f"converged={phase2.converged}\n"
+            f"  phase3:        "
+            f"{sum(1 for r in phase3.sub_task_results if r.success)}/"
+            f"{len(phase3.sub_task_results)} sub-tasks ok, "
+            f"T2-coverage={phase3.at_least_one_t2_per_subtask()}\n"
             f"  rigor_cap:     {'LOW' if prereg.discipline_warning else '(none)'}\n"
             f"  similarity:    {len(framing.similarity_hits)} prior hits ≥ threshold\n"
-            f"NOTE: Phases 3–5, 7, 8 land in increments I4–I8 (see plan v5)."
+            f"NOTE: Phases 4, 5, 7, 8 land in increments I5–I8 (see plan v5)."
         )
         logger.info(scaffold_msg)
-        tracer.emit("run_end", success=True, reason="i3_phase2_done")
-        notify_tool_done(self.name, 3, True, "Phase 0, 0.5, 1, 2, 6-init abgeschlossen")
+        tracer.emit("run_end", success=True, reason="i4_phase3_done")
+        notify_tool_done(self.name, 4, True, "Phase 0, 0.5, 1, 2, 3, 6-init abgeschlossen")
         return ToolResult(
             success=True,
             output=scaffold_msg,
-            iterations=3,
+            iterations=4,
             error="",
-            error_code="i3_phase2_done",
+            error_code="i4_phase3_done",
             retryable=False,
         )

@@ -61,6 +61,7 @@ ALLOWED_ENTRY_TYPES = frozenset({
     "investigation_approval",
     "cross_provider_bypass",
     "persona_allocation",
+    "execution_sub_task",
 })
 
 

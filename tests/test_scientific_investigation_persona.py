@@ -87,11 +87,23 @@ findings: []
 
 
 def _patch_notifier(monkeypatch):
+    from tools.scientific_investigation_phase3 import SubTaskResult
+
     monkeypatch.setattr(
         "tools.scientific_investigation.notify_tool_done",
         lambda *a, **kw: None,
     )
     monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
+
+    def _stub(sub_task, *, sub_state_cwd, env, provider, timeout):
+        return SubTaskResult(
+            sub_task=sub_task, success=True,
+            output=f"stub: {sub_task.sub_id}", duration_sec=0.0,
+        )
+
+    monkeypatch.setattr(
+        "tools.scientific_investigation_phase3.default_devloop_executor", _stub,
+    )
 
 
 def _make_lookup(*available_names: str):
@@ -366,15 +378,15 @@ def test_tool_run_i2_creates_decision_log_and_state(monkeypatch, tmp_path):
     provider = _ScriptedProvider()
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i3_phase2_done"
-    assert result.iterations == 3
+    assert result.error_code == "i4_phase3_done"
+    assert result.iterations == 4
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "decision_log.md").is_file()
     state = json.loads(
         next((tmp_path / ".scientific-investigation").glob("*/state.json"))
         .read_text("utf-8")
     )
-    assert state["phase"] == "phase2_review_done"
+    assert state["phase"] == "phase3_execution_done"
     assert len(state["personas"]) == 3
 
 

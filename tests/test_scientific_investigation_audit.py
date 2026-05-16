@@ -106,17 +106,33 @@ class _ScriptedProvider:
 
 
 def _patch_notifier(monkeypatch):
-    """Patch out Telegram + dispatcher so tests stay hermetic.
+    """Patch out Telegram + dispatcher + Phase-3 sub-task executor so tests
+    stay hermetic.
 
     Without the dispatcher patch, Phase 1 (allocator) would query the real
     dispatcher and pick 'gemini' or 'codex' for the cross-provider personas;
-    Phase 2 would then call those for real (or fail trying).
+    Phase 2 would then call those for real (or fail trying). Without the
+    Phase-3 executor patch, every tool.run() would spawn a real DevLoopTool
+    subprocess per Sub-Task.
     """
+    from tools.scientific_investigation_phase3 import SubTaskResult
+
     monkeypatch.setattr(
         "tools.scientific_investigation.notify_tool_done",
         lambda *a, **kw: None,
     )
     monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
+
+    def _stub_executor(sub_task, *, sub_state_cwd, env, provider, timeout):
+        return SubTaskResult(
+            sub_task=sub_task, success=True,
+            output=f"stub: {sub_task.sub_id}", duration_sec=0.0,
+        )
+
+    monkeypatch.setattr(
+        "tools.scientific_investigation_phase3.default_devloop_executor",
+        _stub_executor,
+    )
 
 
 # ── audit_trail: append-only + validation ────────────────────────────────────
@@ -499,7 +515,7 @@ def test_tool_run_creates_layout(monkeypatch, tmp_path):
     provider = _ScriptedProvider()  # default scripts framing + prereg
     result = tool.run("investigate diffusion bias", provider, cwd=str(tmp_path))
     assert result.success is True
-    assert result.error_code == "i3_phase2_done"
+    assert result.error_code == "i4_phase3_done"
     docs = list((tmp_path / "docs").glob("scientific-investigation-*"))
     assert len(docs) == 1
     run_dir = docs[0]

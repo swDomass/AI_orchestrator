@@ -66,11 +66,23 @@ class _ScriptedProvider:
 
 
 def _patch_notifier(monkeypatch):
+    from tools.scientific_investigation_phase3 import SubTaskResult
+
     monkeypatch.setattr(
         "tools.scientific_investigation.notify_tool_done",
         lambda *a, **kw: None,
     )
     monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: None)
+
+    def _stub(sub_task, *, sub_state_cwd, env, provider, timeout):
+        return SubTaskResult(
+            sub_task=sub_task, success=True,
+            output=f"stub: {sub_task.sub_id}", duration_sec=0.0,
+        )
+
+    monkeypatch.setattr(
+        "tools.scientific_investigation_phase3.default_devloop_executor", _stub,
+    )
 
 
 def _good_framing_yaml(question="Is X true?", framing_text="Engineering eval of X"):
@@ -596,9 +608,10 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
     ])
     result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
     assert result.success is True
-    # I3 reaches phase 2 (multi-persona-review) end-to-end.
-    assert result.error_code == "i3_phase2_done"
-    assert result.iterations == 3
+    # I4 reaches phase 3 (execution-loop) end-to-end. _patch_notifier installs
+    # a stub Phase-3 executor so the sub-tasks run instantly.
+    assert result.error_code == "i4_phase3_done"
+    assert result.iterations == 4
     run_dir = next((tmp_path / "docs").glob("scientific-investigation-*"))
     assert (run_dir / "plan.md").is_file()
     assert (run_dir / "audit" / "approvals.jsonl").is_file()
@@ -606,7 +619,7 @@ def test_tool_run_executes_phase0_and_phase05(monkeypatch, tmp_path):
         (tmp_path / ".scientific-investigation").glob("*/state.json")
     )
     state = json.loads(state_path.read_text("utf-8"))
-    assert state["phase"] == "phase2_review_done"
+    assert state["phase"] == "phase3_execution_done"
     assert state["rigor_cap"] is None  # norm_reference present → no LOW cap
 
 

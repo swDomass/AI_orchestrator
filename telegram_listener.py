@@ -355,6 +355,12 @@ class TelegramListener:
                 self._cmd_decline()
             elif command == "/cancel-shutdown":
                 self._cmd_cancel_shutdown()
+            elif command == "/unblock":
+                self._cmd_unblock(command_args)
+            elif command == "/drop":
+                self._cmd_drop(command_args)
+            elif command == "/retry":
+                self._cmd_retry(command_args)
             return
 
         # AI chat (rate-limited, spawned in worker thread)
@@ -716,6 +722,44 @@ class TelegramListener:
                 return
             cancel_shutdown()
             send_message("✋ Shutdown abgebrochen.")
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    # Queue-Healing (#38) ----------------------------------------------------
+
+    def _cmd_unblock(self, args: str) -> None:
+        task_id = (args or "").strip().split()[0] if args.strip() else ""
+        if not task_id:
+            send_message("ℹ️ Verwendung: `/unblock <task-id>`")
+            return
+        try:
+            from queue_healing import apply_unblock
+            ok, msg = apply_unblock(task_id)
+            send_message(("✅ " if ok else "❌ ") + _escape_telegram_markdown(msg))
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_drop(self, args: str) -> None:
+        task_id = (args or "").strip().split()[0] if args.strip() else ""
+        if not task_id:
+            send_message("ℹ️ Verwendung: `/drop <task-id>`")
+            return
+        try:
+            from queue_healing import apply_drop
+            ok, msg = apply_drop(task_id)
+            send_message(("✅ " if ok else "❌ ") + _escape_telegram_markdown(msg))
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_retry(self, args: str) -> None:
+        dep_ids = [d.strip() for d in (args or "").replace(",", " ").split() if d.strip()]
+        if not dep_ids:
+            send_message("ℹ️ Verwendung: `/retry <dep-id> [dep-id ...]`")
+            return
+        try:
+            from queue_healing import apply_retry_dep
+            ok, msg = apply_retry_dep(dep_ids)
+            send_message(("✅ " if ok else "❌ ") + _escape_telegram_markdown(msg))
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 

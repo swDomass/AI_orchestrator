@@ -646,9 +646,54 @@ def _check_stale_branches() -> Optional[str]:
     return "\n\n".join(results) if results else None
 
 
+def _check_queue_healing(queue_read_fn: Callable) -> Optional[str]:
+    """Queue-healing (#38): scan blocked tasks and surface unblock proposals."""
+    try:
+        import queue_healing
+        from queue_manager import _read_queue_content, read_queue_items
+        from notifier import send_message as _notify
+
+        candidates = queue_healing.heal_once(
+            read_queue_items,
+            _read_queue_content,
+            notify_fn=_notify,
+        )
+        if not candidates:
+            return None
+        return f"Queue-Healing: {len(candidates)} blockierte Task(s) gemeldet."
+    except Exception as exc:
+        logger.debug("queue-healing handler failed: %s", exc)
+        return None
+
+
+def _check_skill_suggest(queue_read_fn: Callable) -> Optional[str]:
+    """Skill-suggester (#36): scan replay records for repeated patterns and
+    write SKILL.md drafts. Manual activation only — drafts land in a separate
+    directory.
+    """
+    try:
+        import skill_suggester
+        from notifier import send_message as _notify
+
+        drafts_root = VAULT_PATH / "99_System" / "AI" / "Skills-Drafts"
+        written = skill_suggester.suggest_once(
+            drafts_root=drafts_root,
+            notify_fn=_notify,
+        )
+        if not written:
+            return None
+        return f"Skill-Suggester: {len(written)} neue(r) Draft(s) erstellt."
+    except Exception as exc:
+        logger.debug("skill-suggester handler failed: %s", exc)
+        return None
+
+
 # ── Handler dispatch table ────────────────────────────────────────────────────
 
 HANDLER_KEYS: list[tuple[str, str]] = [
+    # "queue-healing" must come before "queue" — _match_handler_key returns the
+    # FIRST hit, and "queue" is a substring of "queue-healing".
+    ("queue-healing",    "_check_queue_healing"),
     ("queue",            "_check_queue_idle"),
     ("git status",       "_check_git_status"),
     ("disk space",       "_check_disk_space"),
@@ -659,6 +704,7 @@ HANDLER_KEYS: list[tuple[str, str]] = [
     ("usage-suggest",    "_check_usage_suggest"),
     ("session-cleanup",  "_check_session_cleanup"),
     ("model-check",      "_check_model_updates"),
+    ("skill-suggest",    "_check_skill_suggest"),
 ]
 
 
@@ -976,6 +1022,10 @@ class HeartbeatRunner:
             return _check_session_cleanup()
         elif key == "_check_model_updates":
             return _check_model_updates()
+        elif key == "_check_queue_healing":
+            return _check_queue_healing(queue_read_fn)
+        elif key == "_check_skill_suggest":
+            return _check_skill_suggest(queue_read_fn)
         else:
             logger.debug("No handler for heartbeat item: %s", item.label)
             return None

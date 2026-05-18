@@ -70,7 +70,9 @@ from queue_manager import (
     cleanup_done_tasks,
     ensure_queue_file,
     extract_cwd,
+    extract_id_tag,
     extract_model_tag,
+    extract_needs_tags,
     extract_pass_providers,
     extract_preapproved_actions,
     extract_profile_tag,
@@ -86,6 +88,7 @@ from queue_manager import (
     read_queue_items,
     strip_metadata_tags,
 )
+import replay
 from telegram_listener import TelegramListener
 from tools import extract_tool_tag, get_tool, list_tools
 
@@ -291,7 +294,7 @@ def _build_prompt(
     5. TF-IDF memory matches (layer 3) — relevant deep history
     6. File/wikilink context + task text — budget-capped
     """
-    from skills import load_skill
+    from skills import build_index, load_skill, progressive_body
 
     # Strip routing tags only from the queue task text, not from injected file contents.
     clean_task = strip_metadata_tags(task)
@@ -299,12 +302,16 @@ def _build_prompt(
     # 1. Core prompt (always)
     core = get_system_prompt(provider_name)
 
-    # 2. Skill body (only when #tool: present)
+    # 2. Skill INDEX (always-present, cheap self-routing context) + matched body
+    skill_index = build_index(vault_path=VAULT_PATH)
     skill_prompt = ""
     if skill_name:
         skill = load_skill(skill_name, vault_path=VAULT_PATH)
         if skill and skill.prompt:
-            skill_prompt = _truncate_tokens(skill.prompt, PROMPT_SKILL_TOKENS)
+            # Lazy section selection isn't requested at the queue layer; tools
+            # that want per-phase narrowing pass phase= themselves.
+            body = progressive_body(skill)
+            skill_prompt = _truncate_tokens(body, PROMPT_SKILL_TOKENS)
 
     # 3. Curated MEMORY.md (layer 1 — long-term patterns)
     curated = memory_module.get_curated_memory()
@@ -327,6 +334,8 @@ def _build_prompt(
     parts: list[str] = []
     if core:
         parts.append(core)
+    if skill_index:
+        parts.append(skill_index)
     if skill_prompt:
         parts.append(f"## Skill: {skill_name}\n{skill_prompt}")
     if curated:
@@ -390,6 +399,93 @@ class ToolTaskExecutionOutcome:
     error: str = ""
     error_code: str = ""
     output: str = ""
+
+
+@dataclass
+class _RunSpan:
+    """Per-task run telemetry, emitted to replay JSONL when the iteration ends.
+
+    Default exit_status is ERROR — branches that succeed or retry must override.
+    """
+    run_id: str
+    ts_start: datetime
+    task_text: str
+    task_id: str = ""
+    cwd: str = ""
+    provider: str = ""
+    model: str = ""
+    tool: str = ""
+    profile: str = ""
+    prompt: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    exit_status: str = replay.EXIT_ERROR
+    error_code: str | None = None
+    retry_count: int = 0
+    needs_satisfied_by: list[str] = None  # type: ignore[assignment]
+    emitted: bool = False
+
+    def __post_init__(self) -> None:
+        if self.needs_satisfied_by is None:
+            self.needs_satisfied_by = []
+
+    def ok(self, **fields) -> None:
+        self.exit_status = replay.EXIT_OK
+        self.error_code = None
+        self._merge(fields)
+
+    def retry(self, code: str | None, **fields) -> None:
+        self.exit_status = replay.EXIT_RETRY
+        self.error_code = code
+        self._merge(fields)
+
+    def error(self, code: str | None, **fields) -> None:
+        self.exit_status = replay.EXIT_ERROR
+        self.error_code = code
+        self._merge(fields)
+
+    def blocked(self, code: str = "dep_unsatisfied", **fields) -> None:
+        self.exit_status = replay.EXIT_BLOCKED
+        self.error_code = code
+        self._merge(fields)
+
+    def _merge(self, fields: dict) -> None:
+        for k, v in fields.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+    def emit(self) -> None:
+        """Append the record to replay JSONL. Idempotent — emits at most once."""
+        if self.emitted:
+            return
+        self.emitted = True
+        try:
+            record = replay.build_record(
+                run_id=self.run_id,
+                ts_start=self.ts_start,
+                task_text=self.task_text[:500],
+                task_id=self.task_id,
+                cwd=self.cwd,
+                provider=self.provider,
+                model=self.model,
+                tool=self.tool,
+                profile=self.profile,
+                prompt=self.prompt,
+                input_tokens=self.input_tokens,
+                output_tokens=self.output_tokens,
+                cache_creation_input_tokens=self.cache_creation_input_tokens,
+                cache_read_input_tokens=self.cache_read_input_tokens,
+                exit_status=self.exit_status,
+                error_code=self.error_code,
+                retry_count=self.retry_count,
+                needs_satisfied_by=self.needs_satisfied_by,
+            )
+            replay.append_run(record)
+        except Exception as e:  # noqa: BLE001 — telemetry must never break the loop
+            import logging as _logging
+            _logging.getLogger(__name__).debug("replay emit failed: %s", e)
 
 
 
@@ -650,11 +746,22 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         task = queue_task.task_text
         task_subtasks: tuple[str, ...] | None = getattr(queue_task, "subtasks", None)  # getattr for test-mock compat
 
+        # Replay-Telemetrie: pro Task allokieren. Wird im finally am Ende der
+        # Iteration emittiert; Branches setzen den Status via span.ok/retry/...
+        _span = _RunSpan(
+            run_id=replay.new_run_id(),
+            ts_start=datetime.now(),
+            task_text=task,
+            task_id=extract_id_tag(task) or "",
+        )
+
         # Dependency check — skip blocked tasks without marking them done
         blocked_reason = getattr(queue_task, "blocked_reason", "")
         if blocked_reason:
             print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
             print(f"  [blocked] {blocked_reason} — übersprungen")
+            _span.blocked("dep_unsatisfied", needs_satisfied_by=extract_needs_tags(task))
+            _span.emit()
             continue
 
         print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
@@ -697,6 +804,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Strict mode: when provider/model is explicitly specified, no fallback
         provider_is_forced = has_explicit_provider_tag(task)
 
+        # Populate span basics now that we have all metadata
+        _span.cwd = cwd or ""
+        _span.tool = tool_name or ""
+        _span.profile = profile.name if profile else ""
+
         # Feature 6: denied_skills check
         if tool_name and profile and tool_name in profile.denied_skills:
             msg = f"Tool '{tool_name}' durch Profil '{profile.name}' gesperrt (denied_skills)"
@@ -705,7 +817,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(msg)
                 notify_error(task, "profile", msg)
                 if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                    _span.error("profile_denied")
+                    _span.emit()
                     return False
+            _span.error("profile_denied")
+            _span.emit()
             continue
 
         # Feature 6: allowed_skills whitelist check
@@ -716,7 +832,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(msg)
                 notify_error(task, "profile", msg)
                 if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                    _span.error("profile_denied")
+                    _span.emit()
                     return False
+            _span.error("profile_denied")
+            _span.emit()
             continue
 
         if cwd_tag_present and cwd is None:
@@ -727,7 +847,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             append_log(msg)
             notify_error(task, "queue", msg)
             if not _mark_done_checked(task, "invalid-cwd", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                _span.error("cwd_invalid")
+                _span.emit()
                 return False
+            _span.error("cwd_invalid")
+            _span.emit()
             continue
 
         if cwd:
@@ -805,7 +929,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(msg)
                 notify_error(task, "policy", msg)
                 if not _mark_done_checked(task, "policy-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                    _span.error("policy_denied")
+                    _span.emit()
                     return False
+                _span.error("policy_denied")
+                _span.emit()
                 continue
 
             if verdict == TIER_APPROVE:
@@ -822,21 +950,33 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         append_log(f"Genehmigung abgelehnt für Task: {task[:60]}")
                         reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
                         if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                            _span.error("approval_denied")
+                            _span.emit()
                             return False
+                        _span.retry("approval_denied")
+                        _span.emit()
                         return False
                     elif response == "timeout":
                         print("  ⏱ Genehmigung timeout — Task bleibt in Queue.")
                         append_log(f"Genehmigung timeout für Task: {task[:60]}")
                         reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
                         if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                            _span.error("approval_timeout")
+                            _span.emit()
                             return False
+                        _span.retry("approval_timeout")
+                        _span.emit()
                         return False
                     elif response == "skipped":
                         print("  ⏭ Genehmigung übersprungen — riskante Aktion blockiert, Task bleibt in Queue.")
                         append_log(f"Genehmigung übersprungen für Task: {task[:60]}")
                         reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
                         if not _mark_retry_checked(task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                            _span.error("approval_skipped")
+                            _span.emit()
                             return False
+                        _span.retry("approval_skipped")
+                        _span.emit()
                         return False
                     # "approved" → continue
         except ImportError:
@@ -848,6 +988,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if getattr(queue_task, "subtasks", None):
             print(f"  [parallel] {len(task_subtasks)} Subtask(s)")
             notify_task_started(task, "parallel")
+            _span.provider = "parallel"
             try:
                 from parallel_runner import run_parallel, format_parallel_result
                 results = run_parallel(
@@ -866,10 +1007,16 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 if not _finalize_task_with_result_checked(
                     task, aggregated, provider_tag, queue_line_no=queue_task.line_no, subtasks=task_subtasks
                 ):
+                    _span.error("queue_update_failed")
+                    _span.emit()
                     return False
                 memory_module.store_result(task, aggregated, provider_tag, 0.0, cwd=cwd, success=success_all)
                 append_log(f"Parallel-Task erledigt: {task[:60]}")
                 notify_task_done(task, provider_tag, aggregated)
+                if success_all:
+                    _span.ok()
+                else:
+                    _span.error("parallel_subtask_failure")
             except Exception as e:
                 msg = f"Parallel-Ausführung fehlgeschlagen: {e}"
                 print(f"  ❌ {msg}")
@@ -877,9 +1024,15 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 notify_error(task, "parallel", msg)
                 retry_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
                 if not _mark_retry_checked(task, retry_at, "parallel", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                    _span.error("queue_update_failed")
+                    _span.emit()
                     return False
                 print(f"  [parallel] Task bleibt in Queue (Retry um ~{retry_at[-5:]})")
+                _span.retry("tool_internal_error")
+                _span.emit()
                 return False
+
+            _span.emit()
 
             # Feature 10: trigger shutdown after this task if tagged
             if task_has_shutdown:
@@ -892,6 +1045,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Tool-based task (iterative loop)
         if tool_name:
             tried_providers: set[str] = set()
+            tool_retry_count = 0
             while True:
                 provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
                 if provider is None:
@@ -903,8 +1057,12 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     print(f"  {msg}")
                     append_log(msg)
                     if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                        _span.error("queue_update_failed", retry_count=tool_retry_count)
+                        _span.emit()
                         return False
                     notify_providers_exhausted(fmt_time(earliest))
+                    _span.retry("provider_unreachable", retry_count=tool_retry_count)
+                    _span.emit()
                     return False
 
                 print(f"  → Provider: {provider.name}")
@@ -913,6 +1071,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 model_id = model_id_for_provider(model_tag, provider.name)
                 previous_forced_model = getattr(provider, "_forced_model", None)
                 setattr(provider, "_forced_model", model_id)
+                _span.provider = provider.name
+                _span.model = model_id or ""
                 try:
                     outcome = _execute_tool_task(
                         task,
@@ -927,12 +1087,18 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 finally:
                     setattr(provider, "_forced_model", previous_forced_model)
 
-                if outcome.success or outcome.finalized:
+                if outcome.success:
+                    _span.ok(retry_count=tool_retry_count)
+                    break
+                if outcome.finalized:
+                    _span.error(outcome.error_code or "tool_internal_error", retry_count=tool_retry_count)
                     break
 
                 if not outcome.retryable:
                     print("  ❌ Tool-Task nicht finalisiert (Queue-Update-Fehler). Task bleibt offen.")
                     append_log("Tool-Task nicht finalisiert wegen Queue-Update-Fehler")
+                    _span.error("queue_update_failed", retry_count=tool_retry_count)
+                    _span.emit()
                     return False
 
                 # Capacity exhausted mid-loop: suspend task, don't try other providers
@@ -948,9 +1114,12 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     print(f"  ⏸ {msg}")
                     append_log(msg)
                     _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks)
+                    _span.retry("capacity_exhausted", retry_count=tool_retry_count)
+                    _span.emit()
                     return False
 
                 tried_providers.add(provider.name)
+                tool_retry_count += 1
                 if outcome.error_code == "unreachable":
                     provider.set_cooldown()
                 elif outcome.error_code == "rate_limit":
@@ -977,7 +1146,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     print(f"  {msg}")
                     append_log(msg)
                     if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                        _span.error("queue_update_failed", retry_count=tool_retry_count)
+                        _span.emit()
                         return False
+                    _span.retry("timeout", retry_count=tool_retry_count)
                     break
 
                 if provider_is_forced:
@@ -989,10 +1161,15 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     print(f"  {msg}")
                     append_log(msg)
                     if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                        _span.error("queue_update_failed", retry_count=tool_retry_count)
+                        _span.emit()
                         return False
+                    _span.retry(outcome.error_code or "rate_limit", retry_count=tool_retry_count)
                     break
 
                 print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
+
+            _span.emit()
 
             # Feature 10: trigger shutdown after tool task if tagged
             if task_has_shutdown:
@@ -1011,10 +1188,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Standard single-shot task with provider fallback in the same run
         tried_providers: set[str] = set()
         single_shot_success = False
+        single_shot_retry_count = 0
         while True:
             if pause_event and pause_event.is_set():
                 print("\n[pause] Queue-Verarbeitung pausiert.")
                 append_log("Queue-Verarbeitung pausiert")
+                _span.retry("paused", retry_count=single_shot_retry_count)
+                _span.emit()
                 return False
 
             provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
@@ -1029,12 +1209,17 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     print(f"  {msg}")
                     append_log(msg)
                     if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                        _span.error("queue_update_failed")
+                        _span.emit()
                         return False
                     notify_providers_exhausted(fmt_time(earliest))
+                    _span.retry("provider_unreachable")
+                    _span.emit()
                     return False
 
                 print("  Keine weiteren Provider verfügbar - Task bleibt in Queue.")
                 append_log(f"Keine weiteren Provider verfügbar für Task: {task[:60]}")
+                _span.retry("provider_unreachable", retry_count=single_shot_retry_count)
                 break
 
             print(f"  → Provider: {provider.name}")
@@ -1043,8 +1228,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             model_id = model_id_for_provider(model_tag, provider.name)
             previous_forced_model = getattr(provider, "_forced_model", None)
             setattr(provider, "_forced_model", model_id)
+            _span.provider = provider.name
+            _span.model = model_id or ""
             try:
                 prompt = _build_prompt(task, provider.name, memory_context=memory_context)
+                _span.prompt = prompt
                 start_time = time.time()
                 result, _exhausted = _run_with_retry(
                     provider, task, prompt, cwd, timeout, pause_event=pause_event
@@ -1067,6 +1255,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if result.error == "paused":
                 print("\n[pause] Queue-Verarbeitung pausiert.")
                 append_log("Queue-Verarbeitung pausiert")
+                _span.retry("paused", retry_count=single_shot_retry_count)
+                _span.emit()
                 return False
 
             if result.success:
@@ -1082,6 +1272,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     queue_line_no=queue_task.line_no,
                     subtasks=task_subtasks,
                 ):
+                    _span.error("queue_update_failed", retry_count=single_shot_retry_count)
+                    _span.emit()
                     return False
                 memory_module.store_result(
                     task, result.output, provider.name, duration, cwd=cwd, success=True,
@@ -1093,9 +1285,17 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(f"Task erledigt via {provider.name}: {task[:60]}")
                 notify_task_done(task, provider.name, result.output, change_summary=change_summary)
                 single_shot_success = True
+                _span.ok(
+                    retry_count=single_shot_retry_count,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cache_creation_input_tokens=result.cache_creation_input_tokens,
+                    cache_read_input_tokens=result.cache_read_input_tokens,
+                )
                 break
 
             tried_providers.add(provider.name)
+            single_shot_retry_count += 1
             error = result.error
             print(f"  ❌ Fehler: {error}")
 
@@ -1131,10 +1331,25 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  {msg}")
                 append_log(msg)
                 if not _mark_retry_checked(task, reset_at_marker, queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                    _span.error("queue_update_failed", retry_count=single_shot_retry_count)
+                    _span.emit()
                     return False
+                _span.retry(error or "rate_limit", retry_count=single_shot_retry_count)
                 break
 
             print("  Task bleibt in Queue - versuche nächsten Provider...")
+
+        # Emit replay record for the single-shot run
+        if not _span.emitted:
+            if single_shot_success:
+                # _span.ok() already called inside the success branch
+                _span.emit()
+            else:
+                # Fell out of the while loop without explicit retry/error tag —
+                # default to error with the last observed code (best-effort).
+                if _span.exit_status == replay.EXIT_ERROR and _span.error_code is None:
+                    _span.error_code = "provider_unreachable"
+                _span.emit()
 
         # Feature 10: trigger shutdown after single-shot task if tagged
         if task_has_shutdown:

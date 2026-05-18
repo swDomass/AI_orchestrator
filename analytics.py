@@ -700,6 +700,19 @@ def get_dashboard_data(days: int = 7) -> dict:
     cutoff_window = datetime.now() - timedelta(days=days)
     recent_records = [r for r in records if r.timestamp >= cutoff_window]
 
+    # Failure taxonomy aggregation (#34) — classifies replay JSONL records.
+    failure_counts: dict[str, int] = {}
+    failure_timeline: dict[str, dict[str, int]] = {}
+    try:
+        import replay as _replay
+        import taxonomy as _taxonomy
+        replay_records = _replay.read_runs(since=cutoff_window, include_archive=False)
+        if replay_records:
+            failure_counts = _taxonomy.counts_by_category(replay_records)
+            failure_timeline = _taxonomy.failures_by_day(replay_records, days=days)
+    except Exception as exc:
+        logger.debug("failure taxonomy aggregation skipped: %s", exc)
+
     data = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "total_tasks": len(records),
@@ -722,6 +735,11 @@ def get_dashboard_data(days: int = 7) -> dict:
         # Tool action traces — per-tool run counts, success rate, avg duration.
         # Populated by tools/base_tool.py::ToolTracer (one JSONL file per run).
         "tool_trace_stats": tool_trace_stats,
+        # Failure taxonomy (#34) — per-category counts + per-day timeline.
+        # Categories from taxonomy.py; sourced from replay.jsonl. Empty when
+        # no replay records exist yet.
+        "failure_counts": failure_counts,
+        "failure_timeline": failure_timeline,
     }
 
     _cache["data"] = data

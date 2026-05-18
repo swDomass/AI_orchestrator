@@ -9,12 +9,21 @@ Queue syntax:
 
 Subtasks that share the same CWD run sequentially within that group.
 Different CWD groups run in parallel threads.
+
+Worktree isolation (#worktree on parent task — opt-in):
+    Each CWD group runs inside an isolated `git worktree` under
+    <group-cwd>/.worktrees/parallel-<hash>. Cleanup is automatic on success;
+    failed groups leave the worktree for inspection. Add #keep-worktree on
+    the parent to skip cleanup even on success.
 """
 
+import hashlib
 import logging
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from limits import AllLimits, estimate_task_usage_pct, report_estimated_usage
 
@@ -172,6 +181,95 @@ def _run_single_subtask(
         setattr(provider, "_forced_model", previous_forced_model)
 
 
+# ── Worktree isolation (P1) ──────────────────────────────────────────────────
+
+
+_GIT_CHECK_TIMEOUT_SEC = 5
+_GIT_WORKTREE_TIMEOUT_SEC = 30
+
+
+def _is_clean_git_repo(path: Path) -> tuple[bool, str]:
+    """Return (ok, reason) — True only when path is a git repo with no
+    uncommitted changes. Reason is empty when ok.
+    """
+    try:
+        repo_check = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=str(path), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_GIT_CHECK_TIMEOUT_SEC,
+        )
+        if repo_check.returncode != 0:
+            return False, "not a git repository"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(path), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_GIT_CHECK_TIMEOUT_SEC,
+        )
+        if status.returncode != 0:
+            return False, f"git status failed: {(status.stderr or status.stdout).strip()[:120]}"
+        if status.stdout.strip():
+            return False, "uncommitted changes present"
+        return True, ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"git check error: {exc}"
+
+
+def _worktree_id(parent_task: str, group_key: str | None, idx: int) -> str:
+    """Stable short ID for one worktree (8 hex chars + group index).
+
+    Short on purpose: Windows path limit (260 chars) — combined with the parent
+    CWD and the ``.worktrees`` subdir, longer IDs would trip MAX_PATH.
+    """
+    payload = f"{parent_task}|{group_key or ''}|{idx}".encode("utf-8", errors="replace")
+    return f"parallel-{hashlib.sha1(payload).hexdigest()[:8]}"
+
+
+def _create_worktree(parent_cwd: Path, worktree_id: str) -> tuple[Path | None, str]:
+    """Create a git worktree at parent_cwd/.worktrees/<worktree_id>.
+
+    Returns (path, error). path is None when creation failed; error is empty
+    when path is set. Uses --detach so the worktree gets a detached HEAD —
+    avoids branch-name collisions when the same parent runs concurrently.
+    """
+    from config import PARALLEL_WORKTREE_ROOT
+
+    target = parent_cwd / PARALLEL_WORKTREE_ROOT / worktree_id
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(target), "HEAD"],
+            cwd=str(parent_cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_GIT_WORKTREE_TIMEOUT_SEC,
+        )
+        if r.returncode != 0:
+            return None, f"git worktree add failed: {(r.stderr or r.stdout).strip()[:200]}"
+        if not target.is_dir():
+            return None, f"worktree path missing after add: {target}"
+        return target, ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"git worktree add error: {exc}"
+
+
+def _remove_worktree(parent_cwd: Path, worktree_path: Path) -> bool:
+    """Best-effort worktree removal. Logs failures, never raises."""
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree_path)],
+            cwd=str(parent_cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_GIT_WORKTREE_TIMEOUT_SEC,
+        )
+        if r.returncode == 0:
+            return True
+        logger.warning(
+            "git worktree remove failed for %s: %s",
+            worktree_path, (r.stderr or r.stdout).strip()[:200],
+        )
+        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("git worktree remove error for %s: %s", worktree_path, exc)
+        return False
+
+
 def _group_join_timeout_sec(group: list[tuple[int, SubTask]]) -> int:
     """Join timeout for one CWD group (runs sequentially within a single thread)."""
     total = sum(max(0, st.timeout) for _, st in group)
@@ -195,10 +293,21 @@ def run_parallel(
         return []
 
     subtasks = [_parse_subtask(t) for t in subtask_texts]
+    parent_cwd: str | None = None
+    worktree_enabled = False
+    keep_worktree = False
     try:
-        from queue_manager import extract_cwd, has_cwd_tag, extract_model_tag
+        from queue_manager import (
+            extract_cwd,
+            has_cwd_tag,
+            extract_model_tag,
+            extract_worktree_tag,
+            extract_keep_worktree_tag,
+        )
         parent_cwd = extract_cwd(parent_task)
         parent_model_tag = extract_model_tag(parent_task)
+        worktree_enabled = extract_worktree_tag(parent_task)
+        keep_worktree = extract_keep_worktree_tag(parent_task)
         if parent_cwd:
             subtasks = [
                 replace(st, cwd=parent_cwd)
@@ -223,6 +332,49 @@ def run_parallel(
         cwd_groups.setdefault(key, []).append((i, st))
 
     all_results: list[SubTaskResult | None] = [None] * len(subtasks)
+
+    # Worktree setup (opt-in via #worktree on parent). One worktree per CWD group;
+    # each group's subtasks get their cwd rewritten to point inside it.
+    worktree_map: dict[str | None, Path] = {}   # group_key → worktree path
+    worktree_base: dict[str | None, Path] = {}  # group_key → base cwd (for `git worktree remove`)
+    worktree_errors: dict[str | None, str] = {}  # group_key → setup error
+
+    if worktree_enabled:
+        for group_idx, (group_key, group) in enumerate(cwd_groups.items()):
+            base_cwd_str = group_key or parent_cwd
+            if not base_cwd_str:
+                worktree_errors[group_key] = "worktree requires cwd on parent or subtask"
+                continue
+            base_cwd = Path(base_cwd_str)
+            ok, reason = _is_clean_git_repo(base_cwd)
+            if not ok:
+                worktree_errors[group_key] = f"worktree precheck failed: {reason}"
+                continue
+            wt_id = _worktree_id(parent_task, group_key, group_idx)
+            wt_path, err = _create_worktree(base_cwd, wt_id)
+            if wt_path is None:
+                worktree_errors[group_key] = err
+                continue
+            worktree_map[group_key] = wt_path
+            worktree_base[group_key] = base_cwd
+            wt_cwd_str = str(wt_path)
+            for pos, (orig_idx, st) in enumerate(group):
+                new_st = replace(st, cwd=wt_cwd_str)
+                group[pos] = (orig_idx, new_st)
+                subtasks[orig_idx] = new_st
+
+    # Groups that hit a worktree setup error: short-circuit all their subtasks
+    # to a failed result so they show up clearly in the parent's final output.
+    for group_key, err in worktree_errors.items():
+        for orig_idx, st in cwd_groups[group_key]:
+            all_results[orig_idx] = SubTaskResult(
+                text=st.text,
+                provider_name="worktree",
+                success=False,
+                output="",
+                error=err,
+            )
+
     threads: list[threading.Thread] = []
     thread_timeouts: dict[threading.Thread, int] = {}
     lock = threading.Lock()
@@ -244,6 +396,8 @@ def run_parallel(
                 all_results[idx] = result
 
     for _cwd, group in cwd_groups.items():
+        if _cwd in worktree_errors:
+            continue   # already short-circuited above
         t = threading.Thread(
             target=_run_group,
             args=(group,),
@@ -260,7 +414,33 @@ def run_parallel(
         if t.is_alive():
             logger.warning("parallel: thread %s still alive after %ds timeout", t.name, join_timeout)
 
-    # Replace any None slots (thread timed out or internal error) with error results
+    # Worktree cleanup: remove on success, retain on failure (so the user can inspect).
+    # The retained path is appended to each failed subtask's error string.
+    for group_key, wt_path in worktree_map.items():
+        group_idxs = [orig_idx for orig_idx, _ in cwd_groups[group_key]]
+        group_results = [all_results[idx] for idx in group_idxs]
+        any_failed = any(r is None or not r.success for r in group_results)
+        if any_failed:
+            logger.warning("parallel: leaving worktree intact at %s (subtask failed/missing)", wt_path)
+            for idx in group_idxs:
+                r = all_results[idx]
+                if r is not None and not r.success:
+                    all_results[idx] = SubTaskResult(
+                        text=r.text,
+                        provider_name=r.provider_name,
+                        success=False,
+                        output=r.output,
+                        error=f"{r.error} [worktree retained: {wt_path}]".strip(),
+                    )
+            continue
+        if keep_worktree:
+            logger.info("parallel: keeping worktree at %s (#keep-worktree)", wt_path)
+            continue
+        base = worktree_base.get(group_key)
+        if base is not None:
+            _remove_worktree(base, wt_path)
+
+    # Replace any remaining None slots (thread timed out or internal error)
     final: list[SubTaskResult] = []
     for i, r in enumerate(all_results):
         if r is None:

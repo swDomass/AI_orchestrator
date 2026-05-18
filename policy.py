@@ -27,6 +27,74 @@ TIER_AUTO = "auto"
 TIER_APPROVE = "approve"
 TIER_DENY = "deny"
 
+
+# ── Tool Contracts (P3) ──────────────────────────────────────────────────────
+
+# Recognized reporting paths — used by Doctor schema validation. Unknown paths
+# produce a warning, not a failure (so users can add custom ones).
+_KNOWN_REPORTING_PATHS = frozenset({
+    "telegram", "memory", "file",
+    "telegram+memory", "telegram+file", "memory+file",
+    "telegram+memory+file",
+})
+
+
+@dataclass(frozen=True)
+class ToolContract:
+    """Action budget + stop conditions + reporting destination for one tool.
+
+    Loaded from policy.yaml's `tool_contracts:` section. Fields default to None
+    so callers can fall back to existing config.py constants when a contract
+    omits the field — supports the staged migration of tools off of constants.
+
+    Example yaml:
+        tool_contracts:
+          review-loop:
+            budget:
+              max_iterations: 20
+              max_runtime_sec: 3600
+            stop_conditions: [all_findings_resolved, infinite_loop]
+            reporting_path: telegram+file
+    """
+    tool_name: str
+    max_iterations: int | None = None
+    max_runtime_sec: int | None = None
+    max_files_touched: int | None = None
+    stop_conditions: tuple[str, ...] = ()
+    reporting_path: str = "telegram+memory"
+
+
+def _parse_tool_contract(name: str, raw: dict) -> ToolContract:
+    """Build a ToolContract from one yaml entry. Unknown keys are ignored."""
+    budget = raw.get("budget") or {}
+    if not isinstance(budget, dict):
+        budget = {}
+
+    def _int_or_none(value) -> int | None:
+        if value is None:
+            return None
+        try:
+            n = int(value)
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    stop_raw = raw.get("stop_conditions") or ()
+    if isinstance(stop_raw, str):
+        stop_raw = (stop_raw,)
+    stop_conditions = tuple(str(s) for s in stop_raw if s)
+
+    reporting = raw.get("reporting_path") or "telegram+memory"
+
+    return ToolContract(
+        tool_name=name,
+        max_iterations=_int_or_none(budget.get("max_iterations")),
+        max_runtime_sec=_int_or_none(budget.get("max_runtime_sec")),
+        max_files_touched=_int_or_none(budget.get("max_files_touched")),
+        stop_conditions=stop_conditions,
+        reporting_path=str(reporting),
+    )
+
 _TIER_ORDER = [TIER_DENY, TIER_APPROVE, TIER_AUTO]
 _PREAPPROVAL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*", re.IGNORECASE)
 _PREAPPROVAL_STOPWORDS = {
@@ -111,6 +179,7 @@ class PolicyEngine:
         self._vault_path = vault_path
         self._rules: list[PolicyRule] = []
         self._tool_providers: dict[str, list[str]] = {}
+        self._tool_contracts: dict[str, ToolContract] = {}
         self._mtime: float = 0.0
         self._lock = threading.Lock()
 
@@ -162,12 +231,65 @@ class PolicyEngine:
 
         self._rules = _parse_rules_from_dict(data)
         self._tool_providers = data.get("tool_providers") or {}
-        logger.debug("policy: loaded %d rules and %d tool policies from %s", 
-                     len(self._rules), len(self._tool_providers), path)
+
+        contracts_raw = data.get("tool_contracts") or {}
+        contracts: dict[str, ToolContract] = {}
+        if isinstance(contracts_raw, dict):
+            for tool_name, entry in contracts_raw.items():
+                if isinstance(entry, dict):
+                    contracts[str(tool_name)] = _parse_tool_contract(str(tool_name), entry)
+                else:
+                    logger.warning(
+                        "policy: tool_contracts['%s'] is not a mapping (got %s) — ignored",
+                        tool_name, type(entry).__name__,
+                    )
+        self._tool_contracts = contracts
+
+        logger.debug(
+            "policy: loaded %d rules, %d tool policies, %d tool contracts from %s",
+            len(self._rules), len(self._tool_providers), len(self._tool_contracts), path,
+        )
 
     # ------------------------------------------------------------------
     # Classification
     # ------------------------------------------------------------------
+
+    def get_tool_contract(self, tool_name: str) -> ToolContract:
+        """Return the ToolContract for `tool_name`.
+
+        Resolution order:
+        1. Specific tool entry in `tool_contracts:` (if defined)
+        2. `default` entry in `tool_contracts:` (if defined) — with tool_name rewritten
+        3. Empty/default ToolContract (callers fall back to config.py constants)
+
+        Never returns None — callers can rely on a contract object always being
+        present and check individual fields (max_iterations is None, etc.) to
+        decide whether to use the contract value or their config default.
+        """
+        self._reload_if_changed()
+        with self._lock:
+            contract = self._tool_contracts.get(tool_name)
+            if contract is None:
+                default = self._tool_contracts.get("default")
+                if default is not None:
+                    # Rewrite tool_name so callers see the actual name they asked for.
+                    contract = ToolContract(
+                        tool_name=tool_name,
+                        max_iterations=default.max_iterations,
+                        max_runtime_sec=default.max_runtime_sec,
+                        max_files_touched=default.max_files_touched,
+                        stop_conditions=default.stop_conditions,
+                        reporting_path=default.reporting_path,
+                    )
+        if contract is None:
+            return ToolContract(tool_name=tool_name)
+        return contract
+
+    def list_tool_contracts(self) -> dict[str, ToolContract]:
+        """Snapshot of currently-loaded contracts (used by --doctor)."""
+        self._reload_if_changed()
+        with self._lock:
+            return dict(self._tool_contracts)
 
     def get_allowed_providers(self, tool_name: str | None = None) -> list[str] | None:
         """Return the list of allowed providers for a tool, or None if no restriction.

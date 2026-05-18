@@ -85,6 +85,14 @@ SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
 # Matches #parallel tag
 PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
 
+# Matches #worktree tag — opt-in isolation of parallel subtasks via `git worktree`.
+# Parent task only; subtasks inherit it implicitly via their CWD group.
+WORKTREE_TAG_RE = re.compile(r"(?i)(?<!\S)#worktree(?=\s|$)")
+
+# Matches #keep-worktree tag — disables auto-cleanup of the worktree directory
+# after a successful subtask run, so the user can inspect the working copy.
+KEEP_WORKTREE_TAG_RE = re.compile(r"(?i)(?<!\S)#keep-worktree(?=\s|$)")
+
 # Matches model selection tags across all providers:
 #   Claude: #claude_haiku, #claude_sonnet, #claude_opus
 #   Gemini: #gemini_pro, #gemini_flash
@@ -510,6 +518,16 @@ def extract_shutdown_tag(task: str) -> bool:
     return bool(SHUTDOWN_TAG_RE.search(task))
 
 
+def extract_worktree_tag(task: str) -> bool:
+    """Return True if #worktree tag is present (opt-in isolation for #parallel)."""
+    return bool(WORKTREE_TAG_RE.search(task))
+
+
+def extract_keep_worktree_tag(task: str) -> bool:
+    """Return True if #keep-worktree tag is present (skip auto-cleanup on success)."""
+    return bool(KEEP_WORKTREE_TAG_RE.search(task))
+
+
 def extract_model_tag(task: str) -> str | None:
     """Extract a model alias tag for any provider.
 
@@ -604,6 +622,8 @@ def strip_metadata_tags(task: str) -> str:
     task = PREAPPROVE_TAG_RE.sub("", task)
     task = SHUTDOWN_TAG_RE.sub("", task)
     task = PARALLEL_TAG_RE.sub("", task)
+    task = KEEP_WORKTREE_TAG_RE.sub("", task)   # must precede WORKTREE_TAG_RE — shared "worktree" stem
+    task = WORKTREE_TAG_RE.sub("", task)
     task = MODEL_TAG_RE.sub("", task)
     task = ID_TAG_RE.sub("", task)
     task = NEEDS_TAG_RE.sub("", task)

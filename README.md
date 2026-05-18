@@ -9,8 +9,13 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 - Multi-provider routing with fallback (`Claude → Gemini → Codex`)
 - Capacity checking via `cclimits` (with local JSONL fallback on HTTP 429)
 - Retry handling on rate limits / provider failures
-- Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#shutdown`, `#approve:*` tags
-- Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `deep-security-audit`, `critical-review`, `knowledge-transfer`, `scientific-investigation`, `brainstorm`
+- Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#worktree`, `#keep-worktree`, `#shutdown`, `#approve:*` tags
+- **`#worktree` parallel isolation (P1)**: each CWD group of a `#parallel` parent runs in its own `git worktree` under `.worktrees/parallel-<hash>`. Failed groups retain the worktree for inspection. `#keep-worktree` suppresses cleanup on success.
+- Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `deep-security-audit`, `critical-review`, `knowledge-transfer`, `scientific-investigation`, `brainstorm`, `pr-babysitter`
+- **`#tool:pr-babysitter` (P2/P5)**: polls open PRs via `gh`, queues `#tool:dev-loop` fix-tasks on new comments / CI failures. Two modes via `#pr-mode:queue|report-only` — report-only sends a Telegram summary with `/pr-fix <repo>#N` and `/pr-ignore <repo>#N` slash commands instead of writing the queue directly.
+- **CI-Watcher heartbeat (P4)**: `check-ci-failures` polls `gh run list --status=failure` per `CI_WATCHER_REPOS` whitelist and queues one fix-task per new failing commit (dedup by `(repo, headSha)`, 2h cooldown). Optional repo→local-path mapping via `CI_WATCHER_REPO_PATHS`.
+- **Status-Recap heartbeat (P6)**: daily 07:00 Telegram summary — tasks done/failed, provider breakdown, pending approvals, blocked tasks, top successes/failures of the last 24h. Idle day → one-liner.
+- **Tool Contracts (P3)**: `tool_contracts:` section in `policy.yaml` declares per-tool budgets (`max_iterations`, `max_runtime_sec`, `max_files_touched`), stop conditions, and reporting paths in one auditable place. `PolicyEngine.get_tool_contract(name)` returns a `ToolContract` dataclass; tools may fall back to `config.TOOL_*` constants for fields the contract omits (staged migration).
 - Skills / `SKILL.md` discovery with requirements gating
 - Memory (TF-IDF + temporal decay) for recurring tasks
 - Execution profiles (provider order, allowed skills, timeout, policy overrides)
@@ -68,6 +73,11 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `TELEGRAM_MAX_TASK_LENGTH` | No | `500` | Max characters for `/task` command |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
 | `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
+| `PR_BABYSITTER_REPOS` | No | *(empty)* | Semicolon-separated `owner/name` list for `#tool:pr-babysitter` without an explicit `#repos:` tag. Empty = tool requires the tag. |
+| `PR_BABYSITTER_QUEUE_COOLDOWN_HOURS` | No | `1` | Suppresses duplicate `dev-loop` queue items for the same PR within the window. |
+| `CI_WATCHER_REPOS` | No | *(empty)* | Semicolon-separated `owner/name` list for the `check-ci-failures` heartbeat. Empty list disables the handler. |
+| `CI_WATCHER_REPO_PATHS` | No | *(empty)* | Optional `owner/name=local/path[;...]` mapping so the auto-generated queue item carries a usable `cwd:` tag. |
+| `CI_WATCHER_QUEUE_COOLDOWN_HOURS` | No | `2` | Cooldown per `(repo, headSha)` before re-queueing a CI failure. |
 
 See `.env.example` for a complete annotated template.
 

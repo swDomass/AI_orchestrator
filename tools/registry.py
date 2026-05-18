@@ -14,6 +14,7 @@ from tools.critical_review import CriticalReviewTool
 from tools.deep_security_audit import DeepSecurityAuditTool
 from tools.dev_loop import DevLoopTool
 from tools.knowledge_transfer import KnowledgeTransferTool
+from tools.pr_babysitter import PRBabysitterTool
 from tools.research_qa import ResearchQATool
 from tools.review_loop import ReviewLoopTool
 from tools.scientific_investigation import ScientificInvestigationTool
@@ -34,6 +35,7 @@ _TOOLS: dict[str, BaseTool] = {
     "deep-security-audit": DeepSecurityAuditTool(),
     "scientific-investigation": ScientificInvestigationTool(),
     "brainstorm": BrainstormTool(),
+    "pr-babysitter": PRBabysitterTool(),
 }
 
 

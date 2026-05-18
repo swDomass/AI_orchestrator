@@ -666,6 +666,100 @@ def _check_queue_healing(queue_read_fn: Callable) -> Optional[str]:
         return None
 
 
+def _format_recap(summary: dict) -> str:
+    """Format a 24h status summary into a compact Telegram-friendly markdown block.
+
+    Pure function — kept separate from the handler so tests can drive it with
+    synthetic data without touching the vault/policy/queue.
+    """
+    if summary.get("idle"):
+        return "Keine Aktivität in 24h."
+
+    lines: list[str] = []
+    done = summary.get("done", 0)
+    failed = summary.get("failed", 0)
+    lines.append(f"✅ {done} erledigt | ❌ {failed} fehlgeschlagen")
+
+    provider_counts = summary.get("provider_counts", {})
+    if provider_counts:
+        parts = [f"{name} {count}" for name, count in
+                 sorted(provider_counts.items(), key=lambda kv: kv[1], reverse=True)]
+        lines.append("Provider: " + ", ".join(parts))
+
+    pending = summary.get("pending_approval")
+    blocked = summary.get("blocked_count", 0)
+    status_bits: list[str] = []
+    if pending:
+        status_bits.append("⏸️ 1 ausstehende Approval")
+    if blocked:
+        status_bits.append(f"🚧 {blocked} blockierte Task(s)")
+    if status_bits:
+        lines.append(" | ".join(status_bits))
+
+    top_successes = summary.get("top_successes") or []
+    top_failures = summary.get("top_failures") or []
+    if top_successes or top_failures:
+        lines.append("")  # blank line before details
+        lines.append("Top:")
+        for entry in top_successes:
+            lines.append(f"✅ {entry}")
+        for entry in top_failures:
+            lines.append(f"❌ {entry}")
+
+    return "\n".join(lines)
+
+
+def _check_status_recap() -> Optional[str]:
+    """Daily 24h recap handler (P6).
+
+    Pulls aggregated data from analytics.last_24h_summary() and formats it
+    via _format_recap(). Always returns a string (even on idle day) — daily
+    idempotency is enforced by HeartbeatRunner's last_run_date check, not
+    here. Returns None only on internal failure.
+    """
+    try:
+        from analytics import last_24h_summary
+        summary = last_24h_summary()
+        return _format_recap(summary)
+    except Exception as exc:
+        logger.debug("status-recap failed: %s", exc)
+        return None
+
+
+def _check_ci_failures() -> Optional[str]:
+    """CI-Watcher (P4) heartbeat handler.
+
+    Calls ci_watcher.sweep_once(), returning a Telegram-formatted summary
+    only when something actually happened (queued OR error). Silent on
+    quiet sweeps to avoid notification noise.
+    """
+    try:
+        from config import CI_WATCHER_REPOS
+        if not CI_WATCHER_REPOS:
+            return None  # disabled — no repos configured
+        import ci_watcher
+        summary = ci_watcher.sweep_once()
+    except Exception as exc:
+        logger.debug("ci-watcher handler failed: %s", exc)
+        return None
+
+    queued = summary.get("queued") or []
+    errors = summary.get("errors") or []
+    if not (queued or errors):
+        return None
+
+    parts: list[str] = []
+    if queued:
+        parts.append(f"CI-Watcher queued {len(queued)} fix task(s):")
+        parts.extend(f"  + {q[:120]}" for q in queued[:5])
+        if len(queued) > 5:
+            parts.append(f"  + ... +{len(queued) - 5} more")
+    if errors:
+        parts.append(f"errors ({len(errors)}):")
+        parts.extend(f"  ! {e}" for e in errors[:5])
+    return "\n".join(parts)
+
+
 def _check_skill_suggest(queue_read_fn: Callable) -> Optional[str]:
     """Skill-suggester (#36): scan replay records for repeated patterns and
     write SKILL.md drafts. Manual activation only — drafts land in a separate
@@ -705,6 +799,8 @@ HANDLER_KEYS: list[tuple[str, str]] = [
     ("session-cleanup",  "_check_session_cleanup"),
     ("model-check",      "_check_model_updates"),
     ("skill-suggest",    "_check_skill_suggest"),
+    ("status-recap",     "_check_status_recap"),
+    ("check-ci-failures","_check_ci_failures"),
 ]
 
 
@@ -1026,6 +1122,10 @@ class HeartbeatRunner:
             return _check_queue_healing(queue_read_fn)
         elif key == "_check_skill_suggest":
             return _check_skill_suggest(queue_read_fn)
+        elif key == "_check_status_recap":
+            return _check_status_recap()
+        elif key == "_check_ci_failures":
+            return _check_ci_failures()
         else:
             logger.debug("No handler for heartbeat item: %s", item.label)
             return None

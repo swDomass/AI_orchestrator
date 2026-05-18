@@ -746,3 +746,76 @@ def get_dashboard_data(days: int = 7) -> dict:
     _cache["ts"] = now
     _cache["days"] = days
     return data
+
+
+# ── 24h Status-Recap (P6) ────────────────────────────────────────────────────
+
+def last_24h_summary(now: datetime | None = None) -> dict:
+    """Pure aggregation over the last 24h. No I/O assumptions beyond reading
+    memory task results — callers pass `now` for deterministic tests.
+
+    Returns:
+        {
+            "done": int,            # successful task records
+            "failed": int,          # failed task records
+            "provider_counts": dict[str, int],
+            "top_successes": list[str],  # newest first, "<task> (<provider>)", max 3
+            "top_failures":  list[str],  # newest first, "<task> (<provider>)", max 3
+            "pending_approval": bool,    # policy.has_pending_approval()
+            "blocked_count": int,        # queue items with #needs: deps unmet
+            "idle": bool,                # True ⇔ no tasks + no blockers + no approval
+        }
+    """
+    now = now or datetime.now()
+    cutoff = now - timedelta(hours=24)
+
+    memory_root = VAULT_PATH / "99_System" / "AI" / "memory"
+    task_results_dir = memory_root / "task_results"
+    archive_dir = memory_root / "archive"
+    records = _parse_memory_files(task_results_dir, archive_dir)
+    recent = [r for r in records if r.timestamp >= cutoff]
+    recent.sort(key=lambda r: r.timestamp, reverse=True)
+
+    done = sum(1 for r in recent if r.success)
+    failed = sum(1 for r in recent if not r.success)
+
+    provider_counts: dict[str, int] = defaultdict(int)
+    for r in recent:
+        name = r.provider.split("+")[0].strip() if r.provider else "unknown"
+        provider_counts[name] += 1
+
+    def _fmt(r: TaskRecord) -> str:
+        task = (r.task or "").strip()
+        if len(task) > 80:
+            task = task[:77] + "..."
+        return f"{task} ({r.provider or 'unknown'})"
+
+    top_successes = [_fmt(r) for r in recent if r.success][:3]
+    top_failures = [_fmt(r) for r in recent if not r.success][:3]
+
+    # Policy approval state — never let import errors mask the recap.
+    pending_approval = False
+    try:
+        from policy import get_engine
+        pending_approval = get_engine().has_pending_approval()
+    except Exception as exc:
+        logger.debug("last_24h_summary: policy lookup skipped: %s", exc)
+
+    # Blocked task count from current queue (depends on #needs: resolution).
+    blocked_count = 0
+    try:
+        from queue_manager import read_queue_items
+        blocked_count = sum(1 for item in read_queue_items() if item.blocked_reason)
+    except Exception as exc:
+        logger.debug("last_24h_summary: queue lookup skipped: %s", exc)
+
+    return {
+        "done": done,
+        "failed": failed,
+        "provider_counts": dict(provider_counts),
+        "top_successes": top_successes,
+        "top_failures": top_failures,
+        "pending_approval": pending_approval,
+        "blocked_count": blocked_count,
+        "idle": done == 0 and failed == 0 and blocked_count == 0 and not pending_approval,
+    }

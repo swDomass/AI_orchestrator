@@ -375,14 +375,68 @@ def check_policy_file() -> CheckResult:
             auto_count = len(data.get("auto", []))
             approve_count = len(data.get("approve", []))
             deny_count = len(data.get("deny", []))
-            return CheckResult(
-                PASS, "Policy file",
-                f"{auto_count} auto, {approve_count} approve, {deny_count} deny rules"
+
+            # Tool-contract schema check (P3) — non-fatal warnings stay in details.
+            contract_warnings = _validate_tool_contracts(data.get("tool_contracts"))
+            contract_count = (
+                len(data["tool_contracts"]) if isinstance(data.get("tool_contracts"), dict) else 0
             )
+            details = f"{auto_count} auto, {approve_count} approve, {deny_count} deny rules"
+            if contract_count:
+                details += f", {contract_count} tool contracts"
+            if contract_warnings:
+                details += " [WARN: " + "; ".join(contract_warnings[:3])
+                if len(contract_warnings) > 3:
+                    details += f"; +{len(contract_warnings) - 3} more"
+                details += "]"
+                return CheckResult(WARN, "Policy file", details)
+            return CheckResult(PASS, "Policy file", details)
         except Exception as e:
             return CheckResult(FAIL, "Policy file", f"invalid YAML: {e}")
     except Exception as e:
         return CheckResult(WARN, "Policy file", f"check failed: {e}")
+
+
+def _validate_tool_contracts(contracts_raw) -> list[str]:
+    """Schema-validate the tool_contracts section. Returns a list of warning strings.
+
+    Loose validation: structure must be sane, but unknown keys are accepted.
+    The PolicyEngine itself ignores unknown fields silently — Doctor surfaces
+    obvious typos so the user notices before they take effect.
+    """
+    if contracts_raw is None:
+        return []  # Section absent → not an error, contracts are optional
+    warnings: list[str] = []
+    if not isinstance(contracts_raw, dict):
+        return [f"tool_contracts must be a mapping (got {type(contracts_raw).__name__})"]
+
+    valid_top_keys = {"budget", "stop_conditions", "reporting_path"}
+    valid_budget_keys = {"max_iterations", "max_runtime_sec", "max_files_touched"}
+
+    for tool_name, entry in contracts_raw.items():
+        if not isinstance(entry, dict):
+            warnings.append(f"{tool_name}: entry must be a mapping")
+            continue
+        for k in entry:
+            if k not in valid_top_keys:
+                warnings.append(f"{tool_name}: unknown key '{k}'")
+        budget = entry.get("budget")
+        if budget is not None:
+            if not isinstance(budget, dict):
+                warnings.append(f"{tool_name}.budget: must be a mapping")
+            else:
+                for bk, bv in budget.items():
+                    if bk not in valid_budget_keys:
+                        warnings.append(f"{tool_name}.budget.{bk}: unknown budget key")
+                    elif bv is not None and (not isinstance(bv, int) or bv <= 0):
+                        warnings.append(f"{tool_name}.budget.{bk}: must be a positive int")
+        stop = entry.get("stop_conditions")
+        if stop is not None and not isinstance(stop, (list, tuple)):
+            warnings.append(f"{tool_name}.stop_conditions: must be a list")
+        report = entry.get("reporting_path")
+        if report is not None and not isinstance(report, str):
+            warnings.append(f"{tool_name}.reporting_path: must be a string")
+    return warnings
 
 
 def check_model_aliases() -> CheckResult:
@@ -453,6 +507,68 @@ def check_model_aliases() -> CheckResult:
     return CheckResult(PASS, "Model IDs", f"{total} aliases verified live via CLI ping")
 
 
+def check_worktrees() -> CheckResult:
+    """Scan ALLOWED_CWD_ROOTS for orphaned .worktrees/parallel-* directories
+    left behind by failed/crashed #parallel #worktree runs and offer to prune
+    them via `git worktree prune` (--fix).
+
+    PASS  — no worktrees subdirs found
+    WARN  — orphaned worktrees present (fixable)
+    """
+    from config import ALLOWED_CWD_ROOTS, PARALLEL_WORKTREE_ROOT
+
+    if not ALLOWED_CWD_ROOTS:
+        return CheckResult(PASS, "Worktrees", "no allowed CWD roots configured — skipped")
+
+    found: list[Path] = []
+    for root in ALLOWED_CWD_ROOTS:
+        if not root.is_dir():
+            continue
+        try:
+            for wt_root in root.glob(f"**/{PARALLEL_WORKTREE_ROOT}"):
+                if not wt_root.is_dir():
+                    continue
+                for child in wt_root.glob("parallel-*"):
+                    if child.is_dir():
+                        found.append(child)
+        except OSError:
+            continue
+
+    if not found:
+        return CheckResult(PASS, "Worktrees", "no orphaned parallel worktrees")
+
+    def _fix():
+        # Run `git worktree prune` in each parent repo that owns a leftover worktree.
+        # Then attempt `git worktree remove --force` for each directory still on disk.
+        pruned_repos: set[Path] = set()
+        for wt_path in found:
+            repo_root = wt_path.parent.parent  # <repo>/.worktrees/parallel-X → <repo>
+            if repo_root not in pruned_repos:
+                try:
+                    subprocess.run(
+                        ["git", "worktree", "prune"],
+                        cwd=str(repo_root), capture_output=True, text=True, timeout=15,
+                    )
+                    pruned_repos.add(repo_root)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(wt_path)],
+                    cwd=str(repo_root), capture_output=True, text=True, timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        print(f"    pruned {len(pruned_repos)} repo(s) and attempted removal of {len(found)} worktree dir(s)")
+
+    return CheckResult(
+        WARN, "Worktrees",
+        f"{len(found)} orphaned parallel worktree(s) found",
+        fix_hint=f"git worktree prune in {len(set(p.parent.parent for p in found))} repo(s)",
+        fix_fn=_fix,
+    )
+
+
 def check_skills() -> CheckResult:
     try:
         from skills.discovery import discover_skills
@@ -512,6 +628,7 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_profiles(),
         check_policy_file(),
         check_model_aliases(),
+        check_worktrees(),
     ]
 
     any_fail = False

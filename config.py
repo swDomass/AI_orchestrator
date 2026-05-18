@@ -482,6 +482,45 @@ ESTIMATE_TOKENS_PER_PCT: dict[str, int] = {
     "codex": int(os.getenv("ORCH_TOKENS_PER_PCT_CODEX", "30000")),
 }
 
+# --- Parallel Worktrees (P1) ---
+# Subdir name under the parent CWD where #worktree-tagged parallel subtasks
+# get isolated git worktrees. Kept short to stay within Windows' 260-char path
+# limit even when parent CWDs are already deep.
+PARALLEL_WORKTREE_ROOT = ".worktrees"
+
+# --- PR-Babysitter (P2) + CI-Watcher (P4) ---
+# Repo whitelist (semicolon-separated "owner/name" entries in .env). Empty list
+# means the tool must be invoked with an explicit #repos:<...> tag — never
+# triggers on every repo the user has gh access to.
+_env_pr_repos = os.getenv("PR_BABYSITTER_REPOS", "")
+PR_BABYSITTER_REPOS: list[str] = [
+    r.strip() for r in _env_pr_repos.split(";") if r.strip()
+]
+PR_BABYSITTER_QUEUE_COOLDOWN_HOURS = _parse_int_env("PR_BABYSITTER_QUEUE_COOLDOWN_HOURS", 1)
+PR_BABYSITTER_GH_TIMEOUT_SEC       = _parse_int_env("PR_BABYSITTER_GH_TIMEOUT_SEC", 20)
+PR_BABYSITTER_MAX_PRS_PER_REPO     = _parse_int_env("PR_BABYSITTER_MAX_PRS_PER_REPO", 20)
+
+# CI-Watcher: whitelist for `gh run list --status=failure` polling. Same format
+# as PR_BABYSITTER_REPOS. Empty list disables the heartbeat handler.
+_env_ci_repos = os.getenv("CI_WATCHER_REPOS", "")
+CI_WATCHER_REPOS: list[str] = [
+    r.strip() for r in _env_ci_repos.split(";") if r.strip()
+]
+CI_WATCHER_MAX_RUNS_PER_REPO       = _parse_int_env("CI_WATCHER_MAX_RUNS_PER_REPO", 20)
+CI_WATCHER_QUEUE_COOLDOWN_HOURS    = _parse_int_env("CI_WATCHER_QUEUE_COOLDOWN_HOURS", 2)
+# Optional mapping `owner/repo=local/path[;owner/repo=local/path]` so the queue
+# item can carry a usable `cwd:` tag straight to dev-loop. Unmapped repos
+# get a queue item without cwd — the user has to add one before it runs.
+_env_ci_paths = os.getenv("CI_WATCHER_REPO_PATHS", "")
+CI_WATCHER_REPO_PATHS: dict[str, str] = {}
+for _entry in _env_ci_paths.split(";"):
+    _entry = _entry.strip()
+    if "=" in _entry:
+        _k, _v = _entry.split("=", 1)
+        _k, _v = _k.strip(), _v.strip()
+        if _k and _v:
+            CI_WATCHER_REPO_PATHS[_k] = _v
+
 # --- Shutdown ---
 SHUTDOWN_DELAY_SEC = 60
 

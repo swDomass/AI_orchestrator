@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~1339 tests, ~45 s)
+# Run all tests (~1462 tests, ~50 s)
 python -m pytest tests/ -q
 
 # Run a single test file / single test
@@ -48,11 +48,11 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 ### Core orchestration
 - **`orchestrator.py`** — Main loop (`run_once`/`run_watch`), prompt building, heartbeat thread, blocked-task handling
 - **`dispatcher.py`** — Provider selection (Claude → Gemini → Codex fallback), cooldowns, model-alias routing
-- **`queue_manager.py`** — Obsidian MD queue parser, sidecar `.lock`, regex metadata, `#needs:`/`#id:` two-pass deps, subtask-aware mutations
-- **`policy.py`** — `PolicyEngine` singleton, AUTO/APPROVE/DENY classification, Telegram-blocking
+- **`queue_manager.py`** — Obsidian MD queue parser, sidecar `.lock`, regex metadata, `#needs:`/`#id:` two-pass deps, subtask-aware mutations; P1 `#worktree`/`#keep-worktree` tags for parallel isolation
+- **`policy.py`** — `PolicyEngine` singleton, AUTO/APPROVE/DENY classification, Telegram-blocking; P3 `ToolContract` API (`get_tool_contract(name)`) + `tool_contracts:` yaml section (per-tool budget/stop_conditions/reporting_path, doctor schema-validates)
 - **`usage_suggester.py`** — `UsageSuggester` singleton, proactive task suggestions on low capacity
 - **`memory.py`** — TF-IDF + temporal decay over past results, CWD-filtered lessons, daily log (80-char summaries)
-- **`heartbeat.py`** — Scheduled health checks (10 handlers, mtime-reloaded), Phase-A CLI-probe + Phase-B LLM heuristic for model drift
+- **`heartbeat.py`** — Scheduled health checks (12 handlers, mtime-reloaded), Phase-A CLI-probe + Phase-B LLM heuristic for model drift; P6 `status-recap` (daily 24h Telegram summary), P4 `check-ci-failures` (gh poll → dev-loop queue items)
 - **`limits.py`** — `cclimits` wrapper, OAuth refresh, 3-tier 429 fallback, polling 1h idle / 5min active
 - **`analytics.py`** — TaskRecord/LimitSnapshot/QueueEvent/ToolTraceEvent dataclasses, billing-cost units, cache-hit rate, tool-trace stats
 - **`dashboard.py`** — Standalone HTTP server (port 8411), Chart.js dashboard, 60s refresh
@@ -61,7 +61,7 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`doctor.py`** — 16+ setup validation checks, `--fix`/`--yes` auto-repair, concurrent alias probes
 - **`shutdown.py`** — Shutdown state machine + cancellation
 - **`notifier.py`** — Telegram notifications, 3500-char truncation
-- **`telegram_listener.py`** — Bot listener, `/chat` AI mode, slash tool-commands (`/review` `/security` `/audit` `/dev` `/critique` `/brainstorm`), `/approve` SI-Manager routing
+- **`telegram_listener.py`** — Bot listener, `/chat` AI mode, slash tool-commands (`/review` `/security` `/audit` `/dev` `/critique` `/brainstorm`), `/approve` SI-Manager routing; P5 `/pr-fix <owner/repo#N>` + `/pr-ignore <owner/repo#N>` for PR-Babysitter report-only mode
 - **`queue_linter.py`** — Offline validator (`--lint-queue`), exit codes 0/1/2
 - **`idempotency.py`** — Duplicate-trigger dedup (JSONL store, sha256 keys, 30-day retention)
 - **`session_registry.py`** — Append-only JSONL whitelist of orchestrator-created Claude session UUIDs
@@ -71,6 +71,9 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`queue_healing.py`** — Detects long-blocked tasks (>24h, failed deps, dead ends), proposes `/unblock`/`/drop`/`/retry` via Telegram, 24h notify cooldown
 - **`skill_suggester.py`** — Pattern-gated draft generator: N>=3 occurrences of (tool, cwd, task-shape) in 30 days → SKILL.md draft to `Skills-Drafts/`, 90-day cooldown, never auto-activates
 - **`skills/index.py`** — Progressive skill loading: always-present INDEX block + lazy section extraction by phase name
+- **`gh_helpers.py`** — Thin subprocess wrapper around `gh` CLI (typed errors: `gh_not_found`/`gh_auth`/`gh_timeout`/`gh_not_found_repo`); shared by PR-Babysitter (P2/P5) and CI-Watcher (P4)
+- **`ci_watcher.py`** — P4 CI-Failure-Watcher: `sweep_once()` lists failed GitHub-Action runs per repo, dedups by `(repo, headSha)`, queues `#tool:dev-loop` task per new failure, persistent state in `logs/ci-watcher-state.json`
+- **`parallel_runner.py`** — P1 worktree-isolation helpers (`_is_clean_git_repo`, `_create_worktree`, `_remove_worktree`) — one worktree per CWD group, retained on failure, removed on success unless `#keep-worktree`
 - **`run_orchestrator.ps1`** — Crash-resistant watchdog (PS 5.1+7+), exponential backoff, Telegram alerts
 
 ### Providers (`providers/`)
@@ -90,6 +93,7 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`scientific_investigation.py`** + phase modules (`scientific_investigation_phases.py`, `_phase2/4/5/7/8.py`, `_approvals.py`, `crosschecks/`, `personas/`) — Wissenschaftlicher Autopilot (Plan v5), Phase 0 → 0.5 → 1 → 2 → 3 → 4 → 5a/b → 7 → 8 → 6 pipeline, Status-Tuple max MEDIUM (HIGH structurally excluded), `#tool:scientific-investigation`
 - **`brainstorm.py`** + `brainstorm_phases.py` — Multi-persona round-table (4-6 dynamic personas, Phase 0 → 0.5 → 1 → 2 → K-Konvergenz → 3 Synthese), opt-in `#cross-provider`, `#tool:brainstorm`
 - **`deep_security_audit.py`** — Multi-agent (6 personas + CISO synthesis + optional fix), Phase C1 sub-agent vs. sequential, Phase 6.5 round-table opt-in via `#roundtable`, `#tool:deep-security-audit`
+- **`pr_babysitter.py`** — P2/P5 PR-Babysitter: polls open PRs via `gh`, dedups by `(repo, comment_count, sha, ci_state)`, queues `#tool:dev-loop` (default) or sends Telegram summary with `/pr-fix`+`/pr-ignore` commands (`#pr-mode:report-only`). Tags: `#repos:owner/r1,owner/r2`, `#pr-labels:auto-fix`, `#pr-mode:queue|report-only`. State in `{cwd}/.pr-babysitter/state.json`, 1h cooldown. `#tool:pr-babysitter`
 
 ### Scripts
 - **`scripts/safety_hook.py`** — Claude Code `PreToolUse` hook, hard-deny via `SAFETY_DENY_PATTERNS`
@@ -112,6 +116,8 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **Subtask-aware queue mutations** — `mark_done/mark_retry/finalize` accept `subtasks` kwarg
 - **Task dependencies** — `#id:`/`#needs:`, two-pass resolution, blocked-task header
 - **Schedule tags** — `#at:`/`#every:` reuse retry primitive; queue file is single source of truth
+- **Worktree isolation (P1)** — `#worktree` on parent → one `git worktree add --detach` per CWD group; subtask cwd rewritten; failed groups retain the worktree (path appended to error)
+- **Tool Contracts (P3)** — `tool_contracts:` section in `policy.yaml`; `PolicyEngine.get_tool_contract(name)` returns dataclass with `max_iterations`/`max_runtime_sec`/`stop_conditions`/`reporting_path`; tools may fall back to `config.TOOL_*_*` constants for fields the contract omits (staged migration)
 - **`.env` comment stripping** — whitespace-before-`#` rule protects URLs/paths
 - **HTTP 429 resilience** — 3-tier fallback (claude-monitor JSONL → snapshot cache → optimistic), 5-min polling backoff
 - **3-tier token estimation** — actual JSON → text-char estimate → duration heuristic

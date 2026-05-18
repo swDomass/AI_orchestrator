@@ -24,6 +24,8 @@ Supported commands:
   /dev <desc>        — queue dev-loop task
   /critique <plan>   — queue critical-review task
   /brainstorm <topic>— queue brainstorm task
+  /pr-fix <key>      — queue dev-loop for PR <owner/repo#N> (used by PR-Babysitter report-only)
+  /pr-ignore <key>   — suppress PR <owner/repo#N> until its state changes
 
 Any other text is forwarded to the best available AI provider and the
 response is sent back to the same chat.
@@ -361,6 +363,10 @@ class TelegramListener:
                 self._cmd_drop(command_args)
             elif command == "/retry":
                 self._cmd_retry(command_args)
+            elif command == "/pr-fix":
+                self._cmd_pr_fix(command_args, msg)
+            elif command == "/pr-ignore":
+                self._cmd_pr_ignore(command_args, msg)
             return
 
         # AI chat (rate-limited, spawned in worker thread)
@@ -541,6 +547,8 @@ class TelegramListener:
             "/pick N — Vorschlag N auswählen \\(1\\-3\\)\n"
             "/decline — Vorschläge ablehnen\n"
             "/cancel\\-shutdown — Geplanten Shutdown abbrechen\n"
+            "/pr\\-fix \\<owner/repo\\#N\\> — PR\\-Fix zur Queue \\(dev\\-loop\\)\n"
+            "/pr\\-ignore \\<owner/repo\\#N\\> — PR bis zur nächsten Statusänderung ignorieren\n"
             "/help   — Diese Hilfe\n\n"
             "\\#shutdown in Text → Shutdown einplanen\n"
             "Beliebiger Text → sofortige KI\\-Antwort"
@@ -760,6 +768,52 @@ class TelegramListener:
             from queue_healing import apply_retry_dep
             ok, msg = apply_retry_dep(dep_ids)
             send_message(("✅ " if ok else "❌ ") + _escape_telegram_markdown(msg))
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_pr_fix(self, args: str, msg: dict) -> None:
+        """`/pr-fix owner/repo#42` — queue a dev-loop task for that PR.
+
+        cwd defaults to the chat's last-known cwd (set by prior /review etc.).
+        Designed as the action button replacement for PR-Babysitter report-only mode.
+        """
+        from pathlib import Path
+        pr_key = args.strip()
+        if not pr_key:
+            send_message("ℹ️ Verwendung: `/pr-fix <owner/repo#N>`")
+            return
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        cwd_str = self._last_cwd_per_chat.get(chat_id)
+        if not cwd_str:
+            send_message(
+                "❌ Kein cwd bekannt. Setze einen vorher mit `/review <pfad>`."
+            )
+            return
+        try:
+            from tools.pr_babysitter import cmd_pr_fix
+            ok, message = cmd_pr_fix(pr_key, Path(cwd_str))
+            send_message(("✅ " if ok else "❌ ") + _escape_telegram_markdown(message))
+        except Exception as e:
+            send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
+
+    def _cmd_pr_ignore(self, args: str, msg: dict) -> None:
+        """`/pr-ignore owner/repo#42` — suppress this PR until its state changes."""
+        from pathlib import Path
+        pr_key = args.strip()
+        if not pr_key:
+            send_message("ℹ️ Verwendung: `/pr-ignore <owner/repo#N>`")
+            return
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        cwd_str = self._last_cwd_per_chat.get(chat_id)
+        if not cwd_str:
+            send_message(
+                "❌ Kein cwd bekannt. Setze einen vorher mit `/review <pfad>`."
+            )
+            return
+        try:
+            from tools.pr_babysitter import cmd_pr_ignore
+            ok, message = cmd_pr_ignore(pr_key, Path(cwd_str))
+            send_message(("✅ " if ok else "❌ ") + _escape_telegram_markdown(message))
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 

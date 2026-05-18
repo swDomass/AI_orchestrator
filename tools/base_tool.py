@@ -284,6 +284,18 @@ def _build_system_prompt(
     """
     prompt = get_system_prompt(provider_name)
 
+    # Progressive skill index (#37) — always-present, cheap to keep cache-warm.
+    # Goes right after the static system prompt so the longest stable prefix
+    # stays cache-stable across tool runs.
+    try:
+        from skills import build_index
+        from config import VAULT_PATH as _VAULT_PATH
+        index_block = build_index(vault_path=_VAULT_PATH)
+        if index_block:
+            prompt += f"\n\n{index_block}"
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.debug("Skill index injection skipped: %s", exc)
+
     try:
         import memory as memory_module
     except (ImportError, OSError) as exc:
@@ -317,6 +329,19 @@ def _build_system_prompt(
 
     if memory_context:
         prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
+
+    # Preflight (#35) — deterministic per-tool context injection. Cached on
+    # disk per (tool, cwd, day) so the LLM doesn't pay re-discovery costs on
+    # every iteration. Silently skips when tool_name has no preflight hook.
+    if tool_name and cwd:
+        try:
+            import preflight as _preflight
+            block = _preflight.collect_cached(tool_name, cwd)
+            if block:
+                prompt += f"\n\n{block}"
+        except Exception as exc:  # noqa: BLE001 — preflight is best-effort
+            logger.debug("Preflight injection skipped for %s: %s", tool_name, exc)
+
     return prompt
 
 

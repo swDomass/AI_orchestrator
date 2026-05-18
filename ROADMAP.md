@@ -78,15 +78,15 @@ and `OPENCLAW_FUTURE_IDEAS.md`, with critical re-prioritization. Guiding rule:
 | # | Feature | Effort | Status |
 |---|---------|--------|--------|
 | 29 | Queue Linter (`--lint-queue`) | S | DONE |
-| 30 | Replay JSONL (machine-readable run summaries) | M | backlog |
+| 30 | Replay JSONL (machine-readable run summaries) | M | DONE |
 | 31 | Idempotency Keys (external triggers) | S | DONE |
 | 32 | Telegram Slash-Commands (`/review`, `/dev`, `/security`, `/audit`, `/critique`, `/brainstorm`) | S | DONE |
 | 33 | Schedule tags (`#at:` one-shot, `#every:` recurring) | S | DONE |
-| 34 | Failure Taxonomy (built on #30) | S | backlog |
-| 35 | Preflight Hooks per Tool | M | backlog |
-| 36 | Skill Suggestion (draft-only, pattern-gated) | M | backlog |
-| 37 | Progressive Skill Loading | M | backlog |
-| 38 | Queue Healing (auto-unblock + Telegram-ask) | M | backlog |
+| 34 | Failure Taxonomy (built on #30) | S | DONE |
+| 35 | Preflight Hooks per Tool | M | DONE |
+| 36 | Skill Suggestion (draft-only, pattern-gated) | M | DONE |
+| 37 | Progressive Skill Loading | M | DONE |
+| 38 | Queue Healing (auto-unblock + Telegram-ask) | M | DONE |
 
 **Effort legend**: S = ~1 day, M = 2-5 days, L = >1 week.
 

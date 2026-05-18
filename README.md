@@ -17,6 +17,7 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 - Execution policy (`AUTO` / `APPROVE` / `DENY`) with Telegram approval flows
 - Telegram listener (queue control, status, plain-text AI chat)
 - Heartbeat + Doctor (monitoring / onboarding checks)
+- **Reliability layer (Tier 5)**: queue linter (`--lint-queue`), idempotency keys for external triggers, slash-commands (`/review`, `/dev`, `/security`, `/audit`, `/critique`, `/brainstorm`), schedule tags (`#at:`, `#every:`), machine-readable run summaries (`logs/runs.jsonl`), 16-category failure taxonomy, per-tool preflight hooks (deterministic context collection), queue-healing with `/unblock`/`/drop`/`/retry`, draft-only skill suggester, progressive skill loading
 - Analytics web dashboard (Chart.js, port 8411)
 - `SOUL.md` as central prompt/personality configuration
 - **Anthropic prompt-cache optimization**: static system-prompt (cwd/git-status moved to first user message via `--exclude-dynamic-system-prompt-sections`), stable prompt prefixes, billing analytics with cache-hit-rate

@@ -24,12 +24,11 @@ class CodexProvider(BaseProvider):
         ]
         if model:
             cmd.extend(["--model", model])
-        if read_only:
-            # research-qa runs fully unattended, so read-only mode must also avoid
-            # approval prompts while still enforcing a read-only sandbox.
-            cmd.extend(["--ask-for-approval", "never", "--sandbox", "read-only"])
-        else:
-            cmd.append("--full-auto")
+        # codex CLI ≥ 0.130 removed `--ask-for-approval` and deprecated `--full-auto`.
+        # Replacements: `-c approval_policy=never` for non-interactive runs and
+        # `--sandbox <mode>` for the sandbox policy.
+        cmd.extend(["-c", "approval_policy=never"])
+        cmd.extend(["--sandbox", "read-only" if read_only else "workspace-write"])
         cmd.append("-")
         return cmd
 

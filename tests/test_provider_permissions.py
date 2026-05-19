@@ -41,11 +41,33 @@ def test_codex_read_only_uses_read_only_sandbox_without_approvals(monkeypatch):
     CodexProvider().run("inspect", read_only=True)
 
     cmd = calls[0][0]
-    assert "--ask-for-approval" in cmd
-    assert cmd[cmd.index("--ask-for-approval") + 1] == "never"
+    # codex CLI ≥ 0.130: approval policy goes through `-c approval_policy=never`,
+    # legacy `--ask-for-approval`/`--full-auto` flags are gone.
+    assert "--ask-for-approval" not in cmd
+    assert "--full-auto" not in cmd
+    assert "-c" in cmd
+    assert cmd[cmd.index("-c") + 1] == "approval_policy=never"
     assert "--sandbox" in cmd
     assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+
+
+def test_codex_write_mode_uses_workspace_write_sandbox(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
+
+    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+
+    CodexProvider().run("do work", read_only=False)
+
+    cmd = calls[0][0]
     assert "--full-auto" not in cmd
+    assert "-c" in cmd
+    assert cmd[cmd.index("-c") + 1] == "approval_policy=never"
+    assert "--sandbox" in cmd
+    assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
 
 
 def test_gemini_read_only_uses_default_approval_mode(monkeypatch):

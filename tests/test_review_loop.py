@@ -39,7 +39,7 @@ class _ScriptedProvider:
         return RunResult(success=True, output=self._outputs.pop(0))
 
 
-def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(monkeypatch):
+def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
@@ -50,7 +50,7 @@ def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(mo
     ])
     tool = ReviewLoopTool()
 
-    result = tool.run("Review now", provider, cwd=".")
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
 
     assert result.success is True
     assert result.iterations == 1
@@ -58,7 +58,7 @@ def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(mo
     assert "UNCOMMITTED changes" in provider.prompts[0]
 
 
-def test_review_loop_fixes_p3_findings_too(monkeypatch):
+def test_review_loop_fixes_p3_findings_too(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
@@ -74,7 +74,7 @@ def test_review_loop_fixes_p3_findings_too(monkeypatch):
     )
     tool = ReviewLoopTool()
 
-    result = tool.run("Review now", provider, cwd=".")
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
 
     assert result.success is True
     assert result.iterations == 2
@@ -82,7 +82,7 @@ def test_review_loop_fixes_p3_findings_too(monkeypatch):
     assert "docs typo 1" in provider.prompts[1]
     assert "--- Fix 1 ---" in result.output
 
-def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch):
+def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
@@ -102,7 +102,7 @@ def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch):
     )
     tool = ReviewLoopTool()
 
-    result = tool.run("Review now", provider, cwd=".")
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
 
     assert result.success is True
     assert result.iterations == 4
@@ -131,7 +131,7 @@ def test_resolve_second_opinion_returns_none_for_falsy():
     assert _resolve_second_opinion("") is None
 
 
-def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch):
+def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch, tmp_path):
     """Primary finds 1, second-opinion finds 1 extra → both must end up in fix prompt."""
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
@@ -156,7 +156,7 @@ def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch):
     tool = ReviewLoopTool()
 
     result = tool.run(
-        "Review now", primary, cwd=".",
+        "Review now", primary, cwd=str(tmp_path),
         second_opinion=(so_provider, "or_glm"),
     )
 
@@ -173,7 +173,7 @@ def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch):
     assert so_provider._forced_model is None
 
 
-def test_second_opinion_skipped_when_provider_unavailable(monkeypatch):
+def test_second_opinion_skipped_when_provider_unavailable(monkeypatch, tmp_path):
     """If is_cached_provider_available returns False for the SO provider, skip it."""
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
@@ -191,7 +191,7 @@ def test_second_opinion_skipped_when_provider_unavailable(monkeypatch):
     tool = ReviewLoopTool()
 
     result = tool.run(
-        "Review now", primary, cwd=".",
+        "Review now", primary, cwd=str(tmp_path),
         second_opinion=(so_provider, None),
     )
 
@@ -199,7 +199,7 @@ def test_second_opinion_skipped_when_provider_unavailable(monkeypatch):
     assert len(so_provider.prompts) == 0  # never called
 
 
-def test_second_opinion_skipped_when_diff_too_large(monkeypatch):
+def test_second_opinion_skipped_when_diff_too_large(monkeypatch, tmp_path):
     """If diff fetch returns None (too large / unavailable), skip second-opinion."""
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
@@ -217,7 +217,7 @@ def test_second_opinion_skipped_when_diff_too_large(monkeypatch):
     tool = ReviewLoopTool()
 
     result = tool.run(
-        "Review now", primary, cwd=".",
+        "Review now", primary, cwd=str(tmp_path),
         second_opinion=(so_provider, None),
     )
 
@@ -225,7 +225,7 @@ def test_second_opinion_skipped_when_diff_too_large(monkeypatch):
     assert len(so_provider.prompts) == 0  # diff missing → skipped
 
 
-def test_second_opinion_runs_only_iteration_1(monkeypatch):
+def test_second_opinion_runs_only_iteration_1(monkeypatch, tmp_path):
     """Second-opinion must not run again in iteration 2+."""
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
@@ -251,7 +251,7 @@ def test_second_opinion_runs_only_iteration_1(monkeypatch):
     tool = ReviewLoopTool()
 
     result = tool.run(
-        "Review now", primary, cwd=".",
+        "Review now", primary, cwd=str(tmp_path),
         second_opinion=(so_provider, None),
     )
 

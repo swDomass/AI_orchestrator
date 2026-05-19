@@ -114,9 +114,30 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.8rem; }
   .session-grid .item { font-size: 0.85rem; }
   .session-grid .item span { color: var(--accent); font-weight: 600; }
+  .billing-box, .tool-stats-box, .failure-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem; margin-bottom: 1.5rem;
+  }
+  .billing-box h3, .tool-stats-box h3, .failure-box h3 { font-size: 0.9rem; margin-bottom: 0.8rem; color: var(--muted); }
+  .billing-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.8rem;
+  }
+  .billing-cell {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.7rem; text-align: center;
+  }
+  .billing-cell .label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .billing-cell .val { font-size: 1.2rem; font-weight: 600; color: var(--accent); margin-top: 0.2rem; }
+  .billing-cell .sub { font-size: 0.7rem; color: var(--muted); margin-top: 0.1rem; }
+  .failure-grid {
+    display: grid; grid-template-columns: 1fr 2fr; gap: 1rem;
+  }
+  .empty-hint { color: var(--muted); font-size: 0.85rem; font-style: italic; padding: 0.4rem 0; }
   @media (max-width: 700px) {
     .charts { grid-template-columns: 1fr; }
     .timeline-grid { grid-template-columns: 1fr; }
+    .failure-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -180,6 +201,35 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div class="billing-box">
+  <h3>Token-Verbrauch &amp; Cache-Hit-Rate</h3>
+  <div class="billing-grid" id="billing-recent"></div>
+  <div style="margin-top:0.8rem"><div class="billing-grid" id="billing-total"></div></div>
+</div>
+
+<div class="tool-stats-box">
+  <h3>Tool-Action-Stats</h3>
+  <table>
+    <thead><tr>
+      <th>Tool</th><th>Runs</th><th>Completed</th><th>Erfolg</th><th>Ø Dauer (s)</th><th>Events</th>
+    </tr></thead>
+    <tbody id="tool-stats-body"></tbody>
+  </table>
+</div>
+
+<div class="failure-box">
+  <h3>Fehler-Kategorien (Taxonomy)</h3>
+  <div class="failure-grid">
+    <div>
+      <canvas id="failure-doughnut" height="220"></canvas>
+    </div>
+    <div>
+      <canvas id="failure-timeline" height="220"></canvas>
+    </div>
+  </div>
+  <div id="failure-empty" class="empty-hint" style="display:none">Keine Fehler im gewählten Zeitraum.</div>
+</div>
+
 <div class="events-box">
   <h3>Letzte Events</h3>
   <table>
@@ -241,10 +291,26 @@ const zoomPlugin = {
 };
 
 let tpdChart, pdChart, limitShortChart, limitGeminiChart, limitLongChart;
+let failureDoughnut, failureTimeline;
 let _allTpd = { labels: [], values: [] };
 let _activeRange = 30;
 let _allLimits = {};
 let _activeLimitRange = 168;
+
+const FAILURE_COLORS = [
+  '#ef5350', '#ffa726', '#ffc107', '#66bb6a', '#26c6da',
+  '#42a5f5', '#7e57c2', '#ec407a', '#8d6e63', '#bdbdbd',
+  '#5c6bc0', '#26a69a', '#9ccc65', '#d4e157', '#ff7043', '#ab47bc',
+];
+function failureColor(i) { return FAILURE_COLORS[i % FAILURE_COLORS.length]; }
+
+function formatNumber(n) {
+  if (n == null || isNaN(n)) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'G';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
 
 function safeResetZoom(chart) {
   if (chart && typeof chart.resetZoom === 'function') chart.resetZoom();
@@ -385,6 +451,97 @@ function initCharts() {
   document.getElementById('lim-short-reset').onclick = () => safeResetZoom(limitShortChart);
   document.getElementById('lim-gemini-reset').onclick = () => safeResetZoom(limitGeminiChart);
   document.getElementById('lim-long-reset').onclick = () => safeResetZoom(limitLongChart);
+
+  const fdCtx = document.getElementById('failure-doughnut').getContext('2d');
+  failureDoughnut = new Chart(fdCtx, {
+    type: 'doughnut',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] },
+    options: { responsive: true, plugins: { legend: { labels: { color: '#888' }, position: 'right' } } },
+  });
+
+  const ftCtx = document.getElementById('failure-timeline').getContext('2d');
+  failureTimeline = new Chart(ftCtx, {
+    type: 'bar',
+    data: { labels: [], datasets: [] },
+    options: {
+      ...chartOpts,
+      plugins: { legend: { labels: { color: '#888' } } },
+      scales: {
+        ...chartOpts.scales,
+        x: { ...chartOpts.scales.x, stacked: true },
+        y: { ...chartOpts.scales.y, stacked: true },
+      },
+    },
+  });
+}
+
+function _billingCell(label, value, sub) {
+  const cell = document.createElement('div');
+  cell.className = 'billing-cell';
+  cell.innerHTML = '<div class="label">' + escapeHtml(label) + '</div>'
+    + '<div class="val">' + escapeHtml(value) + '</div>'
+    + (sub ? '<div class="sub">' + escapeHtml(sub) + '</div>' : '');
+  return cell;
+}
+
+function renderBilling(containerId, billing, cacheHitRate, periodLabel) {
+  const c = document.getElementById(containerId);
+  c.innerHTML = '';
+  const b = billing || {};
+  c.appendChild(_billingCell('Input', formatNumber(b.input_tokens || 0), periodLabel));
+  c.appendChild(_billingCell('Output', formatNumber(b.output_tokens || 0), periodLabel));
+  c.appendChild(_billingCell('Cache erstellt', formatNumber(b.cache_creation_input_tokens || 0), periodLabel));
+  c.appendChild(_billingCell('Cache gelesen', formatNumber(b.cache_read_input_tokens || 0), periodLabel));
+  c.appendChild(_billingCell('Weighted Units', formatNumber(Math.round(b.weighted_units || 0)), periodLabel));
+  const hit = cacheHitRate == null ? '—' : (cacheHitRate.toFixed(1) + '%');
+  c.appendChild(_billingCell('Cache-Hit-Rate', hit, periodLabel));
+}
+
+function renderToolStats(stats) {
+  const tbody = document.getElementById('tool-stats-body');
+  tbody.innerHTML = '';
+  const entries = Object.entries(stats || {});
+  if (!entries.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="6" class="empty-hint">Noch keine Tool-Traces erfasst.</td>';
+    tbody.appendChild(tr);
+    return;
+  }
+  entries.sort((a, b) => (b[1].runs || 0) - (a[1].runs || 0));
+  for (const [tool, s] of entries) {
+    const successRate = s.completed_runs ? (100 * (s.success_runs || 0) / s.completed_runs) : 0;
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + escapeHtml(tool) + '</td>'
+      + '<td>' + (s.runs || 0) + '</td>'
+      + '<td>' + (s.completed_runs || 0) + '</td>'
+      + '<td>' + successRate.toFixed(0) + '%</td>'
+      + '<td>' + (s.avg_duration_sec ?? 0).toFixed(1) + '</td>'
+      + '<td>' + (s.total_events || 0) + '</td>';
+    tbody.appendChild(tr);
+  }
+}
+
+function renderFailures(counts, timeline) {
+  const entries = Object.entries(counts || {}).sort((a, b) => b[1] - a[1]);
+  const empty = entries.length === 0;
+  document.getElementById('failure-empty').style.display = empty ? '' : 'none';
+
+  failureDoughnut.data.labels = entries.map(e => e[0]);
+  failureDoughnut.data.datasets[0].data = entries.map(e => e[1]);
+  failureDoughnut.data.datasets[0].backgroundColor = entries.map((_, i) => failureColor(i));
+  failureDoughnut.update();
+
+  // Stacked bar: x = days, datasets = categories
+  const days = Object.keys(timeline || {}).sort();
+  const categories = entries.map(e => e[0]);
+  const datasets = categories.map((cat, i) => ({
+    label: cat,
+    data: days.map(d => (timeline[d] || {})[cat] || 0),
+    backgroundColor: failureColor(i),
+  }));
+  failureTimeline.data.labels = days.map(d => d.slice(5));
+  failureTimeline.data.datasets = datasets;
+  failureTimeline.update();
 }
 
 function update(d) {
@@ -407,6 +564,16 @@ function update(d) {
   // Limits timeline — store full history and apply active range to all three charts
   _allLimits = d.limits_timeline || {};
   applyLimitRange();
+
+  // Billing + cache-hit-rate
+  renderBilling('billing-recent', d.billing_recent, d.cache_hit_rate_recent, 'letzte ' + _activeRange + ' Tage');
+  renderBilling('billing-total', d.billing_total, d.cache_hit_rate_total, 'gesamt');
+
+  // Tool action stats
+  renderToolStats(d.tool_trace_stats);
+
+  // Failure taxonomy
+  renderFailures(d.failure_counts, d.failure_timeline);
 
   // Events
   const typeClass = { error: 'tag-error', queue: 'tag-queue', suggest: 'tag-suggest' };
@@ -452,17 +619,23 @@ setInterval(load, 60000);
 """
 
 
+_CLIENT_DISCONNECT_ERRORS = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
 class _Handler(BaseHTTPRequestHandler):
     """Handles GET / (HTML) and GET /api/data (JSON)."""
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/data":
-            self._json_response(parsed.query)
-        elif parsed.path in ("/", "/index.html"):
-            self._html_response()
-        else:
-            self.send_error(404)
+        try:
+            if parsed.path == "/api/data":
+                self._json_response(parsed.query)
+            elif parsed.path in ("/", "/index.html"):
+                self._html_response()
+            else:
+                self.send_error(404)
+        except _CLIENT_DISCONNECT_ERRORS as e:
+            logger.debug("dashboard: client disconnected during %s (%s)", parsed.path, e)
 
     def _html_response(self):
         body = _HTML_PAGE.encode("utf-8")
@@ -486,6 +659,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except _CLIENT_DISCONNECT_ERRORS as e:
+            logger.debug("dashboard: client disconnect (%s)", e)
+            self.close_connection = True
 
     def log_message(self, format, *args):
         """Suppress default stderr logging; use logger instead."""

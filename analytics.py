@@ -441,19 +441,46 @@ def _cache_hit_rate(records: list[TaskRecord]) -> float:
     return round(cr / total * 100, 1)
 
 
+# Legacy bucket names emitted by the heartbeat log parser. They duplicate the
+# canonical prefixed names from the structured capacity log
+# ({provider}_{window}); the dashboard's provider filter never displays them.
+# Drop them here so the API payload stays compact and unique.
+_LEGACY_UNPREFIXED_LIMIT_BUCKETS = frozenset({
+    "five_hour", "seven_day",
+    "primary_window", "secondary_window",
+})
+
+
 def _limits_timeline(
     snapshots: list[LimitSnapshot],
     hours: int = 7 * 24,
 ) -> dict[str, list[dict]]:
-    """Per-provider timeline of capacity snapshots within the last N hours."""
+    """Per-provider timeline of capacity snapshots within the last N hours.
+
+    Filters legacy aliases that duplicate the canonical ``{provider}_{window}``
+    names — see ``_LEGACY_UNPREFIXED_LIMIT_BUCKETS`` and the post-hoc
+    gemini single-prefix dedup below.
+    """
     cutoff = datetime.now() - timedelta(hours=hours)
     result: dict[str, list[dict]] = defaultdict(list)
     for s in snapshots:
+        if s.provider in _LEGACY_UNPREFIXED_LIMIT_BUCKETS:
+            continue
         if s.timestamp >= cutoff:
             result[s.provider].append({
                 "ts": s.timestamp.isoformat(),
                 "pct": s.remaining_pct if s.available else 0,
             })
+
+    # Drop single-prefix ``gemini_<model>`` whenever the canonical double-prefix
+    # ``gemini_gemini_<model>`` is also present — both describe the same metric
+    # but originate from different parsers (heartbeat log vs. capacity log).
+    for prov in list(result.keys()):
+        if prov.startswith("gemini_") and not prov.startswith("gemini_gemini_"):
+            canonical = "gemini_" + prov  # "gemini_2_5_flash" → "gemini_gemini_2_5_flash"
+            if canonical in result:
+                del result[prov]
+
     return dict(result)
 
 

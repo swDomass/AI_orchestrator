@@ -677,7 +677,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1230 tests, ~45 s)
+# Run all tests (~1463 tests, ~50 s)
 python -m pytest tests/ -q
 
 # Run a single test file

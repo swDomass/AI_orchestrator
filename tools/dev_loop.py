@@ -421,6 +421,8 @@ class DevLoopTool(BaseTool):
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: EXECUTION ===")
+            tracer.emit("iteration_start", iteration=iteration,
+                        max_iterations=TOOL_MAX_ITERATIONS, phase="execution")
 
             # Capacity guard: abort loop if provider is below threshold (RAM-cache, no API call)
             if not is_cached_provider_available(provider.name):

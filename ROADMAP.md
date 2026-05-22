@@ -87,6 +87,9 @@ and `OPENCLAW_FUTURE_IDEAS.md`, with critical re-prioritization. Guiding rule:
 | 36 | Skill Suggestion (draft-only, pattern-gated) | M | DONE |
 | 37 | Progressive Skill Loading | M | DONE |
 | 38 | Queue Healing (auto-unblock + Telegram-ask) | M | DONE |
+| 39 | Goal-Adherence-Guard in review-loop (Scope-Guard + auto/always/skip Drift-Check) | S | DONE — siehe `docs/plans/review-loop-drift-check.md` Section A |
+| 40 | Active-Runs Dashboard-Panel (Live-Index + ToolTracer-Hook) | M | DONE — siehe `docs/plans/review-loop-drift-check.md` Section B |
+| 41 | Cost-Cap (`ToolContract.max_cost_eur` + `budget_exceeded`) | M | deferred — Section C, wartet auf Pricing/Usage-Tracking-Refactor |
 
 **Effort legend**: S = ~1 day, M = 2-5 days, L = >1 week.
 

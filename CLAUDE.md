@@ -55,7 +55,7 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`heartbeat.py`** — Scheduled health checks (12 handlers, mtime-reloaded), Phase-A CLI-probe + Phase-B LLM heuristic for model drift; P6 `status-recap` (daily 24h Telegram summary), P4 `check-ci-failures` (gh poll → dev-loop queue items)
 - **`limits.py`** — `cclimits` wrapper, OAuth refresh, 3-tier 429 fallback, polling 1h idle / 5min active
 - **`analytics.py`** — TaskRecord/LimitSnapshot/QueueEvent/ToolTraceEvent dataclasses, billing-cost units, cache-hit rate, tool-trace stats
-- **`dashboard.py`** — Standalone HTTP server (port 8411), Chart.js dashboard, 60s refresh
+- **`dashboard.py`** — Standalone HTTP server (port 8411), Chart.js dashboard, 60s refresh; Active-Runs-Panel (Live-View laufender Tool-Runs, 30s refresh über `/api/data?only=active_runs`)
 - **`config.py`** — Centralized constants (~70+), `.env` loader, model aliases (Claude/Gemini/Codex/OpenRouter), safety patterns, timeouts
 - **`logging_setup.py`** — Rotating file logger (5MB × 3) + console
 - **`doctor.py`** — 16+ setup validation checks, `--fix`/`--yes` auto-repair, concurrent alias probes
@@ -84,9 +84,9 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`openrouter.py`** — HTTP/urllib (no `requests` dep), pay-per-token, NEVER in fallback chain, opt-in via `#openrouter`/`#or_*` tags, conditional registration on `OPENROUTER_API_KEY`
 
 ### Tools (`tools/`)
-- **`base_tool.py`** — `BaseTool` ABC + 4-layer prompt assembly (stability-ordered for cache hits), `ToolResult`, `TokenCounter`, `SessionContext`, `ToolTracer`
+- **`base_tool.py`** — `BaseTool` ABC + 4-layer prompt assembly (stability-ordered for cache hits), `ToolResult`, `TokenCounter`, `SessionContext`, `ToolTracer`, `ActiveRunRegistry` (zentraler `logs/active_runs/<run_id>.json` Index für Dashboard-Live-View, atomic writes, stale >6h, cleanup >24h)
 - **`research_qa.py`** — 3-phase read-only pre-implementation (Discovery → Analysis → Questions), `#tool:research-qa`
-- **`review_loop.py`** — Iterative review fixing all P1/P2/P3 (max 20 iter), stable/volatile prompt split, optional `#second_opinion:<alias>`, `#tool:review-loop`
+- **`review_loop.py`** — Iterative review fixing all P1/P2/P3 (max 20 iter), stable/volatile prompt split, optional `#second_opinion:<alias>`, Drift-Check (`auto`/`always`/`skip` via `policy.yaml` `tool_phases.review-loop.drift_check_mode`) injiziert Refocus-Warning in den Fix-Prompt bei Goal-Adherence-Verletzung, `#tool:review-loop`
 - **`dev_loop.py`** — Research+Plan (merged call) → Execute → Quality+Resolution Review loop (max 20 iter), `#tool:dev-loop`
 - **`critical_review.py`** — 3-pass adversarial (Pass 1 + Pass 2 + Pass 3 Synthesis), cross-provider via `#pass1:`/`#pass2:`, `{plan}-v2.md` output, `#tool:critical-review`
 - **`security_audit.py`** — 2-phase audit + fix (Phase 1 read-only scan, Phase 2 write+pytest), `#tool:security-audit`

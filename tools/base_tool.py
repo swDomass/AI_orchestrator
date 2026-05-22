@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import logging
+import os
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -183,12 +185,14 @@ class ToolTracer:
     run_id: str
     trace_file: Path | None = None  # None when disabled
     start_time: float = field(default_factory=time.time)
+    cwd: str | None = None  # captured for ActiveRunRegistry mirror
 
     @classmethod
     def create(cls, tool_name: str, cwd: str | None) -> "ToolTracer":
         """Build a tracer for a tool run. Allocates a UUID and the trace file
-        path. If cwd is missing or the directory cannot be created, the tracer
-        becomes a silent no-op (emit() returns immediately).
+        path. If cwd is missing or the directory cannot be created, the JSONL
+        trace becomes a silent no-op — but the central ActiveRunRegistry
+        mirror still runs.
         """
         run_id = str(uuid.uuid4())
         trace_file: Path | None = None
@@ -199,25 +203,246 @@ class ToolTracer:
                 trace_file = trace_dir / f"{run_id}.jsonl"
             except OSError as exc:
                 logger.warning("Tool trace setup failed for %s: %s", tool_name, exc)
-        return cls(tool_name=tool_name, run_id=run_id, trace_file=trace_file)
+        return cls(tool_name=tool_name, run_id=run_id, trace_file=trace_file, cwd=cwd)
 
     def emit(self, action: str, **details) -> None:
-        """Append one JSON line to the trace file. Never raises."""
-        if not self.trace_file:
-            return
-        entry = {
-            "ts": datetime.now().isoformat(),
-            "elapsed_sec": round(time.time() - self.start_time, 3),
-            "run_id": self.run_id,
-            "tool": self.tool_name,
-            "action": action,
-            "details": details,
-        }
+        """Append one JSON line to the trace file. Never raises.
+
+        In addition, mirrors selected lifecycle events (run_start /
+        iteration_start / iteration_end / phase_start / subprocess_result /
+        run_end) into the central ``ActiveRunRegistry`` so the dashboard can
+        show live progress without scanning per-cwd trace files.
+        """
+        if self.trace_file:
+            entry = {
+                "ts": datetime.now().isoformat(),
+                "elapsed_sec": round(time.time() - self.start_time, 3),
+                "run_id": self.run_id,
+                "tool": self.tool_name,
+                "action": action,
+                "details": details,
+            }
+            try:
+                with self.trace_file.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                logger.warning("Tool trace write failed for %s: %s", self.tool_name, exc)
+
+        # Mirror to central active-runs index (best-effort, never raises).
         try:
-            with self.trace_file.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._mirror_to_active_runs(action, details)
+        except Exception as exc:  # pragma: no cover — last-resort safety net
+            logger.warning("ActiveRunRegistry mirror failed: %s", exc)
+
+    def _mirror_to_active_runs(self, action: str, details: dict) -> None:
+        """Translate trace events into ActiveRunRegistry updates."""
+        if action == "run_start":
+            ActiveRunRegistry.start(
+                run_id=self.run_id,
+                tool=self.tool_name,
+                task=str(details.get("task", "")),
+                # Prefer the tracer's captured cwd; emit-details may omit it.
+                cwd=details.get("cwd") or self.cwd,
+                provider=str(details.get("provider", "")),
+                started_at=self.start_time,
+            )
+            # max_iterations is commonly emitted alongside run_start
+            if "max_iterations" in details:
+                ActiveRunRegistry.update(
+                    self.run_id, iteration_max=int(details["max_iterations"])
+                )
+        elif action == "run_end":
+            ActiveRunRegistry.end(self.run_id)
+        elif action in ("iteration_start", "iteration_end", "phase_start",
+                        "subprocess_result"):
+            fields: dict = {}
+            if "iteration" in details:
+                fields["iteration_current"] = int(details["iteration"])
+            if "max_iterations" in details:
+                fields["iteration_max"] = int(details["max_iterations"])
+            if "phase" in details:
+                fields["phase"] = str(details["phase"])
+            delta: dict = {}
+            for src, dst in (
+                ("input_tokens", "input"),
+                ("output_tokens", "output"),
+                ("cache_creation_input_tokens", "cache_creation"),
+                ("cache_read_input_tokens", "cache_read"),
+            ):
+                if src in details and details[src]:
+                    delta[dst] = details[src]
+            if delta:
+                fields["tokens_delta"] = delta
+            if fields:
+                ActiveRunRegistry.update(self.run_id, **fields)
+
+
+# ── ActiveRunRegistry ────────────────────────────────────────────────────────
+
+ACTIVE_RUNS_DIR = Path(__file__).resolve().parent.parent / "logs" / "active_runs"
+_ACTIVE_STALE_SEC = 6 * 3600       # records without update older than this → "stale"
+_ACTIVE_CLEANUP_SEC = 24 * 3600    # records older than this → physically deleted
+
+
+class ActiveRunRegistry:
+    """Central index of currently-running tool runs (file-per-run JSON).
+
+    Files live in ``logs/active_runs/<run_id>.json`` at orchestrator root.
+    Writes are atomic (tempfile + os.replace). Reads from the dashboard never
+    see partial JSON. All operations are best-effort — exceptions are swallowed
+    because tracing must never break a tool run.
+    """
+
+    @staticmethod
+    def _path(run_id: str) -> Path:
+        return ACTIVE_RUNS_DIR / f"{run_id}.json"
+
+    @staticmethod
+    def _ensure_dir() -> bool:
+        try:
+            ACTIVE_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+            return True
         except OSError as exc:
-            logger.warning("Tool trace write failed for %s: %s", self.tool_name, exc)
+            logger.warning("ActiveRunRegistry dir setup failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _atomic_write(path: Path, data: dict) -> None:
+        """tempfile + os.replace so concurrent readers never see partial JSON."""
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{path.stem}.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            logger.warning("ActiveRunRegistry write failed for %s: %s", path.name, exc)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @classmethod
+    def start(
+        cls,
+        run_id: str,
+        tool: str,
+        task: str,
+        cwd: str | None,
+        provider: str,
+        started_at: float | None = None,
+    ) -> None:
+        """Create a new active-run record. Idempotent (overwrites on collision)."""
+        if not cls._ensure_dir():
+            return
+        ts = started_at or time.time()
+        record = {
+            "run_id": run_id,
+            "tool": tool,
+            "task": task[:500],
+            "cwd": cwd or "",
+            "provider": provider,
+            "started_at": ts,
+            "last_update": ts,
+            "elapsed_sec": 0.0,
+            "iteration_current": 0,
+            "iteration_max": 0,
+            "phase": "",
+            "tokens": {
+                "input": 0,
+                "output": 0,
+                "cache_creation": 0,
+                "cache_read": 0,
+            },
+            "status": "running",
+        }
+        cls._atomic_write(cls._path(run_id), record)
+
+    @classmethod
+    def update(cls, run_id: str, **fields) -> None:
+        """Merge fields into the existing record.
+
+        Tokens are accumulated via ``tokens_delta`` (a dict with input/output/
+        cache_creation/cache_read int deltas). Other fields overwrite.
+        """
+        path = cls._path(run_id)
+        try:
+            with path.open(encoding="utf-8") as f:
+                record = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return  # no record → nothing to update (start may not have run)
+
+        now = time.time()
+        record["last_update"] = now
+        record["elapsed_sec"] = round(now - record.get("started_at", now), 3)
+
+        delta = fields.pop("tokens_delta", None)
+        if isinstance(delta, dict):
+            tokens = record.setdefault("tokens", {"input": 0, "output": 0,
+                                                  "cache_creation": 0, "cache_read": 0})
+            for key in ("input", "output", "cache_creation", "cache_read"):
+                if key in delta:
+                    tokens[key] = int(tokens.get(key, 0)) + int(delta[key])
+
+        for key, value in fields.items():
+            record[key] = value
+
+        cls._atomic_write(path, record)
+
+    @classmethod
+    def end(cls, run_id: str) -> None:
+        """Delete the active-run record. Idempotent."""
+        try:
+            cls._path(run_id).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("ActiveRunRegistry end failed for %s: %s", run_id, exc)
+
+    @classmethod
+    def list_active(
+        cls,
+        stale_after_sec: int = _ACTIVE_STALE_SEC,
+        cleanup_after_sec: int = _ACTIVE_CLEANUP_SEC,
+    ) -> list[dict]:
+        """Return all active-run records.
+
+        Records without update for >``cleanup_after_sec`` are physically deleted.
+        Records without update for >``stale_after_sec`` are marked
+        ``status='stale'`` so the dashboard can render them differently.
+        Returned list is sorted by ``started_at`` (oldest first).
+        """
+        if not ACTIVE_RUNS_DIR.exists():
+            return []
+
+        now = time.time()
+        results: list[dict] = []
+        for entry in ACTIVE_RUNS_DIR.iterdir():
+            if not entry.is_file() or entry.suffix != ".json":
+                continue
+            try:
+                with entry.open(encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            last_update = record.get("last_update", record.get("started_at", now))
+            age = now - last_update
+            if age > cleanup_after_sec:
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+                continue
+            if age > stale_after_sec:
+                record["status"] = "stale"
+            # Refresh elapsed for the dashboard (process may still be running)
+            record["elapsed_sec"] = round(now - record.get("started_at", now), 3)
+            results.append(record)
+
+        results.sort(key=lambda r: r.get("started_at", 0))
+        return results
 
 
 def _make_capacity_exhausted_result(

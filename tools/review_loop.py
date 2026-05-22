@@ -21,6 +21,7 @@ from config import (
     TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_FIX_TIMEOUT_SEC,
     TOOL_INTER_STEP_SLEEP_SEC,
+    TOOL_RL_DRIFT_CHECK_TIMEOUT_SEC,
     TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS,
     TOOL_RL_SECOND_OPINION_TIMEOUT_SEC,
     TOOL_VERIFICATION_TIMEOUT_SEC,
@@ -90,11 +91,14 @@ Task:
 - Apply changes directly to the files.
 - Run validation/tests if feasible.
 - Summarize what was fixed.
+- Scope: Fix ONLY issues caused by or directly related to the original task.
+  Do NOT refactor unrelated code. If a listed finding is clearly off-topic,
+  skip it and note `SKIPPED (off-topic): <finding>` in your summary.
 """
 
 _FIX_PROMPT_VOLATILE = """
 Iteration: {iteration}
-
+{drift_warning}
 Review findings (must all be addressed):
 {findings}
 {lessons_hint}"""
@@ -233,6 +237,70 @@ Output format (strict):
 """
 
 
+_DRIFT_CHECK_PROMPT = """\
+You are a Goal-Adherence Reviewer.
+
+Original task: {task}
+Iteration: {iteration} of {max_iter}
+Recent findings (last iteration):
+{findings}
+
+Question: Are these findings still on-topic for the ORIGINAL task,
+or has the review drifted into unrelated refactoring / style work?
+
+Output exactly one of:
+  ON_TOPIC: <one sentence why>
+  DRIFTED: <what is off-topic + how to refocus>
+"""
+
+
+_DRIFT_RE = re.compile(r"^\s*DRIFTED\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_ON_TOPIC_RE = re.compile(r"^\s*ON_TOPIC\s*:", re.IGNORECASE | re.MULTILINE)
+
+
+def _parse_drift_check(text: str) -> tuple[str, str]:
+    """Return ('ON_TOPIC' | 'DRIFTED' | 'UNKNOWN', reason).
+
+    Earliest-match wins, analogous to dev_loop._parse_resolution.
+    """
+    best_label, best_pos, best_reason = "UNKNOWN", len(text) + 1, ""
+    drift_match = _DRIFT_RE.search(text)
+    if drift_match and drift_match.start() < best_pos:
+        best_label, best_pos = "DRIFTED", drift_match.start()
+        best_reason = drift_match.group(1).strip()
+    on_topic_match = _ON_TOPIC_RE.search(text)
+    if on_topic_match and on_topic_match.start() < best_pos:
+        best_label, best_pos = "ON_TOPIC", on_topic_match.start()
+        best_reason = ""
+    return best_label, best_reason
+
+
+def _should_drift_check(
+    mode: str,
+    iteration: int,
+    max_iter: int,
+    current_count: int,
+    previous_count: int,
+) -> bool:
+    """Trigger logic for the drift check.
+
+    auto: trigger when (iter>=3 and findings grew), at half-time, or iter>=5.
+    always: every iteration. skip: never.
+    """
+    if mode == "skip":
+        return False
+    if mode == "always":
+        return True
+    # auto
+    if iteration >= 3 and current_count > previous_count:
+        return True
+    if max_iter >= 4 and iteration == max_iter // 2:
+        return True
+    if iteration >= 5:
+        return True
+    return False
+
+
 class ReviewLoopTool(BaseTool):
     name = "review-loop"
 
@@ -249,6 +317,17 @@ class ReviewLoopTool(BaseTool):
             return phases.get("verification", "auto") != "skip"
         except (ImportError, OSError, ValueError):
             return True  # default: verify
+
+    def _drift_check_mode(self) -> str:
+        """Return 'auto' | 'always' | 'skip' (default: 'auto')."""
+        try:
+            from policy import load_policy
+            policy = load_policy()
+            phases = policy.get("tool_phases", {}).get("review-loop", {})
+            mode = phases.get("drift_check_mode", "auto")
+            return mode if mode in ("auto", "always", "skip") else "auto"
+        except (ImportError, OSError, ValueError):
+            return "auto"
 
     def run(
         self,
@@ -284,6 +363,9 @@ class ReviewLoopTool(BaseTool):
         seen_signatures: set[tuple[str, ...]] = set()
         last_findings_tuple: tuple[str, ...] = ()
         all_outputs: list[str] = []
+        drift_check_mode = self._drift_check_mode()
+        drift_warning = ""  # injected into next iteration's fix prompt when drift detected
+        previous_findings_count = 0  # for "findings grew" drift trigger
 
         review_timeout = timeout or TOOL_REVIEW_TIMEOUT_SEC
         fix_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
@@ -313,6 +395,8 @@ class ReviewLoopTool(BaseTool):
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
             print(f"\n  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: REVIEW ===")
+            tracer.emit("iteration_start", iteration=iteration,
+                        max_iterations=TOOL_MAX_ITERATIONS, phase="review")
 
             # Capacity guard: abort loop if provider is below threshold (RAM-cache, no API call)
             if not is_cached_provider_available(provider.name):
@@ -537,6 +621,61 @@ class ReviewLoopTool(BaseTool):
             seen_signatures.add(signature)
             last_findings_tuple = signature
 
+            # Drift check: gate the next fix prompt with a refocus hint when the
+            # reviewer has wandered off the original task. Non-fatal — failures
+            # and ambiguous outputs are ignored.
+            if _should_drift_check(
+                drift_check_mode,
+                iteration,
+                TOOL_MAX_ITERATIONS,
+                len(findings),
+                previous_findings_count,
+            ):
+                print(f"  [review-loop] === DRIFT CHECK (Iteration {iteration}) ===")
+                drift_prompt = system_prompt + "\n\n" + _DRIFT_CHECK_PROMPT.format(
+                    task=task,
+                    iteration=iteration,
+                    max_iter=TOOL_MAX_ITERATIONS,
+                    findings="\n".join(findings),
+                )
+                drift_result = provider.run(
+                    drift_prompt,
+                    cwd=cwd,
+                    timeout=TOOL_RL_DRIFT_CHECK_TIMEOUT_SEC,
+                    read_only=True,
+                    **_session_kwargs(),
+                )
+                if not drift_result.success and drift_result.error == "session_missing":
+                    sess.rollover(self.name, cwd)
+                    first_call = True
+                    drift_result = provider.run(
+                        drift_prompt, cwd=cwd,
+                        timeout=TOOL_RL_DRIFT_CHECK_TIMEOUT_SEC,
+                        read_only=True,
+                        **_session_kwargs(),
+                    )
+                tokens.add(drift_result)
+                if drift_result.success:
+                    all_outputs.append(
+                        f"--- Drift Check {iteration} ---\n{drift_result.output}"
+                    )
+                    status, reason = _parse_drift_check(drift_result.output)
+                    if status == "DRIFTED":
+                        drift_warning = (
+                            f"\n⚠ Drift detected in previous iteration: {reason}\n"
+                            f"Refocus on the original task. Skip any off-topic findings.\n"
+                        )
+                        print(f"  [review-loop] ⚠ Drift: {reason}")
+                    else:
+                        drift_warning = ""
+                        print(f"  [review-loop] On-topic ({status})")
+                else:
+                    # Non-fatal: log and continue without injecting a warning
+                    print(
+                        f"  [review-loop] Drift-Check fehlgeschlagen: "
+                        f"{drift_result.error} — ignoriert"
+                    )
+
             # Step 2: Fix — with lessons injection
             print(f"  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: FIX ===")
             notify_tool_progress(
@@ -564,6 +703,7 @@ class ReviewLoopTool(BaseTool):
                 + _FIX_PROMPT_STABLE
                 + _FIX_PROMPT_VOLATILE.format(
                     iteration=iteration,
+                    drift_warning=drift_warning,
                     findings=findings_text,
                     lessons_hint=lessons_hint,
                 )
@@ -601,6 +741,7 @@ class ReviewLoopTool(BaseTool):
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
             print(f"  [review-loop] Fix durchgeführt. Starte Re-Review...")
+            previous_findings_count = len(findings)
 
             # Phase B: rollover session every cap iterations to bound conversation
             # length. Review prompt always reads `git diff` fresh, so a fresh

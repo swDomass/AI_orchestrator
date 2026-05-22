@@ -767,12 +767,32 @@ def get_dashboard_data(days: int = 7) -> dict:
         # no replay records exist yet.
         "failure_counts": failure_counts,
         "failure_timeline": failure_timeline,
+        # Live active tool runs — populated from logs/active_runs/ by
+        # ActiveRunRegistry (tools/base_tool.py).
+        "active_runs": _load_active_runs(),
     }
 
     _cache["data"] = data
     _cache["ts"] = now
     _cache["days"] = days
     return data
+
+
+def _load_active_runs() -> list[dict]:
+    """Return live active tool-run records for the dashboard.
+
+    Failures (registry unavailable, broken JSON) are swallowed — the dashboard
+    must keep working even if the index is unhealthy.
+    """
+    try:
+        from tools.base_tool import ActiveRunRegistry
+    except ImportError:
+        return []
+    try:
+        return ActiveRunRegistry.list_active()
+    except Exception as exc:
+        logger.debug("active-runs load failed: %s", exc)
+        return []
 
 
 # ── 24h Status-Recap (P6) ────────────────────────────────────────────────────

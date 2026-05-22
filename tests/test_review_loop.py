@@ -1,9 +1,12 @@
 from providers.base import RunResult
 from tools.review_loop import (
     ReviewLoopTool,
+    _FIX_PROMPT_STABLE,
     _is_no_findings_output,
     _merge_findings,
+    _parse_drift_check,
     _resolve_second_opinion,
+    _should_drift_check,
 )
 
 
@@ -257,4 +260,239 @@ def test_second_opinion_runs_only_iteration_1(monkeypatch, tmp_path):
 
     assert result.success is True
     assert len(so_provider.prompts) == 1  # called exactly once
+
+
+# ─── Drift-Check Phase ────────────────────────────────────────────────
+
+
+def test_parse_drift_check_extracts_drifted_reason():
+    status, reason = _parse_drift_check(
+        "DRIFTED: Reviewer is fixing unrelated style issues in utils.py"
+    )
+    assert status == "DRIFTED"
+    assert "utils.py" in reason
+
+
+def test_parse_drift_check_on_topic_returns_empty_reason():
+    status, reason = _parse_drift_check("ON_TOPIC: findings match original task")
+    assert status == "ON_TOPIC"
+    assert reason == ""
+
+
+def test_parse_drift_check_unknown_when_neither_marker_present():
+    status, reason = _parse_drift_check("Some prose without the required marker")
+    assert status == "UNKNOWN"
+    assert reason == ""
+
+
+def test_should_drift_check_skip_mode_never_triggers():
+    assert _should_drift_check("skip", 100, 20, 999, 0) is False
+
+
+def test_should_drift_check_always_mode_always_triggers():
+    assert _should_drift_check("always", 1, 20, 0, 0) is True
+    assert _should_drift_check("always", 7, 20, 3, 3) is True
+
+
+def test_should_drift_check_auto_triggers_when_findings_grow_from_iter_3():
+    # iter < 3 → no trigger even when growing
+    assert _should_drift_check("auto", 2, 20, 5, 1) is False
+    # iter >= 3 + growing → trigger
+    assert _should_drift_check("auto", 3, 20, 5, 1) is True
+
+
+def test_should_drift_check_auto_triggers_at_halftime():
+    # max=20, half=10, no growth, iter<5 logic wouldn't trigger
+    assert _should_drift_check("auto", 10, 20, 2, 3) is True
+
+
+def test_should_drift_check_auto_triggers_from_iter_5_safety_net():
+    # iter 5, no growth, not halftime — safety-net still fires
+    assert _should_drift_check("auto", 5, 20, 1, 1) is True
+
+
+def test_drift_check_invoked_when_mode_always(monkeypatch, tmp_path):
+    """drift_check_mode=always → extra provider call between review and fix."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P3] Minor issue",            # review iter 1
+        "ON_TOPIC: looks fine",          # drift check iter 1
+        "Fixed it",                      # fix iter 1
+        "No P1/P2/P3 findings.",         # review iter 2
+        "VERIFIED",                      # verification
+        "Pattern: x\nTool-Hint: y",      # summarizer
+    ])
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    # 6 provider calls: review, drift, fix, review, verify, summarizer
+    # (no drift check in iter 2 because no findings → early return before drift)
+    assert len(provider.prompts) == 6
+    assert "Goal-Adherence" in provider.prompts[1]  # drift prompt is call #2
+
+
+def test_drift_check_skipped_when_mode_skip(monkeypatch, tmp_path):
+    """drift_check_mode=skip → no extra provider call."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "skip")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P3] Minor issue",            # review iter 1
+        "Fixed it",                      # fix iter 1
+        "No P1/P2/P3 findings.",         # review iter 2
+        "VERIFIED",                      # verification
+        "Pattern: x\nTool-Hint: y",      # summarizer
+    ])
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert len(provider.prompts) == 5  # no drift-check prompt
+
+
+def test_drifted_response_injects_warning_into_next_fix_prompt(monkeypatch, tmp_path):
+    """When drift check returns DRIFTED, the fix prompt must include a refocus hint."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P3] Style nit in unrelated.py",   # review iter 1
+        "DRIFTED: refactoring unrelated.py",  # drift check iter 1
+        "Skipped off-topic finding",          # fix iter 1
+        "No P1/P2/P3 findings.",              # review iter 2
+        "VERIFIED",                           # verification
+        "Pattern: x\nTool-Hint: y",           # summarizer
+    ])
+    tool = ReviewLoopTool()
+
+    result = tool.run("Fix login bug", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    # fix prompt is the 3rd provider call
+    fix_prompt = provider.prompts[2]
+    assert "Drift detected" in fix_prompt
+    assert "Refocus on the original task" in fix_prompt
+
+
+def test_on_topic_response_does_not_inject_warning(monkeypatch, tmp_path):
+    """When drift check returns ON_TOPIC, the fix prompt has no drift warning."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P3] Minor in target file",   # review iter 1
+        "ON_TOPIC: matches task",         # drift check iter 1
+        "Fixed it",                       # fix iter 1
+        "No P1/P2/P3 findings.",          # review iter 2
+        "VERIFIED",                       # verification
+        "Pattern: x\nTool-Hint: y",       # summarizer
+    ])
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    fix_prompt = provider.prompts[2]
+    assert "Drift detected" not in fix_prompt
+
+
+def test_scope_guard_present_in_stable_fix_prompt():
+    """Scope-guard bullet must be in the stable (cached) prefix, not volatile."""
+    assert "off-topic" in _FIX_PROMPT_STABLE.lower()
+    assert "do not refactor unrelated" in _FIX_PROMPT_STABLE.lower()
+
+
+def test_drift_check_failure_does_not_abort_loop(monkeypatch, tmp_path):
+    """When the drift-check provider call fails, the loop continues without warning."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
+
+    class _FailingDriftProvider:
+        name = "claude"
+        _forced_model = None
+
+        def __init__(self):
+            self.prompts: list[str] = []
+            self._call_idx = 0
+
+        def run(self, task, cwd=None, timeout=0, read_only=False, **_):
+            self.prompts.append(task)
+            self._call_idx += 1
+            # call #1 = review, #2 = drift (fail), #3 = fix, #4 = review clean, #5 = verify, #6 = summary
+            if self._call_idx == 1:
+                return RunResult(success=True, output="- [P3] Bug")
+            if self._call_idx == 2:
+                return RunResult(success=False, output="", error="rate_limit")
+            if self._call_idx == 3:
+                return RunResult(success=True, output="Fixed")
+            if self._call_idx == 4:
+                return RunResult(success=True, output="No P1/P2/P3 findings.")
+            if self._call_idx == 5:
+                return RunResult(success=True, output="VERIFIED")
+            return RunResult(success=True, output="Pattern: x\nTool-Hint: y")
+
+    provider = _FailingDriftProvider()
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    # Loop continued past the failed drift check
+    assert provider._call_idx >= 5
+    # Fix prompt (call #3) has no drift warning because drift call failed
+    assert "Drift detected" not in provider.prompts[2]
+
+
+def test_drift_check_unknown_output_treated_as_no_warning(monkeypatch, tmp_path):
+    """Drift check returning neither ON_TOPIC nor DRIFTED → no warning injected."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P3] Issue",                       # review iter 1
+        "Some prose without sentinel marker", # drift check iter 1 (UNKNOWN)
+        "Fixed",                              # fix iter 1
+        "No P1/P2/P3 findings.",              # review iter 2
+        "VERIFIED",                           # verification
+        "Pattern: x\nTool-Hint: y",           # summarizer
+    ])
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    fix_prompt = provider.prompts[2]
+    assert "Drift detected" not in fix_prompt
 

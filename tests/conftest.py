@@ -42,3 +42,20 @@ def _isolate_replay_store(tmp_path: Path):
                 pass
         if saved_store is not None and setter is not None:
             setter(saved_store, saved_archive)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_active_runs_dir(tmp_path: Path, monkeypatch):
+    """Redirect ActiveRunRegistry writes into pytest's tmp_path.
+
+    Tool-tests construct ToolTracer instances which mirror lifecycle events
+    into a central ``logs/active_runs/`` directory. Without isolation those
+    files leak between tests and pollute the production repo.
+    """
+    try:
+        from tools import base_tool
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(base_tool, "ACTIVE_RUNS_DIR", tmp_path / "active_runs")
+    yield

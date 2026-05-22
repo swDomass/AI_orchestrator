@@ -134,6 +134,23 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     display: grid; grid-template-columns: 1fr 2fr; gap: 1rem;
   }
   .empty-hint { color: var(--muted); font-size: 0.85rem; font-style: italic; padding: 0.4rem 0; }
+  .active-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem; margin-bottom: 1.5rem;
+  }
+  .active-box h3 { font-size: 0.9rem; margin-bottom: 0.8rem; color: var(--muted); }
+  .active-box .live-dot {
+    display: inline-block; width: 0.6em; height: 0.6em; border-radius: 50%;
+    background: var(--green); margin-right: 0.4em; vertical-align: middle;
+    animation: pulse 1.4s infinite ease-in-out;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .active-box table { table-layout: auto; }
+  .active-box td.task-cell {
+    max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .active-box tr.stale td { color: var(--muted); font-style: italic; }
+  .active-box tr.stale .live-dot { background: var(--yellow); animation: none; }
   @media (max-width: 700px) {
     .charts { grid-template-columns: 1fr; }
     .timeline-grid { grid-template-columns: 1fr; }
@@ -147,6 +164,19 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   <h1>AI Orchestrator</h1>
   <span class="ts" id="gen-ts">—</span>
 </header>
+
+<section class="active-box">
+  <h3><span class="live-dot"></span>Active Runs <span id="active-count">(0)</span></h3>
+  <table>
+    <thead><tr>
+      <th>Tool</th><th>Task</th><th>Iter</th><th>Phase</th>
+      <th>Provider</th><th>Tokens (in / out / cache rd)</th><th>Elapsed</th>
+    </tr></thead>
+    <tbody id="active-runs-body">
+      <tr><td colspan="7" class="empty-hint">No active runs.</td></tr>
+    </tbody>
+  </table>
+</section>
 
 <div class="cards">
   <div class="card"><div class="value" id="total-tasks">—</div><div class="label">Tasks gesamt</div></div>
@@ -544,6 +574,59 @@ function renderFailures(counts, timeline) {
   failureTimeline.update();
 }
 
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  if (sec < 60) return sec + 's';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return m + 'm ' + s + 's';
+  const h = Math.floor(m / 60), mm = m % 60;
+  return h + 'h ' + mm + 'm';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
+
+function renderActiveRuns(runs) {
+  runs = runs || [];
+  const body = document.getElementById('active-runs-body');
+  const count = document.getElementById('active-count');
+  count.textContent = '(' + runs.length + ')';
+  if (runs.length === 0) {
+    body.innerHTML = '<tr><td colspan="7" class="empty-hint">No active runs.</td></tr>';
+    return;
+  }
+  body.innerHTML = runs.map(r => {
+    const t = r.tokens || {};
+    const iter = (r.iteration_current || 0) + ' / ' + (r.iteration_max || '?');
+    const stale = r.status === 'stale' ? ' stale' : '';
+    return '<tr class="' + stale.trim() + '">'
+      + '<td>' + escapeHtml(r.tool || '') + '</td>'
+      + '<td class="task-cell" title="' + escapeHtml(r.task || '') + '">'
+        + escapeHtml(r.task || '') + '</td>'
+      + '<td>' + iter + '</td>'
+      + '<td>' + escapeHtml(r.phase || '—') + '</td>'
+      + '<td>' + escapeHtml(r.provider || '') + '</td>'
+      + '<td>' + formatNumber(t.input || 0) + ' / '
+        + formatNumber(t.output || 0) + ' / '
+        + formatNumber(t.cache_read || 0) + '</td>'
+      + '<td>' + fmtDuration(r.elapsed_sec) + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+async function refreshActiveRuns() {
+  try {
+    const r = await fetch('/api/data?only=active_runs');
+    if (r.ok) {
+      const data = await r.json();
+      renderActiveRuns(data.active_runs || []);
+    }
+  } catch (e) { console.warn('active-runs fetch failed', e); }
+}
+
 function update(d) {
   document.getElementById('gen-ts').textContent = 'Stand: ' + d.generated_at;
   document.getElementById('total-tasks').textContent = d.total_tasks;
@@ -551,6 +634,7 @@ function update(d) {
   document.getElementById('avg-dur').textContent = d.avg_duration_sec;
   document.getElementById('providers').textContent = (d.active_providers || []).length;
   document.getElementById('suggest-today').textContent = d.usage_suggest_today ?? '—';
+  renderActiveRuns(d.active_runs);
 
   // Tasks per day — store full 90-day data, then apply active range
   _allTpd = d.tasks_per_day || { labels: [], values: [] };
@@ -613,6 +697,7 @@ async function load() {
 initCharts();
 load();
 setInterval(load, 60000);
+setInterval(refreshActiveRuns, 30000);
 </script>
 </body>
 </html>
@@ -648,8 +733,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _json_response(self, query_string: str = ""):
         try:
             params = urllib.parse.parse_qs(query_string)
-            days = max(1, min(int(params.get("days", ["7"])[0]), 365))
-            data = get_dashboard_data(days=days)
+            only = params.get("only", [""])[0]
+            if only == "active_runs":
+                # Lightweight poll endpoint — bypass the full dashboard cache
+                # and only read the live registry. Used by the 30s active-runs
+                # refresh tick to avoid latency from billing/replay aggregation.
+                from analytics import _load_active_runs
+                data = {"active_runs": _load_active_runs()}
+            else:
+                days = max(1, min(int(params.get("days", ["7"])[0]), 365))
+                data = get_dashboard_data(days=days)
             body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         except Exception as e:
             logger.exception("dashboard data error")

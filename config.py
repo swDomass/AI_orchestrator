@@ -243,6 +243,9 @@ TOOL_VERIFICATION_TIMEOUT_SEC          =   600  # 10 min: Final verification aft
 TOOL_RL_SECOND_OPINION_TIMEOUT_SEC     =   600  # 10 min: single non-agentic LLM call
 TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS  = 30_000  # cap on git-diff chars injected (≈7-8k tokens)
 
+# Review-Loop drift check (mode configured via policy.yaml tool_phases.review-loop.drift_check_mode)
+TOOL_RL_DRIFT_CHECK_TIMEOUT_SEC        =   120  # 2 min: mini-prompt without codebase exploration
+
 # Research-QA timeouts (Discovery → Analysis → Questions)
 TOOL_RQA_DISCOVERY_TIMEOUT_SEC = 1_200  # 20 min: Codebase exploration
 TOOL_RQA_ANALYSIS_TIMEOUT_SEC  = 1_200  # 20 min: Deep analysis
@@ -353,6 +356,13 @@ CAPACITY_LOG_RETENTION_DAYS = 90  # entries older than this are pruned
 
 # --- Queue Event Log (replaces ## Log section in agent-queue.md) ---
 QUEUE_EVENTS_LOG_FILE           = Path(__file__).parent / "logs" / "queue-events.log"
+
+# --- Quota Calibration (Phase 0 telemetry) ---
+# CSV of paired (cclimits utilization %, JSONL token counts) samples — one row
+# per Claude window (five_hour, seven_day) per successful cclimits poll.
+# Used to validate the tokens_per_pct calibration assumption before wiring it
+# into the operational quota estimator. See quota_calibration.py.
+QUOTA_CALIBRATION_LOG_FILE     = Path(__file__).parent / "logs" / "quota-calibration.csv"
 
 # Sidecar registry of Claude session UUIDs created by the orchestrator. Used by
 # the heartbeat session-cleanup handler as a whitelist so we never touch

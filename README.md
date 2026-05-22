@@ -4,6 +4,32 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 
 **Goal:** Run routine work (code, reviews, tests, docs, refactors) from a Markdown queue without managing API keys in your project. Uses existing CLI logins (OAuth/subscription).
 
+## Why this exists
+
+Routine engineering work — code reviews, refactors, test loops, documentation sync, security audits — is the ideal candidate for autonomous execution by an LLM CLI. But the existing tools fall apart at the operational layer:
+
+- **No orchestration across providers.** Claude, Gemini, and Codex are each excellent in isolation, but no tool routes tasks across all three with capacity-aware fallback. When Claude hits a 5 h block, the workflow shouldn't stop — it should silently fail over.
+- **Long-running autonomous loops need an audit trail.** Every dev-loop iteration, every security finding, every retry decision should be inspectable after the fact, not lost to stdout.
+- **State should live in plain Markdown**, not in a database. A human edits the queue with a text editor, version-controls it in Git, and reads every result alongside the task that produced it.
+- **Subscription-driven CLIs (OAuth, no API keys) are the cheapest way to run an autonomous agent** for a single user — provided you have a layer on top that respects quota windows, retries 429s, and knows when *not* to run.
+
+This is the orchestrator built around that reality.
+
+## Engineering highlights
+
+The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
+
+- **~1463 tests / ~50 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
+- **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
+- **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 1 h idle), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
+- **Auditability built in.** Every task end emits a structured `logs/runs.jsonl` record (16-category failure taxonomy: `rate_limit`, `timeout`, `auth_error`, `model_refusal`, …), per-tool action traces in `{cwd}/.<tool>/traces/*.jsonl`, an offline queue linter (`--lint-queue`, exit codes 0/1/2 for CI gating), and a 16-check `--doctor` with `--fix --yes` auto-repair.
+- **Prompt-cache aware.** Stable prompt prefixes, `--exclude-dynamic-system-prompt-sections` to freeze the system prompt for cache hits, opt-in Claude session reuse (`--session-id` / `--resume`) for ~30–50 % token savings across multi-phase tools, and billing analytics with weighted cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and per-task cache-hit rate.
+- **Observability.** Standalone HTTP analytics dashboard (port 8411, Chart.js, 60 s refresh) backed by `logs/runs.jsonl`. Daily Telegram status recap (07:00) summarises the previous 24 h — tasks done/failed, provider breakdown, pending approvals, blocked tasks.
+- **Reproducible quota model.** Phase-0 telemetry (`logs/quota-calibration.csv`) pairs every `cclimits` poll with locally-aggregated JSONL token counts per Anthropic 5 h / 7 d window, with explicit boolean flags for rolling-fallback / low-pct / claude-monitor-unavailable rows. Groundwork for replacing the undocumented `cclimits` endpoint with a real-time local estimator.
+
+Architecture details → [`docs/architecture/components.md`](docs/architecture/components.md) (per-module specs), [`docs/architecture/patterns.md`](docs/architecture/patterns.md) (patterns and invariants).
+
 ## Features
 
 - Multi-provider routing with fallback (`Claude → Gemini → Codex`)
@@ -24,6 +50,7 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 - Heartbeat + Doctor (monitoring / onboarding checks)
 - **Reliability layer (Tier 5)**: queue linter (`--lint-queue`), idempotency keys for external triggers, slash-commands (`/review`, `/dev`, `/security`, `/audit`, `/critique`, `/brainstorm`), schedule tags (`#at:`, `#every:`), machine-readable run summaries (`logs/runs.jsonl`), 16-category failure taxonomy, per-tool preflight hooks (deterministic context collection), queue-healing with `/unblock`/`/drop`/`/retry`, draft-only skill suggester, progressive skill loading
 - Analytics web dashboard (Chart.js, port 8411)
+- **Quota calibration telemetry (Phase 0)**: pairs every successful `cclimits` poll with JSONL-derived token counts in `logs/quota-calibration.csv`. Groundwork for a future `tokens_per_pct`-based real-time quota estimator that needs cclimits only every 10 min for re-calibration instead of for every reading.
 - `SOUL.md` as central prompt/personality configuration
 - **Anthropic prompt-cache optimization**: static system-prompt (cwd/git-status moved to first user message via `--exclude-dynamic-system-prompt-sections`), stable prompt prefixes, billing analytics with cache-hit-rate
 - **Optional Claude session reuse** (`CLAUDE_SESSION_ENABLED=true`): `dev-loop`, `review-loop`, same-provider `critical-review`, and `deep-security-audit` share Claude `--session-id`/`--resume` across phases for cross-call cache hits
@@ -599,6 +626,38 @@ Dashboard sections:
 
 Default port: `8411` (configurable via `DASHBOARD_PORT`).
 
+## Quota Calibration (Phase 0 — telemetry only)
+
+The orchestrator currently relies on `cclimits` for Claude/Codex/Gemini quota readings, but the underlying `api.anthropic.com/api/oauth/usage` endpoint is undocumented and aggressively rate-limited (cf. [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637)). The long-term goal is to estimate quota in real time from local JSONL data and use `cclimits` only every ~10 min as a calibration anchor.
+
+**Phase 0 (current):** pure telemetry — no behaviour change. Every successful `cclimits` poll inside `_bg_refresh_loop` schedules a CSV row per Claude window (`five_hour`, `seven_day`) on a dedicated single-worker thread pool, pairing the real cclimits utilization-% with locally-aggregated JSONL token counts. The async write means the cclimits refresh loop is never blocked by the multi-second JSONL aggregation (10-20 s on installations with thousands of session files).
+
+**Window-aware aggregation:** Anthropic's 5h block starts with the first message in an empty slot, and the 7d window has a user-specific reset cycle (visible via `cclimits seven_day.resets_in` — not aligned to any universal weekday/hour). The calibration derives `window_start = reset_at - window_size` from cclimits' `resets_in` and filters JSONL entries on `entry.timestamp >= window_start` rather than using a rolling "last N hours" filter, so a freshly-started block does not mistakenly include tokens from the previous one. JSONL is loaded once per poll (sized for the 7d window plus a 10 %+6 h drift buffer) and filtered per-window in memory.
+
+- **Path:** `logs/quota-calibration.csv` (created on first write)
+- **Schema version:** 2 (first column `schema_version` lets downstream analysis reject mixed-version files)
+- **Columns** (schema 2): `schema_version`, `timestamp_utc`, `window`, `claude_plan`, `queue_idle_at_sample`, `cclimits_pct_used`, `cclimits_pct_remaining`, `reset_in_sec`, `window_start_utc`, `tokens_input`, `tokens_output`, `tokens_cache_creation`, `tokens_cache_creation_1h`, `tokens_cache_creation_5m`, `tokens_cache_read`, `tokens_inputoutput_only`, `tokens_weighted_billing`, `tokens_per_pct_io_only`, `tokens_per_pct_with_cc`, `tokens_per_pct_all`, `entries_count`, `models`, `flag_rolling_fallback`, `flag_low_pct`, `flag_cm_unavailable`, `note`
+- **Boolean flag columns** (machine-readable, mirror the human-readable `note`):
+  - `flag_rolling_fallback` — cclimits returned `resets_in_sec=0` (just after a window reset); synthetic `now - window_size` start may include leftover tokens from the previous block. **Skip these rows for ratio analysis.**
+  - `flag_low_pct` — `pct_used < 0.5%`, division would amplify cclimits' string-rounding noise; the `tokens_per_pct_*` columns are left empty
+  - `flag_cm_unavailable` — claude-monitor is missing or its loader raised; only cclimits side is preserved
+- **`tokens_cache_creation_1h` / `tokens_cache_creation_5m`:** currently empty — claude-monitor's `UsageEntry` does not expose the ephemeral cache subfields. A future iteration will populate these by direct JSONL parsing if calibration shows the 1h vs. 5m mix materially affects the ratio.
+- **Sample rate:** every 5 min while the queue is active, every 10 min while idle (matches `_BG_POLL_AVAILABLE_SEC=300` / `_BG_POLL_IDLE_SEC=600`). Overlapping submissions are dropped (logged at DEBUG); no unbounded queue.
+- **Requirements:** `claude-monitor>=3.0.0` (optional dependency — rows include `flag_cm_unavailable=true` if missing, cclimits side is still preserved)
+- **Hard skip (no row written):** Claude provider has any error string (cclimits unavailable, 429 fallback, token expired, etc.) or no window data is present (pre-auth state).
+
+#### Phase-0 limitations (read before drawing conclusions from the CSV)
+
+- **Single-machine assumption:** local JSONL files only reflect Claude Code activity on this host, whereas cclimits' utilization is summed across all machines tied to the OAuth account. The calibration is therefore only valid when this is the only host running Claude Code under the account.
+- **Single-orchestrator assumption:** the CSV append is thread-safe but not process-safe — running two orchestrator instances against the same `logs/` directory can corrupt rows on Windows. The CSV path is fixed; if you must run multiple instances, override `QUOTA_CALIBRATION_LOG_FILE` per instance.
+- **Cache-token sub-tiers ignored:** `cache_creation_tokens` is summed across the `ephemeral_1h_input_tokens` and `ephemeral_5m_input_tokens` sub-fields. If the Anthropic rate-limit quota weights them differently (pricing definitely does: 2× vs. 1.25×), the `tokens_per_pct_with_cc` ratio drifts whenever the user-workload's cache-tier mix changes. See the `tokens_cache_creation_1h/5m` placeholder columns above.
+- **JSONL flush latency:** Claude Code persists usage after a tool turn completes; cclimits sees the server-side value immediately. During an active long-running tool call the local JSONL is briefly behind cclimits — `queue_idle_at_sample=false` rows reflect this and should be down-weighted during analysis.
+- **Telemetry scope:** intended for ~2-3 days of data collection. No rotation; the CSV will grow ~1.7 kB per sample (~300 kB/day at active poll rate). Delete or move the file once Phase 1 starts.
+
+The three `tokens_per_pct_*` columns implement different assumptions about which tokens count against the rate-limit quota: `io_only` matches the current `_get_claude_limits_from_local` formula (`input + output`), `with_cc` adds cache-creation tokens, `all` adds both cache tiers. Once 2–3 days of samples are collected, the column with the most stable ratio over time selects the calibration model for Phase 1.
+
+The hook is wrapped in `try/except` at the call site (`limits._bg_refresh_loop`) and inside the module itself — it never raises into the background refresh loop. If `claude-monitor` is not installed, the CSV still receives rows (with empty token columns and `note=claude-monitor unavailable`) so the cclimits side of the calibration is preserved.
+
 ## Security / Guardrails
 
 - Hard bans on destructive commands (`rm -rf`, `git reset --hard`, force-push, `DROP TABLE`, etc.)
@@ -659,6 +718,7 @@ orchestrator.py
   → notifier.py            (Telegram notifications)
   → shutdown.py            (shutdown countdown / cancel)
   → limits.py              (cclimits wrapper, disk cache, 429 resilience)
+  → quota_calibration.py   (Phase-0 telemetry: cclimits ↔ JSONL token pairs)
   → logging_setup.py       (rotating file logger)
   → doctor.py              (setup validation / --doctor)
   → queue_linter.py        (offline queue validation / --lint-queue)

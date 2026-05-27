@@ -557,7 +557,10 @@ def _write_live_quota_state() -> None:
             return
         from quota_state import write_quota_state
         from config import CC_QUOTA_STATE_FILE
-        write_quota_state(_apply_live_estimate(cached[0]), CC_QUOTA_STATE_FILE)
+        write_quota_state(
+            _apply_live_estimate(cached[0]), CC_QUOTA_STATE_FILE,
+            claude_factors=_get_calibrated_windows("claude"),
+        )
     except Exception:
         logger.debug("live quota-state write failed", exc_info=True)
 
@@ -1240,7 +1243,10 @@ def _bg_refresh_loop() -> None:
                     try:
                         from quota_state import write_quota_state
                         from config import CC_QUOTA_STATE_FILE
-                        write_quota_state(result, CC_QUOTA_STATE_FILE)
+                        write_quota_state(
+                            result, CC_QUOTA_STATE_FILE,
+                            claude_factors=_get_calibrated_windows("claude"),
+                        )
                     except Exception:
                         logger.debug("quota-state write hook failed", exc_info=True)
                     # Phase-2: this fresh reading already reflects consumption →

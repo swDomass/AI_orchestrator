@@ -51,6 +51,24 @@ def test_build_state_embeds_calibration():
     )
 
 
+def test_build_state_uses_provided_claude_factors():
+    """Supplied (recalibrated) factors override the static config defaults in the
+    emitted calibration metadata."""
+    factors = {"five_hour": 5290, "seven_day": 74171}
+    state = quota_state.build_state(_sample_all_limits(), now=1_700_000_000.0,
+                                    claude_factors=factors)
+    assert state["calibration"]["tokens_per_pct"]["claude"] == factors
+
+
+def test_write_quota_state_forwards_claude_factors(tmp_path):
+    path = tmp_path / "cc_quota_state.json"
+    factors = {"five_hour": 5290, "seven_day": 74171}
+    assert quota_state.write_quota_state(
+        _sample_all_limits(), path, claude_factors=factors) is True
+    state = quota_state.read_quota_state(path)
+    assert state["calibration"]["tokens_per_pct"]["claude"] == factors
+
+
 def test_write_and_read_roundtrip(tmp_path):
     path = tmp_path / "logs" / "cc_quota_state.json"
     assert quota_state.write_quota_state(_sample_all_limits(), path) is True

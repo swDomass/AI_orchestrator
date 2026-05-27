@@ -77,9 +77,21 @@ def _provider_to_dict(pl: "ProviderLimits", now: float) -> dict:
     }
 
 
-def build_state(all_limits: "AllLimits", now: "float | None" = None) -> dict:
-    """Build the SoTH state dict (pure, testable without disk I/O)."""
+def build_state(
+    all_limits: "AllLimits",
+    now: "float | None" = None,
+    *,
+    claude_factors: "dict[str, int] | None" = None,
+) -> dict:
+    """Build the SoTH state dict (pure, testable without disk I/O).
+
+    ``claude_factors`` lets the caller emit the *currently active* per-window
+    tokens-per-pct (which Phase-2 auto-recalibration may have updated at runtime)
+    instead of the static config defaults — keeping the embedded metadata in sync
+    with the estimator. Falls back to the config defaults when None.
+    """
     now = time.time() if now is None else now
+    factors = dict(claude_factors) if claude_factors else dict(ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS)
     return {
         "schema_version": SCHEMA_VERSION,
         "fetched_at_unix": round(now, 3),
@@ -92,7 +104,7 @@ def build_state(all_limits: "AllLimits", now: "float | None" = None) -> dict:
         },
         "calibration": {
             "model": QUOTA_CALIBRATION_MODEL,
-            "tokens_per_pct": {"claude": dict(ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS)},
+            "tokens_per_pct": {"claude": factors},
             "note": (
                 "io_only, conservative low-percentile; cache tokens excluded; "
                 "single-machine"
@@ -101,15 +113,22 @@ def build_state(all_limits: "AllLimits", now: "float | None" = None) -> dict:
     }
 
 
-def write_quota_state(all_limits: "AllLimits", path) -> bool:
+def write_quota_state(
+    all_limits: "AllLimits", path, *, claude_factors: "dict[str, int] | None" = None,
+) -> bool:
     """Atomically write the SoTH quota state. Never raises.
 
-    Returns True on success, False on any failure (logged at DEBUG so the
-    cclimits refresh loop is never disrupted).
+    ``claude_factors`` is forwarded to :func:`build_state` so the emitted
+    calibration metadata reflects the currently active (possibly recalibrated)
+    factors. Returns True on success, False on any failure (logged at DEBUG so
+    the cclimits refresh loop is never disrupted).
     """
     try:
         path = Path(path)
-        content = json.dumps(build_state(all_limits), ensure_ascii=False, indent=2)
+        content = json.dumps(
+            build_state(all_limits, claude_factors=claude_factors),
+            ensure_ascii=False, indent=2,
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path: "Path | None" = None
         try:

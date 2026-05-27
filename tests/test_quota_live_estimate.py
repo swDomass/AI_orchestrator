@@ -121,7 +121,7 @@ def test_apply_live_estimate_is_noop_when_empty(live_env):
 def test_write_live_quota_state_reflects_estimate(live_env, monkeypatch):
     captured = {}
     monkeypatch.setattr(quota_state, "write_quota_state",
-                        lambda al, path: captured.update(al=al) or True)
+                        lambda al, path, **k: captured.update(al=al) or True)
     monkeypatch.setattr(limits, "QUOTA_LIVE_ESTIMATE_ENABLED", True)
     limits.report_estimated_usage("claude", 5.0)
     assert captured["al"].claude.windows["five_hour"].remaining_pct < 80.0

@@ -992,10 +992,15 @@ def test_report_estimated_usage_scales_nested_long_windows(monkeypatch):
     assert abs(limits._429_estimated_usage["codex"]["seven_day"] - 1.0) < 0.01
 
 
-def test_estimate_window_usage_calibrated_claude_uses_calibrated_ratios():
+def test_estimate_window_usage_calibrated_claude_uses_calibrated_ratios(monkeypatch):
     """Claude splits a headline estimate across windows via Phase-0 calibrated
     tokens-per-pct: per_window = (pct * scalar) / window_tpp. The scalar cancels,
     so 5h/7d differ by the calibration ratio (~14x), not the reset-time ratio."""
+    # Pin the active factors so the test is hermetic w.r.t. Phase-2 auto-recal
+    # (the bg refresh thread can mutate _active_calibrated_windows when the
+    # ORCH_QUOTA_AUTO_RECALIBRATE env flag is on).
+    monkeypatch.setattr(limits, "_active_calibrated_windows",
+                        {"claude": dict(limits.ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS)})
     base = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
         "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
         "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
@@ -1022,6 +1027,8 @@ def test_estimate_window_usage_calibrated_falls_back_for_uncalibrated_provider()
 def test_report_estimated_usage_claude_calibrated_in_429(monkeypatch):
     """End-to-end: claude 429 accumulation uses calibrated per-window usage."""
     _reset_429_state(monkeypatch)
+    monkeypatch.setattr(limits, "_active_calibrated_windows",
+                        {"claude": dict(limits.ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS)})
     base_pl = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
         "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
         "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
@@ -1326,6 +1333,8 @@ def test_get_limits_fresh_accumulates_estimated_usage(monkeypatch):
     """Estimated usage is subtracted from cached data across multiple calls."""
     _reset_bg_state(monkeypatch)
     _reset_429_state(monkeypatch)
+    monkeypatch.setattr(limits, "_active_calibrated_windows",
+                        {"claude": dict(limits.ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS)})
 
     def fake_run_cclimits():
         return {

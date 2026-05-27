@@ -364,6 +364,12 @@ QUEUE_EVENTS_LOG_FILE           = Path(__file__).parent / "logs" / "queue-events
 # into the operational quota estimator. See quota_calibration.py.
 QUOTA_CALIBRATION_LOG_FILE     = Path(__file__).parent / "logs" / "quota-calibration.csv"
 
+# Phase-1 Single-Source-of-Truth quota state: the orchestrator's bg refresh loop
+# writes the latest cclimits per-window snapshot here (atomic) so external,
+# read-only consumers (Claude Code statusline, --check-limits) can show real
+# 5h/7d rate-limit usage without re-polling the rate-limited cclimits endpoint.
+CC_QUOTA_STATE_FILE            = Path(__file__).parent / "logs" / "cc_quota_state.json"
+
 # Sidecar registry of Claude session UUIDs created by the orchestrator. Used by
 # the heartbeat session-cleanup handler as a whitelist so we never touch
 # interactive Claude Code sessions in the same project directory.
@@ -491,6 +497,21 @@ ESTIMATE_TOKENS_PER_PCT: dict[str, int] = {
     "gemini": int(os.getenv("ORCH_TOKENS_PER_PCT_GEMINI", "100000")),
     "codex": int(os.getenv("ORCH_TOKENS_PER_PCT_CODEX", "30000")),
 }
+
+# Calibrated per-window tokens-per-pct for Claude (Phase-0 calibration 2026-05-27,
+# io_only model = input + output*weight; cache tokens excluded as they barely
+# count against the rate limit). 5h and 7d differ ~14x, so a single scalar cannot
+# serve both windows. The scalar ESTIMATE_TOKENS_PER_PCT["claude"] above is only a
+# headline reference for estimate_task_usage_pct(); its value CANCELS OUT in the
+# per-window 429-fallback split (limits._estimate_window_usage_calibrated), which
+# reconstructs true per-window usage via these ratios. Values are conservative
+# (low percentile → consumption overestimated → never under-report near the limit):
+# 5h P25 ~5400 (CV ~18% in the >=60% danger band), 7d ~75000 (tight, CV <1% there).
+ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS: dict[str, int] = {
+    "five_hour": int(os.getenv("ORCH_TOKENS_PER_PCT_CLAUDE_5H", "5400")),
+    "seven_day": int(os.getenv("ORCH_TOKENS_PER_PCT_CLAUDE_7D", "75000")),
+}
+QUOTA_CALIBRATION_MODEL = "io_only"  # informational; emitted in cc_quota_state.json
 
 # --- Parallel Worktrees (P1) ---
 # Subdir name under the parent CWD where #worktree-tagged parallel subtasks

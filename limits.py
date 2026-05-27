@@ -21,6 +21,7 @@ from config import (
     ESTIMATE_CHARS_PER_TOKEN,
     ESTIMATE_OUTPUT_TOKEN_WEIGHT,
     ESTIMATE_TOKENS_PER_PCT,
+    ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
     MIN_CAPACITY_PERCENT,
 )
 
@@ -379,6 +380,47 @@ def _aggregate_remaining_pct(
     return min(values)
 
 
+# Per-provider calibrated tokens-per-pct windows. Phase-1: only Claude is
+# calibrated (Phase-0, 2026-05-27). Providers absent here fall back to the
+# reset-time heuristic in _estimate_window_usage.
+_CALIBRATED_WINDOWS: "dict[str, dict[str, int]]" = {
+    "claude": ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
+}
+
+
+def _estimate_window_usage_calibrated(
+    provider_name: str,
+    base: ProviderLimits,
+    estimated_pct: float,
+) -> dict[str, float]:
+    """Split a headline usage estimate across windows using Phase-0 calibrated
+    tokens-per-pct ratios.
+
+    ``estimated_pct`` was produced by ``estimate_task_usage_pct`` with the scalar
+    ``ESTIMATE_TOKENS_PER_PCT[provider]``, so the implied billable token count is
+    ``estimated_pct * scalar``. Dividing that by each window's calibrated
+    tokens-per-pct yields the true per-window usage — and because the same scalar
+    multiplies then divides, its exact value cancels and does not affect
+    correctness (it stays a back-compat headline reference).
+
+    Windows present on ``base`` but absent from the calibration table keep the
+    headline ``estimated_pct`` (conservative). Providers without calibration fall
+    back entirely to the reset-time heuristic.
+    """
+    calibration = _CALIBRATED_WINDOWS.get(provider_name)
+    scalar = ESTIMATE_TOKENS_PER_PCT.get(provider_name, 0)
+    if not calibration or not base.windows or scalar <= 0:
+        return _estimate_window_usage(base, estimated_pct)
+
+    pct = max(0.0, float(estimated_pct))
+    effective_tokens = pct * scalar
+    usage: dict[str, float] = {}
+    for name in base.windows:
+        tpp = calibration.get(name)
+        usage[name] = effective_tokens / tpp if tpp and tpp > 0 else pct
+    return usage
+
+
 def report_estimated_usage(provider_name: str, estimated_pct: float) -> None:
     """Track estimated capacity consumption during HTTP 429 periods.
 
@@ -391,7 +433,9 @@ def report_estimated_usage(provider_name: str, estimated_pct: float) -> None:
         base_pl, _ = _429_snapshots[provider_name]
         if not (base_pl.available or base_pl.windows):
             return
-        usage_delta = _estimate_window_usage(base_pl, estimated_pct)
+        usage_delta = _estimate_window_usage_calibrated(
+            provider_name, base_pl, estimated_pct,
+        )
         current_usage = _normalize_estimated_usage(
             base_pl,
             _429_estimated_usage.get(provider_name, {}),
@@ -1026,6 +1070,17 @@ def _bg_refresh_loop() -> None:
                         )
                     except Exception:
                         logger.debug("calibration hook failed", exc_info=True)
+                    # Phase-1 SoTH: persist the fresh per-window snapshot so the
+                    # statusline / --check-limits can read real 5h/7d usage
+                    # without re-polling the rate-limited cclimits endpoint.
+                    # Tiny atomic JSON write (no JSONL load) — synchronous is
+                    # fine; never raises.
+                    try:
+                        from quota_state import write_quota_state
+                        from config import CC_QUOTA_STATE_FILE
+                        write_quota_state(result, CC_QUOTA_STATE_FILE)
+                    except Exception:
+                        logger.debug("quota-state write hook failed", exc_info=True)
 
             _bg_wake.wait(timeout=sleep_sec)
         except Exception:

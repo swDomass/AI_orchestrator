@@ -949,25 +949,31 @@ def test_estimate_task_usage_pct_minimum_clamp():
 
 
 def test_report_estimated_usage_accumulates_only_in_429_mode(monkeypatch):
-    """report_estimated_usage only accumulates when _429_base_snapshot is set."""
+    """report_estimated_usage only accumulates when a 429 base snapshot is set.
+
+    Uses codex (no per-window calibration) so the accumulation math is the raw
+    reset-time heuristic — calibrated providers (claude) are covered separately.
+    """
     _reset_429_state(monkeypatch)
 
     # Without base snapshot, reporting does nothing
-    limits.report_estimated_usage("claude", 5.0)
+    limits.report_estimated_usage("codex", 5.0)
     assert limits._429_estimated_usage == {}
 
     # Set a base snapshot
     base_pl = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
         "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
     })
-    monkeypatch.setattr(limits, "_429_snapshots", {"claude": (base_pl, time.monotonic())})
+    monkeypatch.setattr(limits, "_429_snapshots", {"codex": (base_pl, time.monotonic())})
 
-    limits.report_estimated_usage("claude", 5.0)
-    limits.report_estimated_usage("claude", 3.0)
-    assert limits._429_estimated_usage["claude"] == {"five_hour": 8.0}
+    limits.report_estimated_usage("codex", 5.0)
+    limits.report_estimated_usage("codex", 3.0)
+    assert limits._429_estimated_usage["codex"] == {"five_hour": 8.0}
 
 
 def test_report_estimated_usage_scales_nested_long_windows(monkeypatch):
+    """Reset-time heuristic for uncalibrated providers: longer windows receive a
+    proportionally smaller deduction (codex, no calibration table entry)."""
     _reset_429_state(monkeypatch)
 
     base_pl = limits.ProviderLimits(
@@ -978,12 +984,58 @@ def test_report_estimated_usage_scales_nested_long_windows(monkeypatch):
             "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
         },
     )
+    monkeypatch.setattr(limits, "_429_snapshots", {"codex": (base_pl, time.monotonic())})
+
+    limits.report_estimated_usage("codex", 24.0)
+
+    assert limits._429_estimated_usage["codex"]["five_hour"] == 24.0
+    assert abs(limits._429_estimated_usage["codex"]["seven_day"] - 1.0) < 0.01
+
+
+def test_estimate_window_usage_calibrated_claude_uses_calibrated_ratios():
+    """Claude splits a headline estimate across windows via Phase-0 calibrated
+    tokens-per-pct: per_window = (pct * scalar) / window_tpp. The scalar cancels,
+    so 5h/7d differ by the calibration ratio (~14x), not the reset-time ratio."""
+    base = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
+        "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+        "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
+    })
+    out = limits._estimate_window_usage_calibrated("claude", base, 10.0)
+    scalar = limits.ESTIMATE_TOKENS_PER_PCT["claude"]
+    cal = limits.ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS
+    assert abs(out["five_hour"] - 10.0 * scalar / cal["five_hour"]) < 1e-6
+    assert abs(out["seven_day"] - 10.0 * scalar / cal["seven_day"]) < 1e-6
+    assert out["five_hour"] > out["seven_day"]
+
+
+def test_estimate_window_usage_calibrated_falls_back_for_uncalibrated_provider():
+    """Providers absent from the calibration table use the reset-time heuristic
+    (identical to _estimate_window_usage)."""
+    base = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
+        "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+        "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
+    })
+    assert limits._estimate_window_usage_calibrated("codex", base, 24.0) == \
+        limits._estimate_window_usage(base, 24.0)
+
+
+def test_report_estimated_usage_claude_calibrated_in_429(monkeypatch):
+    """End-to-end: claude 429 accumulation uses calibrated per-window usage."""
+    _reset_429_state(monkeypatch)
+    base_pl = limits.ProviderLimits(available=True, remaining_pct=80.0, windows={
+        "five_hour": limits.WindowData(remaining_pct=80.0, resets_in_sec=3600),
+        "seven_day": limits.WindowData(remaining_pct=90.0, resets_in_sec=86400),
+    })
     monkeypatch.setattr(limits, "_429_snapshots", {"claude": (base_pl, time.monotonic())})
 
-    limits.report_estimated_usage("claude", 24.0)
-
-    assert limits._429_estimated_usage["claude"]["five_hour"] == 24.0
-    assert abs(limits._429_estimated_usage["claude"]["seven_day"] - 1.0) < 0.01
+    limits.report_estimated_usage("claude", 5.0)
+    scalar = limits.ESTIMATE_TOKENS_PER_PCT["claude"]
+    cal = limits.ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS
+    eff = 5.0 * scalar
+    acc = limits._429_estimated_usage["claude"]
+    assert abs(acc["five_hour"] - round(eff / cal["five_hour"], 2)) < 0.02
+    assert abs(acc["seven_day"] - round(eff / cal["seven_day"], 2)) < 0.02
+    assert acc["five_hour"] > acc["seven_day"]
 
 
 def test_build_429_fallback_provider_adjusts_remaining():
@@ -1302,20 +1354,27 @@ def test_get_limits_fresh_accumulates_estimated_usage(monkeypatch):
     result1 = limits._get_limits_fresh()
     assert result1.claude.remaining_pct == 50.0
 
-    # Simulate task consuming estimated 10%
+    # Simulate task consuming an estimated 10% (headline). For claude the
+    # five_hour deduction is the Phase-0 calibrated amount, not 1:1 — the
+    # headline implies (10% * scalar) tokens, divided by the 5h tokens-per-pct.
     limits.report_estimated_usage("claude", 10.0)
 
-    # Second call: 429 still, should show 50% - 10% = 40%
+    scalar = limits.ESTIMATE_TOKENS_PER_PCT["claude"]
+    fh_tpp = limits.ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS["five_hour"]
+    expected_deduction = round(10.0 * scalar / fh_tpp, 2)
+
+    # Second call: 429 still, remaining = 50% minus calibrated 5h deduction.
     result2 = limits._get_limits_fresh()
-    assert result2.claude.remaining_pct == 40.0
+    assert abs(result2.claude.remaining_pct - (50.0 - expected_deduction)) < 0.05
     assert result2.claude.available is True
 
-    # Simulate another task consuming 5%
+    # Simulate another task consuming an estimated 5% (headline) — accumulates.
     limits.report_estimated_usage("claude", 5.0)
 
-    # Third call: should show 50% - 15% = 35%
+    # Third call: remaining = 50% minus the calibrated 5h deduction for 15% total.
+    expected_deduction_total = round(15.0 * scalar / fh_tpp, 2)
     result3 = limits._get_limits_fresh()
-    assert result3.claude.remaining_pct == 35.0
+    assert abs(result3.claude.remaining_pct - (50.0 - expected_deduction_total)) < 0.1
 
 
 def test_get_limits_fresh_clears_429_state_when_resolved(monkeypatch):

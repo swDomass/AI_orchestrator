@@ -448,3 +448,85 @@ def shutdown_executor(wait: bool = False) -> None:
             _executor.shutdown(wait=wait)
             _executor = None
     _pending_sample.clear()
+
+
+# ───────────────────────────── Phase-2 auto-recalibration ────────────────────
+
+
+def _percentile(values: "list[float]", p: float) -> float:
+    """Linear-interpolation percentile (p in 0..100)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def recalibrate_claude_factors(
+    csv_path,
+    defaults: "dict[str, int]",
+    *,
+    min_samples: int,
+    clamp: float,
+    percentile: float = 25.0,
+) -> "dict[str, int] | None":
+    """Recompute conservative per-window ``io_only`` tokens-per-pct from the
+    running calibration CSV (Phase-2 drift correction).
+
+    Returns ``{window: int}`` or ``None`` (caller keeps the defaults). Guards:
+
+    - **Schema-aware:** trusts only rows whose column count matches the current
+      schema, sidestepping a stale/mixed CSV header (no DictReader).
+    - **Filtered:** drops rolling-fallback / low-pct / cm-unavailable rows.
+    - **Min samples:** each window needs ``>= min_samples`` usable rows.
+    - **Clamped:** each factor is clamped to ``[default/clamp, default*clamp]``.
+    - **All-or-nothing:** if either Claude window lacks data, returns None.
+
+    The ``percentile`` (default 25) is a conservative low percentile — a smaller
+    tokens-per-pct overestimates consumption, the safe side for gating.
+    """
+    try:
+        path = Path(csv_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        expected = len(CSV_FIELDS)
+        usable: list = []
+        with path.open(encoding="utf-8", newline="") as fh:
+            for raw in csv.reader(fh):
+                if len(raw) != expected:
+                    continue
+                row = dict(zip(CSV_FIELDS, raw))
+                if (
+                    row.get("flag_rolling_fallback") == "false"
+                    and row.get("flag_low_pct") == "false"
+                    and row.get("flag_cm_unavailable") == "false"
+                    and (row.get("tokens_per_pct_io_only") or "").strip()
+                ):
+                    usable.append(row)
+
+        result: dict[str, int] = {}
+        for window in ("five_hour", "seven_day"):
+            default = defaults.get(window)
+            if not default:
+                return None
+            vals = []
+            for row in usable:
+                if row.get("window") != window:
+                    continue
+                try:
+                    vals.append(float(row["tokens_per_pct_io_only"]))
+                except (ValueError, KeyError, TypeError):
+                    continue
+            if len(vals) < min_samples:
+                return None
+            factor = _percentile(vals, percentile)
+            lo, hi = default / clamp, default * clamp
+            result[window] = int(round(max(lo, min(hi, factor))))
+        return result
+    except Exception as exc:
+        logger.debug("recalibrate_claude_factors failed: %s", exc)
+        return None

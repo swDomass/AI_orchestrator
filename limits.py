@@ -23,6 +23,7 @@ from config import (
     ESTIMATE_TOKENS_PER_PCT,
     ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
     MIN_CAPACITY_PERCENT,
+    QUOTA_LIVE_ESTIMATE_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -382,10 +383,66 @@ def _aggregate_remaining_pct(
 
 # Per-provider calibrated tokens-per-pct windows. Phase-1: only Claude is
 # calibrated (Phase-0, 2026-05-27). Providers absent here fall back to the
-# reset-time heuristic in _estimate_window_usage.
-_CALIBRATED_WINDOWS: "dict[str, dict[str, int]]" = {
-    "claude": ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
+# reset-time heuristic in _estimate_window_usage. Phase-2: the Claude factors
+# may be updated at runtime by auto-recalibration (set_calibrated_windows);
+# guarded by a lock so reads/writes are consistent across threads.
+_active_calibration_lock = threading.Lock()
+_active_calibrated_windows: "dict[str, dict[str, int]]" = {
+    "claude": dict(ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS),
 }
+
+
+def _get_calibrated_windows(provider_name: str) -> "dict[str, int] | None":
+    """Snapshot of the (possibly recalibrated) per-window factors, or None."""
+    with _active_calibration_lock:
+        windows = _active_calibrated_windows.get(provider_name)
+        return dict(windows) if windows else None
+
+
+def set_calibrated_windows(provider_name: str, windows: "dict[str, int]") -> None:
+    """Replace the live per-window tokens-per-pct factors (Phase-2 auto-recal)."""
+    with _active_calibration_lock:
+        _active_calibrated_windows[provider_name] = dict(windows)
+
+
+_last_recalibration_date = None
+
+
+def _maybe_recalibrate() -> None:
+    """Phase-2 (b): once per day, refresh the live Claude tokens-per-pct factors
+    from the running calibration CSV (drift correction). Flag-gated, day-cached,
+    guarded (min samples + clamp inside ``recalibrate_claude_factors``). Never
+    raises into the bg refresh loop."""
+    global _last_recalibration_date
+    try:
+        from config import QUOTA_AUTO_RECALIBRATE_ENABLED
+        if not (QUOTA_LIVE_ESTIMATE_ENABLED and QUOTA_AUTO_RECALIBRATE_ENABLED):
+            return
+        import datetime as _dt
+        today = _dt.date.today()
+        if _last_recalibration_date == today:
+            return
+        _last_recalibration_date = today
+        from config import (
+            ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
+            QUOTA_CALIBRATION_LOG_FILE,
+            QUOTA_RECALIBRATE_CLAMP,
+            QUOTA_RECALIBRATE_MIN_SAMPLES,
+            QUOTA_RECALIBRATE_PERCENTILE,
+        )
+        from quota_calibration import recalibrate_claude_factors
+        new_factors = recalibrate_claude_factors(
+            QUOTA_CALIBRATION_LOG_FILE,
+            ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
+            min_samples=QUOTA_RECALIBRATE_MIN_SAMPLES,
+            clamp=QUOTA_RECALIBRATE_CLAMP,
+            percentile=QUOTA_RECALIBRATE_PERCENTILE,
+        )
+        if new_factors:
+            set_calibrated_windows("claude", new_factors)
+            logger.info("quota factors auto-recalibrated from CSV: %s", new_factors)
+    except Exception:
+        logger.debug("quota recalibration failed", exc_info=True)
 
 
 def _estimate_window_usage_calibrated(
@@ -407,7 +464,7 @@ def _estimate_window_usage_calibrated(
     headline ``estimated_pct`` (conservative). Providers without calibration fall
     back entirely to the reset-time heuristic.
     """
-    calibration = _CALIBRATED_WINDOWS.get(provider_name)
+    calibration = _get_calibrated_windows(provider_name)
     scalar = ESTIMATE_TOKENS_PER_PCT.get(provider_name, 0)
     if not calibration or not base.windows or scalar <= 0:
         return _estimate_window_usage(base, estimated_pct)
@@ -421,28 +478,133 @@ def _estimate_window_usage_calibrated(
     return usage
 
 
-def report_estimated_usage(provider_name: str, estimated_pct: float) -> None:
-    """Track estimated capacity consumption during HTTP 429 periods.
+# ── Phase-2: live between-poll usage estimate (Closed-Loop-Rebalancing) ───────
+# Estimated usage (%) accumulated since the last successful cclimits poll, per
+# provider/window. Applied at serve time (get_limits / _effective_provider) and
+# reset on each fresh poll (re-anchor). Distinct from _429_estimated_usage (429
+# fallback, applied at poll time). Only active when QUOTA_LIVE_ESTIMATE_ENABLED.
+_live_estimate_lock = threading.Lock()
+_live_estimated_usage: "dict[str, dict[str, float]]" = {}
 
-    Called by the orchestrator after each task to maintain running estimates.
-    Only accumulates if we're in a 429 fallback state for this provider.
+
+def _reset_live_estimate() -> None:
+    """Re-anchor: drop the between-poll estimate (a fresh cclimits read already
+    reflects that consumption)."""
+    with _live_estimate_lock:
+        _live_estimated_usage.clear()
+
+
+def _subtract_usage(base: ProviderLimits, usage: "dict[str, float]") -> ProviderLimits:
+    """Copy of *base* with per-window remaining_pct reduced by *usage* (percent),
+    recomputing the aggregate remaining_pct and availability. Reset times and
+    error string are preserved (this is not a 429 fallback)."""
+    usage_by_window = _normalize_estimated_usage(base, usage)
+    adjusted_windows: dict[str, WindowData] = {}
+    for wname, wdata in base.windows.items():
+        used = usage_by_window.get(wname, 0.0)
+        adjusted_windows[wname] = WindowData(
+            remaining_pct=max(0.0, wdata.remaining_pct - used),
+            resets_in_sec=wdata.resets_in_sec,
+        )
+    if adjusted_windows:
+        new_remaining = _aggregate_remaining_pct(base, adjusted_windows)
+    else:
+        new_remaining = max(0.0, base.remaining_pct - usage_by_window.get("__provider__", 0.0))
+    return ProviderLimits(
+        available=new_remaining >= MIN_CAPACITY_PERCENT,
+        remaining_pct=new_remaining,
+        resets_in_sec=base.resets_in_sec,
+        reset_at_epoch=base.reset_at_epoch,
+        error=base.error,
+        windows=adjusted_windows,
+    )
+
+
+def _apply_live_estimate_to_provider(
+    provider_name: str, pl: "ProviderLimits | None",
+) -> "ProviderLimits | None":
+    """Apply the accumulated live estimate to one provider (no-op when the flag
+    is off, the snapshot is None, or nothing has accumulated)."""
+    if pl is None or not QUOTA_LIVE_ESTIMATE_ENABLED:
+        return pl
+    with _live_estimate_lock:
+        usage = dict(_live_estimated_usage.get(provider_name, {}))
+    return _subtract_usage(pl, usage) if usage else pl
+
+
+def _apply_live_estimate(all_limits: AllLimits) -> AllLimits:
+    """Apply the live between-poll estimate to every provider (serve-time)."""
+    if not QUOTA_LIVE_ESTIMATE_ENABLED:
+        return all_limits
+    with _live_estimate_lock:
+        any_usage = bool(_live_estimated_usage)
+    if not any_usage:
+        return all_limits
+    return AllLimits(
+        claude=_apply_live_estimate_to_provider("claude", all_limits.claude),
+        gemini=_apply_live_estimate_to_provider("gemini", all_limits.gemini),
+        codex=_apply_live_estimate_to_provider("codex", all_limits.codex),
+    )
+
+
+def _write_live_quota_state() -> None:
+    """Rewrite the SoTH file with the live-adjusted snapshot so the statusline
+    reflects between-poll consumption. Best-effort, never raises."""
+    try:
+        with _limits_cache_lock:
+            cached = _limits_cache
+        if cached is None:
+            return
+        from quota_state import write_quota_state
+        from config import CC_QUOTA_STATE_FILE
+        write_quota_state(_apply_live_estimate(cached[0]), CC_QUOTA_STATE_FILE)
+    except Exception:
+        logger.debug("live quota-state write failed", exc_info=True)
+
+
+def _accumulate_live_estimate(provider_name: str, estimated_pct: float) -> None:
+    """Add one task's calibrated per-window usage to the live estimate. The base
+    (anchor) is the current cached cclimits snapshot."""
+    base_pl = _get_cached_provider(provider_name)
+    if base_pl is None or not (base_pl.available or base_pl.windows):
+        return
+    usage_delta = _estimate_window_usage_calibrated(provider_name, base_pl, estimated_pct)
+    with _live_estimate_lock:
+        current = _live_estimated_usage.get(provider_name, {})
+        for key, pct in usage_delta.items():
+            current[key] = round(current.get(key, 0.0) + pct, 2)
+        _live_estimated_usage[provider_name] = current
+    _write_live_quota_state()
+
+
+def report_estimated_usage(provider_name: str, estimated_pct: float) -> None:
+    """Track estimated capacity consumption between real cclimits readings.
+
+    Two modes:
+    - **HTTP 429 fallback** (provider has a 429 snapshot): accumulate into
+      ``_429_estimated_usage``, applied at the next poll via the 429 fallback.
+    - **Normal operation** (Phase-2, flag-gated): accumulate into the live
+      between-poll estimate, applied at serve time and re-anchored each poll.
+    Called by the orchestrator after each task.
     """
     with _429_estimate_lock:
-        if provider_name not in _429_snapshots:
+        if provider_name in _429_snapshots:
+            base_pl, _ = _429_snapshots[provider_name]
+            if not (base_pl.available or base_pl.windows):
+                return
+            usage_delta = _estimate_window_usage_calibrated(
+                provider_name, base_pl, estimated_pct,
+            )
+            current_usage = _normalize_estimated_usage(
+                base_pl, _429_estimated_usage.get(provider_name, {}),
+            )
+            for key, pct in usage_delta.items():
+                current_usage[key] = round(current_usage.get(key, 0.0) + pct, 2)
+            _429_estimated_usage[provider_name] = current_usage
             return
-        base_pl, _ = _429_snapshots[provider_name]
-        if not (base_pl.available or base_pl.windows):
-            return
-        usage_delta = _estimate_window_usage_calibrated(
-            provider_name, base_pl, estimated_pct,
-        )
-        current_usage = _normalize_estimated_usage(
-            base_pl,
-            _429_estimated_usage.get(provider_name, {}),
-        )
-        for key, pct in usage_delta.items():
-            current_usage[key] = round(current_usage.get(key, 0.0) + pct, 2)
-        _429_estimated_usage[provider_name] = current_usage
+    # Not in 429 fallback → Phase-2 live between-poll estimation (flag-gated).
+    if QUOTA_LIVE_ESTIMATE_ENABLED:
+        _accumulate_live_estimate(provider_name, estimated_pct)
 
 
 def _build_429_fallback_provider(
@@ -1081,6 +1243,11 @@ def _bg_refresh_loop() -> None:
                         write_quota_state(result, CC_QUOTA_STATE_FILE)
                     except Exception:
                         logger.debug("quota-state write hook failed", exc_info=True)
+                    # Phase-2: this fresh reading already reflects consumption →
+                    # re-anchor the live between-poll estimate; then (if enabled)
+                    # refresh the calibrated factors from the running CSV.
+                    _reset_live_estimate()
+                    _maybe_recalibrate()
 
             _bg_wake.wait(timeout=sleep_sec)
         except Exception:
@@ -1121,6 +1288,7 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
         result = _get_limits_fresh(force_fresh=True)
         with _limits_cache_lock:
             _limits_cache = (result, time.monotonic())
+        _reset_live_estimate()   # fresh reading = re-anchor the live estimate
         _cache_ready.set()
         _bg_wake.set()          # reset bg thread sleep timer with fresh data
         _start_bg_thread()
@@ -1134,7 +1302,7 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
     # thread is still hung on its first refresh.
     with _limits_cache_lock:
         if _limits_cache is not None:
-            return _limits_cache[0]
+            return _apply_live_estimate(_limits_cache[0])
         fallback = AllLimits(
             claude=ProviderLimits(error="cclimits unavailable"),
             gemini=ProviderLimits(error="cclimits unavailable"),
@@ -1161,7 +1329,7 @@ def get_cached_provider_pct(provider_name: str) -> float:
     No API call is made.  Returns 100.0 (safe default) when the cache is empty
     so tools don't abort prematurely on first startup.
     """
-    p = _get_cached_provider(provider_name)
+    p = _apply_live_estimate_to_provider(provider_name, _get_cached_provider(provider_name))
     return p.remaining_pct if p is not None else 100.0
 
 
@@ -1176,7 +1344,7 @@ def is_cached_provider_available(provider_name: str) -> bool:
     Returns ``True`` (safe default) when the cache is empty so tools don't
     abort prematurely on first startup.
     """
-    p = _get_cached_provider(provider_name)
+    p = _apply_live_estimate_to_provider(provider_name, _get_cached_provider(provider_name))
     return p.available if p is not None else True
 
 

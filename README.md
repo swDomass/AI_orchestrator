@@ -632,6 +632,7 @@ Default port: `8411` (configurable via `DASHBOARD_PORT`).
 
 - **Phase 0 — telemetry** (`quota_calibration.py`): each successful `cclimits` poll appends a CSV row per Claude window (5h / 7d) to `logs/quota-calibration.csv`, pairing the real utilization-% with locally-aggregated JSONL token counts. Calibration selected the `io_only` model (input + output; cache tokens are negligible to the rate limit).
 - **Phase 1 — SoTH + estimation** (`quota_state.py`): `_bg_refresh_loop` writes `logs/cc_quota_state.json` atomically each poll (per-window `remaining_pct` / reset times + embedded calibration constants). The Claude Code statusline and `--check-limits` read it instead of re-polling cclimits; the 429-fallback estimator uses the calibrated per-window factors.
+- **Phase 2 — live rebalancing** (opt-in, `ORCH_QUOTA_LIVE_ESTIMATE`, default off): between polls, `get_limits()` decrements the cached snapshot by the calibrated per-task estimate and re-anchors on each fresh cclimits poll; optional daily auto-recalibration of the factors from the running CSV (`ORCH_QUOTA_AUTO_RECALIBRATE`, min-samples + clamp guarded). Default off keeps cclimits the per-poll source of truth.
 
 The calibrated factors are plan- and workload-specific (env-overridable, not universal constants). Full CSV schema, calibration result, limitations, and the refuted 1h/5m tier-split experiment → [`docs/architecture/components.md`](docs/architecture/components.md#quota_calibrationpy--quota_statepy).
 

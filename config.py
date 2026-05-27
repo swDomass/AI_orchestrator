@@ -513,6 +513,24 @@ ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS: dict[str, int] = {
 }
 QUOTA_CALIBRATION_MODEL = "io_only"  # informational; emitted in cc_quota_state.json
 
+# --- Phase-2: live between-poll quota estimation (Closed-Loop-Rebalancing) ---
+# (a) When enabled, get_limits() decrements the cached cclimits snapshot by the
+# calibrated per-task usage estimate as tasks run; the bg refresh loop re-anchors
+# (resets the estimate) on every successful poll. Default OFF — it changes
+# capacity gating in normal operation (conservative factors lean toward
+# over-gating, the safe side). Toggle in .env; off = instant rollback.
+QUOTA_LIVE_ESTIMATE_ENABLED = _parse_bool_env("ORCH_QUOTA_LIVE_ESTIMATE", False)
+
+# (b) Auto-recalibrate the per-window tokens_per_pct factors from the running
+# calibration CSV (drift correction) instead of the frozen defaults above. Only
+# effective when QUOTA_LIVE_ESTIMATE_ENABLED. Guarded by a minimum sample count
+# and clamped to a sane band [default/clamp, default*clamp] around the defaults;
+# falls back to the defaults on thin/insane data.
+QUOTA_AUTO_RECALIBRATE_ENABLED = _parse_bool_env("ORCH_QUOTA_AUTO_RECALIBRATE", False)
+QUOTA_RECALIBRATE_MIN_SAMPLES = int(os.getenv("ORCH_QUOTA_RECAL_MIN_SAMPLES", "60"))
+QUOTA_RECALIBRATE_CLAMP = float(os.getenv("ORCH_QUOTA_RECAL_CLAMP", "3.0"))
+QUOTA_RECALIBRATE_PERCENTILE = float(os.getenv("ORCH_QUOTA_RECAL_PERCENTILE", "25"))
+
 # --- Parallel Worktrees (P1) ---
 # Subdir name under the parent CWD where #worktree-tagged parallel subtasks
 # get isolated git worktrees. Kept short to stay within Windows' 260-char path

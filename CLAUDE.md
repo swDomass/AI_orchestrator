@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~1524 tests, ~70 s)
+# Run all tests (~1541 tests, ~70 s)
 python -m pytest tests/ -q
 
 # Run a single test file / single test

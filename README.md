@@ -19,7 +19,7 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1524 tests / ~70 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **~1541 tests / ~70 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
@@ -716,7 +716,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1524 tests, ~70 s)
+# Run all tests (~1541 tests, ~70 s)
 python -m pytest tests/ -q
 
 # Run a single test file

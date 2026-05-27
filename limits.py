@@ -40,10 +40,11 @@ _BG_POLL_AVAILABLE_SEC = 300   # refresh every 5 min when capacity is available 
                                # this interval only needs to cover within-batch drift between
                                # consecutive tasks in run_once. 5 min keeps drift well under the
                                # MIN_CAPACITY_PERCENT=10% threshold.
-_BG_POLL_IDLE_SEC      = 3600  # refresh once per hour when queue is empty — set_queue_idle(False)
-                               # wakes the thread on task arrival so the cache is fresh before
-                               # the next task starts; the hourly poll only keeps the dashboard
-                               # capacity-log warm during long idle periods.
+_BG_POLL_IDLE_SEC      = 600   # refresh every 10 min when queue is empty — matches the
+                               # cclimits --cache-ttl, so every idle poll bypasses the disk
+                               # cache and hits the real API (no wasted subprocess calls on
+                               # stale cache hits). set_queue_idle(False) wakes the thread
+                               # on task arrival so the cache is fresh before the next task.
 _BG_POLL_ERROR_SEC     = 30    # initial retry after errors (thread backs off up to 90 s)
 _BG_POLL_429_SEC       = 300   # back off when cclimits itself gets rate-limited (5 min)
 _429_MAX_BASE_AGE_SEC  = 3600 # 1h maximum age for a 429 base snapshot
@@ -1010,6 +1011,21 @@ def _bg_refresh_loop() -> None:
                 else:
                     backoff = _BG_POLL_ERROR_SEC
                     sleep_sec = _compute_next_poll_sec(result)
+                    # Phase-0 telemetry: pair real cclimits utilization with
+                    # JSONL token counts so we can later validate the
+                    # tokens_per_pct calibration. Telemetry-only — must never
+                    # break the refresh loop. Uses the async variant so the
+                    # multi-second JSONL load runs on a separate worker thread
+                    # and does NOT delay the next _bg_wake.wait() cycle.
+                    try:
+                        from quota_calibration import log_calibration_sample_async
+                        from config import QUOTA_CALIBRATION_LOG_FILE
+                        log_calibration_sample_async(
+                            result, QUOTA_CALIBRATION_LOG_FILE,
+                            queue_idle=_queue_idle.is_set(),
+                        )
+                    except Exception:
+                        logger.debug("calibration hook failed", exc_info=True)
 
             _bg_wake.wait(timeout=sleep_sec)
         except Exception:
@@ -1130,8 +1146,8 @@ def set_queue_idle(idle: bool) -> None:
     """Signal whether the task queue is currently empty.
 
     When idle=True the background refresh thread uses a longer poll interval
-    (_BG_POLL_IDLE_SEC = 10 min) instead of the default 90 s, reducing
-    unnecessary calls to the cclimits monitoring API and lowering 429 risk.
+    (_BG_POLL_IDLE_SEC = 10 min) instead of the default 5 min, matching the
+    cclimits --cache-ttl so each idle poll hits the real API.
 
     When idle=False (task found) the thread is woken immediately so the next
     get_limits() call returns a fresh snapshot before the task starts.

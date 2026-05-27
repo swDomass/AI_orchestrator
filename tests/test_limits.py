@@ -1472,7 +1472,15 @@ def test_get_claude_limits_from_local_returns_none_for_unknown_plan():
 def test_get_claude_limits_from_local_returns_none_when_claude_monitor_missing(monkeypatch):
     """If claude_monitor is unavailable (ImportError), return None gracefully."""
     import sys
-    # Block the top-level package so the internal imports raise ImportError
+    # Evict any already-cached claude_monitor submodules so `from
+    # claude_monitor.core.models import CostMode` actually attempts a fresh
+    # import (which then fails because the top-level package is set to None).
+    # Without this, code paths that load claude_monitor earlier in the run
+    # (e.g. the quota-calibration hook in _bg_refresh_loop) leave submodules
+    # cached and the import succeeds despite the patched top-level entry.
+    for key in list(sys.modules):
+        if key == "claude_monitor" or key.startswith("claude_monitor."):
+            monkeypatch.delitem(sys.modules, key, raising=False)
     monkeypatch.setitem(sys.modules, "claude_monitor", None)
     result = limits._get_claude_limits_from_local("pro")
     assert result is None

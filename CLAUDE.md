@@ -53,7 +53,8 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`usage_suggester.py`** — `UsageSuggester` singleton, proactive task suggestions on low capacity
 - **`memory.py`** — TF-IDF + temporal decay over past results, CWD-filtered lessons, daily log (80-char summaries)
 - **`heartbeat.py`** — Scheduled health checks (12 handlers, mtime-reloaded), Phase-A CLI-probe + Phase-B LLM heuristic for model drift; P6 `status-recap` (daily 24h Telegram summary), P4 `check-ci-failures` (gh poll → dev-loop queue items)
-- **`limits.py`** — `cclimits` wrapper, OAuth refresh, 3-tier 429 fallback, polling 1h idle / 5min active
+- **`limits.py`** — `cclimits` wrapper, OAuth refresh, 3-tier 429 fallback, polling 10min idle / 5min active (idle matches cclimits `--cache-ttl=600`); Phase-0 calibration hook in `_bg_refresh_loop`
+- **`quota_calibration.py`** — Phase-0 telemetry: pairs cclimits utilization-% with locally-aggregated JSONL token counts per Claude window (5h/7d), CSV schema v2, async single-worker write (never blocks refresh loop). Calibration result (2026-05-27): `io_only` model both windows, cache-tokens negligible to quota; 1h/5m tier-split refuted. One-time analysis: `quota_calibration_backfill.py`
 - **`analytics.py`** — TaskRecord/LimitSnapshot/QueueEvent/ToolTraceEvent dataclasses, billing-cost units, cache-hit rate, tool-trace stats
 - **`dashboard.py`** — Standalone HTTP server (port 8411), Chart.js dashboard, 60s refresh; Active-Runs-Panel (Live-View laufender Tool-Runs, 30s refresh über `/api/data?only=active_runs`)
 - **`config.py`** — Centralized constants (~70+), `.env` loader, model aliases (Claude/Gemini/Codex/OpenRouter), safety patterns, timeouts

@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~1541 tests, ~70 s)
+# Run all tests (~1577 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file / single test
@@ -80,9 +80,10 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 
 ### Providers (`providers/`)
 - **`base.py`** — `BaseProvider` ABC, per-provider `_lock`, `threading.local()` for forced model, `RunResult` with 4 token fields, `supports_sessions` capability flag
-- **`claude.py`** — `--output-format json`, `--exclude-dynamic-system-prompt-sections` for cache stability, session-id/resume support, `supports_sessions=True`
-- **`gemini.py`** — `--yolo` full tool access, `--approval-mode default` read-only, `--model <id>` forced
-- **`codex.py`** — `codex exec --full-auto` or sandbox, `--model <id>` forced
+- **`process_runner.py`** — Liveness-/Hang-Watchdog: `Popen` + 2 daemon-Reader-Threads (stdout/stderr gleichzeitig, sonst Pipe-Buffer-Deadlock), `idle_timeout` (Hang) + `hard_timeout` (Backstop), Tree-Kill (Windows `taskkill /F /T` doppelt, POSIX `killpg` SIGTERM→SIGKILL). Claude tool-aware (`liveness_lines=True`: laufender `tool_use` pausiert idle-Timer via `_Liveness`), Gemini/Codex byte-only. `run_with_watchdog` ersetzt `subprocess.run` in allen 3 Providern (DRY). Raise `TimeoutExpired` mit `timeout_kind` ("idle"|"hard")
+- **`claude.py`** — `--output-format stream-json --verbose` (NDJSON-Liveness-Events), NDJSON-Parser `_extract_result_event` (letztes `type==result`), Token-Feld-Parity erhalten, rate_limit/session-Keyword-Detektion auf ROH-stdout, `--exclude-dynamic-system-prompt-sections` for cache stability, session-id/resume support, `supports_sessions=True`; idle-Kill → `error="hang"`, hard → `error="timeout"`
+- **`gemini.py`** — `--yolo` full tool access, `--approval-mode default` read-only, `--model <id>` forced; byte-only Liveness (`CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC`)
+- **`codex.py`** — `codex exec --full-auto` or sandbox, `--model <id>` forced; byte-only Liveness (`CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC`)
 - **`openrouter.py`** — HTTP/urllib (no `requests` dep), pay-per-token, NEVER in fallback chain, opt-in via `#openrouter`/`#or_*` tags, conditional registration on `OPENROUTER_API_KEY`
 
 ### Tools (`tools/`)
@@ -123,6 +124,8 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **`.env` comment stripping** — whitespace-before-`#` rule protects URLs/paths
 - **HTTP 429 resilience** — 3-tier fallback (claude-monitor JSONL → snapshot cache → optimistic), 5-min polling backoff
 - **3-tier token estimation** — actual JSON → text-char estimate → duration heuristic
+- **Liveness-Watchdog statt Wall-Clock-Deadline** (`providers/process_runner.py`) — Popen + 2 Reader-Threads + Tree-Kill; idle_timeout (Hang) vs hard_timeout (Backstop). Claude tool-aware (laufender `tool_use` pausiert idle-Timer wegen stiller Tool-Phasen), Gemini/Codex byte-only mit konservativem idle. `#timeout:`/`timeout_minutes` = hard-Backstop + oberer Tool-Cap (nicht mehr aggressive Deadline). idle-Kill → `error="hang"` → Requeue mit Backoff bis `MAX_HANG_RETRIES`, dann Block (kein Quota-Reset-Retry)
+- **Tool-Gesamt-Deadline** — `ToolContract.max_runtime_sec` (Fallback `TOOL_DEFAULT_MAX_RUNTIME_SEC`) deckelt die SUMME aller Phasen/Iterationen (`BaseTool._runtime_deadline`); ein hochgesetzter Task-`timeout` hebt die Per-Phase-Caps NICHT über die `TOOL_*_TIMEOUT_SEC`-Konstanten (`BaseTool._phase_cap`)
 
 ## Testing Conventions
 

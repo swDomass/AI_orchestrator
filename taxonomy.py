@@ -10,6 +10,8 @@ Categories
 
 * ``rate_limit``           — provider quota hit
 * ``timeout``              — task exceeded its time budget
+* ``hang``                 — process idle-killed (no output, no running tool)
+* ``tool_runtime_exceeded`` — tool total-runtime deadline reached
 * ``auth_error``           — credentials missing / expired
 * ``provider_unreachable`` — CLI not found, all providers exhausted, network
 * ``model_refusal``        — provider returned a refusal/safety message
@@ -44,6 +46,8 @@ import replay
 
 CAT_RATE_LIMIT = "rate_limit"
 CAT_TIMEOUT = "timeout"
+CAT_HANG = "hang"
+CAT_RUNTIME = "tool_runtime_exceeded"
 CAT_AUTH = "auth_error"
 CAT_UNREACHABLE = "provider_unreachable"
 CAT_REFUSAL = "model_refusal"
@@ -60,9 +64,10 @@ CAT_PAUSED = "paused"
 CAT_UNKNOWN = "unknown"
 
 ALL_CATEGORIES: tuple[str, ...] = (
-    CAT_RATE_LIMIT, CAT_TIMEOUT, CAT_AUTH, CAT_UNREACHABLE, CAT_REFUSAL,
-    CAT_TOOL_INTERNAL, CAT_CWD, CAT_POLICY, CAT_PROFILE, CAT_APPROVAL,
-    CAT_CAPACITY, CAT_DEP, CAT_TEST, CAT_QUEUE, CAT_PAUSED, CAT_UNKNOWN,
+    CAT_RATE_LIMIT, CAT_TIMEOUT, CAT_HANG, CAT_RUNTIME, CAT_AUTH,
+    CAT_UNREACHABLE, CAT_REFUSAL, CAT_TOOL_INTERNAL, CAT_CWD, CAT_POLICY,
+    CAT_PROFILE, CAT_APPROVAL, CAT_CAPACITY, CAT_DEP, CAT_TEST, CAT_QUEUE,
+    CAT_PAUSED, CAT_UNKNOWN,
 )
 
 # error_code → category. The orchestrator emits these codes (see _RunSpan in
@@ -71,6 +76,12 @@ ALL_CATEGORIES: tuple[str, ...] = (
 _ERROR_CODE_MAP: dict[str, str] = {
     "rate_limit":             CAT_RATE_LIMIT,
     "timeout":                CAT_TIMEOUT,
+    # Idle-kill (process froze, no running tool) → its own category so the
+    # hang vs. hard-timeout vs. runtime-deadline failure modes stay
+    # differentiable in analytics/dashboards.
+    "hang":                   CAT_HANG,
+    "hang_blocked":           CAT_HANG,
+    "tool_runtime_exceeded":  CAT_RUNTIME,
     "auth_error":             CAT_AUTH,
     "auth":                   CAT_AUTH,
     "unreachable":            CAT_UNREACHABLE,
@@ -81,6 +92,15 @@ _ERROR_CODE_MAP: dict[str, str] = {
     "tool_internal_error":    CAT_TOOL_INTERNAL,
     "internal_error":         CAT_TOOL_INTERNAL,
     "parallel_subtask_failure": CAT_TOOL_INTERNAL,
+    "executor_exception":     CAT_TOOL_INTERNAL,
+    "read_only_violation":    CAT_TOOL_INTERNAL,
+    # Tool precondition / input failures (empty topic, no ideas/repos, missing
+    # cwd) — the tool itself could not proceed, not a provider/capacity issue.
+    "empty_topic":            CAT_TOOL_INTERNAL,
+    "no_ideas":               CAT_TOOL_INTERNAL,
+    "no_repos":               CAT_TOOL_INTERNAL,
+    "missing_cwd":            CAT_TOOL_INTERNAL,
+    "gh_unavailable":         CAT_UNREACHABLE,
     "cwd_invalid":            CAT_CWD,
     "invalid_cwd":            CAT_CWD,
     "policy_denied":          CAT_POLICY,

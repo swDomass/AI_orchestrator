@@ -575,6 +575,36 @@ class BaseTool(ABC):
     description: str = ""
     read_only: bool = False
 
+    def _runtime_deadline(self) -> float:
+        """Monotonic wall-clock deadline for the whole tool run.
+
+        Bounds the SUM of all phases/iterations via the tool's
+        ToolContract.max_runtime_sec (falls back to TOOL_DEFAULT_MAX_RUNTIME_SEC).
+        Prevents 20 iterations × multiple long phases from binding 10+ hours of
+        wall-clock when a high #timeout: hard backstop is set per call.
+        """
+        from config import TOOL_DEFAULT_MAX_RUNTIME_SEC
+        max_runtime = TOOL_DEFAULT_MAX_RUNTIME_SEC
+        try:
+            import policy
+            contract = policy.get_engine().get_tool_contract(self.name)
+            if contract and contract.max_runtime_sec:
+                max_runtime = contract.max_runtime_sec
+        except Exception:
+            pass
+        return time.monotonic() + max_runtime
+
+    @staticmethod
+    def _phase_cap(task_timeout: int | None, phase_default: int) -> int:
+        """Per-phase timeout cap.
+
+        A high task #timeout: hard backstop must NOT raise a phase above its
+        established TOOL_*_TIMEOUT_SEC constant — it only acts as an upper deckel.
+        """
+        if not task_timeout:
+            return phase_default
+        return min(task_timeout, phase_default)
+
     @abstractmethod
     def run(
         self,

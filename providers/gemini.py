@@ -10,7 +10,8 @@ import shutil
 import subprocess
 import sys
 from providers.base import BaseProvider, RunResult
-from config import TASK_TIMEOUT_SEC
+from providers.process_runner import run_with_watchdog
+from config import TASK_TIMEOUT_SEC, CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC
 
 _GEMINI_CMD = shutil.which("gemini") or "gemini"
 
@@ -45,15 +46,12 @@ class GeminiProvider(BaseProvider):
                 cmd.extend(["--approval-mode", "default"])
             else:
                 cmd.append("--yolo")
-            result = subprocess.run(
+            result = run_with_watchdog(
                 cmd,
-                input=task,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
+                input_text=task,
                 cwd=cwd,
+                idle_timeout=CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC,
+                hard_timeout=timeout,
                 shell=sys.platform == "win32",
             )
 
@@ -71,8 +69,9 @@ class GeminiProvider(BaseProvider):
 
             return RunResult(success=False, error=stderr or output or "empty output")
 
-        except subprocess.TimeoutExpired:
-            return RunResult(success=False, error="timeout")
+        except subprocess.TimeoutExpired as exc:
+            kind = getattr(exc, "timeout_kind", "hard")
+            return RunResult(success=False, error="hang" if kind == "idle" else "timeout")
         except FileNotFoundError:
             return RunResult(success=False, error="gemini CLI not found")
         except (OSError, ValueError) as e:

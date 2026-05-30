@@ -288,12 +288,15 @@ class DevLoopTool(BaseTool):
         # Research+Plan are merged into a single subprocess call (saves ~42 k
         # cache_creation tokens vs. the prior two-call pattern). Skip-mode
         # still runs research-only because there is no plan to produce.
-        research_plan_timeout = (
-            timeout or (TOOL_DEV_RESEARCH_TIMEOUT_SEC + TOOL_DEV_PLAN_TIMEOUT_SEC)
-        )
-        exec_timeout = timeout or TOOL_DEV_EXEC_TIMEOUT_SEC
-        quality_timeout = timeout or TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC
-        resolution_timeout = timeout or TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC
+        # Per-phase caps: task #timeout: hard backstop is an upper deckel only.
+        research_plan_timeout = self._phase_cap(
+            timeout, TOOL_DEV_RESEARCH_TIMEOUT_SEC + TOOL_DEV_PLAN_TIMEOUT_SEC)
+        exec_timeout = self._phase_cap(timeout, TOOL_DEV_EXEC_TIMEOUT_SEC)
+        quality_timeout = self._phase_cap(timeout, TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC)
+        resolution_timeout = self._phase_cap(timeout, TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC)
+
+        # Total-runtime deadline bounds the SUM of all iterations/phases.
+        deadline = self._runtime_deadline()
 
         tokens = TokenCounter()
 
@@ -420,6 +423,22 @@ class DevLoopTool(BaseTool):
         previous_resolution_output: str = ""
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
+            # Total-runtime deadline: stop with a partial result rather than
+            # binding the wall-clock for hours across many long phases.
+            if time.monotonic() >= deadline:
+                msg = f"Gesamt-Laufzeit-Limit erreicht nach Iteration {iteration - 1}"
+                print(f"  [dev-loop] ⏱ {msg}")
+                notify_tool_done(self.name, iteration - 1, False, msg)
+                return ToolResult(
+                    success=False,
+                    output="\n\n".join(all_outputs),
+                    iterations=iteration - 1,
+                    error=msg,
+                    error_code="tool_runtime_exceeded",
+                    retryable=True,
+                    **tokens.as_kwargs(),
+                )
+
             print(f"\n  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: EXECUTION ===")
             tracer.emit("iteration_start", iteration=iteration,
                         max_iterations=TOOL_MAX_ITERATIONS, phase="execution")

@@ -73,6 +73,9 @@ PROVIDER_TAG_RE = re.compile(r"#(?:claude|gemini|codex)\b", re.IGNORECASE)
 # Matches retry comment (legacy HH:MM or absolute local timestamp)
 RETRY_TAG_RE = re.compile(r"<!-- retry: ([^>]+?) -->")
 
+# Matches the persistent hang-retry counter comment (idle-kill bookkeeping).
+HANG_COUNT_RE = re.compile(r"<!-- hang: (\d+) -->")
+
 # Matches #agent:<name> profile tag
 PROFILE_TAG_RE = re.compile(r"(?i)#agent:([\w-]+)")
 
@@ -136,6 +139,7 @@ class QueueTask:
     line_no: int
     subtasks: tuple[str, ...] = ()   # populated for #parallel tasks
     blocked_reason: str = ""         # non-empty = task is blocked by unmet #needs: deps
+    raw_line: str = ""               # full source line incl. comments (hang-counter marker)
 
 
 def _find_heading_line(content: str, heading: str, prefer_last: bool = False):
@@ -478,7 +482,14 @@ def has_cwd_tag(task: str) -> bool:
 
 
 def extract_timeout(task: str, default: int = 0) -> int:
-    """Extract timeout from task text (#timeout:30s, #timeout:5m, #timeout:1h)."""
+    """Extract timeout from task text (#timeout:30s, #timeout:5m, #timeout:1h).
+
+    Since the liveness-watchdog refactor this sets the HARD backstop (absolute
+    upper bound for a progressing run), NOT an aggressive deadline. Hang
+    detection is liveness/idle-based (see providers/process_runner.py). For
+    iterative tools the value is an upper cap only and never raises per-phase
+    caps above the TOOL_*_TIMEOUT_SEC constants; total tool runtime is bounded
+    by the ToolContract max_runtime_sec."""
     match = TIMEOUT_RE.search(task)
     if not match:
         return default
@@ -823,7 +834,7 @@ def read_queue_items() -> list[QueueTask]:
                     break
             subtask_lines = tuple(collected)
 
-        items.append(QueueTask(task_text=task_text, line_no=line_no, subtasks=subtask_lines))
+        items.append(QueueTask(task_text=task_text, line_no=line_no, subtasks=subtask_lines, raw_line=line))
 
     # Pass 2: Resolve #needs: dependencies
     needs_per_item = [extract_needs_tags(item.task_text) for item in items]
@@ -839,6 +850,7 @@ def read_queue_items() -> list[QueueTask]:
                         line_no=item.line_no,
                         subtasks=item.subtasks,
                         blocked_reason=f"needs {', '.join(missing)}",
+                        raw_line=item.raw_line,
                     ))
                     continue
             resolved.append(item)
@@ -1018,15 +1030,27 @@ def mark_done(
     return _apply_update(update)
 
 
+def extract_hang_count(line_text: str) -> int:
+    """Read the persistent hang-retry counter from a raw queue line (0 if absent)."""
+    match = HANG_COUNT_RE.search(line_text)
+    return int(match.group(1)) if match else 0
+
+
 def mark_retry(
     task_text: str,
     retry_at: str,
     *,
     line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    hang_count: int | None = None,
 ) -> bool:
-    """Add retry annotation to a task (stays open, shows when it will retry)."""
-    replacement = f"- [ ] {task_text} <!-- retry: {retry_at} -->"
+    """Add retry annotation to a task (stays open, shows when it will retry).
+
+    ``hang_count`` (when set) appends a persistent ``<!-- hang: N -->`` marker so
+    the orchestrator can block a task that hangs repeatedly instead of looping.
+    """
+    hang_suffix = f" <!-- hang: {hang_count} -->" if hang_count else ""
+    replacement = f"- [ ] {task_text} <!-- retry: {retry_at} -->{hang_suffix}"
 
     def update(content: str) -> str | None:
         if line_no is not None:

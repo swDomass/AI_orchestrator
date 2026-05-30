@@ -109,8 +109,29 @@ CLAUDE_PLAN = os.getenv("CLAUDE_PLAN", "")
 # How long to wait between cclimits polls when sleeping (seconds)
 SLEEP_POLL_INTERVAL = 5 * 60
 
-# Timeout for a single CLI task call (seconds)
-TASK_TIMEOUT_SEC = 900  # 15 minutes
+# Hard backstop for a single CLI task call (seconds). With the liveness watchdog
+# (providers/process_runner.py) this is NO LONGER an aggressive deadline — a run
+# that keeps making progress (Claude: emits NDJSON events / has an active tool;
+# Gemini/Codex: emits output) runs to completion. This is only the absolute upper
+# bound for a progressing process that never finishes. #timeout: tag / profile
+# timeout_minutes set THIS value (semantics changed in the watchdog refactor).
+TASK_TIMEOUT_SEC = _parse_int_env("TASK_TIMEOUT_SEC", 5400)  # 90 min hard backstop
+
+# Liveness/hang detector. Claude is TOOL-AWARE (a running tool_use pauses the
+# idle timer, see process_runner._Liveness), so 300s comfortably covers the gaps
+# between NDJSON events when no tool runs. Gemini/Codex have NO structured tool
+# signal — for them stdout-silence is the only liveness proxy and a long single
+# tool phase (pytest/build/install) looks idle; CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC
+# is therefore conservative.
+TASK_IDLE_TIMEOUT_SEC = _parse_int_env("TASK_IDLE_TIMEOUT_SEC", 300)  # 5 min, Claude (tool-aware)
+CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC = _parse_int_env(
+    "CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC", 1200)  # 20 min, Gemini/Codex (byte-only)
+
+# Hang handling: an idle-kill yields error="hang" (vs "timeout" for the hard
+# backstop). A repeatedly hanging task is requeued with a short backoff up to
+# MAX_HANG_RETRIES, then BLOCKED (not quota-reset-retried forever).
+MAX_HANG_RETRIES = _parse_int_env("MAX_HANG_RETRIES", 2)
+HANG_RETRY_BACKOFF_SEC = _parse_int_env("HANG_RETRY_BACKOFF_SEC", 5 * 60)
 
 # Timeout for interactive Telegram chat responses (seconds)
 TELEGRAM_CHAT_TIMEOUT_SEC = 180  # 3 minutes
@@ -225,6 +246,11 @@ TELEGRAM_MAX_TASK_LENGTH = 500
 # --- Tools ---
 # Max iterations for review/fix loops
 TOOL_MAX_ITERATIONS = 20
+
+# Fallback total-runtime deadline for an iterative tool when its ToolContract
+# omits max_runtime_sec. Caps the SUM of all phases/iterations (wall-clock),
+# independent of the per-phase TOOL_*_TIMEOUT_SEC caps.
+TOOL_DEFAULT_MAX_RUNTIME_SEC = _parse_int_env("TOOL_DEFAULT_MAX_RUNTIME_SEC", 3600)  # 60 min
 TOOL_REVIEW_TIMEOUT_SEC = 1_200  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
 TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations

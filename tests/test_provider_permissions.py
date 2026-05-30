@@ -12,7 +12,7 @@ def test_claude_read_only_disables_write_capable_tools(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.claude.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.claude.run_with_watchdog", fake_run)
 
     ClaudeProvider().run("inspect", read_only=True)
 
@@ -36,7 +36,7 @@ def test_codex_read_only_uses_read_only_sandbox_without_approvals(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.codex.run_with_watchdog", fake_run)
 
     CodexProvider().run("inspect", read_only=True)
 
@@ -58,7 +58,7 @@ def test_codex_write_mode_uses_workspace_write_sandbox(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.codex.run_with_watchdog", fake_run)
 
     CodexProvider().run("do work", read_only=False)
 
@@ -77,7 +77,7 @@ def test_gemini_read_only_uses_default_approval_mode(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.gemini.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.gemini.run_with_watchdog", fake_run)
 
     GeminiProvider().run("inspect", read_only=True)
 
@@ -94,7 +94,7 @@ def test_gemini_forced_model_appends_model_flag(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.gemini.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.gemini.run_with_watchdog", fake_run)
 
     provider = GeminiProvider()
     provider._forced_model = "gemini-3-flash-preview"
@@ -115,7 +115,7 @@ def test_gemini_no_forced_model_omits_model_flag(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.gemini.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.gemini.run_with_watchdog", fake_run)
 
     GeminiProvider().run("inspect")
 
@@ -130,7 +130,7 @@ def test_codex_forced_model_appends_model_flag(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.codex.run_with_watchdog", fake_run)
 
     provider = CodexProvider()
     provider._forced_model = "gpt-5.4-mini"
@@ -151,7 +151,7 @@ def test_codex_no_forced_model_omits_model_flag(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.codex.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.codex.run_with_watchdog", fake_run)
 
     CodexProvider().run("inspect")
 
@@ -168,7 +168,7 @@ def test_claude_session_id_added_when_flag_enabled(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.claude.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.claude.run_with_watchdog", fake_run)
     monkeypatch.setattr("config.CLAUDE_SESSION_ENABLED", True)
 
     ClaudeProvider().run("task", session_id="abc-123", resume=False)
@@ -186,7 +186,7 @@ def test_claude_resume_flag_when_flag_enabled(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.claude.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.claude.run_with_watchdog", fake_run)
     monkeypatch.setattr("config.CLAUDE_SESSION_ENABLED", True)
 
     ClaudeProvider().run("task", session_id="abc-123", resume=True)
@@ -206,7 +206,7 @@ def test_claude_session_id_ignored_when_flag_disabled(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.claude.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.claude.run_with_watchdog", fake_run)
     monkeypatch.setattr("config.CLAUDE_SESSION_ENABLED", False)
 
     ClaudeProvider().run("task", session_id="abc-123", resume=True)
@@ -223,7 +223,7 @@ def test_claude_no_session_id_omits_flags(monkeypatch):
         calls.append((cmd, kwargs))
         return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
 
-    monkeypatch.setattr("providers.claude.subprocess.run", fake_run)
+    monkeypatch.setattr("providers.claude.run_with_watchdog", fake_run)
     monkeypatch.setattr("config.CLAUDE_SESSION_ENABLED", True)
 
     ClaudeProvider().run("task")
@@ -236,7 +236,7 @@ def test_claude_no_session_id_omits_flags(monkeypatch):
 def test_claude_session_missing_typed_error(monkeypatch):
     """--resume against a non-existent UUID returns error_code=session_missing."""
     monkeypatch.setattr(
-        "providers.claude.subprocess.run",
+        "providers.claude.run_with_watchdog",
         lambda *a, **kw: SimpleNamespace(
             returncode=1,
             stdout="",

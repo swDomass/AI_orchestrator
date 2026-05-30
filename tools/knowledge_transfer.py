@@ -362,6 +362,14 @@ class KnowledgeTransferTool(BaseTool):
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         total_in = total_out = 0
 
+        # Per-phase caps + total-runtime deadline: a high #timeout: backstop is
+        # an upper deckel only and must not let 3 sequential LLM phases bind
+        # hours of wall-clock.
+        knowhow_timeout = self._phase_cap(timeout, TOOL_KT_KNOWHOW_TIMEOUT_SEC)
+        applications_timeout = self._phase_cap(timeout, TOOL_KT_APPLICATIONS_TIMEOUT_SEC)
+        synthesis_timeout = self._phase_cap(timeout, TOOL_KT_SYNTHESIS_TIMEOUT_SEC)
+        deadline = self._runtime_deadline()
+
         # ── Phase 0: Vault-Scan ──────────────────────────────────────────────
         print("  [knowledge-transfer] === Phase 0: VAULT-SCAN ===")
         notify_tool_progress(self.name, 0, 4, "Vault wird intelligent durchsucht...")
@@ -378,7 +386,7 @@ class KnowledgeTransferTool(BaseTool):
             topic_instruction=topic_instr,
             vault_content=vault_content,
         )
-        r1 = provider.run(p1, cwd=cwd, timeout=timeout or TOOL_KT_KNOWHOW_TIMEOUT_SEC)
+        r1 = provider.run(p1, cwd=cwd, timeout=knowhow_timeout)
         total_in += r1.input_tokens
         total_out += r1.output_tokens
         if not r1.success:
@@ -392,11 +400,20 @@ class KnowledgeTransferTool(BaseTool):
         print("  [knowledge-transfer] Know-How-Extraktion abgeschlossen")
         time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
+        if time.monotonic() >= deadline:
+            msg = "Gesamt-Laufzeit-Limit erreicht nach Phase 1 — Recherche/Synthese übersprungen"
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False, output=knowhow, iterations=1, error=msg,
+                error_code="tool_runtime_exceeded", retryable=True,
+                input_tokens=total_in, output_tokens=total_out,
+            )
+
         # ── Phase 2: Cross-Domain-Recherche ──────────────────────────────────
         print("  [knowledge-transfer] === Phase 2: CROSS-DOMAIN-RECHERCHE ===")
         notify_tool_progress(self.name, 2, 4, "Branchenrecherche (WebSearch)...")
         p2 = system_prompt + "\n\n" + _APPLICATIONS_PROMPT.format(knowhow=knowhow)
-        r2 = provider.run(p2, cwd=cwd, timeout=timeout or TOOL_KT_APPLICATIONS_TIMEOUT_SEC)
+        r2 = provider.run(p2, cwd=cwd, timeout=applications_timeout)
         total_in += r2.input_tokens
         total_out += r2.output_tokens
         if not r2.success:
@@ -410,6 +427,15 @@ class KnowledgeTransferTool(BaseTool):
         print("  [knowledge-transfer] Cross-Domain-Recherche abgeschlossen")
         time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
+        if time.monotonic() >= deadline:
+            msg = "Gesamt-Laufzeit-Limit erreicht nach Phase 2 — Synthese übersprungen"
+            notify_tool_done(self.name, 2, False, msg)
+            return ToolResult(
+                success=False, output=f"{knowhow}\n\n{applications}", iterations=2,
+                error=msg, error_code="tool_runtime_exceeded", retryable=True,
+                input_tokens=total_in, output_tokens=total_out,
+            )
+
         # ── Phase 3: Synthese → Obsidian-Notiz ───────────────────────────────
         print("  [knowledge-transfer] === Phase 3: SYNTHESE ===")
         notify_tool_progress(self.name, 3, 4, "Beste Idee wird ausgearbeitet...")
@@ -419,7 +445,7 @@ class KnowledgeTransferTool(BaseTool):
             applications=applications,
             today=today,
         )
-        r3 = provider.run(p3, cwd=cwd, timeout=timeout or TOOL_KT_SYNTHESIS_TIMEOUT_SEC)
+        r3 = provider.run(p3, cwd=cwd, timeout=synthesis_timeout)
         total_in += r3.input_tokens
         total_out += r3.output_tokens
         if not r3.success:

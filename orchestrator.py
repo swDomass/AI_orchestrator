@@ -37,6 +37,8 @@ from logging_setup import setup_logging
 
 from config import (
     GIT_AUTO_STASH,
+    MAX_HANG_RETRIES,
+    HANG_RETRY_BACKOFF_SEC,
     MAX_RETRIES_PER_PROVIDER,
     is_known_model_tag,
     model_id_for_provider,
@@ -79,6 +81,7 @@ from queue_manager import (
     extract_second_opinion_alias,
     extract_shutdown_tag,
     extract_timeout,
+    extract_hang_count,
     finalize_task_with_result,
     has_cwd_tag,
     inject_file_context,
@@ -373,7 +376,9 @@ def _run_with_retry(
         if result.success:
             return result, False
 
-        if result.error in ("rate_limit", "unreachable", "timeout"):
+        # "hang" (idle-kill) like "timeout": no provider fallback — a frozen
+        # process is not a "different provider would help" case.
+        if result.error in ("rate_limit", "unreachable", "timeout", "hang"):
             return result, True
 
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
@@ -1118,6 +1123,29 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _span.emit()
                     return False
 
+                # Total-runtime deadline hit: the tool's max_runtime_sec wall-clock
+                # budget is exhausted. This is TERMINAL — do NOT fall back to the
+                # next provider (each provider would start the loop from iteration 1
+                # with a FRESH deadline → 3× budget) and do NOT mark_retry (the next
+                # poll would re-run with a fresh deadline → unbounded). Finalize with
+                # the partial result so the wall-clock bound actually holds.
+                if outcome.error_code == "tool_runtime_exceeded":
+                    msg = (
+                        f"Tool-Gesamt-Laufzeit-Limit ({provider.name}/{tool_name}) erreicht "
+                        f"→ Task abgeschlossen mit Teilergebnis (kein Provider-Fallback)"
+                    )
+                    if cwd:
+                        msg += f" | Teilarbeit ggf. in {cwd}/.{tool_name}/"
+                    print(f"  ⏱ {msg}")
+                    append_log(msg)
+                    notify_error(task, f"{provider.name}+{tool_name}", msg)
+                    _finalize_task_with_result_checked(
+                        task, outcome.output or msg, f"{provider.name}+{tool_name}",
+                        queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                    )
+                    _span.error("tool_runtime_exceeded", retry_count=tool_retry_count)
+                    break
+
                 tried_providers.add(provider.name)
                 tool_retry_count += 1
                 if outcome.error_code == "unreachable":
@@ -1125,10 +1153,48 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 elif outcome.error_code == "rate_limit":
                     limits = get_limits(force_refresh=True)
                     provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
-                elif outcome.error_code == "timeout":
-                    pass
+                elif outcome.error_code in ("timeout", "hang"):
+                    pass  # not a provider-capacity problem → no cooldown
                 elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
+
+                # Hang (idle-kill): the process froze, not a capacity issue. Do NOT
+                # take the quota-reset retry path (that would re-run the same hanging
+                # task forever). Requeue with a short backoff up to MAX_HANG_RETRIES,
+                # then BLOCK the task so it stops looping silently.
+                if outcome.error_code == "hang":
+                    hang_count = extract_hang_count(getattr(queue_task, "raw_line", "")) + 1
+                    if hang_count > MAX_HANG_RETRIES:
+                        msg = (
+                            f"Tool-Hang ({provider.name}/{tool_name}) zum {hang_count}. Mal "
+                            f"→ Task blockiert (kein weiterer Retry)"
+                        )
+                        print(f"  🚫 {msg}")
+                        append_log(msg)
+                        notify_error(task, f"{provider.name}+{tool_name}", msg)
+                        _finalize_task_with_result_checked(
+                            task, msg, f"{provider.name}+{tool_name}",
+                            queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        )
+                        _span.error("hang_blocked", retry_count=tool_retry_count)
+                        break
+                    reset_dt = datetime.now() + timedelta(seconds=HANG_RETRY_BACKOFF_SEC)
+                    reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                    msg = (
+                        f"Tool-Hang ({provider.name}/{tool_name}) #{hang_count} "
+                        f"→ Requeue um ~{reset_dt.strftime('%H:%M')}"
+                    )
+                    print(f"  {msg}")
+                    append_log(msg)
+                    if not mark_retry(
+                        task, reset_at_marker, line_no=queue_task.line_no,
+                        subtasks=task_subtasks, hang_count=hang_count,
+                    ):
+                        _span.error("queue_update_failed", retry_count=tool_retry_count)
+                        _span.emit()
+                        return False
+                    _span.retry("hang", retry_count=tool_retry_count)
+                    break
 
                 # Timeout: task-complexity issue — don't fall back to other providers.
                 # Falling back risks the next provider failing non-retryably, which would
@@ -1298,6 +1364,46 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             single_shot_retry_count += 1
             error = result.error
             print(f"  ❌ Fehler: {error}")
+
+            # Hang (idle-kill): the process froze, not a capacity issue. Do NOT
+            # rotate providers / cooldown forever — that re-runs the same hanging
+            # task endlessly. Requeue with a short backoff up to MAX_HANG_RETRIES,
+            # then BLOCK the task so it stops looping silently (mirrors the
+            # tool-path hang handling; spec §4.1 / README "then the task is BLOCKED").
+            if error == "hang":
+                hang_count = extract_hang_count(getattr(queue_task, "raw_line", "")) + 1
+                if hang_count > MAX_HANG_RETRIES:
+                    msg = (
+                        f"Hang ({provider.name}) zum {hang_count}. Mal "
+                        f"→ Task blockiert (kein weiterer Retry)"
+                    )
+                    print(f"  🚫 {msg}")
+                    append_log(msg)
+                    notify_error(task, provider.name, msg)
+                    _finalize_task_with_result_checked(
+                        task, msg, provider.name,
+                        queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                    )
+                    _span.error("hang_blocked", retry_count=single_shot_retry_count)
+                    break
+                reset_dt = datetime.now() + timedelta(seconds=HANG_RETRY_BACKOFF_SEC)
+                reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
+                msg = (
+                    f"Hang ({provider.name}) #{hang_count} "
+                    f"→ Requeue um ~{reset_dt.strftime('%H:%M')}"
+                )
+                print(f"  {msg}")
+                append_log(msg)
+                notify_error(task, provider.name, error)
+                if not mark_retry(
+                    task, reset_at_marker, line_no=queue_task.line_no,
+                    subtasks=task_subtasks, hang_count=hang_count,
+                ):
+                    _span.error("queue_update_failed", retry_count=single_shot_retry_count)
+                    _span.emit()
+                    return False
+                _span.retry("hang", retry_count=single_shot_retry_count)
+                break
 
             if error == "rate_limit":
                 limits = get_limits(force_refresh=True)

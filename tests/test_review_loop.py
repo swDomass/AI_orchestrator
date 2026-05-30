@@ -496,3 +496,35 @@ def test_drift_check_unknown_output_treated_as_no_warning(monkeypatch, tmp_path)
     fix_prompt = provider.prompts[2]
     assert "Drift detected" not in fix_prompt
 
+
+
+def test_review_loop_aborts_on_runtime_deadline(monkeypatch, tmp_path):
+    """Total-runtime deadline already passed -> abort iteration 1 with
+    tool_runtime_exceeded instead of running all 20 iterations."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _s: None)
+    monkeypatch.setattr("tools.review_loop.is_cached_provider_available", lambda _n: True)
+
+    # Deadline in the past -> loop must bail before any provider.run call.
+    monkeypatch.setattr(ReviewLoopTool, "_runtime_deadline", lambda self: 0.0)
+
+    provider = _ScriptedProvider(outputs=["should never be used"])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is False
+    assert result.error_code == "tool_runtime_exceeded"
+    assert result.retryable is True
+    assert provider.prompts == []  # no phase executed
+
+
+def test_phase_cap_does_not_raise_above_constant():
+    """A high task #timeout: hard backstop is an upper deckel only."""
+    from config import TOOL_REVIEW_TIMEOUT_SEC
+    tool = ReviewLoopTool()
+    # huge task timeout must be clamped to the phase constant
+    assert tool._phase_cap(999999, TOOL_REVIEW_TIMEOUT_SEC) == TOOL_REVIEW_TIMEOUT_SEC
+    # a smaller task timeout caps below the constant
+    assert tool._phase_cap(60, TOOL_REVIEW_TIMEOUT_SEC) == 60
+    # no task timeout -> phase default
+    assert tool._phase_cap(None, TOOL_REVIEW_TIMEOUT_SEC) == TOOL_REVIEW_TIMEOUT_SEC

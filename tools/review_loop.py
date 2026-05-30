@@ -367,9 +367,14 @@ class ReviewLoopTool(BaseTool):
         drift_warning = ""  # injected into next iteration's fix prompt when drift detected
         previous_findings_count = 0  # for "findings grew" drift trigger
 
-        review_timeout = timeout or TOOL_REVIEW_TIMEOUT_SEC
-        fix_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
-        verification_timeout = timeout or TOOL_VERIFICATION_TIMEOUT_SEC
+        # Per-phase caps: a high task #timeout: hard backstop is an upper deckel
+        # only — it never raises a phase above its TOOL_*_TIMEOUT_SEC constant.
+        review_timeout = self._phase_cap(timeout, TOOL_REVIEW_TIMEOUT_SEC)
+        fix_timeout = self._phase_cap(timeout, TOOL_FIX_TIMEOUT_SEC)
+        verification_timeout = self._phase_cap(timeout, TOOL_VERIFICATION_TIMEOUT_SEC)
+
+        # Total-runtime deadline bounds the SUM of all iterations/phases.
+        deadline = self._runtime_deadline()
 
         tokens = TokenCounter()
 
@@ -394,6 +399,22 @@ class ReviewLoopTool(BaseTool):
             memory_module = None
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
+            # Total-runtime deadline: stop with a partial result rather than
+            # binding the wall-clock for hours across many long phases.
+            if time.monotonic() >= deadline:
+                msg = f"Gesamt-Laufzeit-Limit erreicht nach Iteration {iteration - 1}"
+                print(f"  [review-loop] ⏱ {msg}")
+                notify_tool_done(self.name, iteration - 1, False, msg)
+                return ToolResult(
+                    success=False,
+                    output="\n\n".join(all_outputs),
+                    iterations=iteration - 1,
+                    error=msg,
+                    error_code="tool_runtime_exceeded",
+                    retryable=True,
+                    **tokens.as_kwargs(),
+                )
+
             print(f"\n  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: REVIEW ===")
             tracer.emit("iteration_start", iteration=iteration,
                         max_iterations=TOOL_MAX_ITERATIONS, phase="review")

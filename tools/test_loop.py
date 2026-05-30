@@ -89,12 +89,29 @@ class TestLoopTool(BaseTool):
         all_outputs: list[str] = []
         last_failures: str = ""
 
-        step_timeout = timeout or TOOL_FIX_TIMEOUT_SEC
+        # Per-phase cap: a high task #timeout: hard backstop is an upper deckel
+        # only — it never raises a phase above its TOOL_FIX_TIMEOUT_SEC constant.
+        step_timeout = self._phase_cap(timeout, TOOL_FIX_TIMEOUT_SEC)
+        # Total-runtime deadline bounds the SUM of all iterations/phases so the
+        # loop cannot bind hours of wall-clock under a raised TASK_TIMEOUT_SEC.
+        deadline = self._runtime_deadline()
 
         total_input_tokens = 0
         total_output_tokens = 0
 
         for iteration in range(1, TOOL_MAX_ITERATIONS + 1):
+            # Total-runtime deadline: stop with a partial result rather than
+            # binding the wall-clock across many long phases.
+            if time.monotonic() >= deadline:
+                msg = f"Gesamt-Laufzeit-Limit erreicht nach Iteration {iteration - 1}"
+                print(f"  [test-loop] ⏱ {msg}")
+                notify_tool_done(self.name, iteration - 1, False, msg)
+                return ToolResult(success=False, output="\n\n".join(all_outputs),
+                                  iterations=iteration - 1, error=msg,
+                                  error_code="tool_runtime_exceeded", retryable=True,
+                                  input_tokens=total_input_tokens,
+                                  output_tokens=total_output_tokens)
+
             print(f"\n  [test-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: TESTS ===")
 
             test_result = provider.run(

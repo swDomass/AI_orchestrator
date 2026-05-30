@@ -20,6 +20,7 @@ Output:
 """
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -441,9 +442,15 @@ class CriticalReviewTool(BaseTool):
             pass2_provider=pass_providers.get(2) or provider.name,
         )
 
-        pass1_timeout = timeout or TOOL_CR_PASS1_TIMEOUT_SEC
-        pass2_timeout = timeout or TOOL_CR_PASS2_TIMEOUT_SEC
-        pass3_timeout = timeout or TOOL_CR_PASS3_TIMEOUT_SEC
+        # Per-phase caps: a high task #timeout: hard backstop is an upper deckel
+        # only — it never raises a pass above its TOOL_CR_*_TIMEOUT_SEC constant.
+        pass1_timeout = self._phase_cap(timeout, TOOL_CR_PASS1_TIMEOUT_SEC)
+        pass2_timeout = self._phase_cap(timeout, TOOL_CR_PASS2_TIMEOUT_SEC)
+        pass3_timeout = self._phase_cap(timeout, TOOL_CR_PASS3_TIMEOUT_SEC)
+
+        # Total-runtime deadline bounds the SUM of all 3 passes — a high
+        # #timeout: must not let 3 sequential passes bind hours of wall-clock.
+        deadline = self._runtime_deadline()
 
         total_input_tokens = 0
         total_output_tokens = 0
@@ -566,6 +573,21 @@ class CriticalReviewTool(BaseTool):
 
         # ── Pass 2: Adversarial Challenge ────────────────────────────
 
+        if time.monotonic() >= deadline:
+            msg = "Gesamt-Laufzeit-Limit erreicht nach Pass 1 — Pass 1 gespeichert"
+            print(f"  [critical-review] ⏱ {msg}")
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False,
+                output=f"Pass 1 gespeichert: docs/{pass1_filename}\n\n{msg}",
+                iterations=1,
+                error=msg,
+                error_code="tool_runtime_exceeded",
+                retryable=True,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+
         pass2_provider = _resolve_pass2_provider(pass_providers, provider)
 
         if not is_cached_provider_available(pass2_provider.name):
@@ -684,7 +706,13 @@ class CriticalReviewTool(BaseTool):
 
         v2_path: Path | None = None
 
-        if has_plan and plan_path is not None:
+        if has_plan and plan_path is not None and time.monotonic() >= deadline:
+            # Deliberate graceful degradation (NOT a tool_runtime_exceeded abort):
+            # Pass 1+2 are the core review and are already complete. Pass 3 only
+            # synthesizes an optional -v2 plan; on deadline we keep the finished
+            # review and return success rather than discarding it.
+            print("  [critical-review] ⏱ Gesamt-Laufzeit-Limit erreicht — Pass 3 (Synthese) übersprungen")
+        elif has_plan and plan_path is not None:
             notify_tool_progress(self.name, 3, 3, "Pass 3: Plan-Synthese...")
             print(f"  [critical-review] Pass 3 — Synthese → {plan_path.stem}-v2.md ...")
 

@@ -439,9 +439,13 @@ class ResearchQATool(BaseTool):
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         all_outputs: list[str] = []
 
-        discovery_timeout = timeout or TOOL_RQA_DISCOVERY_TIMEOUT_SEC
-        analysis_timeout = timeout or TOOL_RQA_ANALYSIS_TIMEOUT_SEC
-        questions_timeout = timeout or TOOL_RQA_QUESTIONS_TIMEOUT_SEC
+        # Per-phase caps: a high #timeout: backstop is an upper deckel only.
+        discovery_timeout = self._phase_cap(timeout, TOOL_RQA_DISCOVERY_TIMEOUT_SEC)
+        analysis_timeout = self._phase_cap(timeout, TOOL_RQA_ANALYSIS_TIMEOUT_SEC)
+        questions_timeout = self._phase_cap(timeout, TOOL_RQA_QUESTIONS_TIMEOUT_SEC)
+
+        # Total-runtime deadline bounds Discovery + Analysis + Questions together.
+        deadline = self._runtime_deadline()
 
         total_input_tokens = 0
         total_output_tokens = 0
@@ -494,6 +498,16 @@ class ResearchQATool(BaseTool):
         print(f"  [research-qa] Discovery abgeschlossen")
         time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
+        if time.monotonic() >= deadline:
+            msg = "Gesamt-Laufzeit-Limit erreicht nach Discovery — Analysis/Questions übersprungen"
+            print(f"  [research-qa] ⏱ {msg}")
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False, output="\n\n".join(all_outputs), iterations=1,
+                error=msg, error_code="tool_runtime_exceeded", retryable=True,
+                input_tokens=total_input_tokens, output_tokens=total_output_tokens,
+            )
+
         # -- Phase 2: Analysis -------------------------------------------------
         print("  [research-qa] === Phase 2: ANALYSIS ===")
         notify_tool_progress(self.name, 2, 3, "Tiefenanalyse...")
@@ -543,6 +557,16 @@ class ResearchQATool(BaseTool):
                      f"# Analysis: {task}\n\n{analysis_output}\n")
         print(f"  [research-qa] Analysis abgeschlossen")
         time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
+
+        if time.monotonic() >= deadline:
+            msg = "Gesamt-Laufzeit-Limit erreicht nach Analysis — Questions übersprungen"
+            print(f"  [research-qa] ⏱ {msg}")
+            notify_tool_done(self.name, 2, False, msg)
+            return ToolResult(
+                success=False, output="\n\n".join(all_outputs), iterations=2,
+                error=msg, error_code="tool_runtime_exceeded", retryable=True,
+                input_tokens=total_input_tokens, output_tokens=total_output_tokens,
+            )
 
         # -- Phase 3: Question Generation --------------------------------------
         print("  [research-qa] === Phase 3: QUESTIONS ===")

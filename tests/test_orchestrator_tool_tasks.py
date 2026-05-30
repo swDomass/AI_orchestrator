@@ -112,6 +112,236 @@ def test_run_once_marks_tool_task_for_retry_on_timeout_without_provider_fallback
     p2.set_cooldown.assert_not_called()
 
 
+def test_run_once_tool_runtime_exceeded_is_terminal_no_fallback_no_fresh_deadline(monkeypatch):
+    """tool_runtime_exceeded must be terminal: the task is finalized with its
+    partial result, NOT retried on the next provider (which would restart from
+    iteration 1 with a fresh max_runtime_sec deadline → 3× the budget) and NOT
+    mark_retry'd (the next poll would also restart with a fresh deadline)."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    p2 = SimpleNamespace(name="codex", set_cooldown=Mock())
+
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="Gesamt-Laufzeit-Limit erreicht nach Iteration 7",
+        error_code="tool_runtime_exceeded",
+        output="partial work so far",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+    finalize_mock = Mock(return_value=True)
+
+    def fake_select_provider(_task, _limits, exclude=None, **_kwargs):
+        exclude = exclude or set()
+        if "claude" not in exclude:
+            return p1
+        if "codex" not in exclude:
+            return p2
+        return None
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:review-loop", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:review-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "review-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 3600)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    # Only ONE provider invocation — no fallback to the next provider, which
+    # would restart the loop from iteration 1 with a fresh deadline.
+    assert exec_mock.call_count == 1
+    assert exec_mock.call_args_list[0].args[2].name == "claude"
+    # Task finalized with the partial result, NOT requeued for a fresh-deadline re-run.
+    finalize_mock.assert_called_once()
+    assert finalize_mock.call_args.args[1] == "partial work so far"
+    mark_retry_mock.assert_not_called()
+    p1.set_cooldown.assert_not_called()
+    p2.set_cooldown.assert_not_called()
+
+
+def test_run_once_hang_requeues_with_backoff_not_quota_reset(monkeypatch):
+    """A tool-task hang (idle-kill) must requeue with a short backoff via
+    mark_retry(hang_count=...) — NOT take the quota-reset retry path."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="hang", error_code="hang",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+    next_retry_mock = Mock(return_value=99999)  # must NOT be used for hang
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1, raw_line="- [ ] Task #tool:test-loop")],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:test-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", next_retry_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    result = orchestrator.run_once()
+
+    assert result is False
+    mark_retry_mock.assert_called_once()
+    assert mark_retry_mock.call_args.kwargs["hang_count"] == 1
+    next_retry_mock.assert_not_called()  # NOT quota-reset retried
+    p1.set_cooldown.assert_not_called()
+
+
+def test_run_once_hang_blocks_task_after_max_retries(monkeypatch):
+    """After MAX_HANG_RETRIES the task is BLOCKED (finalized), not requeued."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="hang", error_code="hang",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+    finalize_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(
+            task_text="Task #tool:test-loop", line_no=1,
+            raw_line="- [ ] Task #tool:test-loop <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->",
+        )],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:test-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    # hang_count was 2 → +1 = 3 > MAX_HANG_RETRIES(2) → blocked (finalized), no requeue
+    finalize_mock.assert_called_once()
+    mark_retry_mock.assert_not_called()
+
+
+def _stub_single_shot_env(monkeypatch, *, raw_line, provider):
+    """Common monkeypatching so run_once reaches the single-shot provider loop
+    for a plain (non-tool) task without hitting policy/memory/limits I/O."""
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(
+            task_text="Plain claude task", line_no=1, raw_line=raw_line,
+            subtasks=None,
+        )],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Plain claude task"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)  # NON-tool
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: provider)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *a, **kw: "prompt")
+    monkeypatch.setattr(orchestrator, "report_estimated_usage", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "estimate_task_usage_pct", lambda *a, **kw: 0.0)
+    monkeypatch.setattr(orchestrator, "model_id_for_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_is_git_repo", lambda *a, **kw: False)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *a, **kw: "")
+    monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda *a, **kw: 0)
+    monkeypatch.setattr(orchestrator, "extract_profile_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_model_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "is_known_model_tag", lambda _tag: True)
+    monkeypatch.setattr(orchestrator, "has_cwd_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "has_explicit_provider_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+
+def test_run_once_single_shot_hang_requeues_with_backoff(monkeypatch):
+    """A plain (non-tool) #claude task that idle-hangs must requeue with a
+    short backoff via mark_retry(hang_count=...) — NOT loop/rotate forever."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task",
+        provider=p1,
+    )
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=False, error="hang"), False),
+    )
+    mark_retry_mock = Mock(return_value=True)
+    next_retry_mock = Mock(return_value=99999)  # must NOT be used for hang
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", next_retry_mock)
+
+    orchestrator.run_once()
+
+    mark_retry_mock.assert_called_once()
+    assert mark_retry_mock.call_args.kwargs["hang_count"] == 1
+    next_retry_mock.assert_not_called()  # NOT quota-reset retried
+    p1.set_cooldown.assert_not_called()  # hang is not a capacity/health issue
+
+
+def test_run_once_single_shot_hang_blocks_after_max_retries(monkeypatch):
+    """A non-tool task that has already hung MAX_HANG_RETRIES times is BLOCKED
+    (finalized), not requeued — proving it stops looping silently (spec §4.1)."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task <!-- hang: 2 -->",
+        provider=p1,
+    )
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=False, error="hang"), False),
+    )
+    mark_retry_mock = Mock(return_value=True)
+    finalize_mock = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(
+        orchestrator, "_finalize_task_with_result_checked", finalize_mock,
+    )
+
+    orchestrator.run_once()
+
+    # hang_count 2 → +1 = 3 > MAX_HANG_RETRIES(2) → blocked (finalized), no requeue
+    finalize_mock.assert_called_once()
+    mark_retry_mock.assert_not_called()
+
+
 def test_run_once_sets_rate_limit_cooldown_for_tool_task(monkeypatch):
     p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
     p2 = SimpleNamespace(name="codex", set_cooldown=Mock())

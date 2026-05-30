@@ -279,14 +279,20 @@ def test_claude_run_returns_tokens_from_json(monkeypatch):
     import json
     from types import SimpleNamespace
 
-    json_out = json.dumps({
-        "type": "result",
-        "result": "Task done successfully",
-        "usage": {"input_tokens": 8000, "output_tokens": 3000},
-    })
+    # stream-json NDJSON: init + assistant + result events (one per line).
+    json_out = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "assistant", "message": {"content": "working"}}),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "Task done successfully",
+            "usage": {"input_tokens": 8000, "output_tokens": 3000},
+        }),
+    ])
 
     monkeypatch.setattr(
-        "providers.claude.subprocess.run",
+        "providers.claude.run_with_watchdog",
         lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
     )
 
@@ -303,14 +309,17 @@ def test_claude_run_rejects_non_success_json_without_result(monkeypatch):
     import json
     from types import SimpleNamespace
 
-    json_out = json.dumps({
-        "type": "result",
-        "subtype": "error_max_turns",
-        "usage": {"input_tokens": 120, "output_tokens": 45},
-    })
+    json_out = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({
+            "type": "result",
+            "subtype": "error_max_turns",
+            "usage": {"input_tokens": 120, "output_tokens": 45},
+        }),
+    ])
 
     monkeypatch.setattr(
-        "providers.claude.subprocess.run",
+        "providers.claude.run_with_watchdog",
         lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
     )
 
@@ -326,15 +335,18 @@ def test_claude_run_rejects_non_success_json_even_with_result(monkeypatch):
     import json
     from types import SimpleNamespace
 
-    json_out = json.dumps({
-        "type": "result",
-        "subtype": "error_during_execution",
-        "result": "Task aborted",
-        "usage": {"input_tokens": 300, "output_tokens": 50},
-    })
+    json_out = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "result": "Task aborted",
+            "usage": {"input_tokens": 300, "output_tokens": 50},
+        }),
+    ])
 
     monkeypatch.setattr(
-        "providers.claude.subprocess.run",
+        "providers.claude.run_with_watchdog",
         lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
     )
 
@@ -343,3 +355,35 @@ def test_claude_run_rejects_non_success_json_even_with_result(monkeypatch):
     assert result.error == "Task aborted"
     assert result.input_tokens == 300
     assert result.output_tokens == 50
+
+
+def test_claude_run_rc0_without_result_event_is_not_success(monkeypatch):
+    """rc=0 but stream truncated (no type==result line) must NOT be success.
+
+    Regression for the stream-json success-branch bug: previously the raw
+    NDJSON blob fell into `output`, `_is_success_output(json_payload=None)`
+    returned True, and a partial/failed run was finalized as success=True →
+    falsely satisfying #needs: deps. Now requires an explicit result event.
+    """
+    import json
+    from types import SimpleNamespace
+
+    # init + assistant text, but the run was cut off before the result line.
+    json_out = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "partial answer"}]},
+        }),
+    ])
+
+    monkeypatch.setattr(
+        "providers.claude.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr=""),
+    )
+
+    result = ClaudeProvider().run("test task")
+    assert result.success is False
+    # The raw NDJSON must not be passed through as if it were the answer.
+    assert "partial answer" not in result.output
+    assert "no result event" in result.error

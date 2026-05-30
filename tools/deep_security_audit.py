@@ -27,6 +27,7 @@ Usage in queue:
 """
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -587,8 +588,13 @@ class DeepSecurityAuditTool(BaseTool):
         docs_dir = cwd_path / "docs"
         do_fix = _wants_fix(task)
         clean_task = _clean_tags(task)
-        master_timeout = timeout or (TOOL_DSA_SYNTHESIS_TIMEOUT_SEC + TOOL_DSA_AGENT_TIMEOUT_SEC)
-        fix_timeout = timeout or TOOL_DSA_FIX_TIMEOUT_SEC
+        # Per-phase caps + total-runtime deadline: a high #timeout: backstop is
+        # an upper deckel only — it must not let master+fix bind hours.
+        master_timeout = self._phase_cap(
+            timeout, TOOL_DSA_SYNTHESIS_TIMEOUT_SEC + TOOL_DSA_AGENT_TIMEOUT_SEC
+        )
+        fix_timeout = self._phase_cap(timeout, TOOL_DSA_FIX_TIMEOUT_SEC)
+        deadline = self._runtime_deadline()
 
         total_input_tokens = 0
         total_output_tokens = 0
@@ -752,6 +758,27 @@ class DeepSecurityAuditTool(BaseTool):
                 cache_read_input_tokens=total_cache_read,
             )
 
+        if time.monotonic() >= deadline:
+            msg = (
+                f"Gesamt-Laufzeit-Limit erreicht — Audit gespeichert ({synthesis_path.name}), "
+                "Fixes übersprungen"
+            )
+            print(f"  [deep-security-audit] ⏱ {msg}")
+            tracer.emit("run_end", success=False, reason="runtime_exceeded_fix")
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False,
+                output=master_result.output,
+                iterations=1,
+                error=msg,
+                error_code="tool_runtime_exceeded",
+                retryable=True,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_creation_input_tokens=total_cache_creation,
+                cache_read_input_tokens=total_cache_read,
+            )
+
         if not is_cached_provider_available(provider.name):
             msg = (
                 f"Provider erschöpft — Audit gespeichert ({synthesis_path.name}), "
@@ -841,7 +868,11 @@ class DeepSecurityAuditTool(BaseTool):
         do_fix = _wants_fix(task)
         do_roundtable = _wants_roundtable(task)
         clean_task = _clean_tags(task)
-        agent_timeout = timeout or TOOL_DSA_AGENT_TIMEOUT_SEC
+        # Per-phase cap + total-runtime deadline: with #timeout: each of the 6
+        # agents + roundtable + synthesis + fix would otherwise take the full
+        # backstop → multi-hour wall-clock. The deadline bounds their SUM.
+        agent_timeout = self._phase_cap(timeout, TOOL_DSA_AGENT_TIMEOUT_SEC)
+        deadline = self._runtime_deadline()
 
         tracer = ToolTracer.create(self.name, cwd)
         tracer.emit(
@@ -871,6 +902,29 @@ class DeepSecurityAuditTool(BaseTool):
         # ── Phase 1-6: Expert Agents (read-only) ─────────────────────
 
         for idx, agent in enumerate(_AGENTS, 1):
+            if time.monotonic() >= deadline:
+                msg = (
+                    f"Gesamt-Laufzeit-Limit erreicht bei Agent {idx}/{total_agents} "
+                    f"— bisherige Ergebnisse gespeichert"
+                )
+                print(f"  [deep-security-audit] ⏱ {msg}")
+                tracer.emit("runtime_exceeded", phase="agents", agent=agent.key, idx=idx)
+                if agent_outputs:
+                    self._save_partial(docs_dir, timestamp, clean_task, provider, cwd_path, agent_outputs)
+                tracer.emit("run_end", success=False, reason="runtime_exceeded", iterations=idx - 1)
+                notify_tool_done(self.name, idx - 1, False, msg)
+                return ToolResult(
+                    success=False,
+                    output=self._format_partial(agent_outputs),
+                    iterations=idx - 1,
+                    error=msg,
+                    error_code="tool_runtime_exceeded",
+                    retryable=True,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cache_creation_input_tokens=total_cache_creation,
+                    cache_read_input_tokens=total_cache_read,
+                )
             if not is_cached_provider_available(provider.name):
                 msg = (
                     f"Provider nicht verfügbar bei Agent {idx}/{total_agents} "

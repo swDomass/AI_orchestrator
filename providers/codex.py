@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import sys
 from providers.base import BaseProvider, RunResult
-from config import TASK_TIMEOUT_SEC
+from providers.process_runner import run_with_watchdog
+from config import TASK_TIMEOUT_SEC, CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC
 
 _CODEX_CMD = shutil.which("codex") or "codex"
 
@@ -48,15 +49,12 @@ class CodexProvider(BaseProvider):
             print(f"  [codex] Führe Task aus...")
         try:
             cmd = self._build_command(read_only=read_only, model=model_label)
-            result = subprocess.run(
+            result = run_with_watchdog(
                 cmd,
-                input=task,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
+                input_text=task,
                 cwd=cwd,
+                idle_timeout=CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC,
+                hard_timeout=timeout,
                 shell=sys.platform == "win32",
             )
 
@@ -74,8 +72,9 @@ class CodexProvider(BaseProvider):
 
             return RunResult(success=False, error=stderr or output or "empty output")
 
-        except subprocess.TimeoutExpired:
-            return RunResult(success=False, error="timeout")
+        except subprocess.TimeoutExpired as exc:
+            kind = getattr(exc, "timeout_kind", "hard")
+            return RunResult(success=False, error="hang" if kind == "idle" else "timeout")
         except FileNotFoundError:
             return RunResult(success=False, error="codex CLI not found")
         except (OSError, ValueError) as e:

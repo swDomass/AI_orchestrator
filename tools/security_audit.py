@@ -13,6 +13,7 @@ Usage in queue:
     - [ ] Check providers/ for injection risks #tool:security-audit cwd:/d/proj
 """
 
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -143,8 +144,12 @@ class SecurityAuditTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         cwd_path = Path(cwd) if cwd else Path(".")
-        audit_timeout = TOOL_SA_AUDIT_TIMEOUT_SEC   # 40 min
-        fix_timeout = timeout or TOOL_DEV_EXEC_TIMEOUT_SEC  # 2 h
+        # Per-phase caps: a high #timeout: backstop is an upper deckel only.
+        audit_timeout = self._phase_cap(timeout, TOOL_SA_AUDIT_TIMEOUT_SEC)   # 40 min
+        fix_timeout = self._phase_cap(timeout, TOOL_DEV_EXEC_TIMEOUT_SEC)  # 2 h
+
+        # Total-runtime deadline bounds Phase 1 (audit) + Phase 2 (fix) together.
+        deadline = self._runtime_deadline()
 
         # ------------------------------------------------------------------ #
         # Phase 1 — Audit (read-only)                                         #
@@ -203,6 +208,30 @@ class SecurityAuditTool(BaseTool):
         # ------------------------------------------------------------------ #
         # Phase 2 — Fix + Verify                                              #
         # ------------------------------------------------------------------ #
+        if time.monotonic() >= deadline:
+            # Save partial result (audit only) and stop — Phase 2 would blow the
+            # total-runtime budget. Finalize with the audit so the deadline holds.
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            filename = f"security-audit-{timestamp}-audit-only.md"
+            _write_tool_file(
+                cwd_path / "docs",
+                filename,
+                f"# Security Audit (Fixes ausstehend — Gesamt-Laufzeit-Limit erreicht)\n\n{audit_output}",
+            )
+            msg = f"Gesamt-Laufzeit-Limit erreicht — Audit gespeichert (docs/{filename}), Fixes übersprungen"
+            print(f"  [security-audit] ⏱ {msg}")
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False,
+                output=audit_output,
+                iterations=1,
+                error=msg,
+                error_code="tool_runtime_exceeded",
+                retryable=True,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+            )
+
         notify_tool_progress(self.name, 2, 2, "Phase 2/2: Fixes werden implementiert...")
         print(f"  [security-audit] Phase 2: Fixes implementieren...")
 

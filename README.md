@@ -19,7 +19,7 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1541 tests / ~70 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **~1577 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
@@ -207,7 +207,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
 | Working directory | `cwd:<path>` | `cwd:D:\projects\repo` |
 | Working directory with spaces | `cwd:"<path>"` | `cwd:"D:\My Projects\App"` |
-| Timeout | `#timeout:<n>[s\|m\|h]` | `#timeout:30s`, `#timeout:15m`, `#timeout:1h` |
+| Timeout (hard backstop, not aggressive deadline; for tools an upper cap) | `#timeout:<n>[s\|m\|h]` | `#timeout:30s`, `#timeout:15m`, `#timeout:1h` |
 | Execution profile | `#agent:<name>` | `#agent:work` |
 | Parallel task | `#parallel` | Parent task with indented subtasks |
 | Task ID | `#id:<name>` | `- [ ] Build backend #id:build` |
@@ -326,6 +326,21 @@ Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED, read-only)
 | `TOOL_DEV_EXEC_TIMEOUT_SEC` | 7200 (2 h) | Execution |
 | `TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC` | 3600 (60 min) | Quality Review |
 | `TOOL_DEV_RESOLUTION_REVIEW_TIMEOUT_SEC` | 1800 (30 min) | Resolution Review |
+
+## Timeout / Liveness-Watchdog
+
+CLI provider calls run through a liveness/hang watchdog (`providers/process_runner.py`) instead of a raw wall-clock deadline. A run that keeps making progress runs to completion; only a truly frozen process is killed — with a real process-tree kill (Windows `taskkill /F /T`, POSIX `killpg`), unlike `subprocess.run` which orphaned the real grandchild and then blocked on it.
+
+**Semantics change:** `#timeout:` / profile `timeout_minutes` now set the HARD backstop (absolute upper bound for a progressing run), not an aggressive deadline. For iterative tools the value is an upper cap only and never raises per-phase caps above the `TOOL_*_TIMEOUT_SEC` constants; total tool runtime is bounded by `ToolContract.max_runtime_sec`.
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `TASK_TIMEOUT_SEC` | 5400 (90 min) | Hard backstop per CLI call (env-overridable) |
+| `TASK_IDLE_TIMEOUT_SEC` | 300 (5 min) | Idle/hang detector for Claude (tool-aware: a running `tool_use` pauses the timer) |
+| `CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC` | 1200 (20 min) | Idle detector for Gemini/Codex (byte-only, conservative — covers a long single tool phase) |
+| `MAX_HANG_RETRIES` | 2 | Idle-kills (`error="hang"`) are requeued with a short backoff up to this many times, then the task is BLOCKED (not quota-reset-retried forever) |
+| `HANG_RETRY_BACKOFF_SEC` | 300 (5 min) | Backoff before requeueing a hung task |
+| `TOOL_DEFAULT_MAX_RUNTIME_SEC` | 3600 (60 min) | Fallback total-runtime deadline for an iterative tool when its ToolContract omits `max_runtime_sec` |
 
 ## Research-QA (`#tool:research-qa`)
 
@@ -716,7 +731,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1541 tests, ~70 s)
+# Run all tests (~1577 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file

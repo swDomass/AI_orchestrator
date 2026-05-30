@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -14,11 +15,13 @@ from taxonomy import (
     CAT_CAPACITY,
     CAT_CWD,
     CAT_DEP,
+    CAT_HANG,
     CAT_POLICY,
     CAT_PROFILE,
     CAT_QUEUE,
     CAT_RATE_LIMIT,
     CAT_REFUSAL,
+    CAT_RUNTIME,
     CAT_TEST,
     CAT_TIMEOUT,
     CAT_TOOL_INTERNAL,
@@ -190,3 +193,66 @@ def test_error_code_case_insensitive():
 
 def test_empty_error_code_and_no_keywords_returns_unknown():
     assert classify(_rec(error_code=None, task_text="")) == CAT_UNKNOWN
+
+
+def test_error_code_hang_and_blocked():
+    assert classify(_rec(error_code="hang")) == CAT_HANG
+    assert classify(_rec(error_code="hang_blocked")) == CAT_HANG
+
+
+def test_error_code_tool_runtime_exceeded():
+    assert classify(_rec(error_code="tool_runtime_exceeded")) == CAT_RUNTIME
+
+
+# ---------------------------------------------------------------------------
+# Invariant: every error code literal emitted by the orchestrator / tools must
+# be mapped in _ERROR_CODE_MAP. The module docstring promises this stays "in
+# sync with the codes actually emitted" — this test enforces it for real
+# instead of trusting a hand-maintained comment.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Codes that are intentionally free-form / routed through keyword scan rather
+# than the direct map (provider error strings, dynamic messages, etc.).
+_NON_MAP_CODES = {
+    "",                       # empty / cleared
+    "session_missing",        # provider-internal, never reaches replay error_code
+    "pipeline_complete",      # success marker on a success=True result (not a failure)
+}
+
+
+def _emitted_error_codes() -> set[str]:
+    """Scan orchestrator.py + tools for _span.error/_span.retry/error_code= literals."""
+    sources = [_REPO_ROOT / "orchestrator.py"]
+    sources.extend((_REPO_ROOT / "tools").glob("*.py"))
+    patterns = [
+        re.compile(r"_span\.(?:error|retry)\(\s*[\"']([a-z_]+)[\"']"),
+        re.compile(r"error_code\s*=\s*[\"']([a-z_]+)[\"']"),
+    ]
+    found: set[str] = set()
+    for path in sources:
+        text = path.read_text(encoding="utf-8")
+        for pat in patterns:
+            found.update(pat.findall(text))
+    return found - _NON_MAP_CODES
+
+
+def test_emitted_error_codes_are_all_mapped():
+    emitted = _emitted_error_codes()
+    # Codes routed via record.error_code that may legitimately be free-form
+    # provider strings fall through to the keyword scan; only the structured
+    # literals emitted in source must be in the map.
+    unmapped = {
+        code for code in emitted
+        if code not in taxonomy._ERROR_CODE_MAP
+    }
+    assert not unmapped, (
+        f"error codes emitted in source but missing from _ERROR_CODE_MAP: "
+        f"{sorted(unmapped)}"
+    )
+
+
+def test_all_mapped_categories_are_in_all_categories():
+    for category in taxonomy._ERROR_CODE_MAP.values():
+        assert category in taxonomy.ALL_CATEGORIES

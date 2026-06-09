@@ -68,6 +68,23 @@ def test_codex_write_mode_uses_workspace_write_sandbox(monkeypatch):
     assert cmd[cmd.index("-c") + 1] == "approval_policy=never"
     assert "--sandbox" in cmd
     assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+    # Non-git / non-trusted cwds (e.g. content folders) must not abort.
+    assert "--skip-git-repo-check" in cmd
+
+
+def test_codex_read_only_skips_git_repo_check(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=1, stdout="", stderr="empty output")
+
+    monkeypatch.setattr("providers.codex.run_with_watchdog", fake_run)
+
+    CodexProvider().run("inspect", read_only=True)
+
+    cmd = calls[0][0]
+    assert "--skip-git-repo-check" in cmd
 
 
 def test_gemini_read_only_uses_default_approval_mode(monkeypatch):

@@ -30,6 +30,12 @@ class CodexProvider(BaseProvider):
         # `--sandbox <mode>` for the sandbox policy.
         cmd.extend(["-c", "approval_policy=never"])
         cmd.extend(["--sandbox", "read-only" if read_only else "workspace-write"])
+        # The orchestrator dispatches tasks to arbitrary cwds, many of which are
+        # not git repos nor in codex' trusted-projects list (e.g. content
+        # folders). Without this flag codex aborts with "Not inside a trusted
+        # directory and --skip-git-repo-check was not specified." The
+        # orchestrator already decides what to run, so this guard is redundant.
+        cmd.append("--skip-git-repo-check")
         cmd.append("-")
         return cmd
 

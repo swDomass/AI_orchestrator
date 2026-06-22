@@ -45,6 +45,20 @@ def _isolate_replay_store(tmp_path: Path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_gemini_api_key(monkeypatch):
+    """Default GEMINI_API_KEY to empty so the suite is hermetic against a real
+    key in the developer's .env.
+
+    With a key present, the Gemini provider switches to HTTP-API mode
+    (always-available, cclimits refresh skipped) — which would otherwise flip
+    the CLI-mode / limits-governed assumptions baked into unrelated dispatcher,
+    limits and provider-permission tests. Tests that exercise HTTP mode set the
+    key explicitly (see test_providers_gemini.py)."""
+    monkeypatch.setattr("config.GEMINI_API_KEY", "", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_active_runs_dir(tmp_path: Path, monkeypatch):
     """Redirect ActiveRunRegistry writes into pytest's tmp_path.
 

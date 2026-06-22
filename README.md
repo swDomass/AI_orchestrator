@@ -19,7 +19,7 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1578 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **~1615 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
@@ -59,8 +59,8 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 
 - Python `3.10+`
 - `cclimits` CLI (`npm install -g cclimits`)
-- Provider CLIs in `PATH`: `claude`, `gemini`, `codex`
-- Valid authentication in each CLI (OAuth / subscription login)
+- Provider CLIs in `PATH`: `claude`, `codex` (and `gemini` unless you use `GEMINI_API_KEY` HTTP mode — the consumer Gemini CLI was retired 2026-06-18)
+- Valid authentication in each CLI (OAuth / subscription login); Gemini alternatively via a `GEMINI_API_KEY`
 
 ## Installation
 
@@ -93,6 +93,10 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `CODEX_PRIMARY_MIN_CAPACITY_PCT` | No | `10` | Per-window override for Codex primary |
 | `CODEX_SECONDARY_MIN_CAPACITY_PCT` | No | `3` | Per-window override for Codex secondary |
 | `CLAUDE_PLAN` | No | — | Claude subscription plan for local 429 fallback: `pro`, `max5`, `max20`, `custom` |
+| `GEMINI_API_KEY` | No | — | Google AI Studio key. When set, the Gemini provider uses the HTTP REST API instead of the CLI (the consumer Gemini CLI was shut down 2026-06-18). HTTP mode stays in the fallback chain but has no pollable quota — availability is cooldown-driven. Without a key, falls back to the legacy `gemini` CLI (Standard/Enterprise only). |
+| `GEMINI_BASE_URL` | No | `https://generativelanguage.googleapis.com/v1beta` | Override for testing or a proxy |
+| `GEMINI_DEFAULT_MODEL` | No | `gemini-3.5-flash` | Model for HTTP mode without a `#gemini_*` tag (free-tier-safe GA Flash) |
+| `GEMINI_MAX_OUTPUT_TOKENS` | No | `16384` | Output cap for HTTP mode; generous because gemini-3.x thinking tokens count toward it |
 | `OPENROUTER_API_KEY` | No | — | OpenRouter API key. When set, enables `#openrouter`/`#or_*` tags as an opt-in pay-per-token provider for non-agentic tasks (heartbeat checks, summaries). Never enters the default fallback chain. |
 | `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | Override for testing or self-hosted proxy |
 | `OPENROUTER_DEFAULT_MODEL` | No | `minimax/minimax-m2.5:free` | Model used by `#openrouter` without a specific `#or_*` alias |
@@ -731,7 +735,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1578 tests, ~90 s)
+# Run all tests (~1615 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file

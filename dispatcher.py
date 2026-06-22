@@ -74,6 +74,11 @@ def _limits_ok(name: str, limits: AllLimits) -> bool:
     # via the provider's own cooldown on HTTP 429.
     if name == "openrouter":
         return True
+    # Gemini in HTTP-API mode (GEMINI_API_KEY set) has no pollable subscription
+    # quota either — the consumer CLI/OAuth endpoint cclimits reads is dead. Treat
+    # it as available; rate-limit recovery is cooldown-driven, exactly like OpenRouter.
+    if name == "gemini" and config.GEMINI_API_KEY:
+        return True
     return getattr(limits, name).available
 
 

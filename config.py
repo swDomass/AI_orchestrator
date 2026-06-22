@@ -217,6 +217,27 @@ OPENROUTER_DEFAULT_MODEL = os.getenv(
     "OPENROUTER_DEFAULT_MODEL", "minimax/minimax-m2.5:free"
 )
 
+# --- Gemini HTTP API (preferred over the deprecated CLI) ---
+# The consumer Gemini CLI (Code Assist for individuals / AI Pro / AI Ultra) was
+# shut down 2026-06-18. When GEMINI_API_KEY is set, the Gemini provider calls the
+# Google Gemini REST API directly via urllib (stdlib, like the OpenRouter provider).
+# Without a key it falls back to the legacy `gemini` CLI for Standard/Enterprise
+# users who retain CLI access. Either way Gemini stays in the default fallback
+# chain; in HTTP mode there is no pollable subscription quota, so availability is
+# cooldown-driven (HTTP 429 -> 30-min cooldown), exactly like OpenRouter.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+)
+# Free-tier-safe GA default. Per-task override via #gemini_pro / #gemini_flash_lite.
+GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-3.5-flash")
+# Generous output cap: gemini-3.x are thinking models whose hidden reasoning is
+# token-hungry (observed ~150 thinking tokens even for a one-word reply) and
+# counts toward this cap — too small a value lets thinking consume everything and
+# return empty text (finishReason=MAX_TOKENS). 16k leaves room for a full review
+# plus reasoning. Free tier is uncharged, so headroom costs nothing.
+GEMINI_MAX_OUTPUT_TOKENS = _parse_int_env("GEMINI_MAX_OUTPUT_TOKENS", 16384)
+
 # --- Telegram Notifications ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

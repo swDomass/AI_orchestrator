@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+import config
 from config import (
     CLAUDE_PLAN,
     CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT,
@@ -230,6 +231,25 @@ def _parse_gemini(data: dict) -> ProviderLimits:
     )
 
 
+def _gemini_http_snapshot() -> ProviderLimits:
+    """Synthetic limits for Gemini HTTP-API mode (GEMINI_API_KEY set).
+
+    The public Gemini REST API exposes no pollable subscription-quota endpoint,
+    so report fully available — rate-limit recovery is cooldown-driven via the
+    provider's HTTP 429 handling, exactly like OpenRouter. cclimits (which only
+    knows the dead consumer CLI/OAuth quota) is bypassed for Gemini in this mode.
+    """
+    return ProviderLimits(available=True, remaining_pct=100.0, resets_in_sec=0)
+
+
+def _apply_gemini_http_override(result: AllLimits) -> AllLimits:
+    """Replace the cclimits-derived Gemini limits with the HTTP-API snapshot when
+    a key is configured. No-op in CLI mode (no key)."""
+    if config.GEMINI_API_KEY:
+        result.gemini = _gemini_http_snapshot()
+    return result
+
+
 def _parse_codex(data: dict) -> ProviderLimits:
     return _parse_dual_window_provider(
         data,
@@ -247,10 +267,16 @@ def _is_provider_429(provider_data: dict) -> bool:
 
 def _providers_with_429(raw: dict) -> set[str]:
     """Return set of provider names that have 429 errors in cclimits output."""
-    return {
+    p429 = {
         name for name in ("claude", "gemini", "codex")
         if _is_provider_429(raw.get(name, {}))
     }
+    # Gemini in HTTP-API mode doesn't use cclimits, so a cclimits 429 for it is
+    # irrelevant — must not trigger retry sleeps, _apply_429_fallback, 429 state
+    # or Telegram notifications. The snapshot is overridden at return anyway.
+    if config.GEMINI_API_KEY:
+        p429.discard("gemini")
+    return p429
 
 
 def estimate_task_usage_pct(
@@ -946,6 +972,10 @@ _RUN_CCLIMITS_DEFAULT = _run_cclimits
 
 def _needs_token_refresh(data: dict, provider: str) -> bool:
     """Check if a provider's cclimits data indicates an expired token."""
+    # Gemini in HTTP-API mode (GEMINI_API_KEY set) has no CLI/OAuth token to
+    # refresh — the consumer endpoint cclimits reads is dead. Never refresh it.
+    if provider == "gemini" and config.GEMINI_API_KEY:
+        return False
     pdata = data.get(provider, {})
     if pdata.get("status") == "ok":
         return False
@@ -1032,11 +1062,11 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
             _CCLIMITS_TIMEOUT_SEC, use_cache=not force_fresh,
         )
         if raw is None:
-            return AllLimits(
+            return _apply_gemini_http_override(AllLimits(
                 claude=ProviderLimits(error="cclimits timeout"),
                 gemini=ProviderLimits(error="cclimits timeout"),
                 codex=ProviderLimits(error="cclimits timeout"),
-            )
+            ))
 
         # Auto-refresh expired tokens and re-query
         refresh_attempted = False
@@ -1047,11 +1077,11 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
         # Publish preliminary result before the slow token refresh so that
         # get_limits() callers don't time out waiting for _cache_ready.
         if needs_refresh and on_preliminary is not None:
-            preliminary = AllLimits(
+            preliminary = _apply_gemini_http_override(AllLimits(
                 claude=_parse_claude(raw.get("claude", {"status": "missing"})),
                 gemini=_parse_gemini(raw.get("gemini", {"status": "missing"})),
                 codex=_parse_codex(raw.get("codex", {"status": "missing"})),
-            )
+            ))
             on_preliminary(preliminary)
 
         now = time.monotonic()
@@ -1131,7 +1161,9 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
             if had_429:
                 _clear_429_state(result)
 
-        return result
+        # Gemini HTTP-API mode bypasses cclimits entirely (applied last so neither
+        # the 429 fallback nor _clear_429_state can clobber the synthetic snapshot).
+        return _apply_gemini_http_override(result)
 
 
 def _is_timeout_snapshot(result: AllLimits) -> bool:
@@ -1309,11 +1341,11 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
     with _limits_cache_lock:
         if _limits_cache is not None:
             return _apply_live_estimate(_limits_cache[0])
-        fallback = AllLimits(
+        fallback = _apply_gemini_http_override(AllLimits(
             claude=ProviderLimits(error="cclimits unavailable"),
             gemini=ProviderLimits(error="cclimits unavailable"),
             codex=ProviderLimits(error="cclimits unavailable"),
-        )
+        ))
         _limits_cache = (fallback, time.monotonic())
         _cache_ready.set()
         return fallback

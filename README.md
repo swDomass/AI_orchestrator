@@ -19,13 +19,13 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1577 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **~1578 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
 - **Auditability built in.** Every task end emits a structured `logs/runs.jsonl` record (16-category failure taxonomy: `rate_limit`, `timeout`, `auth_error`, `model_refusal`, …), per-tool action traces in `{cwd}/.<tool>/traces/*.jsonl`, an offline queue linter (`--lint-queue`, exit codes 0/1/2 for CI gating), and a 16-check `--doctor` with `--fix --yes` auto-repair.
 - **Prompt-cache aware.** Stable prompt prefixes, `--exclude-dynamic-system-prompt-sections` to freeze the system prompt for cache hits, opt-in Claude session reuse (`--session-id` / `--resume`) for ~30–50 % token savings across multi-phase tools, and billing analytics with weighted cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and per-task cache-hit rate.
-- **Observability.** Standalone HTTP analytics dashboard (port 8411, Chart.js, 60 s refresh) backed by `logs/runs.jsonl`. Live "Active Runs" panel (30 s refresh) shows currently-running tool iterations, phase, tokens (in / out / cache_read) and elapsed time via the central `ActiveRunRegistry` in `logs/active_runs/`. Daily Telegram status recap (07:00) summarises the previous 24 h — tasks done/failed, provider breakdown, pending approvals, blocked tasks.
+- **Observability.** Standalone HTTP analytics dashboard (port 8211, Chart.js, 60 s refresh) backed by `logs/runs.jsonl`. Live "Active Runs" panel (30 s refresh) shows currently-running tool iterations, phase, tokens (in / out / cache_read) and elapsed time via the central `ActiveRunRegistry` in `logs/active_runs/`. Daily Telegram status recap (07:00) summarises the previous 24 h — tasks done/failed, provider breakdown, pending approvals, blocked tasks.
 - **Calibrated quota model.** Phase-0 telemetry (`logs/quota-calibration.csv`) paired every `cclimits` poll with locally-aggregated JSONL token counts per Anthropic 5 h / 7 d window; ~6 days of data selected the `io_only` model (input + output — cache tokens are negligible to the rate limit). Phase 1 writes a single-source-of-truth `logs/cc_quota_state.json` each poll (consumed by the Claude Code statusline and `--check-limits`) and feeds the calibrated per-window factors into the 429-fallback estimator, reducing reliance on the undocumented, rate-limited `cclimits` endpoint.
 
 Architecture details → [`docs/architecture/components.md`](docs/architecture/components.md) (per-module specs), [`docs/architecture/patterns.md`](docs/architecture/patterns.md) (patterns and invariants).
@@ -49,7 +49,7 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 - Telegram listener (queue control, status, plain-text AI chat)
 - Heartbeat + Doctor (monitoring / onboarding checks)
 - **Reliability layer (Tier 5)**: queue linter (`--lint-queue`), idempotency keys for external triggers, slash-commands (`/review`, `/dev`, `/security`, `/audit`, `/critique`, `/brainstorm`), schedule tags (`#at:`, `#every:`), machine-readable run summaries (`logs/runs.jsonl`), 16-category failure taxonomy, per-tool preflight hooks (deterministic context collection), queue-healing with `/unblock`/`/drop`/`/retry`, draft-only skill suggester, progressive skill loading
-- Analytics web dashboard (Chart.js, port 8411)
+- Analytics web dashboard (Chart.js, port 8211)
 - **Calibrated quota model (Phase 0 + 1)**: Phase-0 telemetry (`logs/quota-calibration.csv`) selected the `io_only` `tokens_per_pct` model (input + output). Phase 1 persists a SoTH `logs/cc_quota_state.json` per poll (read by the statusline + `--check-limits`) and uses calibrated per-window factors in the 429-fallback estimator. The undocumented `cclimits` endpoint stays the calibration anchor (polled every 5–10 min), not the per-reading source. Details → [`docs/architecture/components.md`](docs/architecture/components.md#quota_calibrationpy--quota_statepy).
 - `SOUL.md` as central prompt/personality configuration
 - **Anthropic prompt-cache optimization**: static system-prompt (cwd/git-status moved to first user message via `--exclude-dynamic-system-prompt-sections`), stable prompt prefixes, billing analytics with cache-hit-rate
@@ -96,7 +96,7 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `OPENROUTER_API_KEY` | No | — | OpenRouter API key. When set, enables `#openrouter`/`#or_*` tags as an opt-in pay-per-token provider for non-agentic tasks (heartbeat checks, summaries). Never enters the default fallback chain. |
 | `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | Override for testing or self-hosted proxy |
 | `OPENROUTER_DEFAULT_MODEL` | No | `minimax/minimax-m2.5:free` | Model used by `#openrouter` without a specific `#or_*` alias |
-| `DASHBOARD_PORT` | No | `8411` | Port for the analytics web dashboard |
+| `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
 | `TELEGRAM_MAX_TASK_LENGTH` | No | `500` | Max characters for `/task` command |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
 | `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
@@ -639,7 +639,7 @@ Dashboard sections:
 - **Session stats**: live data for the current `--watch` session
 - **Billing analytics**: weighted token cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and cache hit rate from Claude prompt cache. Quota gating uses ONLY `input + output` — cache fields are billing-only.
 
-Default port: `8411` (configurable via `DASHBOARD_PORT`).
+Default port: `8211` (configurable via `DASHBOARD_PORT`). If the port is already in use or reserved by Windows (Hyper-V/WSL dynamic ranges → `WinError 10013`), the server automatically falls back to a free port and logs the actual URL.
 
 ## Quota Calibration & State (cclimits anchor → local estimation)
 
@@ -731,7 +731,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1577 tests, ~90 s)
+# Run all tests (~1578 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file

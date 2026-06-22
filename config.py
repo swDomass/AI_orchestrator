@@ -603,7 +603,10 @@ for _entry in _env_ci_paths.split(";"):
 SHUTDOWN_DELAY_SEC = 60
 
 # --- Dashboard ---
-DASHBOARD_PORT = 8411
+# Default 8211 (8411 fell inside a Windows dynamically-reserved port range
+# 8386-8485 → WSAEACCES/WinError 10013 on bind). Overridable via .env; the
+# dashboard also falls back to a free port at bind time if this one is taken.
+DASHBOARD_PORT = _parse_int_env("DASHBOARD_PORT", 8211)
 SHUTDOWN_COMMAND = (
     ["shutdown", "/s", "/t", "0", "/f"]
     if sys.platform == "win32"

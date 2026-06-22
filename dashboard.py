@@ -5,7 +5,7 @@ Lightweight HTTP server serving an analytics dashboard.
 Uses only stdlib (http.server) + Chart.js via CDN.
 
 Standalone usage:
-    python dashboard.py              # open browser on port 8411
+    python dashboard.py              # open browser on port 8211 (or free fallback)
     python dashboard.py --port 9000  # custom port
     python dashboard.py --no-open    # don't auto-open browser
 
@@ -769,6 +769,39 @@ class _ReuseServer(socketserver.TCPServer):
     allow_reuse_address = True
 
 
+def _bind_server(port: int) -> tuple["_ReuseServer", int]:
+    """Bind the dashboard to 127.0.0.1, tolerating an unavailable port.
+
+    Windows dynamically reserves port ranges for Hyper-V/WSL (bind then fails
+    with WSAEACCES / WinError 10013), and the preferred port may simply be in
+    use. Try the preferred port first, then a few spaced fallbacks, and as a
+    last resort let the OS pick a free ephemeral port — so the dashboard always
+    comes up. Returns the bound server and the actual port.
+    """
+    candidates = [port, port + 100, port + 211, port - 100, 0]
+    last_err: OSError | None = None
+    seen: set[int] = set()
+    for candidate in candidates:
+        if candidate < 0 or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            server = _ReuseServer(("127.0.0.1", candidate), _Handler)
+        except OSError as e:
+            last_err = e
+            logger.warning("dashboard: port %d unavailable (%s)", candidate, e)
+            continue
+        actual = server.server_address[1]
+        if actual != port:
+            logger.warning(
+                "dashboard: preferred port %d unavailable, bound to %d instead",
+                port, actual,
+            )
+        return server, actual
+    # port 0 above should always succeed; be explicit if it somehow didn't.
+    raise last_err or OSError(f"dashboard: could not bind any port near {port}")
+
+
 def start_server(
     port: int | None = None,
     open_browser: bool = True,
@@ -782,7 +815,7 @@ def start_server(
         background: if True, run in a daemon thread and return immediately.
     """
     port = port or DASHBOARD_PORT
-    server = _ReuseServer(("127.0.0.1", port), _Handler)
+    server, port = _bind_server(port)
     url = f"http://127.0.0.1:{port}"
 
     if background:

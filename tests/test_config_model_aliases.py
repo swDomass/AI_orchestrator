@@ -17,9 +17,9 @@ def test_claude_tags_resolve_for_claude():
 
 
 def test_gemini_tags_resolve_for_gemini():
-    assert model_id_for_provider("gemini_flash", "gemini") == "gemini-3-flash-preview"
+    assert model_id_for_provider("gemini_flash", "gemini") == "gemini-3.5-flash"
     assert model_id_for_provider("gemini_pro", "gemini") == "gemini-3.1-pro-preview"
-    assert model_id_for_provider("gemini_flash_lite", "gemini") == "gemini-3.1-flash-lite-preview"
+    assert model_id_for_provider("gemini_flash_lite", "gemini") == "gemini-3.1-flash-lite"
 
 
 def test_codex_tags_resolve_for_codex():
@@ -56,13 +56,14 @@ def test_is_known_model_tag_rejects_unknown():
     assert is_known_model_tag("") is False
 
 
-def test_gemini_aliases_match_verified_preview_ids():
-    # Verified against `cclimits --json` (2026-05-08): user's Gemini Code Assist tier
-    # exposes gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-3.1-flash-lite-preview.
-    # gemini-3.1-flash (non-lite) does not exist, so gemini_flash maps to 3.0.
+def test_gemini_aliases_match_current_ids():
+    # Drift-checked 2026-06-22 against Google's deprecations page: pro is still the
+    # 3.1 preview (no GA gemini-3.1-pro yet); flash + flash-lite moved to GA. The old
+    # gemini-3-flash-preview is deprecated and gemini-3.1-flash-lite-preview was shut
+    # down 2026-05-25, so both preview IDs are replaced by their GA successors.
     assert GEMINI_MODEL_ALIASES["gemini_pro"] == "gemini-3.1-pro-preview"
-    assert GEMINI_MODEL_ALIASES["gemini_flash"] == "gemini-3-flash-preview"
-    assert GEMINI_MODEL_ALIASES["gemini_flash_lite"] == "gemini-3.1-flash-lite-preview"
+    assert GEMINI_MODEL_ALIASES["gemini_flash"] == "gemini-3.5-flash"
+    assert GEMINI_MODEL_ALIASES["gemini_flash_lite"] == "gemini-3.1-flash-lite"
 
 
 def test_codex_aliases_match_verified_model_cache():

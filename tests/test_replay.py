@@ -38,11 +38,19 @@ def _isolated_store(tmp_path: Path):
 def _make_record(
     *,
     run_id: str = "r1",
-    ts_start: str = "2026-05-18T10:00:00",
-    ts_end: str = "2026-05-18T10:01:00",
+    ts_start: str | None = None,
+    ts_end: str | None = None,
     exit_status: str = EXIT_OK,
     error_code: str | None = None,
 ) -> RunRecord:
+    # Default to "just now" so records aren't auto-archived by the 30-day rotation
+    # that append_run() triggers. Hardcoded dates here were a time-bomb: fixtures
+    # dated 2026-05-18 began failing exactly 30 days later (rotation moved them to
+    # the archive on append, so read_runs() returned []).
+    if ts_start is None:
+        ts_start = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    if ts_end is None:
+        ts_end = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     return RunRecord(
         run_id=run_id,
         ts_start=ts_start,
@@ -94,19 +102,27 @@ def test_invalid_exit_status_coerced_to_error():
 
 
 def test_read_runs_since_filter():
-    append_run(_make_record(run_id="old", ts_start="2026-05-01T10:00:00"))
-    append_run(_make_record(run_id="new", ts_start="2026-05-18T10:00:00"))
+    # Relative dates inside the 30-day rotation window so neither record is
+    # auto-archived; the cutoff sits between them.
+    old_ts = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%S")
+    new_ts = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    append_run(_make_record(run_id="old", ts_start=old_ts))
+    append_run(_make_record(run_id="new", ts_start=new_ts))
 
-    cutoff = datetime(2026, 5, 10)
+    cutoff = datetime.now() - timedelta(days=3)
     runs = read_runs(since=cutoff)
     assert [r["run_id"] for r in runs] == ["new"]
 
 
 def test_read_runs_until_filter():
-    append_run(_make_record(run_id="old", ts_start="2026-05-01T10:00:00"))
-    append_run(_make_record(run_id="new", ts_start="2026-05-18T10:00:00"))
+    # Relative dates inside the 30-day rotation window so neither record is
+    # auto-archived; the cutoff sits between them.
+    old_ts = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%S")
+    new_ts = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    append_run(_make_record(run_id="old", ts_start=old_ts))
+    append_run(_make_record(run_id="new", ts_start=new_ts))
 
-    runs = read_runs(until=datetime(2026, 5, 10))
+    runs = read_runs(until=datetime.now() - timedelta(days=3))
     assert [r["run_id"] for r in runs] == ["old"]
 
 

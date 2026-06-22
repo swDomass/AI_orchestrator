@@ -443,14 +443,17 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
     "claude_sonnet": "claude-sonnet-4-6",
-    "claude_opus":   "claude-opus-4-7",
+    "claude_opus":   "claude-opus-4-8",   # 4.8 = current Opus (2026-06); 4.7 is previous-gen
 }
-# Gemini: Code Assist tier exposes preview IDs only (verified via cclimits --json).
-# gemini-3.1-flash (non-lite) does not exist; flash maps to the 3-Flash preview.
+# Gemini model IDs (drift-checked 2026-06-22 against Google's deprecations page):
+# pro stays on the 3.1 preview (no GA `gemini-3.1-pro` exists yet); flash + flash-lite
+# moved to GA. The old `gemini-3-flash-preview` is deprecated and
+# `gemini-3.1-flash-lite-preview` was SHUT DOWN 2026-05-25, so both preview IDs are
+# replaced by their GA successors.
 GEMINI_MODEL_ALIASES: dict[str, str] = {
     "gemini_pro":        "gemini-3.1-pro-preview",
-    "gemini_flash":      "gemini-3-flash-preview",
-    "gemini_flash_lite": "gemini-3.1-flash-lite-preview",
+    "gemini_flash":      "gemini-3.5-flash",
+    "gemini_flash_lite": "gemini-3.1-flash-lite",
 }
 # Codex: gpt-5.5 is the current flagship (April 2026, ChatGPT-auth only — falls
 # back to gpt-5.4 if not yet rolled out for the account). gpt-5.4 stays as the

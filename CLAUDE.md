@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Co
 ## Commands
 
 ```bash
-# Run all tests (~1577 tests, ~90 s)
+# Run all tests (~1578 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file / single test
@@ -83,7 +83,7 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`process_runner.py`** — Liveness-/Hang-Watchdog: `Popen` + 2 daemon-Reader-Threads (stdout/stderr gleichzeitig, sonst Pipe-Buffer-Deadlock), `idle_timeout` (Hang) + `hard_timeout` (Backstop), Tree-Kill (Windows `taskkill /F /T` doppelt, POSIX `killpg` SIGTERM→SIGKILL). Claude tool-aware (`liveness_lines=True`: laufender `tool_use` pausiert idle-Timer via `_Liveness`), Gemini/Codex byte-only. `run_with_watchdog` ersetzt `subprocess.run` in allen 3 Providern (DRY). Raise `TimeoutExpired` mit `timeout_kind` ("idle"|"hard")
 - **`claude.py`** — `--output-format stream-json --verbose` (NDJSON-Liveness-Events), NDJSON-Parser `_extract_result_event` (letztes `type==result`), Token-Feld-Parity erhalten, rate_limit/session-Keyword-Detektion auf ROH-stdout, `--exclude-dynamic-system-prompt-sections` for cache stability, session-id/resume support, `supports_sessions=True`; idle-Kill → `error="hang"`, hard → `error="timeout"`
 - **`gemini.py`** — `--yolo` full tool access, `--approval-mode default` read-only, `--model <id>` forced; byte-only Liveness (`CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC`)
-- **`codex.py`** — `codex exec --full-auto` or sandbox, `--model <id>` forced; byte-only Liveness (`CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC`)
+- **`codex.py`** — `codex exec` + `-c approval_policy=never` + `--sandbox read-only|workspace-write` (CLI ≥0.130; `--full-auto` deprecated) + `--skip-git-repo-check`, `--model <id>` forced; byte-only Liveness (`CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC`)
 - **`openrouter.py`** — HTTP/urllib (no `requests` dep), pay-per-token, NEVER in fallback chain, opt-in via `#openrouter`/`#or_*` tags, conditional registration on `OPENROUTER_API_KEY`
 
 ### Tools (`tools/`)

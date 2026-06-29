@@ -89,6 +89,7 @@ from queue_manager import (
     mark_retry,
     read_queue,
     read_queue_items,
+    realign_stale_freshonly,
     strip_metadata_tags,
 )
 import replay
@@ -729,6 +730,18 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             _log.debug("Moved %d done task(s) to erledigt.md", moved)
     except (OSError, ImportError):
         pass
+
+    # Realign stale #freshonly tasks (e.g. a daily brief whose slot was missed while
+    # the orchestrator was off) to their next anchored slot BEFORE reading — so they
+    # are filtered out this cycle instead of firing late at the wrong time of day.
+    # Skipped under dry_run: it mutates the queue, and dry_run must only parse.
+    if not dry_run:
+        try:
+            realigned = realign_stale_freshonly()
+            if realigned:
+                _log.debug("Realigned %d stale #freshonly task(s) to next slot", realigned)
+        except (OSError, ValueError) as e:
+            _log.warning("realign_stale_freshonly failed: %s", e)
 
     task_items = read_queue_items()
     if not task_items:

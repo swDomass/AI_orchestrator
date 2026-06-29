@@ -207,6 +207,36 @@ def test_all_deps_met_unblocked(mock_queue_file):
 # run_once — blocked tasks are skipped but not marked done
 # ---------------------------------------------------------------------------
 
+def test_run_once_skips_realign_in_dry_run(monkeypatch):
+    """dry_run must not mutate the queue: realign_stale_freshonly is not invoked."""
+    with patch("config._load_dotenv"):
+        import orchestrator
+
+    realign_calls = []
+    monkeypatch.setattr(orchestrator, "realign_stale_freshonly",
+                        lambda *a, **kw: realign_calls.append(1) or 0)
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [])
+
+    orchestrator.run_once(dry_run=True)
+
+    assert realign_calls == [], "realign_stale_freshonly must not run under dry_run"
+
+
+def test_run_once_runs_realign_when_not_dry_run(monkeypatch):
+    """A normal cycle DOES run the realign pass before reading the queue."""
+    with patch("config._load_dotenv"):
+        import orchestrator
+
+    realign_calls = []
+    monkeypatch.setattr(orchestrator, "realign_stale_freshonly",
+                        lambda *a, **kw: realign_calls.append(1) or 0)
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [])
+
+    orchestrator.run_once(dry_run=False)
+
+    assert realign_calls == [1], "realign_stale_freshonly must run when not dry_run"
+
+
 def test_run_once_skips_blocked(monkeypatch):
     """run_once must not dispatch a blocked task (select_provider must not be called)."""
     blocked_task = QueueTask(

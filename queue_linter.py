@@ -32,6 +32,8 @@ from queue_manager import (
     AT_TAG_RE,
     CWD_RE,
     EVERY_TAG_RE,
+    FRESHONLY_TAG_RE,
+    GRACE_TAG_RE,
     MODEL_TAG_RE,
     NEEDS_TAG_RE,
     PARALLEL_TAG_RE,
@@ -40,11 +42,13 @@ from queue_manager import (
     _decode_queue_bytes,
     _parse_subtask_line,
     extract_cwd,
+    extract_every_tag,
     extract_id_tag,
     extract_needs_tags,
     extract_model_tag,
     extract_pass_providers,
     has_cwd_tag,
+    _is_whole_day_interval,
 )
 
 # Regex for any open task line (subset of OPEN_TASK_RE — without retry-stripping)
@@ -240,6 +244,9 @@ def _check_task(
     out.extend(_check_parallel(line_no, task_text, subtasks))
     out.extend(_check_at_tag(line_no, task_text))
     out.extend(_check_every_tag(line_no, task_text))
+    out.extend(_check_anchor_interval(line_no, task_text))
+    out.extend(_check_grace_tag(line_no, task_text))
+    out.extend(_check_freshonly_tag(line_no, task_text))
     return out
 
 
@@ -465,4 +472,67 @@ def _check_every_tag(line_no: int, task_text: str) -> list[LintFinding]:
         f"#every: erwartet '<zahl><s|m|h|d>', z.B. '#every:24h' "
         f"(bekam: {permissive.group(1)!r})",
         code="invalid_every",
+    )]
+
+
+def _check_grace_tag(line_no: int, task_text: str) -> list[LintFinding]:
+    """`#grace:` must be `<number><s|m|h|d>` and is only used by `#freshonly` tasks."""
+    permissive = re.search(r"(?i)(?<!\S)#grace:(\S+)", task_text)
+    if not permissive:
+        return []
+    out: list[LintFinding] = []
+    if not GRACE_TAG_RE.search(task_text):
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            f"#grace: erwartet '<zahl><s|m|h|d>', z.B. '#grace:4h' "
+            f"(bekam: {permissive.group(1)!r})",
+            code="invalid_grace",
+        ))
+        return out
+    if not FRESHONLY_TAG_RE.search(task_text):
+        out.append(LintFinding(
+            LEVEL_WARN, line_no, task_text,
+            "#grace: ohne #freshonly hat keine Wirkung (Grace gilt nur für #freshonly-Tasks)",
+            code="grace_without_freshonly",
+        ))
+    return out
+
+
+def _check_anchor_interval(line_no: int, task_text: str) -> list[LintFinding]:
+    """A `#at:` time-of-day anchor only drives recurrence for whole-day `#every:`
+    intervals (24h, 48h, 7d, ...). With a sub-day or non-whole-day interval the anchor
+    is ignored for rescheduling (the task falls back to now+interval) — flag the silent
+    mismatch so the user isn't surprised the slot still drifts."""
+    if not AT_TAG_RE.search(task_text):
+        return []
+    every_sec = extract_every_tag(task_text)
+    if every_sec is None or _is_whole_day_interval(every_sec):
+        return []
+    return [LintFinding(
+        LEVEL_WARN, line_no, task_text,
+        "#at:-Anker wirkt nur bei ganztägigem #every: (24h, 7d, …) als Tageszeit-Anker; "
+        "bei diesem Intervall wird er fürs Reschedule ignoriert (now+Intervall, Slot driftet)",
+        code="anchor_subday_interval",
+    )]
+
+
+def _check_freshonly_tag(line_no: int, task_text: str) -> list[LintFinding]:
+    """`#freshonly` is a bare flag, only meaningful on recurring (`#every:`) tasks."""
+    # A value-bearing form (#freshonly:false) is a mistake — the flag takes no value
+    # and would otherwise be silently ignored.
+    if re.search(r"(?i)(?<!\S)#freshonly:\S*", task_text):
+        return [LintFinding(
+            LEVEL_WARN, line_no, task_text,
+            "#freshonly ist ein Flag ohne Wert — '#freshonly:...' wird ignoriert, "
+            "nutze nur '#freshonly'",
+            code="freshonly_with_value",
+        )]
+    if not FRESHONLY_TAG_RE.search(task_text):
+        return []
+    if EVERY_TAG_RE.search(task_text):
+        return []
+    return [LintFinding(
+        LEVEL_WARN, line_no, task_text,
+        "#freshonly ohne #every hat keine Wirkung (gilt nur für wiederkehrende Tasks)",
+        code="freshonly_without_every",
     )]

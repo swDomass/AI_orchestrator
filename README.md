@@ -218,6 +218,9 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Task dependency | `#needs:<id1,id2>` | `- [ ] Test #needs:build` |
 | One-time schedule | `#at:<timestamp>` | `- [ ] Review #at:2026-05-17T22:00` |
 | Recurring schedule | `#every:<duration>` | `- [ ] Daily review #every:24h` |
+| Time-of-day anchor | `#at:<HH:MM>` + `#every:<Nd>` | `- [ ] Daily brief #at:08:00 #every:24h` |
+| Skip stale slot | `#freshonly` | `- [ ] Daily brief #at:08:00 #every:24h #freshonly` |
+| Stale grace window | `#grace:<duration>` | `- [ ] Recap #at:19:00 #every:24h #freshonly #grace:4h` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
 | Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:gemini` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
@@ -253,17 +256,20 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 ```md
 - [ ] One-time review tonight #at:2026-05-17T22:00 #tool:review-loop cwd:D:\proj
 - [ ] Daily review #every:24h #tool:review-loop cwd:D:\proj
-- [ ] First at 22:00, then weekly #at:2026-05-17T22:00 #every:7d cwd:D:\proj
+- [ ] Daily brief, anchored at 08:00 #at:08:00 #every:24h cwd:D:\proj
+- [ ] Daily brief, skip if missed #at:08:00 #every:24h #freshonly #grace:4h cwd:D:\proj
 ```
 
 Both schedule tags reuse the existing retry primitive — no separate scheduler.
 
-- **`#at:<timestamp>`** delays the task until the given time. Formats: `YYYY-MM-DDTHH:MM`, `YYYY-MM-DD HH:MM`, or `HH:MM` (closest-day interpretation). After first fire, the task is marked `[x]` like any other one-shot.
-- **`#every:<duration>`** turns the task into a recurring schedule. Units: `s|m|h|d`. On successful completion, the line is rewritten as open with a new `<!-- retry: now+duration -->` annotation instead of `[x]` — it fires again on schedule. Stale `#at:` tags are stripped on this rewrite.
-- **Combine them** for "first fire at time T, then every D": `#at:2026-05-17T22:00 #every:24h` = first run at 22:00, then daily.
+- **`#at:<timestamp>`** delays the task until the given time. Formats: `YYYY-MM-DDTHH:MM`, `YYYY-MM-DD HH:MM`, or `HH:MM` (closest-day interpretation). For a **one-time** task (no `#every:`), it is marked `[x]` after the first fire.
+- **`#every:<duration>`** turns the task into a recurring schedule. Units: `s|m|h|d`. On successful completion, the line is rewritten as open with a new `<!-- retry: ... -->` annotation instead of `[x]` — it fires again on schedule.
+- **Anchored recurrence (no drift)**: combine `#at:<HH:MM>` with a day-multiple `#every:` (e.g. `#every:24h`, `#every:7d`). The next run is computed as the **next occurrence of the anchor time-of-day** (not `now + duration`), so a late boot never shifts the daily slot. The `#at:` anchor is **preserved** (normalized to bare `HH:MM`). Without an `#at:` anchor (or with a sub-day interval), the legacy `now + duration` behavior applies and a stale one-time `#at:` is stripped.
+- **`#freshonly`** marks a recurring task whose run is only meaningful close to its slot (daily briefs). If the orchestrator was off and the slot is more than the grace window in the past, the task is **realigned to its next slot without running** — no late, stale fire. Tasks **without** `#freshonly` keep catch-up semantics (a missed weekly maintenance run still executes on next start).
+- **`#grace:<duration>`** sets how late after the anchor a `#freshonly` task may still run before it counts as stale (default `2h`). Example: `#grace:4h` lets a 19:00 recap still fire on a 22:00 boot.
 - **Pause / remove** a recurring schedule = edit the queue file (delete the line, comment it out, or mark `[x]` manually).
-- **Missed runs replay automatically**: if the orchestrator was off when a schedule was due, the retry time is in the past on next start — the task runs immediately.
-- **Validated by `--lint-queue`**: malformed `#at:` and `#every:` values are flagged as errors.
+- **Missed runs**: without `#freshonly`, the retry time is in the past on next start → the task runs immediately (catch-up). With `#freshonly`, a stale slot is skipped and realigned.
+- **Validated by `--lint-queue`**: malformed `#at:`, `#every:` and `#grace:` values are flagged as errors; `#freshonly` without `#every:` and `#grace:` without `#freshonly` are warnings.
 
 ### Retry Markers
 

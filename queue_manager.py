@@ -129,6 +129,23 @@ AT_TAG_RE = re.compile(
 # Examples: #every:30m, #every:24h, #every:7d.
 EVERY_TAG_RE = re.compile(r"(?i)(?<!\S)#every:(\d+)([smhd])(?=\s|$)")
 
+# Matches #freshonly — bare flag (no value). Marks a recurring task whose run is only
+# meaningful close to its anchored slot: a missed slot is realigned to the next
+# occurrence instead of being caught up late. See realign_stale_freshonly().
+# Requires whitespace/EOL after, so a stray value like `#freshonly:false` does NOT
+# silently count as the flag being set (the linter flags such values separately).
+FRESHONLY_TAG_RE = re.compile(r"(?i)(?<!\S)#freshonly(?=\s|$)")
+
+# Matches #grace:<duration> — how late after the anchored slot a #freshonly task
+# may still run before it counts as stale. Same units as #every. Default 2h.
+GRACE_TAG_RE = re.compile(r"(?i)(?<!\S)#grace:(\d+)([smhd])(?=\s|$)")
+
+# Default grace window for #freshonly tasks without an explicit #grace: tag.
+DEFAULT_GRACE_SEC = 2 * 3600
+
+# Whole-day threshold: anchored recurrence only applies to day-multiple intervals.
+_ONE_DAY_SEC = 86400
+
 # Extract only the markdown body under "## Queue" (until the next H2 heading)
 QUEUE_SECTION_RE = re.compile(r"^## Queue\s*$\n?(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)
 
@@ -350,49 +367,103 @@ def _extract_queue_section(content: str) -> str:
     return match.group(1)
 
 
-def _retry_is_due(retry_at: str, now: datetime | None = None) -> bool:
-    """Return True when a retry marker is due.
+def _resolve_scheduled_dt(raw: str, now: datetime | None = None) -> datetime | None:
+    """Resolve a retry/at timestamp string to a concrete datetime, or None if unparseable.
 
-    Newer markers may store an absolute local timestamp (YYYY-MM-DD HH:MM
-    or YYYY-MM-DDTHH:MM), which is unambiguous and compared directly.
+    Absolute forms (YYYY-MM-DD HH:MM / YYYY-MM-DDTHH:MM) are returned directly.
 
-    Legacy markers store only HH:MM. To resolve the ambiguity across midnight,
-    we pick the interpretation closest to *now* (within ±12h) and check if
-    that time has already passed.
-
-    Examples (assuming retry is always set for the near future):
-      - retry_at="14:00", now=15:00 → candidate today 14:00 (1h ago) → due
-      - retry_at="14:00", now=13:00 → candidate today 14:00 (1h ahead) → not due
-      - retry_at="00:15", now=23:50 → today 00:15 is 23h35m ago, tomorrow 00:15
-        is 25m ahead → pick tomorrow → not due
-      - retry_at="23:50", now=00:10 → today 23:50 is 23h40m ahead, yesterday
-        23:50 is 20m ago → pick yesterday → due
+    Bare HH:MM is ambiguous across midnight; we pick the interpretation (today /
+    ±1 day) closest to *now*:
+      - "14:00", now=15:00 → today 14:00 (1h ago)
+      - "00:15", now=23:50 → tomorrow 00:15 (25m ahead)
+      - "23:50", now=00:10 → yesterday 23:50 (20m ago)
     """
     now = now or datetime.now()
-    retry_at = retry_at.strip()
+    raw = raw.strip()
 
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
         try:
-            return datetime.strptime(retry_at, fmt) <= now
+            return datetime.strptime(raw, fmt)
         except ValueError:
             pass
 
     try:
-        hour, minute = map(int, retry_at.split(":", 1))
+        hour, minute = map(int, raw.split(":", 1))
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     except ValueError:
-        # Invalid retry marker: fail open so tasks are not stuck forever.
-        return True
+        return None
 
-    # Consider both today and +/- 1 day, pick the one closest to now
     candidates = [
         candidate - timedelta(days=1),
         candidate,
         candidate + timedelta(days=1),
     ]
-    closest = min(candidates, key=lambda c: abs((c - now).total_seconds()))
+    return min(candidates, key=lambda c: abs((c - now).total_seconds()))
 
-    return closest <= now
+
+def _retry_is_due(retry_at: str, now: datetime | None = None) -> bool:
+    """Return True when a retry marker is due (resolved time has passed).
+
+    Delegates parsing to _resolve_scheduled_dt. Unparseable markers fail open
+    (return True) so tasks are never stuck forever.
+    """
+    now = now or datetime.now()
+    dt = _resolve_scheduled_dt(retry_at, now)
+    if dt is None:
+        return True
+    return dt <= now
+
+
+def _anchor_time_of_day(task_text: str) -> tuple[int, int] | None:
+    """Return (hour, minute) of the task's #at: anchor, or None if absent/unparseable.
+
+    Works for both bare HH:MM and full-ISO #at: forms — only the time-of-day matters
+    for recurring anchoring.
+    """
+    raw = extract_at_tag(task_text)
+    if not raw:
+        return None
+    dt = _resolve_scheduled_dt(raw)
+    if dt is None:
+        return None
+    return (dt.hour, dt.minute)
+
+
+def _is_whole_day_interval(every_sec: int) -> bool:
+    """True when the interval is a positive whole-day multiple (24h, 48h, 7d, ...)."""
+    return every_sec >= _ONE_DAY_SEC and every_sec % _ONE_DAY_SEC == 0
+
+
+def _next_anchor_occurrence(
+    anchor: tuple[int, int], every_sec: int, now: datetime | None = None
+) -> datetime:
+    """Next datetime at the anchor time-of-day, strictly after now. Callers gate on
+    _is_whole_day_interval (so every_sec is 24h or a whole-day multiple).
+
+    Daily (`#every:24h`): today's slot if still ahead, else tomorrow — every day has a
+    slot, so filling today's still-future slot is correct.
+
+    Multi-day (`#every:7d`, ...): the cadence is measured from `now` (this run / this
+    realign), not from a fixed weekday phase — only the time-of-day is anchored. This
+    avoids collapsing the cadence to the same day when `now` is before today's anchor
+    time (a fixed-phase calendar would need a tracked epoch we don't keep).
+    """
+    now = now or datetime.now()
+    hour, minute = anchor
+
+    if every_sec == _ONE_DAY_SEC:
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        while candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    step_days = max(2, every_sec // _ONE_DAY_SEC)
+    candidate = (now + timedelta(days=step_days)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    while candidate <= now:
+        candidate += timedelta(days=step_days)
+    return candidate
 
 
 # --- Note resolution ---
@@ -622,6 +693,24 @@ def extract_every_tag(task: str) -> int | None:
     return val * unit_seconds[m.group(2).lower()]
 
 
+def has_freshonly_tag(task: str) -> bool:
+    """Return True if the task carries the #freshonly flag."""
+    return FRESHONLY_TAG_RE.search(task) is not None
+
+
+def extract_grace_tag(task: str) -> int | None:
+    """Extract #grace:<duration> from task text. Returns duration in seconds, or None.
+
+    Supported units: s, m, h, d (same as #every). Example: #grace:4h → 14400.
+    """
+    m = GRACE_TAG_RE.search(task)
+    if not m:
+        return None
+    val = int(m.group(1))
+    unit_seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return val * unit_seconds[m.group(2).lower()]
+
+
 def strip_metadata_tags(task: str) -> str:
     """Remove routing/metadata tags before sending the task text to a provider."""
     task = CWD_RE.sub("", task)
@@ -642,6 +731,8 @@ def strip_metadata_tags(task: str) -> str:
     task = SECOND_OPINION_TAG_RE.sub("", task)
     task = AT_TAG_RE.sub("", task)
     task = EVERY_TAG_RE.sub("", task)
+    task = FRESHONLY_TAG_RE.sub("", task)
+    task = GRACE_TAG_RE.sub("", task)
     task = re.sub(r"\s{2,}", " ", task)
     return task.strip()
 
@@ -779,6 +870,85 @@ def _collect_completed_ids(content: str) -> set[str]:
         if task_id:
             completed.add(task_id)
     return completed
+
+
+def _set_retry_marker(line_body: str, dt: datetime) -> str:
+    """Return line_body with its `<!-- retry: ... -->` set to dt (replace or append)."""
+    marker = f"<!-- retry: {dt.strftime('%Y-%m-%d %H:%M')} -->"
+    if RETRY_TAG_RE.search(line_body):
+        return RETRY_TAG_RE.sub(marker, line_body)
+    return f"{line_body.rstrip()} {marker}"
+
+
+def realign_stale_freshonly(now: datetime | None = None) -> int:
+    """Realign stale `#freshonly` recurring tasks to their next slot WITHOUT running them.
+
+    A `#freshonly` task is "stale" when its scheduled slot (retry marker, else `#at:`
+    anchor) lies more than its grace window (#grace:, default 2h) in the past. For such
+    tasks the retry marker is rewritten to the next anchor occurrence so that
+    read_queue_items() filters them out this cycle — no provider call, no side effects.
+
+    Tasks without `#freshonly` are never touched (they keep catch-up semantics, e.g.
+    weekly/monthly maintenance). Run this once per poll cycle BEFORE read_queue_items().
+
+    Returns the number of tasks realigned.
+    """
+    now = now or datetime.now()
+    count = [0]
+
+    def transform(content: str) -> str | None:
+        in_queue = False
+        out: list[str] = []
+        changed = 0
+        for line in content.splitlines(keepends=True):
+            body = line.rstrip("\r\n")
+            newline = line[len(body):]
+            if body.startswith("## "):
+                in_queue = body.strip() == "## Queue"
+                out.append(line)
+                continue
+            if not in_queue:
+                out.append(line)
+                continue
+            m = OPEN_TASK_RE.match(body)
+            if not m:
+                out.append(line)
+                continue
+
+            task_text = m.group(1).strip()
+            every_sec = extract_every_tag(task_text)
+            if every_sec is None or not has_freshonly_tag(task_text):
+                out.append(line)
+                continue
+
+            retry_m = RETRY_TAG_RE.search(body)
+            raw_schedule = retry_m.group(1) if retry_m else extract_at_tag(task_text)
+            scheduled = _resolve_scheduled_dt(raw_schedule, now) if raw_schedule else None
+            if scheduled is None or scheduled > now:
+                out.append(line)  # no timing info, or not due yet → untouched
+                continue
+
+            grace = extract_grace_tag(task_text)
+            if grace is None:
+                grace = DEFAULT_GRACE_SEC
+            if (now - scheduled).total_seconds() <= grace:
+                out.append(line)  # fresh enough → let read_queue_items run it
+                continue
+
+            # Stale → realign to the next slot, do NOT run.
+            anchor = _anchor_time_of_day(task_text)
+            if anchor is not None and _is_whole_day_interval(every_sec):
+                next_dt = _next_anchor_occurrence(anchor, every_sec, now)
+            else:
+                next_dt = now + timedelta(seconds=every_sec)
+            out.append(_set_retry_marker(body, next_dt) + newline)
+            changed += 1
+
+        count[0] = changed
+        return "".join(out) if changed else None
+
+    applied = _apply_update(transform)
+    return count[0] if applied else 0
 
 
 def read_queue_items() -> list[QueueTask]:
@@ -969,15 +1139,31 @@ def _completion_replacement(task_text: str, done_replacement: str) -> str:
     """Return the rewrite for a successfully completed task.
 
     Normal case: returns `done_replacement` (a `- [x] ...` line).
-    `#every:<duration>` case: returns `- [ ] <task> <!-- retry: now+duration -->`,
-    so the task stays in the queue and fires again on schedule. The `#at:` tag
-    (if any) is stripped — it served its purpose on the first fire.
+
+    `#every:<duration>` case: returns `- [ ] <task> <!-- retry: <next> -->`, so the
+    task stays in the queue and fires again on schedule.
+
+    Anchored (`#at:HH:MM #every:Nd`, N>=1 day): the next run is the next occurrence of
+    the anchor time-of-day — NOT now+duration — so the daily slot never drifts. The
+    `#at:` anchor is preserved (normalized to bare `HH:MM`, dropping any stale date).
+
+    Non-anchored (no `#at:` or sub-day interval): legacy behavior — next run is
+    now+duration and a stale one-time `#at:` is stripped.
     """
     every_sec = extract_every_tag(task_text)
     if every_sec is None:
         return done_replacement
-    next_retry = datetime.now() + timedelta(seconds=every_sec)
-    cleaned = AT_TAG_RE.sub("", task_text)
+
+    now = datetime.now()
+    anchor = _anchor_time_of_day(task_text)
+    if anchor is not None and _is_whole_day_interval(every_sec):
+        next_retry = _next_anchor_occurrence(anchor, every_sec, now)
+        # Preserve the anchor, normalized to bare HH:MM (idempotent; drops stale date).
+        cleaned = AT_TAG_RE.sub(f"#at:{anchor[0]:02d}:{anchor[1]:02d}", task_text)
+    else:
+        next_retry = now + timedelta(seconds=every_sec)
+        cleaned = AT_TAG_RE.sub("", task_text)
+
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return f"- [ ] {cleaned} <!-- retry: {next_retry.strftime('%Y-%m-%d %H:%M')} -->"
 

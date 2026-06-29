@@ -31,3 +31,4 @@ logs/
 # Tool output & planning docs (not tracked)
 /docs
 /.review-loop
+/.dev-loop

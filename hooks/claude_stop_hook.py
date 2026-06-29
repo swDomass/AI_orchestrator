@@ -28,6 +28,13 @@ MIN_RESPONSE_LEN = 80
 
 NOTIFIER = Path(__file__).parent.parent / "notifier.py"
 
+# How to announce a completed task in an interactive CLI session:
+#   "telegram" → send a Telegram message via notifier.py (default)
+#   "bell"     → ring the terminal bell (WezTerm shows its visual bell), no Telegram
+# Both paths are kept fully intact — set this to "bell" to use the terminal
+# bell instead of Telegram notifications.
+NOTIFY_CHANNEL = "telegram"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Windows focus check (no external deps)
@@ -108,28 +115,26 @@ def _escape_md(text: str) -> str:
     return "".join(out)
 
 
-def main() -> None:
-    raw = sys.stdin.read()
+def ring_terminal_bell() -> None:
+    """Ring the terminal bell so WezTerm fires its (visual) bell.
+
+    The hook's stdout/stderr are captured by Claude Code and never reach the
+    terminal, so writing a BEL there would be swallowed. Instead we open the
+    Windows console device (CONOUT$) directly — it is attached to the same
+    ConPTY that WezTerm drives, so the BEL (0x07) actually gets through.
+    """
     try:
-        data = json.loads(raw)
-    except Exception:
-        sys.exit(0)
+        with open("CONOUT$", "w") as con:
+            con.write("\a")
+            con.flush()
+    except OSError:
+        # Fallback: stderr may still reach the terminal in some setups.
+        sys.stderr.write("\a")
+        sys.stderr.flush()
 
-    # Guard: stop_hook_active prevents infinite loops when Claude continues
-    # processing because of this hook's output.
-    if data.get("stop_hook_active"):
-        sys.exit(0)
 
-    last_msg: str = data.get("last_assistant_message", "")
-
-    # Skip trivially short responses (acknowledgments, single-word replies, etc.)
-    if len(last_msg) < MIN_RESPONSE_LEN:
-        sys.exit(0)
-
-    # Don't notify if the user is already looking at this terminal window.
-    if is_terminal_focused():
-        sys.exit(0)
-
+def send_telegram(data: dict, last_msg: str) -> None:
+    """Forward a completion notification to Telegram via notifier.py."""
     # Build a readable preview (first ~200 chars, stripped of leading whitespace)
     preview = last_msg.strip()[:200]
     if len(last_msg.strip()) > 200:
@@ -151,6 +156,36 @@ def main() -> None:
         capture_output=True,
         timeout=15,
     )
+
+
+def main() -> None:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        sys.exit(0)
+
+    # Guard: stop_hook_active prevents infinite loops when Claude continues
+    # processing because of this hook's output.
+    if data.get("stop_hook_active"):
+        sys.exit(0)
+
+    last_msg: str = data.get("last_assistant_message", "")
+
+    # Skip trivially short responses (acknowledgments, single-word replies, etc.)
+    if len(last_msg) < MIN_RESPONSE_LEN:
+        sys.exit(0)
+
+    if NOTIFY_CHANNEL == "telegram":
+        # Don't notify if the user is already looking at this terminal window.
+        if is_terminal_focused():
+            sys.exit(0)
+        send_telegram(data, last_msg)
+    else:
+        # Terminal bell: ring on every non-trivial completion. No focus guard —
+        # a visual bell is only perceptible when you ARE looking at the window.
+        ring_terminal_bell()
+
     sys.exit(0)
 
 

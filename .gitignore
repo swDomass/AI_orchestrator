@@ -32,3 +32,4 @@ logs/
 /docs
 /.review-loop
 /.dev-loop
+*_FUTURE_IDEAS.md

@@ -15,7 +15,6 @@ import time
 from config import (
     CLAUDE_MODEL_ALIASES,
     CODEX_MODEL_ALIASES,
-    GEMINI_MODEL_ALIASES,
     OPENROUTER_MODEL_ALIASES,
     TOOL_MAX_ITERATIONS,
     TOOL_REVIEW_TIMEOUT_SEC,
@@ -134,7 +133,10 @@ subtle bugs the primary reviewer might overlook.
 # Maps alias → owning provider. Used to resolve #second_opinion:<alias> tags.
 # Bare provider names (without underscore) map to themselves with no model
 # override → default CLI model.
-_SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "gemini", "codex"}
+# Gemini removed as a review voice (dead consumer CLI + data-training/privacy
+# concerns); Codex is the external non-Claude second opinion. Gemini stays only
+# as a fallback *execution* provider in the dispatcher chain, not as a reviewer.
+_SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "codex"}
 
 
 def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None] | None:
@@ -154,8 +156,6 @@ def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None
         provider_name, model_id = "openrouter", alias
     elif alias in CLAUDE_MODEL_ALIASES:
         provider_name, model_id = "claude", alias
-    elif alias in GEMINI_MODEL_ALIASES:
-        provider_name, model_id = "gemini", alias
     elif alias in CODEX_MODEL_ALIASES:
         provider_name, model_id = "codex", alias
     elif alias in _SECOND_OPINION_BARE_PROVIDERS:

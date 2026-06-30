@@ -187,7 +187,7 @@ The queue is read from Markdown. Open tasks are standard checkbox lines:
 - [ ] Add CSV export #tool:dev-loop cwd:D:\projects\app #agent:work
 - [ ] Add OAuth2 flow #tool:research-qa cwd:D:\projects\app
 - [ ] Architecture audit #tool:critical-review cwd:D:\projects\app
-- [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:D:\projects\app
+- [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:codex cwd:D:\projects\app
 - [ ] Security audit #tool:security-audit cwd:D:\projects\app
 - [ ] Deep security audit #tool:deep-security-audit cwd:D:\projects\app
 - [ ] Deep audit (no fix) #tool:deep-security-audit #no-fix cwd:D:\projects\app
@@ -222,7 +222,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Skip stale slot | `#freshonly` | `- [ ] Daily brief #at:08:00 #every:24h #freshonly` |
 | Stale grace window | `#grace:<duration>` | `- [ ] Recap #at:19:00 #every:24h #freshonly #grace:4h` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
-| Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:gemini` |
+| Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:codex` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
 
 ### Parallel Tasks (`#parallel`)
@@ -286,7 +286,7 @@ Both schedule tags reuse the existing retry primitive — no separate scheduler.
 | `test-loop` | Iterative test / fix loop until tests pass or max iterations. |
 | `research-qa` | Read-only pre-implementation research: Discovery → Analysis → Question catalogue. Output in `{cwd}/.research-qa/`. No code changes. |
 | `knowledge-transfer` | Cross-domain knowledge transfer: Vault expertise → industry applications (via web search) → Obsidian idea note. |
-| `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:gemini`. Output in `{cwd}/docs/critical-review-*.md`. |
+| `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:codex`. Output in `{cwd}/docs/critical-review-*.md`. |
 | `security-audit` | Two-phase workflow: Audit (read-only) → Fix + pytest. Scans for hardcoded secrets, command injection, path traversal, unsafe deserialization, SSRF, and more. Output in `{cwd}/docs/security-audit-*.md`. |
 | `deep-security-audit` | Multi-agent deep audit: 6 expert personas (pentester, architect, SAST, supply chain, data privacy, forensics) + CISO synthesis + optional fix. `#no-fix` skips fix phase. `#roundtable` inserts a Phase 6.5 dialogue where each persona reviews the others' findings (~6 extra subprocess calls, more robust CISO synthesis on conflicting findings). Output in `{cwd}/docs/deep-security-audit-*.md`. Structured action trace at `{cwd}/.deep-security-audit/traces/<run_id>.jsonl`. |
 | `scientific-investigation` | Wissenschaftlicher Autopilot mit Audit-Trail. Pipeline (Plan v5, I0–I9): Framing + Pre-Registration → Multi-Persona Review (Author + Devils-Advocate + Methodiker) → Sub-Task-Execution-Loop → Synthesis mit Falsifikations-Tabelle → Mechanical & heuristic check → Engineering-Reviewer Rework → Final Telegram-Approval. Status-Tuple `methodological_rigor=MEDIUM\|LOW` (HIGH strukturell ausgeschlossen). Output in `{cwd}/docs/scientific-investigation-{ts}/` + audit-pack via `scripts/build_audit_pack.py`. |
@@ -409,8 +409,8 @@ Pass 3 — Synthesis (only when plan file referenced)
 # Plan review with improved output (3 passes)
 - [ ] Prüfe docs/plan.md #tool:critical-review cwd:D:\projects\app
 
-# Cross-provider (Claude analyzes, Gemini challenges)
-- [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:D:\projects\app
+# Cross-provider (Claude analyzes, Codex challenges)
+- [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:codex cwd:D:\projects\app
 
 # Same provider for both passes
 - [ ] Prüfe [[MyPlan]] #tool:critical-review #pass1:claude #pass2:claude cwd:D:\projects\app
@@ -485,7 +485,7 @@ Phase 3 — Synthese + Ranking
 
 ## Best Practice: Full Dev-Loop Workflow
 
-A battle-tested 8-step queue pattern for implementing a plan end-to-end with cost-optimized model tiering. Strong models (Opus) handle value creation and final validation; cheaper tiers (`codex_mini`, `codex`) do the iterative cleanup; Gemini runs strictly read-only as a second opinion.
+A battle-tested 8-step queue pattern for implementing a plan end-to-end with cost-optimized model tiering. Strong models (Opus) handle value creation and final validation; cheaper tiers (`codex_mini`, `codex`) do the iterative cleanup; Codex runs strictly read-only as a second opinion.
 
 **Recommendation:** keep plans small (one feature / one phase per plan file) and apply this flow per plan. For multi-phase changes, split the plan file into several smaller ones — one commit per plan is cleaner than one commit for many phases.
 
@@ -500,7 +500,7 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 
 - [ ] Review-fix loop for the uncommitted changes. dont commit the changes! #tool:review-loop #id:ID5 #need:ID4 #codex cwd:<repo>
 
-- [ ] Critical review (read-only) of the uncommitted changes against docs\plan-XXX.md #tool:critical-review #pass1:gemini #pass2:claude #gemini_flash #id:ID6 #need:ID5 cwd:<repo>
+- [ ] Critical review (read-only) of the uncommitted changes against docs\plan-XXX.md #tool:critical-review #pass1:claude #pass2:codex #id:ID6 #need:ID5 cwd:<repo>
 
 - [ ] Review-fix loop for the uncommitted changes. Also incorporate findings from the most recent critical-review report in docs/. dont commit the changes! #tool:review-loop #id:ID7 #need:ID6 #claude_opus cwd:<repo>
 
@@ -516,7 +516,7 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 | 3. simplify | `#claude_sonnet` | Refactoring is a bounded task |
 | 4. review-loop (pass A) | `#codex_mini` | Cheap first pass — obvious bugs, unused imports, trivial wins |
 | 5. review-loop (pass B) | `#codex` (gpt-5.4) | Mid-tier — structural issues, missing coverage |
-| 6. critical-review | `#gemini_flash` + `#pass2:claude` | Independent second opinion, strictly read-only — zero risk of broken code |
+| 6. critical-review | `#pass1:claude` + `#pass2:codex` | Independent second opinion, strictly read-only — zero risk of broken code |
 | 7. review-loop (final) | `#claude_opus` | Final validator; integrates critical-review findings. If Opus finds nothing here, the code is genuinely clean |
 | 8. commit | `#claude_haiku` | Trivial — diff + doc sync + single commit. Escalate to `#claude_sonnet` if the plan spans multiple commits |
 
@@ -526,9 +526,9 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 - **Security-critical**: swap step 2 for `#tool:deep-security-audit` (6-agent deep scan)
 - **Multi-commit plans**: raise step 8 to `#claude_sonnet` and instruct it to split via `git add -p`
 
-### Gemini caveat
+### External second opinion: Codex (Gemini retired as reviewer)
 
-Gemini is included **only** in step 6 as `#tool:critical-review`, which is read-only and produces a report file. Do not use Gemini in `dev-loop` or `review-loop` — in write mode it has shown unreliable adherence to task specs.
+Step 6 (`#tool:critical-review #pass2:codex`) runs Codex as an independent, read-only second opinion — a non-Claude voice catches assumptions the Claude reviewers share. Gemini is **no longer used as a reviewer**: the consumer CLI was retired (2026-06-18) and data-training/privacy concerns rule out the HTTP mode for review content. Gemini remains available only as a fallback *execution* provider in the routing chain, never as a reviewer in `dev-loop`/`review-loop`/`critical-review`.
 
 ## Skills (`SKILL.md`)
 

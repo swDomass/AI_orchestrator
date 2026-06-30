@@ -10,7 +10,7 @@ If a plan file is referenced (wikilink or file path), Pass 3 writes {name}-v2.md
 If no plan file, Pass 3 is skipped (2-pass mode, review-only).
 
 Cross-provider support enables real perspective diversity:
-  - [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:gemini cwd:/d/proj
+  - [ ] Prüfe docs/plan.md #tool:critical-review #pass1:claude #pass2:codex cwd:/d/proj
   - [ ] Prüfe [[Plan]] #tool:critical-review #pass1:claude #pass2:claude cwd:/d/proj
   - [ ] Review auth #tool:critical-review cwd:/d/proj  (no plan file → 2-pass review-only)
 

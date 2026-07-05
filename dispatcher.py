@@ -14,7 +14,7 @@ A provider is skipped if:
 import re
 
 import config
-from limits import AllLimits
+from limits import AllLimits, ProviderLimits, is_transient_token_refresh
 from providers.base import BaseProvider
 from providers import ClaudeProvider, GeminiProvider, CodexProvider, OpenRouterProvider
 
@@ -88,6 +88,22 @@ def has_explicit_provider_tag(task: str) -> bool:
     return any(_TAG_RE_BY_PROVIDER[tag].search(task_lower) for tag in _TAG_MAP)
 
 
+def resolve_forced_provider(task: str, force_name: str | None = None) -> BaseProvider | None:
+    """Return the provider a task explicitly forces — via *force_name* or a
+    #provider/#model tag — or None if none is forced / the tagged provider isn't
+    registered (e.g. openrouter without an API key). Shared by select_provider()
+    and force_refresh_can_unblock() so both agree on which provider is forced."""
+    if force_name and force_name in _providers:
+        return _providers[force_name]
+    task_lower = task.lower()
+    for tag, provider_name in _TAG_MAP.items():
+        if _TAG_RE_BY_PROVIDER[tag].search(task_lower):
+            provider = _providers.get(provider_name)
+            if provider is not None:
+                return provider
+    return None
+
+
 def select_provider(
     task: str,
     limits: AllLimits,
@@ -105,20 +121,10 @@ def select_provider(
     If a profile is given, its provider order overrides the default priority.
     If tool_name is given, allowed providers are filtered via PolicyEngine.
     """
-    # Check for explicit provider tag.
-    # Use .get() because some tagged providers (currently: openrouter) are only
-    # registered when their API key is configured — without it, the tag resolves
-    # to None and the task falls through to the default chain.
-    task_lower = task.lower()
-    forced = None
-    if force_name and force_name in _providers:
-        forced = _providers[force_name]
-    else:
-        for tag, provider_name in _TAG_MAP.items():
-            if _TAG_RE_BY_PROVIDER[tag].search(task_lower):
-                forced = _providers.get(provider_name)
-                if forced is not None:
-                    break
+    # Resolve an explicitly forced provider (via force_name or a #provider/#model
+    # tag). Returns None when a tagged provider isn't registered (e.g. openrouter
+    # without an API key), so the task falls through to the default chain.
+    forced = resolve_forced_provider(task, force_name)
 
     # Tool Policy Layering: filter allowed providers for this tool
     allowed_by_policy = None
@@ -181,6 +187,28 @@ def select_provider(
         return provider
 
     return None
+
+
+def force_refresh_can_unblock(
+    task: str,
+    limits: AllLimits,
+    *,
+    force_name: str | None = None,
+    strict: bool = False,
+) -> bool:
+    """True iff select_provider() returned None only because a provider this task can
+    actually route to is mid OAuth-token-refresh (a transient "expired" snapshot) — so
+    a synchronous limits force_refresh could plausibly turn that None into a provider.
+
+    For a strict/forced task only the forced provider is routable, so an unrelated
+    provider's expired token must NOT trigger a refresh (that would waste a synchronous
+    refresh while the forced provider is genuinely capacity-exhausted). For non-forced
+    tasks any provider counts, since a refresh could open up a fallback."""
+    if strict:
+        forced = resolve_forced_provider(task, force_name)
+        if forced is not None:
+            return is_transient_token_refresh(getattr(limits, forced.name, ProviderLimits()))
+    return limits.has_transient_token_refresh()
 
 
 def get_provider_by_name(name: str) -> BaseProvider | None:

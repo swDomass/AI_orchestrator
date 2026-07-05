@@ -5,7 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from dispatcher import select_provider, has_explicit_provider_tag, _providers
+import limits
+from dispatcher import (
+    select_provider,
+    has_explicit_provider_tag,
+    resolve_forced_provider,
+    force_refresh_can_unblock,
+    _providers,
+)
 
 
 def _make_limits(claude_avail=True, gemini_avail=True, codex_avail=True,
@@ -207,3 +214,62 @@ def test_limits_ok_still_checks_native_providers():
     limits = _make_limits(claude_avail=False)
     assert _limits_ok("claude", limits) is False
     assert _limits_ok("gemini", limits) is True
+
+
+def test_resolve_forced_provider_via_model_tag():
+    p = resolve_forced_provider("Morning brief #claude_sonnet")
+    assert p is not None and p.name == "claude"
+
+
+def test_resolve_forced_provider_via_force_name():
+    p = resolve_forced_provider("Plain task", force_name="gemini")
+    assert p is not None and p.name == "gemini"
+
+
+def test_resolve_forced_provider_none_for_plain_task():
+    assert resolve_forced_provider("Fix the login bug") is None
+
+
+def test_force_refresh_can_unblock_strict_ignores_unrelated_expired_provider():
+    """Codex P2: strict #claude_sonnet with claude GENUINELY exhausted (reset known)
+    while an unrelated provider's token is expired must NOT trigger a force_refresh —
+    a refresh can't unblock the only routable provider."""
+    all_limits = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+        gemini=limits.ProviderLimits(available=False, error="token expired"),
+        codex=limits.ProviderLimits(available=False, error="token expired"),
+    )
+    assert force_refresh_can_unblock(
+        "Morning brief #claude_sonnet", all_limits, strict=True
+    ) is False
+
+
+def test_force_refresh_can_unblock_strict_true_when_forced_provider_expired():
+    all_limits = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, error="token expired"),
+        gemini=limits.ProviderLimits(available=True, remaining_pct=100.0),
+        codex=limits.ProviderLimits(available=True, remaining_pct=100.0),
+    )
+    assert force_refresh_can_unblock(
+        "Morning brief #claude_sonnet", all_limits, strict=True
+    ) is True
+
+
+def test_force_refresh_can_unblock_non_strict_checks_any_provider():
+    """Non-forced task: claude exhausted but gemini expired → a refresh could open
+    the gemini fallback, so it SHOULD be attempted."""
+    all_limits = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+        gemini=limits.ProviderLimits(available=False, error="token expired"),
+        codex=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+    )
+    assert force_refresh_can_unblock("Fix a bug", all_limits, strict=False) is True
+
+
+def test_force_refresh_can_unblock_false_when_nothing_transient():
+    all_limits = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+        gemini=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+        codex=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+    )
+    assert force_refresh_can_unblock("Fix a bug", all_limits, strict=False) is False

@@ -53,7 +53,7 @@ from config import (
     TRACK_FILE_CHANGES,
     get_system_prompt,
 )
-from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag
+from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag, force_refresh_can_unblock
 from limits import get_limits, set_queue_idle, set_paused, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
     notify_error,
@@ -1064,9 +1064,23 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if tool_name:
             tried_providers: set[str] = set()
             tool_retry_count = 0
+            tool_token_refreshed = False
             while True:
                 provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
                 if provider is None:
+                    # Boot-race recovery (mirrors the single-shot path): on the FIRST
+                    # selection, if the provider this task can route to is only blocked
+                    # by an in-flight OAuth token refresh, wait for it once via a
+                    # synchronous force_refresh before parking. Gated to the first
+                    # selection (empty tried_providers) + a one-shot flag so real
+                    # exhaustion / mid-loop rotation never loops force-refreshing.
+                    if (not tried_providers and not tool_token_refreshed
+                            and force_refresh_can_unblock(task, limits, strict=provider_is_forced)):
+                        tool_token_refreshed = True
+                        print("  [limits] Provider unreachable (Token wird erneuert) → force-refresh + Retry")
+                        append_log("Provider unreachable wegen Token-Refresh → force_refresh der Limits")
+                        limits = get_limits(force_refresh=True)
+                        continue
                     earliest = _get_next_retry_sec(limits)
                     reset_dt = datetime.now() + timedelta(seconds=earliest)
                     reset_at_display = reset_dt.strftime("%H:%M")
@@ -1268,6 +1282,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         tried_providers: set[str] = set()
         single_shot_success = False
         single_shot_retry_count = 0
+        single_shot_token_refreshed = False
         while True:
             if pause_event and pause_event.is_set():
                 print("\n[pause] Queue-Verarbeitung pausiert.")
@@ -1280,6 +1295,22 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
             if provider is None:
                 if not tried_providers:
+                    # Boot-race recovery: a strict/forced task can hit an expired
+                    # OAuth token that the background limits thread is still
+                    # refreshing (preliminary snapshot). Wait for that refresh once
+                    # via a synchronous force_refresh before giving up — mirrors the
+                    # tool-path's rate_limit handling. Scoped to the provider this task
+                    # can actually route to (force_refresh_can_unblock), so genuine
+                    # exhaustion of the forced provider still falls straight through to
+                    # the retry path. Bounded to a single attempt (no endless loop).
+                    if not single_shot_token_refreshed and force_refresh_can_unblock(
+                        task, limits, strict=provider_is_forced
+                    ):
+                        single_shot_token_refreshed = True
+                        print("  [limits] Provider unreachable (Token wird erneuert) → force-refresh + Retry")
+                        append_log("Provider unreachable wegen Token-Refresh → force_refresh der Limits")
+                        limits = get_limits(force_refresh=True)
+                        continue
                     earliest = _get_next_retry_sec(limits)
                     reset_dt = datetime.now() + timedelta(seconds=earliest)
                     reset_at_display = reset_dt.strftime("%H:%M")

@@ -426,6 +426,64 @@ def test_compute_next_poll_sec_returns_error_interval_for_transient():
     assert limits._compute_next_poll_sec(result) == limits._BG_POLL_ERROR_SEC
 
 
+def test_is_transient_token_refresh_true_for_expired_token():
+    pl = limits.ProviderLimits(available=False, error="token expired")
+    assert limits.is_transient_token_refresh(pl) is True
+
+
+def test_is_transient_token_refresh_true_for_auth_expired():
+    pl = limits.ProviderLimits(available=False, remaining_pct=0.0, error="auth expired")
+    assert limits.is_transient_token_refresh(pl) is True
+
+
+def test_is_transient_token_refresh_false_for_genuine_exhaustion():
+    # Real capacity exhaustion carries a known reset window and no "expired" error.
+    pl = limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600)
+    assert limits.is_transient_token_refresh(pl) is False
+
+
+def test_is_transient_token_refresh_false_when_available():
+    pl = limits.ProviderLimits(available=True, remaining_pct=100.0)
+    assert limits.is_transient_token_refresh(pl) is False
+
+
+def test_is_transient_token_refresh_false_for_non_expired_error():
+    # A cclimits transport timeout is not a token-refresh state.
+    pl = limits.ProviderLimits(available=False, error="cclimits timeout")
+    assert limits.is_transient_token_refresh(pl) is False
+
+
+def test_is_transient_token_refresh_false_when_expired_but_reset_known():
+    # Defensive: a set reset window means real exhaustion, not a token refresh,
+    # even if the error string happens to mention "expired".
+    pl = limits.ProviderLimits(available=False, error="token expired", resets_in_sec=1800)
+    assert limits.is_transient_token_refresh(pl) is False
+
+
+def test_has_transient_token_refresh_detects_any_provider():
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+        gemini=limits.ProviderLimits(available=False, error="token expired"),
+        codex=limits.ProviderLimits(available=True, remaining_pct=100.0),
+    )
+    assert result.has_transient_token_refresh() is True
+
+
+def test_has_transient_token_refresh_false_for_healthy_or_exhausted():
+    result = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=100.0),
+        gemini=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+        codex=limits.ProviderLimits(available=False, error="cclimits timeout"),
+    )
+    assert result.has_transient_token_refresh() is False
+
+
+def test_has_transient_token_refresh_false_for_default_snapshot():
+    # A bare AllLimits() (all unavailable, no error, no reset) is NOT a token
+    # refresh — matches the dispatcher's no-op fall-through at boot.
+    assert limits.AllLimits().has_transient_token_refresh() is False
+
+
 def test_compute_next_poll_sec_returns_idle_interval_when_queue_is_empty(monkeypatch):
     """When _queue_idle is set and capacity is available, return the longer idle interval."""
     monkeypatch.setattr(limits, "_queue_idle", threading.Event())

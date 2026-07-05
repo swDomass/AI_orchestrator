@@ -135,6 +135,35 @@ class AllLimits:
     def any_available(self) -> bool:
         return any((self.claude.available, self.gemini.available, self.codex.available))
 
+    def has_transient_token_refresh(self) -> bool:
+        """True when any provider is unavailable solely because its OAuth token is
+        mid-refresh (an "expired" snapshot). The dispatcher uses this to force a
+        synchronous limits refresh before declaring a task unroutable at boot."""
+        return any(
+            is_transient_token_refresh(p)
+            for p in (self.claude, self.gemini, self.codex)
+        )
+
+
+def is_transient_token_refresh(pl: ProviderLimits) -> bool:
+    """True when *pl* is unavailable only because its OAuth token is being refreshed
+    (an "expired" snapshot), NOT because of genuine capacity exhaustion.
+
+    Genuine exhaustion always carries a known reset window (``resets_in_sec > 0``);
+    a token-expired snapshot has no reset and an "expired" error string (see
+    ``_needs_token_refresh`` and ``_parse_dual_window_provider``).
+
+    Trade-off: this inspects the collapsed ``ProviderLimits.error``, which
+    ``_parse_dual_window_provider`` fills as ``error or token_status``. It matches
+    every observed cclimits boot state (``token_status="expired"`` → ``error="expired"``).
+    It would miss a hypothetical snapshot carrying a distinct non-"expired" ``error``
+    string *alongside* ``token_status="expired"``. Broadening to "any error present"
+    is deliberately avoided so transient transport errors (e.g. "cclimits timeout")
+    are NOT misclassified as a token refresh."""
+    if pl.available or pl.resets_in_sec > 0:
+        return False
+    return "expired" in (pl.error or "").lower()
+
 
 def _parse_resets_in(resets_str: str) -> int:
     """Convert '2h 30m' or '45m' or '1d 2h' to seconds."""

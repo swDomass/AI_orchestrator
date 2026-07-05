@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import limits
 import orchestrator
 import policy as policy_module
 from tools.base_tool import ToolResult
@@ -110,6 +111,106 @@ def test_run_once_marks_tool_task_for_retry_on_timeout_without_provider_fallback
     mark_retry_mock.assert_called_once()
     p1.set_cooldown.assert_not_called()
     p2.set_cooldown.assert_not_called()
+
+
+def test_run_once_tool_task_recovers_from_token_refresh_race(monkeypatch):
+    """Tool-path boot race: on the FIRST selection a tool task whose provider is only
+    blocked by an in-flight OAuth token refresh must force-refresh limits ONCE and then
+    dispatch — not fast-fail as provider_unreachable (mirrors the single-shot fix)."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    expired = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, error="token expired"),
+    )
+    healthy = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=100.0),
+    )
+    get_limits_calls = []
+
+    def fake_get_limits(force_refresh=False):
+        get_limits_calls.append(force_refresh)
+        return healthy if force_refresh else expired
+
+    # None on the first selection (limits show expired), provider once refreshed.
+    select_results = [None, provider]
+
+    def fake_select_provider(_task, _limits, exclude=None, **_kw):
+        return select_results.pop(0)
+
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=True, finalized=True, retryable=False, error="", error_code="",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:test-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 3600)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_a, **_k: None)
+
+    orchestrator.run_once()
+
+    # Exactly one force_refresh after the transient miss, then the tool executes.
+    assert get_limits_calls == [False, True]
+    exec_mock.assert_called_once()
+    assert exec_mock.call_args.args[2].name == "claude"
+    mark_retry_mock.assert_not_called()
+
+
+def test_run_once_tool_task_parks_after_single_force_refresh_when_token_stays_expired(monkeypatch):
+    """Tool-path endless-loop guard: if the token is STILL expired after the one
+    force_refresh, the task is parked after EXACTLY ONE refresh — never loops."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    expired = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, error="token expired"),
+    )
+    get_limits_calls = []
+
+    def fake_get_limits(force_refresh=False):
+        get_limits_calls.append(force_refresh)
+        return expired
+
+    exec_mock = Mock()
+    mark_retry_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:test-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 3600)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_a, **_k: None)
+
+    orchestrator.run_once()
+
+    # Exactly one force_refresh, then parked — no endless force-refresh loop.
+    assert get_limits_calls == [False, True]
+    exec_mock.assert_not_called()
+    mark_retry_mock.assert_called_once()
 
 
 def test_run_once_tool_runtime_exceeded_is_terminal_no_fallback_no_fresh_deadline(monkeypatch):
@@ -262,7 +363,9 @@ def _stub_single_shot_env(monkeypatch, *, raw_line, provider):
     monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)  # NON-tool
-    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    # Real AllLimits() so the single-shot None-path can call
+    # limits.has_transient_token_refresh() (default → False = no transient state).
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: limits.AllLimits())
     monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: provider)
     monkeypatch.setattr(orchestrator, "_build_prompt", lambda *a, **kw: "prompt")
     monkeypatch.setattr(orchestrator, "report_estimated_usage", lambda *a, **kw: None)
@@ -340,6 +443,159 @@ def test_run_once_single_shot_hang_blocks_after_max_retries(monkeypatch):
     # hang_count 2 → +1 = 3 > MAX_HANG_RETRIES(2) → blocked (finalized), no requeue
     finalize_mock.assert_called_once()
     mark_retry_mock.assert_not_called()
+
+
+def test_run_once_single_shot_recovers_from_token_refresh_race(monkeypatch):
+    """Boot race: a single-shot task whose provider is briefly unavailable because
+    its OAuth token is mid-refresh (preliminary "expired" snapshot) must force-refresh
+    the limits ONCE and then dispatch — NOT fast-fail as provider_unreachable."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task",
+        provider=provider,
+    )
+
+    # First snapshot mimics the boot preliminary: claude token expired (transient).
+    # The synchronous force_refresh then returns healthy limits.
+    expired = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, error="token expired"),
+    )
+    healthy = limits.AllLimits(
+        claude=limits.ProviderLimits(available=True, remaining_pct=100.0),
+    )
+    get_limits_calls = []
+
+    def fake_get_limits(force_refresh=False):
+        get_limits_calls.append(force_refresh)
+        return healthy if force_refresh else expired
+
+    # select_provider: None while limits show expired, provider once refreshed.
+    select_results = [None, provider]
+
+    def fake_select_provider(_task, _limits, exclude=None, **_kw):
+        return select_results.pop(0)
+
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=True, output="ok"), False),
+    )
+    mark_retry_mock = Mock(return_value=True)
+    finalize_mock = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "_get_change_summary", lambda *a, **kw: "")
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    # Exactly one force_refresh after the transient miss, then dispatch succeeds.
+    assert get_limits_calls == [False, True]
+    finalize_mock.assert_called_once()      # task dispatched + finalized
+    mark_retry_mock.assert_not_called()     # NOT parked as provider_unreachable
+
+
+def test_run_once_single_shot_no_force_refresh_on_genuine_exhaustion(monkeypatch):
+    """Genuine capacity exhaustion (a known reset window, no "expired" token) must
+    NOT trigger a force_refresh — it falls straight through to the retry path."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task",
+        provider=provider,
+    )
+
+    exhausted = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
+    )
+    get_limits_calls = []
+
+    def fake_get_limits(force_refresh=False):
+        get_limits_calls.append(force_refresh)
+        return exhausted
+
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 3600)
+    mark_retry_mock = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+
+    orchestrator.run_once()
+
+    # No force_refresh (transient marker is False for genuine exhaustion); parked.
+    assert get_limits_calls == [False]
+    mark_retry_mock.assert_called_once()
+
+
+def test_run_once_single_shot_parks_after_single_force_refresh_when_token_stays_expired(monkeypatch):
+    """If the OAuth token is STILL expired after the one synchronous force_refresh
+    (persistent re-auth needed — the _refresh_failed_until backoff case), the task is
+    parked as provider_unreachable after EXACTLY ONE force_refresh — it must NEVER
+    force-refresh on every loop iteration (endless-loop guard)."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task",
+        provider=provider,
+    )
+
+    # The refresh never clears the expired state (persistent re-auth required).
+    expired = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, error="token expired"),
+    )
+    get_limits_calls = []
+
+    def fake_get_limits(force_refresh=False):
+        get_limits_calls.append(force_refresh)
+        return expired
+
+    monkeypatch.setattr(orchestrator, "get_limits", fake_get_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 900)
+    mark_retry_mock = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+
+    orchestrator.run_once()
+
+    # Exactly one force_refresh (guard fires once), then parked — no endless loop.
+    assert get_limits_calls == [False, True]
+    mark_retry_mock.assert_called_once()
+
+
+def test_run_once_single_shot_passes_strict_flag_to_force_refresh_check(monkeypatch):
+    """run_once must scope the token-refresh recovery to the routable provider by
+    passing strict=provider_is_forced into force_refresh_can_unblock (so a forced
+    task's unrelated expired provider can't trigger a wasteful refresh)."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+    _stub_single_shot_env(monkeypatch, raw_line="- [ ] Plain claude task", provider=provider)
+    monkeypatch.setattr(orchestrator, "has_explicit_provider_tag", lambda _task: True)  # forced
+
+    all_limits = limits.AllLimits(
+        claude=limits.ProviderLimits(available=False, error="token expired"),
+    )
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: all_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 900)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", Mock(return_value=True))
+
+    seen = {}
+
+    def spy(task, lim, *, strict=False, force_name=None):
+        seen["strict"] = strict
+        return False  # short-circuit: skip the force_refresh, park the task
+
+    monkeypatch.setattr(orchestrator, "force_refresh_can_unblock", spy)
+
+    orchestrator.run_once()
+
+    assert seen["strict"] is True
 
 
 def test_run_once_sets_rate_limit_cooldown_for_tool_task(monkeypatch):
@@ -605,7 +861,7 @@ def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
     monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
-    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: limits.AllLimits())
     monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1)
     monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
     monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_args, **_kwargs: "")

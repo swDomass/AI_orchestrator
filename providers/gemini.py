@@ -238,7 +238,18 @@ class GeminiProvider(BaseProvider):
             output = (result.stdout or "").strip()
             stderr = (result.stderr or "").strip()
 
+            # A truncated prompt still yields rc==0 plus a plausible answer to
+            # whatever fragment arrived — see providers/process_runner._feed_stdin.
+            # Bare code — matches the exact-equality convention noted above.
+            # getattr(): provider tests fake the result as a SimpleNamespace.
+            # Deliberately NOT checked up front: a child dying early (rate limit)
+            # ALSO breaks the pipe, so an early check would mask that better
+            # classification. Applied where it is the only explanation.
+            stdin_error = getattr(result, "stdin_error", None)
+
             if result.returncode == 0 and output:
+                if stdin_error:
+                    return RunResult(success=False, error="stdin_incomplete", output=stdin_error)
                 return RunResult(success=True, output=output)
 
             combined = (output + stderr).lower()
@@ -247,7 +258,19 @@ class GeminiProvider(BaseProvider):
             if any(kw in combined for kw in ("unavailable", "503", "connection", "unreachable", "network")):
                 return RunResult(success=False, error="unreachable")
 
-            return RunResult(success=False, error=stderr or output or "empty output")
+            # Nothing better matched — but ONLY trust this at rc == 0. At
+            # rc != 0 the broken pipe is almost always a SYMPTOM: any CLI dying
+            # early (not logged in, model not found, a panic) also breaks the
+            # feeder, because the prompt (~100 KB) far exceeds the OS pipe
+            # buffer. Those keep their real error; the diagnosis is appended.
+            if stdin_error and result.returncode == 0:
+                return RunResult(success=False, error="stdin_incomplete", output=stdin_error)
+
+            return RunResult(
+                success=False,
+                error=stderr or output or "empty output",
+                output=(output + "\n[stdin] " + stdin_error) if stdin_error else output,
+            )
 
         except subprocess.TimeoutExpired as exc:
             kind = getattr(exc, "timeout_kind", "hard")

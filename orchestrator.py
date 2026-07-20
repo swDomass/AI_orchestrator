@@ -379,7 +379,12 @@ def _run_with_retry(
 
         # "hang" (idle-kill) like "timeout": no provider fallback — a frozen
         # process is not a "different provider would help" case.
-        if result.error in ("rate_limit", "unreachable", "timeout", "hang"):
+        # "stdin_incomplete": retrying the SAME oversized prompt down the SAME
+        # pipe is the least likely thing to work, and each attempt burns a full
+        # prompt (~26k cache_creation tokens in the 2026-07-20 incident). Bail
+        # out of the in-run backoff; the task keeps its past retry marker and is
+        # picked up again on the next poll within the grace window.
+        if result.error in ("rate_limit", "unreachable", "timeout", "hang", "stdin_incomplete"):
             return result, True
 
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
@@ -1449,6 +1454,21 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 _span.retry("hang", retry_count=single_shot_retry_count)
                 break
 
+            # NOTE on "stdin_incomplete" (prompt not fully delivered, see
+            # providers/process_runner._feed_stdin): deliberately NOT special-
+            # cased here. It takes the generic else-branch below — 5-min
+            # provider cooldown + rotation — which is bounded and self-healing:
+            # this run rotates and breaks without touching the queue line; on a
+            # LATER poll, with every provider still cooled, select_provider
+            # returns None and the `if not tried_providers` branch parks the
+            # task via mark_retry until the cooldowns expire.
+            # An earlier attempt to skip cooldown+rotation (a local pipe fault
+            # says nothing about provider health, and all providers share the
+            # feeder) removed that throttle without replacing it, producing an
+            # unbounded 30-second retry loop. Rotating costs one prompt per
+            # provider; looping forever costs everything. If this is revisited,
+            # it needs the `hang` treatment: a persistent counter in the queue
+            # line, backoff, and BLOCK after N — not a bare `break`.
             if error == "rate_limit":
                 limits = get_limits(force_refresh=True)
                 lim = getattr(limits, provider.name)

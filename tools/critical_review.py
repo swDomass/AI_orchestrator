@@ -550,7 +550,7 @@ class CriticalReviewTool(BaseTool):
 
         if result1.error:
             print(f"  [critical-review] ✗ Pass 1 Fehler: {result1.error}")
-            retryable = result1.error in ("rate_limit", "unreachable", "timeout")
+            retryable = result1.error in ("rate_limit", "unreachable", "timeout", "stdin_incomplete")
             return ToolResult(
                 success=False,
                 output=result1.output,
@@ -687,7 +687,7 @@ class CriticalReviewTool(BaseTool):
         if result2.error:
             print(f"  [critical-review] ⚠ Pass 2 Fehler: {result2.error}")
             print(f"  [critical-review] Pass 1 gespeichert: {docs_dir / pass1_filename}")
-            retryable2 = result2.error in ("rate_limit", "unreachable", "timeout")
+            retryable2 = result2.error in ("rate_limit", "unreachable", "timeout", "stdin_incomplete")
             return ToolResult(
                 success=False,
                 output=(

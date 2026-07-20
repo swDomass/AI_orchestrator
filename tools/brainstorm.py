@@ -527,6 +527,7 @@ class BrainstormTool(BaseTool):
             state["report_path"] = str(report_path)
             state["phase"] = "synthesis_failed"
             _atomic_write_json(state_path, state)
+            err_code = getattr(synth_result, "error", "") or "synthesis_failed"
             notify_tool_done(self.name, iterations_used, False,
                              f"Synthese fehlgeschlagen, Raw-Report: {report_path.name}")
             return ToolResult(
@@ -534,8 +535,10 @@ class BrainstormTool(BaseTool):
                 output=f"Synthese fehlgeschlagen — Raw-Report: {report_path}",
                 iterations=iterations_used,
                 error=err,
-                error_code=getattr(synth_result, "error", "synthesis_failed") or "synthesis_failed",
-                retryable=False,
+                error_code=err_code,
+                # A prompt that never fully reached the CLI is the most clearly
+                # repeatable failure class there is — it must not close the task.
+                retryable=err_code in ("stdin_incomplete",),
                 **counter.as_kwargs(),
             )
 

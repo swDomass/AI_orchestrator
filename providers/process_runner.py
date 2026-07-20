@@ -37,6 +37,7 @@ Liveness model — see ``_Liveness``:
 
 import codecs
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -47,6 +48,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 from config import TASK_TIMEOUT_SEC
+
+_log = logging.getLogger(__name__)
 
 _POSIX_TERM_GRACE_SEC = 5.0      # SIGTERM → wait → SIGKILL
 _WATCHDOG_POLL_SEC = 0.5         # interval of the watchdog loop
@@ -73,11 +76,20 @@ class WatchdogResult:
     Own class instead of subprocess.CompletedProcess because the latter
     requires ``args``; the providers and tests only read returncode/stdout/
     stderr, so duck typing is enough.
+
+    ``stdin_error`` carries a diagnostic string when the prompt did NOT fully
+    reach the child — see ``_feed_stdin``. None means every byte was handed to
+    the OS pipe, NOT that the child read them: a prompt below the pipe buffer
+    (~64 KB) is accepted whole even by a child that never reads, so small
+    prompts are a blind spot (documented in docs/architecture/components.md).
+    Providers MUST read it via ``getattr(result, "stdin_error", None)``: the
+    provider tests fake this object with a three-field ``SimpleNamespace``.
     """
 
     returncode: int
     stdout: str
     stderr: str
+    stdin_error: str | None = None
 
 
 class _Liveness:
@@ -270,19 +282,78 @@ def _content_blocks(evt: dict, block_type: str) -> list[dict]:
     ]
 
 
-def _feed_stdin(proc: subprocess.Popen, input_text: str | None) -> None:
-    """Write input_text to the process stdin and close it (own thread)."""
+@dataclass
+class _StdinDelivery:
+    """Outcome of the stdin feeder thread, read by the caller AFTER its join.
+
+    Fail-CLOSED by design: ``delivered`` is set ONLY after a successful
+    ``close()``. Every other way out of the feeder — a caught write/flush error,
+    an exception class we do NOT catch (``MemoryError`` on a multi-MB prompt,
+    ``RuntimeError`` at interpreter shutdown), or a thread that never finished —
+    leaves it False and therefore counts as a failed delivery. The default state
+    has to be "not delivered": the whole reason this class exists is that a
+    silently lost prompt used to look like a success.
+    """
+
+    expected_chars: int = 0
+    delivered: bool = False
+    error: str | None = None
+
+
+def _feed_stdin(
+    proc: subprocess.Popen,
+    input_text: str | None,
+    delivery: _StdinDelivery,
+) -> None:
+    """Write input_text to the process stdin and close it (own thread).
+
+    A swallowed failure here is NOT harmless. ``_spawn`` opens stdin with
+    ``text=True`` → a buffered ``TextIOWrapper``, so ``write()`` only fills the
+    buffer and the *tail* is flushed by ``flush()``/``close()``. If that final
+    flush fails, the child receives a TRUNCATED prompt. The orchestrator builds
+    its prompt as ``core → skills → memory → task`` (orchestrator._build_prompt),
+    i.e. the task text sits at the very END — so a lost tail removes the
+    instruction and leaves a context-only prompt. The CLI then answers "what
+    would you like me to do?", exits 0 with a valid result event, and the run is
+    finalized as a SUCCESS that did nothing. Observed 5×; cost 3 days of vault
+    health data (2026-07-20).
+
+    ``flush()`` is therefore called explicitly before ``close()`` so the tail
+    flush is its own, attributable failure site, and the outcome is recorded in
+    ``delivery`` instead of being dropped.
+    """
     if input_text is None:
         try:
             proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
+        delivery.delivered = True
         return
+
+    stage = "write"
     try:
-        proc.stdin.write(input_text)
+        written = proc.stdin.write(input_text)
+        # Defensive: write() returns the accepted character count. Against a real
+        # pipe it has always returned the full length in testing (verified to
+        # 5 MB), but a short return would silently drop the tail — the exact
+        # failure this function exists to catch — so treat it as one.
+        if written is not None and written < len(input_text):
+            raise OSError(f"short write: {written} of {len(input_text)} chars accepted")
+        stage = "flush"
+        proc.stdin.flush()
+        stage = "close"
         proc.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass  # process may die before the write completes
+        delivery.delivered = True  # last statement: only a clean run confirms
+    except (BrokenPipeError, OSError, ValueError) as e:
+        # A failing write/flush/close raises without telling us how much of the
+        # buffer reached the pipe, so we report the prompt length and say plainly
+        # that the delivered amount is unknown rather than implying all N failed.
+        # (A short return from write() is handled above, where the count IS known.)
+        delivery.error = (
+            f"{stage}() failed; prompt was {len(input_text)} chars, "
+            f"delivered amount unknown: {type(e).__name__}: {e}"
+        )
+        _log.error("[stdin] prompt delivery incomplete — %s", delivery.error)
 
 
 def _tree_kill(proc: subprocess.Popen) -> None:
@@ -392,6 +463,9 @@ def run_with_watchdog(
 
     stdout_sink: list[str] = []
     stderr_sink: list[str] = []
+    delivery = _StdinDelivery(
+        expected_chars=len(input_text) if input_text is not None else 0
+    )
     threads = [
         threading.Thread(
             target=_make_reader(proc.stdout, stdout_sink, liveness, liveness_lines, encoding, errors),
@@ -401,7 +475,7 @@ def run_with_watchdog(
             target=_make_reader(proc.stderr, stderr_sink, liveness, False, encoding, errors),
             daemon=True,
         ),
-        threading.Thread(target=_feed_stdin, args=(proc, input_text), daemon=True),
+        threading.Thread(target=_feed_stdin, args=(proc, input_text, delivery), daemon=True),
     ]
     for thread in threads:
         thread.start()
@@ -422,14 +496,46 @@ def run_with_watchdog(
                 stderr="".join(stderr_sink),
             )
             exc.timeout_kind = kind
+            # A child waiting for a prompt that never arrived idles out and is
+            # killed as "hang" — carry the delivery diagnosis so the real cause
+            # is visible instead of a bare hang after MAX_HANG_RETRIES.
+            # Fail-closed like the normal path: a feeder still blocked in
+            # write() when we kill the tree never confirmed delivery, and that
+            # is EXACTLY the case this diagnosis exists for — reading only
+            # delivery.error would report None there.
+            exc.stdin_error = None
+            if input_text is not None and not delivery.delivered:
+                exc.stdin_error = delivery.error or (
+                    f"feeder did not confirm delivery for "
+                    f"{delivery.expected_chars} chars before the {kind} timeout"
+                )
+                # Logged here so the diagnosis has an effect even though the
+                # providers map timeouts to the bare codes hang/timeout.
+                _log.error(
+                    "[stdin] prompt delivery incomplete at %s timeout — %s",
+                    kind, exc.stdin_error,
+                )
             raise exc
 
         for thread in threads:
             thread.join(_READER_JOIN_TIMEOUT_SEC)
+        # Read AFTER the joins (join() establishes happens-before). Fail-closed:
+        # anything short of a confirmed delivery is an error — a feeder still
+        # blocked in write() while the child already exited means the child
+        # stopped reading early, i.e. the prompt tail never made it.
+        stdin_error = None
+        if input_text is not None and not delivery.delivered:
+            stdin_error = delivery.error or (
+                f"feeder did not confirm delivery within {_READER_JOIN_TIMEOUT_SEC}s "
+                f"for {delivery.expected_chars} chars"
+            )
+            if delivery.error is None:  # unlogged path → log it here
+                _log.error("[stdin] prompt delivery incomplete — %s", stdin_error)
         return WatchdogResult(
             returncode=proc.returncode,
             stdout="".join(stdout_sink),
             stderr="".join(stderr_sink),
+            stdin_error=stdin_error,
         )
     finally:
         # Close the pipe FDs we opened. subprocess.run did this via its context

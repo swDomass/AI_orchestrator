@@ -916,3 +916,48 @@ def test_run_once_parallel_exception_marks_retry_instead_of_done(monkeypatch):
     assert result is False
     mark_retry.assert_called_once()
     mark_done.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# stdin_incomplete: prompt not fully delivered to the CLI
+# (providers/process_runner._feed_stdin). MAX_RETRIES_PER_PROVIDER is 2, so
+# without the bail-out the same oversized prompt would be pushed down the same
+# broken pipe a second time after a 10 s backoff — pure token burn.
+# ---------------------------------------------------------------------------
+
+def test_run_with_retry_does_not_retry_stdin_incomplete_in_run(monkeypatch):
+    # Patched so a REGRESSION fails fast instead of sitting through the backoff.
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda _s: None)
+    calls = []
+
+    class _Provider:
+        name = "claude"
+
+        def run(self, *a, **kw):
+            calls.append(1)
+            return orchestrator.RunResult(success=False, error="stdin_incomplete")
+
+    result, exhausted = orchestrator._run_with_retry(
+        _Provider(), task="t", prompt="p", cwd=None, timeout=60,
+    )
+    assert result.error == "stdin_incomplete"
+    assert exhausted is True
+    assert len(calls) == 1, f"expected no in-run retry, got {len(calls)} attempts"
+
+
+def test_run_with_retry_still_retries_generic_errors(monkeypatch):
+    """Guard the bail-out list: ordinary failures keep their in-run retry."""
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda _s: None)  # skip backoff
+    calls = []
+
+    class _Provider:
+        name = "claude"
+
+        def run(self, *a, **kw):
+            calls.append(1)
+            return orchestrator.RunResult(success=False, error="something odd")
+
+    orchestrator._run_with_retry(
+        _Provider(), task="t", prompt="p", cwd=None, timeout=60,
+    )
+    assert len(calls) > 1, "generic errors must still be retried in-run"

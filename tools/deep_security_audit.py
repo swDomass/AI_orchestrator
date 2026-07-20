@@ -727,7 +727,7 @@ class DeepSecurityAuditTool(BaseTool):
                 iterations=1,
                 error=msg,
                 error_code=master_result.error,
-                retryable=master_result.error in ("rate_limit", "timeout", "session_missing"),
+                retryable=master_result.error in ("rate_limit", "timeout", "session_missing", "stdin_incomplete"),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
                 cache_creation_input_tokens=total_cache_creation,

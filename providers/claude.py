@@ -102,6 +102,25 @@ class ClaudeProvider(BaseProvider):
             output = self._output_from_event(result_event, fallback=stdout)
             tokens = self._tokens_from_event(result_event)
 
+            # An incompletely delivered prompt produces a PERFECTLY well-formed
+            # run: the CLI answers the truncated prompt, exits 0 and emits a
+            # subtype=="success" result event. Nothing downstream can tell the
+            # task text was missing, so it must be caught before the success
+            # evaluation. getattr(): provider tests fake the watchdog result
+            # with a three-field SimpleNamespace.
+            #
+            # Bare code, no suffix: the orchestrator matches error codes by
+            # exact equality (see the note in providers/gemini.py), and a
+            # variable suffix would both miss those branches and make every
+            # incident a unique error_code in analytics. Detail goes to output
+            # and to the _log.error in process_runner._feed_stdin.
+            # Deliberately NOT checked here at the top: a child that dies early
+            # (rate limit, missing session) ALSO breaks the stdin pipe, so an
+            # up-front check masks those better-informed classifications. It is
+            # applied where it is the ONLY explanation — inside the success
+            # branch, and as a last resort before the generic fallback.
+            stdin_error = getattr(result, "stdin_error", None)
+
             # A clean run MUST carry a top-level type=="result" event. With
             # --output-format stream-json the absence of a result line is a real
             # failure mode (truncated/partial stream, --verbose noise without a
@@ -117,6 +136,16 @@ class ClaudeProvider(BaseProvider):
                     json_payload=result_event,
                 )
             ):
+                # The run looks clean — but a truncated prompt produces exactly
+                # this shape: the CLI happily answers the context-only remainder
+                # and reports subtype=="success". This is the one place where an
+                # incomplete delivery is the ONLY possible explanation, so it
+                # wins here and nowhere earlier.
+                if stdin_error:
+                    return RunResult(
+                        success=False, error="stdin_incomplete",
+                        output=stdin_error, **tokens,
+                    )
                 return RunResult(success=True, output=output, **tokens)
 
             # Keyword detection for rate_limit/session_missing must NOT scan the
@@ -145,6 +174,18 @@ class ClaudeProvider(BaseProvider):
             if any(kw in combined for kw in ("rate limit", "usage limit", "quota", "overloaded")):
                 return RunResult(success=False, error="rate_limit", **tokens)
 
+            # No better classification matched — but ONLY trust this at rc == 0.
+            # At rc != 0 the broken pipe is almost always a SYMPTOM: any CLI
+            # dying early (not logged in, model not found, a panic) also breaks
+            # the feeder, because the orchestrator prompt (~100 KB) far exceeds
+            # the OS pipe buffer (4-64 KB). Booking those as stdin_incomplete
+            # would bury the real cause, so below it is appended, not swapped in.
+            if stdin_error and result.returncode == 0:
+                return RunResult(
+                    success=False, error="stdin_incomplete",
+                    output=stdin_error, **tokens,
+                )
+
             # rc==0 but no result event → incomplete/partial stream. Surface a
             # clear error instead of passing the raw NDJSON blob through as if
             # it were the answer.
@@ -158,6 +199,9 @@ class ClaudeProvider(BaseProvider):
             return RunResult(
                 success=False,
                 error=stderr or output or "empty output",
+                # Keep the real CLI message as the classification, carry the
+                # delivery diagnosis alongside it instead of losing it.
+                output=(f"{output}\n[stdin] {stdin_error}" if stdin_error else output),
                 **tokens,
             )
 

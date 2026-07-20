@@ -428,3 +428,259 @@ def test_anonymous_tool_use_idle_resumes_after_result():
         now=2.0,
     )
     assert lv.idle_for(5.0) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# (l) stdin prompt delivery — a lost prompt TAIL must not look like success
+#
+# Regression for 2026-07-20: _feed_stdin swallowed the failing tail flush, the
+# CLI answered the context-only remainder ("what would you like me to do?"),
+# exited 0 with subtype=="success", and the queue task was finalized as done.
+# Cost: 3 days of vault health data.
+# ---------------------------------------------------------------------------
+
+def test_stdin_full_delivery_reports_no_error():
+    """Happy path: child consumes everything → stdin_error stays None."""
+    code = "import sys; data = sys.stdin.read(); sys.stdout.write(str(len(data)))"
+    prompt = "x" * 100_000
+    result = run_with_watchdog(
+        _py(code), input_text=prompt, cwd=None,
+        idle_timeout=10.0, hard_timeout=30, shell=False,
+    )
+    assert result.returncode == 0
+    assert result.stdin_error is None
+    assert result.stdout.strip() == str(len(prompt))
+
+
+def test_stdin_partial_delivery_is_reported():
+    """Child reads one line then exits → tail is lost → must be reported.
+
+    This is the exact shape of the incident: the write/flush fails midway, so
+    the child never sees the prompt tail (which carries the task text).
+    """
+    code = "import sys; sys.stdin.readline(); sys.exit(0)"
+    prompt = "context line\n" + ("filler " * 700_000) + "\nTHE ACTUAL TASK"
+    result = run_with_watchdog(
+        _py(code), input_text=prompt, cwd=None,
+        idle_timeout=10.0, hard_timeout=30, shell=False,
+    )
+    # The child itself is perfectly healthy — that is the whole trap.
+    assert result.returncode == 0
+    assert result.stdin_error is not None
+    assert str(len(prompt)) in result.stdin_error
+
+
+def test_stdin_none_reports_no_error():
+    """input_text=None (no prompt at all) is not a delivery failure."""
+    result = run_with_watchdog(
+        _py("print('ok')"), input_text=None, cwd=None,
+        idle_timeout=5.0, hard_timeout=20, shell=False,
+    )
+    assert result.returncode == 0
+    assert result.stdin_error is None
+
+
+@pytest.mark.parametrize("provider_cls,module", [
+    (ClaudeProvider, "providers.claude.run_with_watchdog"),
+    (CodexProvider, "providers.codex.run_with_watchdog"),
+    (GeminiProvider, "providers.gemini.run_with_watchdog"),
+])
+def test_incomplete_stdin_overrides_a_clean_looking_run(provider_cls, module, monkeypatch):
+    """rc==0 + valid success payload must still FAIL when the prompt was cut."""
+    json_out = json.dumps({
+        "type": "result", "subtype": "success",
+        "result": "Was möchtest du heute tun?",
+        "usage": {"input_tokens": 10, "output_tokens": 1079},
+    })
+    monkeypatch.setattr(module, lambda *a, **kw: SimpleNamespace(
+        returncode=0, stdout=json_out, stderr="",
+        stdin_error="flush failed for 51234 chars: OSError: [Errno 22] Invalid argument",
+    ))
+    result = provider_cls().run("test task")
+    assert result.success is False
+    assert result.error == "stdin_incomplete"  # bare code, exact match (R7)
+
+
+def test_claude_reports_tokens_even_when_stdin_incomplete(monkeypatch):
+    """The truncated run still burned tokens — quota accounting must see them."""
+    json_out = json.dumps({
+        "type": "result", "subtype": "success", "result": "Was soll ich tun?",
+        "usage": {"input_tokens": 3, "output_tokens": 189,
+                  "cache_creation_input_tokens": 25988,
+                  "cache_read_input_tokens": 24507},
+    })
+    monkeypatch.setattr(
+        "providers.claude.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr="",
+                                         stdin_error="close failed for 51234 chars: BrokenPipeError: "),
+    )
+    result = ClaudeProvider().run("test task")
+    assert result.success is False
+    assert result.output_tokens == 189
+    assert result.cache_creation_input_tokens == 25988
+
+
+@pytest.mark.parametrize("provider_cls,module,stdout", [
+    (ClaudeProvider, "providers.claude.run_with_watchdog",
+     json.dumps({"type": "result", "subtype": "success", "result": "19 Felder geschrieben",
+                 "usage": {"input_tokens": 18, "output_tokens": 989}})),
+    (CodexProvider, "providers.codex.run_with_watchdog", "19 Felder geschrieben"),
+    (GeminiProvider, "providers.gemini.run_with_watchdog", "19 Felder geschrieben"),
+])
+def test_legacy_result_without_stdin_field_still_succeeds(provider_cls, module, stdout, monkeypatch):
+    """A three-field SimpleNamespace (no stdin_error) must not raise/regress.
+
+    Guards the getattr() contract AND the no-threshold rule: 989 output tokens
+    is a REAL success for the health-snapshot task — any output-size heuristic
+    would wrongly fail it (2026-07-16/17 vs 07-15/20, see .dev-loop plan §4).
+    """
+    monkeypatch.setattr(module, lambda *a, **kw: SimpleNamespace(
+        returncode=0, stdout=stdout, stderr="",
+    ))
+    result = provider_cls().run("test task")
+    assert result.success is True
+
+
+@pytest.fixture(scope="module")
+def broken_pipe_rate_limit_result():
+    """A REAL run where both signals are present: rc!=0 with a rate-limit
+    message AND a genuinely broken stdin pipe (prompt > OS pipe buffer)."""
+    # "rate limit" is the one phrase all three providers classify (claude also
+    # knows "usage limit", codex "429"/"too many", gemini "resource exhausted").
+    code = (
+        "import sys; "
+        "sys.stderr.write('Error: rate limit exceeded. Resets at 3pm.'); "
+        "sys.exit(1)"
+    )
+    result = run_with_watchdog(
+        _py(code), input_text="x" * 160_000, cwd=None,
+        idle_timeout=10.0, hard_timeout=30, shell=False,
+    )
+    assert result.returncode == 1
+    assert result.stdin_error is not None, "test premise: the pipe must break"
+    return result
+
+
+@pytest.mark.parametrize("provider_cls,module", [
+    (ClaudeProvider, "providers.claude.run_with_watchdog"),
+    (CodexProvider, "providers.codex.run_with_watchdog"),
+    (GeminiProvider, "providers.gemini.run_with_watchdog"),
+])
+def test_stdin_error_does_not_mask_rate_limit(
+    provider_cls, module, broken_pipe_rate_limit_result, monkeypatch,
+):
+    """A better classification must win over stdin_incomplete.
+
+    Regression for the review finding: a child that dies early (rate limit,
+    missing session) ALSO breaks the stdin pipe, so the broken pipe is a
+    symptom. An up-front stdin check masked rate_limit — which skips the quota
+    cooldown — and session_missing — which skips session recovery in every
+    dev-loop/review-loop phase.
+    """
+    r = broken_pipe_rate_limit_result
+    monkeypatch.setattr(module, lambda *a, **kw: SimpleNamespace(
+        returncode=r.returncode, stdout=r.stdout,
+        stderr=r.stderr, stdin_error=r.stdin_error,
+    ))
+    res = provider_cls().run("test task")
+    assert res.success is False
+    assert res.error == "rate_limit", f"{res.error!r} masked the rate limit"
+
+
+def test_stdin_incomplete_wins_at_rc0_when_nothing_better_matches(monkeypatch):
+    """rc == 0 with no other signal → the truncated prompt IS the cause."""
+    monkeypatch.setattr(
+        "providers.codex.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(
+            returncode=0, stdout="", stderr="",
+            stdin_error="write() failed; prompt was 160000 chars",
+        ),
+    )
+    res = CodexProvider().run("test task")
+    assert res.error == "stdin_incomplete"
+
+
+@pytest.mark.parametrize("module,provider_cls", [
+    ("providers.codex.run_with_watchdog", CodexProvider),
+    ("providers.gemini.run_with_watchdog", GeminiProvider),
+    ("providers.claude.run_with_watchdog", ClaudeProvider),
+])
+def test_nonzero_rc_keeps_real_error_even_without_keyword_match(
+    module, provider_cls, monkeypatch,
+):
+    """A CLI crash with no matching keyword must NOT become stdin_incomplete.
+
+    Any child dying early breaks the feeder too (the prompt dwarfs the OS pipe
+    buffer), so at rc != 0 the broken pipe is a symptom. Booking these as
+    stdin_incomplete would bury causes like "not logged in" / "model not found"
+    and route ordinary crashes into the stdin retry path.
+    """
+    monkeypatch.setattr(module, lambda *a, **kw: SimpleNamespace(
+        returncode=1, stdout="", stderr="Error: not logged in",
+        stdin_error="write() failed; prompt was 160000 chars",
+    ))
+    res = provider_cls().run("test task")
+    assert res.success is False
+    assert res.error != "stdin_incomplete"
+    assert "not logged in" in res.error
+    # ...but the delivery diagnosis must not be lost either.
+    assert "stdin" in (res.output or "").lower()
+
+
+def test_stdin_incomplete_is_a_bare_error_code(monkeypatch):
+    """Error codes are matched by exact equality across the orchestrator.
+
+    A suffixed string ("stdin_incomplete: flush() failed; 51234 chars…") would
+    miss every classification branch AND make each incident a unique
+    error_code in analytics. Detail belongs in output, not in the code.
+    """
+    json_out = json.dumps({
+        "type": "result", "subtype": "success", "result": "Was soll ich tun?",
+        "usage": {"input_tokens": 3, "output_tokens": 189},
+    })
+    monkeypatch.setattr(
+        "providers.claude.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json_out, stderr="",
+                                         stdin_error="flush() failed; prompt was 51234 chars"),
+    )
+    result = ClaudeProvider().run("test task")
+    assert result.error == "stdin_incomplete"          # exact, not prefixed
+    assert "51234" in (result.output or "")            # detail preserved
+
+
+def test_stdin_incomplete_is_registered_in_taxonomy():
+    """An unregistered error code silently books as 'unknown' in the dashboard."""
+    import taxonomy
+    assert taxonomy._ERROR_CODE_MAP.get("stdin_incomplete") == taxonomy.CAT_STDIN
+    assert taxonomy.CAT_STDIN in taxonomy.ALL_CATEGORIES
+
+
+def test_stdin_delivery_defaults_to_not_delivered():
+    """Fail-closed contract: only an explicit success may set delivered=True.
+
+    Guards against re-introducing the fail-open variant, where an uncaught
+    exception class (MemoryError on a multi-MB prompt, RuntimeError at
+    interpreter shutdown) left 'finished=True, error=None' → silent success.
+    """
+    from providers.process_runner import _StdinDelivery
+    assert _StdinDelivery().delivered is False
+    assert _StdinDelivery().error is None
+
+
+def test_timeout_carries_stdin_diagnosis():
+    """A child waiting for a prompt that never arrived idles out as 'hang'.
+
+    Without the attached diagnosis that surfaces as a bare hang and burns
+    MAX_HANG_RETRIES before blocking, with no hint at the real cause.
+    """
+    code = "import sys; sys.stdin.readline(); import time; time.sleep(30)"
+    prompt = "line one\n" + "y" * 200_000
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        run_with_watchdog(
+            _py(code), input_text=prompt, cwd=None,
+            idle_timeout=1.0, hard_timeout=20, shell=False,
+        )
+    # hasattr() alone would be vacuous — the attribute is assigned on every
+    # timeout, including with value None. Assert the DIAGNOSIS is present.
+    assert exc_info.value.stdin_error is not None
+    assert str(len(prompt)) in exc_info.value.stdin_error

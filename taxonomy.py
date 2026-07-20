@@ -25,6 +25,7 @@ Categories
 * ``test_failure``         — dev-loop terminal state with failing tests
 * ``queue_update_failed``  — atomic queue mutation failed
 * ``paused``               — task interrupted by /pause
+* ``stdin_incomplete``     — prompt not fully delivered to the CLI over stdin
 * ``unknown``              — fallback when no rule matches
 
 Usage::
@@ -61,13 +62,17 @@ CAT_DEP = "dep_unsatisfied"
 CAT_TEST = "test_failure"
 CAT_QUEUE = "queue_update_failed"
 CAT_PAUSED = "paused"
+# Prompt did not fully reach the CLI over stdin → the run answered a truncated
+# prompt. Own category because it is a LOCAL transport fault, not a provider
+# health problem: it must never be lumped in with rate_limit/unreachable.
+CAT_STDIN = "stdin_incomplete"
 CAT_UNKNOWN = "unknown"
 
 ALL_CATEGORIES: tuple[str, ...] = (
     CAT_RATE_LIMIT, CAT_TIMEOUT, CAT_HANG, CAT_RUNTIME, CAT_AUTH,
     CAT_UNREACHABLE, CAT_REFUSAL, CAT_TOOL_INTERNAL, CAT_CWD, CAT_POLICY,
     CAT_PROFILE, CAT_APPROVAL, CAT_CAPACITY, CAT_DEP, CAT_TEST, CAT_QUEUE,
-    CAT_PAUSED, CAT_UNKNOWN,
+    CAT_PAUSED, CAT_STDIN, CAT_UNKNOWN,
 )
 
 # error_code → category. The orchestrator emits these codes (see _RunSpan in
@@ -75,6 +80,7 @@ ALL_CATEGORIES: tuple[str, ...] = (
 # in sync with the codes actually emitted.
 _ERROR_CODE_MAP: dict[str, str] = {
     "rate_limit":             CAT_RATE_LIMIT,
+    "stdin_incomplete":       CAT_STDIN,
     "timeout":                CAT_TIMEOUT,
     # Idle-kill (process froze, no running tool) → its own category so the
     # hang vs. hard-timeout vs. runtime-deadline failure modes stay

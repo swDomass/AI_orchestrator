@@ -28,8 +28,12 @@ pytesttmp/
 # Logs
 logs/
 
-# Tool output & planning docs (not tracked)
-/docs
+# Tool output & planning docs (not tracked).
+# `/docs/*` (not `/docs`) because git cannot re-include a file whose parent
+# directory is excluded — the architecture docs are linked from CLAUDE.md and
+# must ship with the repo, everything else in docs/ is tool output.
+/docs/*
+!/docs/architecture/
 /.review-loop
 /.dev-loop
 *_FUTURE_IDEAS.md

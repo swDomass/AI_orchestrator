@@ -19,11 +19,11 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1690 tests / ~85 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **~1720 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
-- **Auditability built in.** Every task end emits a structured `logs/runs.jsonl` record (19-category failure taxonomy: `rate_limit`, `timeout`, `auth_error`, `model_refusal`, …), per-tool action traces in `{cwd}/.<tool>/traces/*.jsonl`, an offline queue linter (`--lint-queue`, exit codes 0/1/2 for CI gating), and a 16-check `--doctor` with `--fix --yes` auto-repair.
+- **Auditability built in.** Every task end emits a structured `logs/runs.jsonl` record (19-category failure taxonomy: `rate_limit`, `timeout`, `auth_error`, `model_refusal`, …), per-tool action traces in `{cwd}/.<tool>/traces/*.jsonl`, an offline queue linter (`--lint-queue`, exit codes 0/1/2 for CI gating), and an 18-check `--doctor` with `--fix --yes` auto-repair.
 - **Prompt-cache aware.** Stable prompt prefixes, `--exclude-dynamic-system-prompt-sections` to freeze the system prompt for cache hits, opt-in Claude session reuse (`--session-id` / `--resume`) for ~30–50 % token savings across multi-phase tools, and billing analytics with weighted cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and per-task cache-hit rate.
 - **Observability.** Standalone HTTP analytics dashboard (port 8211, Chart.js, 60 s refresh) backed by `logs/runs.jsonl`. Live "Active Runs" panel (30 s refresh) shows currently-running tool iterations, phase, tokens (in / out / cache_read) and elapsed time via the central `ActiveRunRegistry` in `logs/active_runs/`. Daily Telegram status recap (07:00) summarises the previous 24 h — tasks done/failed, provider breakdown, pending approvals, blocked tasks.
 - **Calibrated quota model.** Phase-0 telemetry (`logs/quota-calibration.csv`) paired every `cclimits` poll with locally-aggregated JSONL token counts per Anthropic 5 h / 7 d window; ~6 days of data selected the `io_only` model (input + output — cache tokens are negligible to the rate limit). Phase 1 writes a single-source-of-truth `logs/cc_quota_state.json` each poll (consumed by the Claude Code statusline and `--check-limits`) and feeds the calibrated per-window factors into the 429-fallback estimator, reducing reliance on the undocumented, rate-limited `cclimits` endpoint.
@@ -33,6 +33,7 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 ## Features
 
 - Multi-provider routing with fallback (`Claude → Gemini → Codex`)
+- **Two opt-in providers outside the fallback chain**: OpenRouter (pay-per-token, `#openrouter`/`#or_*`) for cheap single-call work, and Mistral Vibe (`#vibe`, `#second_opinion:vibe`) as a read-only second non-Claude reviewer. Both are registered only when their prerequisite exists (API key / binary on `PATH`); a `#vibe` tag without the CLI **parks** the task rather than handing a review job to a file-writing executor.
 - Capacity checking via `cclimits` (with local JSONL fallback on HTTP 429)
 - Retry handling on rate limits / provider failures
 - Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#worktree`, `#keep-worktree`, `#shutdown`, `#approve:*` tags
@@ -61,6 +62,7 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 - `cclimits` CLI (`npm install -g cclimits`)
 - Provider CLIs in `PATH`: `claude`, `codex` (and `gemini` unless you use `GEMINI_API_KEY` HTTP mode — the consumer Gemini CLI was retired 2026-06-18)
 - Valid authentication in each CLI (OAuth / subscription login); Gemini alternatively via a `GEMINI_API_KEY`
+- Optional, opt-in only: `vibe` (Mistral Vibe CLI) as a second non-Claude reviewer, and an `OPENROUTER_API_KEY` for pay-per-token single-call tasks. Neither is required, and neither ever enters the default fallback chain.
 
 ## Installation
 
@@ -103,6 +105,8 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `VIBE_MAX_PRICE_USD` | No | `0.50` | Per-run cost ceiling for the Mistral Vibe provider (vibe interrupts itself above it) |
 | `VIBE_MAX_TURNS` | No | `12` | Assistant-turn budget for tool-enabled Vibe runs (`read_file`/`grep` only) |
 | `VIBE_READONLY_MAX_TURNS` | No | `1` | Turn budget when all tools are disabled — a single turn is all that can happen |
+| `ORCH_QUOTA_LIVE_ESTIMATE` | No | `false` | Phase 2: decrement the cached quota snapshot by a live per-task estimate between cclimits polls |
+| `ORCH_QUOTA_AUTO_RECALIBRATE` | No | `false` | Requires the flag above: re-derive the per-window `tokens_per_pct` factors daily from `logs/quota-calibration.csv` (min-samples + clamp guarded) |
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
 | `TELEGRAM_MAX_TASK_LENGTH` | No | `500` | Max characters for `/task` command |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
@@ -177,6 +181,8 @@ Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
 - `#openrouter` / `#or_*` without `OPENROUTER_API_KEY` configured (warning — task falls back to default chain)
 - `#parallel` with 0-1 subtasks (warning) or shared CWD (info)
 
+Not yet covered: `#vibe*` tags (neither the unknown-alias check nor a "CLI missing → task will be parked" warning) — the linter shares `extract_model_tag()` with the queue parser and inherits the gap described under [Known Limitations](#known-limitations).
+
 Exit codes: **0** = clean, **1** = warnings only, **2** = errors. Wire into CI / pre-commit if you have a shared queue file.
 
 ## Queue File Syntax
@@ -233,15 +239,20 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 
 ### Known Limitations
 
-**Model tags: only a subset is enforced.** `queue_manager.MODEL_TAG_RE` recognises
-`#claude_haiku/_sonnet/_opus`, `#gemini_pro/_flash` and `#codex_mini`. Every other
-model tag — `#gemini_flash_lite`, `#codex_5`, `#codex_5_4`, `#vibe_medium`,
-`#vibe_small` and all nine `#or_*` — still routes to the right **provider** via the
+**Model tags: only 6 of 20 are enforced.** `queue_manager.MODEL_TAG_RE` recognises
+`#claude_haiku/_sonnet/_opus`, `#gemini_pro/_flash` and `#codex_mini`. The other
+fourteen — `#gemini_flash_lite`, `#codex_5`, `#codex_5_4`, `#vibe_medium`,
+`#vibe_small` and all nine `#or_*` — still route to the right **provider** via the
 dispatcher, but the **model is not forced**: the task runs on that provider's default
 model. `#or_glm` and `#or_kimi` therefore produce the same model today. The
 `#second_opinion:<alias>` path is unaffected — it resolves aliases separately and
-honours every one of them. Fix in progress: derive the pattern from the alias maps
-in `config.py` instead of hard-coding it.
+honours every one of them. Fix vector: derive the pattern from the alias maps in
+`config.py` instead of hard-coding it, so it cannot drift again.
+
+**`#pass1:` / `#pass2:` accept only `claude`, `gemini`, `codex`.** The
+cross-provider `critical-review` tags are matched by their own regex, which
+predates the opt-in providers — `#pass2:vibe` and `#pass2:openrouter` are ignored
+rather than rejected. Use `#second_opinion:` for those.
 
 ### Parallel Tasks (`#parallel`)
 
@@ -308,6 +319,7 @@ Both schedule tags reuse the existing retry primitive — no separate scheduler.
 | `security-audit` | Two-phase workflow: Audit (read-only) → Fix + pytest. Scans for hardcoded secrets, command injection, path traversal, unsafe deserialization, SSRF, and more. Output in `{cwd}/docs/security-audit-*.md`. |
 | `deep-security-audit` | Multi-agent deep audit: 6 expert personas (pentester, architect, SAST, supply chain, data privacy, forensics) + CISO synthesis + optional fix. `#no-fix` skips fix phase. `#roundtable` inserts a Phase 6.5 dialogue where each persona reviews the others' findings (~6 extra subprocess calls, more robust CISO synthesis on conflicting findings). Output in `{cwd}/docs/deep-security-audit-*.md`. Structured action trace at `{cwd}/.deep-security-audit/traces/<run_id>.jsonl`. |
 | `scientific-investigation` | Wissenschaftlicher Autopilot mit Audit-Trail. Pipeline (Plan v5, I0–I9): Framing + Pre-Registration → Multi-Persona Review (Author + Devils-Advocate + Methodiker) → Sub-Task-Execution-Loop → Synthesis mit Falsifikations-Tabelle → Mechanical & heuristic check → Engineering-Reviewer Rework → Final Telegram-Approval. Status-Tuple `methodological_rigor=MEDIUM\|LOW` (HIGH strukturell ausgeschlossen). Output in `{cwd}/docs/scientific-investigation-{ts}/` + audit-pack via `scripts/build_audit_pack.py`. |
+| `pr-babysitter` | Polls open GitHub PRs via `gh` and reacts to new review comments / CI failures. `#pr-mode:queue` (default) appends a `#tool:dev-loop` fix task, `#pr-mode:report-only` sends a Telegram summary with `/pr-fix` + `/pr-ignore`. Tool itself is read-only. |
 | `brainstorm` | Multi-persona Round-Table mit **domain-aware Personas**: LLM analysiert das Thema und wählt 4–6 themenspezifische Personas, die in Cross-Pollination-Runden Ideen produzieren bis Konvergenz (TF-IDF Cluster-Wachstum < 20 %) oder Hard-Cap (5 Iterationen). `#cross-provider` verteilt Personas Round-Robin über alle verfügbaren Provider. Synthesizer ranked Top-N (default 5) mit Pro/Contra/Nächster-Schritt. Output in `{cwd}/docs/brainstorm-*.md`, State + Per-Iteration-Files in `{cwd}/.brainstorm/{ts}/`. |
 
 ```bash
@@ -544,9 +556,13 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 - **Security-critical**: swap step 2 for `#tool:deep-security-audit` (6-agent deep scan)
 - **Multi-commit plans**: raise step 8 to `#claude_sonnet` and instruct it to split via `git add -p`
 
-### External second opinion: Codex (Gemini retired as reviewer)
+### External second opinion: Codex first, Mistral Vibe for high-risk work
 
-Step 6 (`#tool:critical-review #pass2:codex`) runs Codex as an independent, read-only second opinion — a non-Claude voice catches assumptions the Claude reviewers share. Gemini is **no longer used as a reviewer**: the consumer CLI was retired (2026-06-18) and data-training/privacy concerns rule out the HTTP mode for review content. Gemini remains available only as a fallback *execution* provider in the routing chain, never as a reviewer in `dev-loop`/`review-loop`/`critical-review`.
+Step 6 (`#tool:critical-review #pass2:codex`) runs Codex as an independent, read-only second opinion — a non-Claude voice catches assumptions the Claude reviewers share. Codex is the default external reviewer.
+
+For high-risk changes a **second** non-Claude voice is available: `#second_opinion:vibe` (or `:vibe_medium` / `:vibe_small`) on a `#tool:review-loop` task routes to the Mistral Vibe CLI, which runs strictly read-only — all tools disabled, or `read_file`+`grep` at most. It is opt-in, pay-per-token (`VIBE_MAX_PRICE_USD` caps a run), and never joins the fallback chain. Reserve it for cases where one external opinion is not enough; two paid reviewers on trivial diffs is waste.
+
+Gemini is **no longer used as a reviewer**: the consumer CLI was retired (2026-06-18) and data-training/privacy concerns rule out the HTTP mode for review content. Gemini remains available only as a fallback *execution* provider in the routing chain, never as a reviewer in `dev-loop`/`review-loop`/`critical-review`.
 
 ## Skills (`SKILL.md`)
 
@@ -605,6 +621,9 @@ In `--watch` mode a Telegram long-poll listener starts (when `TELEGRAM_*` env va
 | `/limits` | Detailed limits with per-window breakdown |
 | `/pause` / `/resume` | Pause / resume processing |
 | `/approve`, `/approve-all <cat>`, `/deny`, `/skip` | Approval flow |
+| `/reject <run_id> [criterion] [reason]` | Reject a scientific-investigation pre-registration / final gate |
+| `/unblock <id>`, `/drop <id>`, `/retry <dep-id>` | Queue-healing responses for long-blocked tasks |
+| `/pr-fix <owner/repo#N>`, `/pr-ignore <owner/repo#N>` | PR-Babysitter report-only mode: queue a fix task or silence the PR |
 | `/pick N` | Accept usage suggestion (1–3) |
 | `/decline` | Decline suggestions |
 | `/cancel-shutdown` | Cancel pending shutdown |
@@ -634,9 +653,9 @@ Rate limits (anti-spam):
   - Auto-archival after 180 days.
 
 - **Heartbeat (`heartbeat.py`)** — Proactive checks in `--watch` mode, configured via `<vault>/99_System/AI/HEARTBEAT.md`.
-  - 10 built-in handlers: `queue-idle`, `git-status`, `disk-space`, `check-limits`, `log-capacity`, `summarize`, `stale-branch`, `usage-suggest`, `session-cleanup`, `model-check`
+  - 14 built-in handlers: `queue-idle`, `queue-healing`, `git-status`, `disk-space`, `check-limits`, `log-capacity`, `summarize`, `stale-branch`, `usage-suggest`, `session-cleanup`, `model-check`, `skill-suggest`, `status-recap`, `check-ci-failures`
   - Sections support `## Every N minutes/hours/days` and `## Daily (after HH:MM)` — so a monthly check is just `## Every 30 days`.
-  - `model-check` (recommended monthly): CLI-probes every entry in `CLAUDE_MODEL_ALIASES`/`GEMINI_MODEL_ALIASES`/`CODEX_MODEL_ALIASES` to detect dead IDs (skips providers currently in cooldown), then asks the best available LLM with today's date as anchor whether newer IDs are known. Telegram notification only fires on findings; LLM-call failures surface as `⚠️ LLM-Check failed: …` instead of being silently swallowed.
+  - `model-check` (recommended monthly): CLI-probes every entry in `CLAUDE_MODEL_ALIASES`/`GEMINI_MODEL_ALIASES`/`CODEX_MODEL_ALIASES` to detect dead IDs (skips providers currently in cooldown; pay-per-token aliases are not probed — a scheduled ping would be a recurring charge), then asks the best available LLM with today's date as anchor whether newer IDs are known. That second phase lists **all five** alias dicts including `or_*` and `vibe_*`, since one call costs the same regardless of list length. Telegram notification only fires on findings; LLM-call failures surface as `⚠️ LLM-Check failed: …` instead of being silently swallowed.
   - **Persistent state**: items with interval ≥ 1 day record their last run in `logs/heartbeat-state.json`, so a `## Every 30 days` check does NOT fire on every `--watch` restart.
   - `session-cleanup` deletes orchestrator-created Claude session JSONL files in `~/.claude/projects/**` older than `ORCH_SESSION_RETENTION_DAYS` — uses sidecar whitelist (`logs/orchestrator-sessions.jsonl`) to NEVER touch interactive Claude Code sessions.
   - Mtime-cached config — changes to `HEARTBEAT.md` take effect immediately (no restart).
@@ -702,9 +721,10 @@ The calibrated factors are plan- and workload-specific (env-overridable, not uni
 
 ## Doctor (`--doctor`)
 
-`python orchestrator.py --doctor` runs 16+ checks:
+`python orchestrator.py --doctor` runs 18 checks:
 
-- Provider CLIs (`claude`, `gemini`, `codex`)
+- Provider CLIs (`claude`, `gemini`, `codex`; `vibe` reported as WARN when absent — it is optional)
+- Worktrees (orphaned `.worktrees/parallel-*` dirs, `--fix` prunes them)
 - `git`, `cclimits`
 - Vault path + queue file
 - Telegram bot configuration (`getMe` API call)
@@ -715,7 +735,7 @@ The calibrated factors are plan- and workload-specific (env-overridable, not uni
 - Profiles directory + validation
 - Policy file
 - Provider limits (via `cclimits`)
-- **Model IDs** — CLI-pings every entry in `CLAUDE/GEMINI/CODEX_MODEL_ALIASES` concurrently (~5–10 s). FAIL on rejected IDs (unknown/deprecated), WARN on transient probe errors, PASS when every alias responds live. The deeper LLM-based "are there newer IDs?" heuristic runs only in the monthly heartbeat `model-check`, not here.
+- **Model IDs** — CLI-pings every entry in `CLAUDE/GEMINI/CODEX_MODEL_ALIASES` concurrently (~5–10 s). FAIL on rejected IDs (unknown/deprecated), WARN on transient probe errors, PASS when every alias responds live. The pay-per-token aliases (`or_*`, `vibe_*`) are deliberately **not** probed — a probe would cost money on every `--doctor` run. The deeper LLM-based "are there newer IDs?" heuristic runs only in the monthly heartbeat `model-check`, not here.
 
 With `--fix` (optionally `--yes`) simple problems are auto-created/repaired.
 
@@ -724,6 +744,8 @@ With `--fix` (optionally `--yes`) simple problems are auto-created/repaired.
 ```text
 orchestrator.py
   → dispatcher.py          (provider selection + fallback)
+      → providers/         claude, gemini (HTTP or CLI), codex  ← fallback chain
+                           openrouter, vibe                     ← opt-in only, tag-gated
   → queue_manager.py       (queue read/write, tags, atomic updates)
   → parallel_runner.py     (#parallel subtasks)
   → tools/registry.py      (#tool handlers)
@@ -745,6 +767,14 @@ orchestrator.py
   → doctor.py              (setup validation / --doctor)
   → queue_linter.py        (offline queue validation / --lint-queue)
   → idempotency.py         (duplicate-trigger dedup for external sources)
+  → replay.py              (logs/runs.jsonl run records)
+  → taxonomy.py            (19-category failure classification over runs.jsonl)
+  → preflight.py           (deterministic per-tool context collection)
+  → queue_healing.py       (long-blocked task detection + /unblock /drop /retry)
+  → skill_suggester.py     (draft-only SKILL.md proposals, pattern-gated)
+  → session_registry.py    (whitelist of orchestrator-created Claude sessions)
+  → usage_budget.py        (pace analysis over rolling windows)
+  → ci_watcher.py          (CI-failure sweep) → gh_helpers.py (gh CLI wrapper)
   → config.py              (constants, .env loader, SOUL.md loader)
 ```
 
@@ -759,7 +789,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1615 tests, ~90 s)
+# Run all tests (~1723 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file

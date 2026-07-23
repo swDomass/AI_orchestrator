@@ -10,12 +10,12 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## Project
 
-Autonomous task orchestrator routing work across Claude Code, Gemini CLI, and Codex CLI. Tasks come from an Obsidian vault Markdown queue (`99_System/AI/agent-queue.md`). Pure Python stdlib + pyyaml, Windows-first.
+Autonomous task orchestrator routing work across Claude Code, Gemini (HTTP API or legacy CLI), and Codex CLI, plus two opt-in providers that never enter the fallback chain: OpenRouter (HTTP) and Mistral Vibe (reviewer-only). Tasks come from an Obsidian vault Markdown queue (`99_System/AI/agent-queue.md`). Pure Python stdlib + pyyaml, Windows-first.
 
 ## Commands
 
 ```bash
-# Run all tests (~1615 tests, ~90 s)
+# Run all tests (~1723 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file / single test
@@ -47,24 +47,26 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 
 ### Core orchestration
 - **`orchestrator.py`** — Main loop (`run_once`/`run_watch`), prompt building, heartbeat thread, blocked-task handling
-- **`dispatcher.py`** — Provider selection (Claude → Gemini → Codex fallback), cooldowns, model-alias routing
-- **`queue_manager.py`** — Obsidian MD queue parser, sidecar `.lock`, regex metadata, `#needs:`/`#id:` two-pass deps, subtask-aware mutations; P1 `#worktree`/`#keep-worktree` tags for parallel isolation
+- **`dispatcher.py`** — Provider selection (Claude → Gemini → Codex fallback), cooldowns, model-alias routing; `_REVIEWER_ONLY` guard so an unregistered reviewer tag parks the task instead of degrading to an executor
+- **`queue_manager.py`** — Obsidian MD queue parser, sidecar `.lock`, regex metadata, `#needs:`/`#id:` two-pass deps, subtask-aware mutations; P1 `#worktree`/`#keep-worktree` tags for parallel isolation. **Known gap:** `MODEL_TAG_RE` hard-codes 6 of the 20 model aliases — the other 14 route to the right provider but never force the model (details + fix vector in `components.md`)
 - **`policy.py`** — `PolicyEngine` singleton, AUTO/APPROVE/DENY classification, Telegram-blocking; P3 `ToolContract` API (`get_tool_contract(name)`) + `tool_contracts:` yaml section (per-tool budget/stop_conditions/reporting_path, doctor schema-validates)
+- **`profiles.py`** — `#agent:<name>` YAML profiles (provider order, allowed roots, skill allow/deny, timeout, policy overrides); vault first, repo-local second
 - **`usage_suggester.py`** — `UsageSuggester` singleton, proactive task suggestions on low capacity
+- **`usage_budget.py`** — Pace factor for rolling windows (7d) + CLI/Telegram formatting; consumed by heartbeat, orchestrator, usage_suggester
 - **`memory.py`** — TF-IDF + temporal decay over past results, CWD-filtered lessons, daily log (80-char summaries)
-- **`heartbeat.py`** — Scheduled health checks (12 handlers, mtime-reloaded), Phase-A CLI-probe + Phase-B LLM heuristic for model drift; P6 `status-recap` (daily 24h Telegram summary), P4 `check-ci-failures` (gh poll → dev-loop queue items)
+- **`heartbeat.py`** — Scheduled health checks (14 handlers, mtime-reloaded), Phase-A CLI-probe + Phase-B LLM heuristic for model drift; P6 `status-recap` (daily 24h Telegram summary), P4 `check-ci-failures` (gh poll → dev-loop queue items)
 - **`limits.py`** — `cclimits` wrapper, OAuth refresh, 3-tier 429 fallback, polling 10min idle / 5min active (idle matches cclimits `--cache-ttl=600`); Phase-0 calibration hook in `_bg_refresh_loop`
 - **`quota_calibration.py`** — Phase-0 telemetry: pairs cclimits utilization-% with locally-aggregated JSONL token counts per Claude window (5h/7d), CSV schema v2, async single-worker write (never blocks refresh loop). Calibration result (2026-05-27): `io_only` model both windows, cache-tokens negligible to quota; 1h/5m tier-split refuted. One-time analysis: `quota_calibration_backfill.py`
 - **`quota_state.py`** — Phase-1 SoTH: `_bg_refresh_loop` writes `logs/cc_quota_state.json` (atomic, per-window 5h/7d snapshot + embedded calibration constants) each poll; external read-only consumers (statusline, `--check-limits`) read via `read_quota_state` instead of re-polling cclimits. 429-fallback per-window split for Claude uses calibrated `ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS` (5h≈5400/7d≈75000) via `limits._estimate_window_usage_calibrated` (scalar cancels); uncalibrated providers keep the reset-time heuristic. **Phase-2 (flag `ORCH_QUOTA_LIVE_ESTIMATE`, default OFF):** `get_limits()` decrements the cached snapshot by the live between-poll estimate (`_apply_live_estimate`, accumulated in `report_estimated_usage`, re-anchored each poll via `_reset_live_estimate`); optional daily auto-recalibration of the factors from the running CSV (`ORCH_QUOTA_AUTO_RECALIBRATE` → `quota_calibration.recalibrate_claude_factors` → `limits.set_calibrated_windows`, min-samples + clamp guarded)
 - **`analytics.py`** — TaskRecord/LimitSnapshot/QueueEvent/ToolTraceEvent dataclasses, billing-cost units, cache-hit rate, tool-trace stats
 - **`dashboard.py`** — Standalone HTTP server (port 8211, `DASHBOARD_PORT`-overridable, auto-fallback to a free port if taken/Windows-reserved), Chart.js dashboard, 60s refresh; Active-Runs-Panel (Live-View laufender Tool-Runs, 30s refresh über `/api/data?only=active_runs`)
-- **`config.py`** — Centralized constants (~70+), `.env` loader, model aliases (Claude/Gemini/Codex/OpenRouter), safety patterns, timeouts
+- **`config.py`** — Centralized constants (~70+), `.env` loader, model aliases (Claude/Gemini/Codex/OpenRouter/Vibe — 20 total), safety patterns, timeouts
 - **`logging_setup.py`** — Rotating file logger (5MB × 3) + console
-- **`doctor.py`** — 16+ setup validation checks, `--fix`/`--yes` auto-repair, concurrent alias probes
+- **`doctor.py`** — 18 setup validation checks, `--fix`/`--yes` auto-repair, concurrent alias probes (subscription CLIs only — pay-per-token providers are deliberately not probed)
 - **`shutdown.py`** — Shutdown state machine + cancellation
 - **`notifier.py`** — Telegram notifications, 3500-char truncation
 - **`telegram_listener.py`** — Bot listener, `/chat` AI mode, slash tool-commands (`/review` `/security` `/audit` `/dev` `/critique` `/brainstorm`), `/approve` SI-Manager routing; P5 `/pr-fix <owner/repo#N>` + `/pr-ignore <owner/repo#N>` for PR-Babysitter report-only mode
-- **`queue_linter.py`** — Offline validator (`--lint-queue`), exit codes 0/1/2
+- **`queue_linter.py`** — Offline validator (`--lint-queue`), exit codes 0/1/2; shares `extract_model_tag` with the queue parser, so it inherits the `MODEL_TAG_RE` gap and does not yet validate `#vibe*` tags
 - **`idempotency.py`** — Duplicate-trigger dedup (JSONL store, sha256 keys, 30-day retention)
 - **`session_registry.py`** — Append-only JSONL whitelist of orchestrator-created Claude session UUIDs
 - **`replay.py`** — Machine-readable run summaries (`logs/runs.jsonl`), one record per task end (ok/retry/error/blocked), 30-day rotation → gzip archive
@@ -89,7 +91,10 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 
 ### Tools (`tools/`)
 - **`base_tool.py`** — `BaseTool` ABC + 4-layer prompt assembly (stability-ordered for cache hits), `ToolResult`, `TokenCounter`, `SessionContext`, `ToolTracer`, `ActiveRunRegistry` (zentraler `logs/active_runs/<run_id>.json` Index für Dashboard-Live-View, atomic writes, stale >6h, cleanup >24h)
+- **`registry.py`** — `#tool:<name>` → handler table (`--list-tools`)
 - **`research_qa.py`** — 3-phase read-only pre-implementation (Discovery → Analysis → Questions), `#tool:research-qa`
+- **`test_loop.py`** — Run tests → fix failures → re-run until green, `#tool:test-loop`
+- **`knowledge_transfer.py`** — Vault expertise → cross-domain applications (web search) → Obsidian idea note, `#tool:knowledge-transfer`
 - **`review_loop.py`** — Iterative review fixing all P1/P2/P3 (max 20 iter), stable/volatile prompt split, optional `#second_opinion:<alias>`, Drift-Check (`auto`/`always`/`skip` via `policy.yaml` `tool_phases.review-loop.drift_check_mode`) injiziert Refocus-Warning in den Fix-Prompt bei Goal-Adherence-Verletzung, `#tool:review-loop`
 - **`dev_loop.py`** — Research+Plan (merged call) → Execute → Quality+Resolution Review loop (max 20 iter), `#tool:dev-loop`
 - **`critical_review.py`** — 3-pass adversarial (Pass 1 + Pass 2 + Pass 3 Synthesis), cross-provider via `#pass1:`/`#pass2:`, `{plan}-v2.md` output, `#tool:critical-review`

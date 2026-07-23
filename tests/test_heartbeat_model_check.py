@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import heartbeat
+from config import CLAUDE_MODEL_ALIASES, CODEX_MODEL_ALIASES
 from heartbeat import (
     _check_model_updates,
     _llm_check_for_newer_models,
@@ -346,8 +347,10 @@ def test_check_model_updates_returns_none_when_all_alive(monkeypatch):
 
 
 def test_check_model_updates_reports_dead_ids(monkeypatch):
+    dead_id = CLAUDE_MODEL_ALIASES["claude_haiku"]
+
     def fake_probe(provider, model_id, **kwargs):
-        if model_id == "claude-haiku-4-5-20251001":
+        if model_id == dead_id:
             return False, "model not found"
         return True, ""
 
@@ -358,7 +361,7 @@ def test_check_model_updates_reports_dead_ids(monkeypatch):
 
     assert msg is not None
     assert "Tote Model-IDs" in msg
-    assert "claude-haiku-4-5-20251001" in msg
+    assert dead_id in msg
 
 
 def test_check_model_updates_includes_llm_suggestions(monkeypatch):
@@ -373,8 +376,12 @@ def test_check_model_updates_includes_llm_suggestions(monkeypatch):
 
 
 def test_check_model_updates_reports_flaky_ids(monkeypatch):
+    # Read the ID from config so a model-alias swap can't silently defuse the test
+    # (it did once: the fake probe kept matching a retired ID and never fired).
+    flaky_id = CODEX_MODEL_ALIASES["codex_5"]
+
     def fake_probe(provider, model_id, **kwargs):
-        if model_id == "gpt-5.5":
+        if model_id == flaky_id:
             return True, "unclear (some odd error)"
         return True, ""
 
@@ -385,7 +392,7 @@ def test_check_model_updates_reports_flaky_ids(monkeypatch):
 
     assert msg is not None
     assert "Auffällige" in msg
-    assert "gpt-5.5" in msg
+    assert flaky_id in msg
 
 
 # ── Persistent state: last_run survives restart for long-interval items ──────

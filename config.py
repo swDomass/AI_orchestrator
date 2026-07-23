@@ -463,26 +463,30 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 # Tags are provider-bound: #claude_opus only applies to claude, not to gemini on fallback.
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
-    "claude_sonnet": "claude-sonnet-4-6",
+    "claude_sonnet": "claude-sonnet-5",    # Sonnet 5 = current Sonnet tier (2026-07)
     "claude_opus":   "claude-opus-4-8",   # 4.8 = current Opus (2026-06); 4.7 is previous-gen
 }
-# Gemini model IDs (drift-checked 2026-06-22 against Google's deprecations page):
-# pro stays on the 3.1 preview (no GA `gemini-3.1-pro` exists yet); flash + flash-lite
-# moved to GA. The old `gemini-3-flash-preview` is deprecated and
-# `gemini-3.1-flash-lite-preview` was SHUT DOWN 2026-05-25, so both preview IDs are
-# replaced by their GA successors.
+# Gemini model IDs (drift-checked 2026-07-23 against Google's deprecations page and
+# the live `/v1beta/models` listing for this API key): pro stays on the 3.1 preview
+# (still no GA pro model of any generation). `gemini-3.1-flash-lite` is deprecated
+# (shutdown 2027-05-07) with `gemini-3.5-flash-lite` (GA 2026-07-21) as Google's named
+# successor. `gemini-3.5-flash` stays — not deprecated; the newer `gemini-3.6-flash`
+# (GA 2026-07-21) is a watch item, not yet adopted for a fallback executor.
 GEMINI_MODEL_ALIASES: dict[str, str] = {
     "gemini_pro":        "gemini-3.1-pro-preview",
     "gemini_flash":      "gemini-3.5-flash",
-    "gemini_flash_lite": "gemini-3.1-flash-lite",
+    "gemini_flash_lite": "gemini-3.5-flash-lite",
 }
-# Codex: gpt-5.5 is the current flagship (April 2026, ChatGPT-auth only — falls
-# back to gpt-5.4 if not yet rolled out for the account). gpt-5.4 stays as the
-# stable default; gpt-5.4-mini is the cheap variant for subagents/lighter tasks.
+# Codex: the GPT-5.6 family (2026-07-09) replaced gpt-5.5/gpt-5.4 — Codex CLI 0.145.0
+# migrated its own bundled selections to Terra/Luna. Tier mapping: sol = flagship,
+# terra = balanced default, luna = cheap variant for subagents/lighter tasks.
+# All three verified live via `codex exec -m <id>` on 2026-07-23.
+# NOTE: the version-shaped keys `codex_5`/`codex_5_4` now point at 5.6 IDs — kept
+# stable so existing queue lines keep working; rename is a separate cleanup.
 CODEX_MODEL_ALIASES: dict[str, str] = {
-    "codex_5":    "gpt-5.5",
-    "codex_5_4":  "gpt-5.4",
-    "codex_mini": "gpt-5.4-mini",
+    "codex_5":    "gpt-5.6-sol",
+    "codex_5_4":  "gpt-5.6-terra",
+    "codex_mini": "gpt-5.6-luna",
 }
 # OpenRouter aliases: prefix `or_*` so they cannot collide with native CLI tags.
 # Free models for trivial single-call tasks (heartbeat, summaries). Paid flagships

@@ -205,7 +205,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Force provider | `#claude`, `#gemini`, `#codex` | `- [ ] Task #codex` |
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
 | Gemini model | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
-| Codex model | `#codex_5` (gpt-5.5), `#codex_5_4` (gpt-5.4), `#codex_mini` (gpt-5.4-mini) | `- [ ] Run #codex_mini` |
+| Codex model | `#codex_5` (gpt-5.6-sol), `#codex_5_4` (gpt-5.6-terra), `#codex_mini` (gpt-5.6-luna) | `- [ ] Run #codex_mini` |
 | OpenRouter model (opt-in, requires `OPENROUTER_API_KEY`) | Free: `#or_minimax_free`, `#or_deepseek_free`, `#or_qwen_free`, `#or_nemotron_free`. Paid flagships: `#or_glm`, `#or_kimi`, `#or_qwen`, `#or_deepseek`, `#or_minimax`. Generic: `#openrouter` (default model). | `- [ ] Daily summary #or_minimax_free` |
 | Run tool | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
 | Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
@@ -515,7 +515,7 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 | 2. security-audit | `#claude_opus` | Finds subtle exploit chains; cheaper tiers miss logic flaws |
 | 3. simplify | `#claude_sonnet` | Refactoring is a bounded task |
 | 4. review-loop (pass A) | `#codex_mini` | Cheap first pass — obvious bugs, unused imports, trivial wins |
-| 5. review-loop (pass B) | `#codex` (gpt-5.4) | Mid-tier — structural issues, missing coverage |
+| 5. review-loop (pass B) | `#codex` (CLI default) | Mid-tier — structural issues, missing coverage |
 | 6. critical-review | `#pass1:claude` + `#pass2:codex` | Independent second opinion, strictly read-only — zero risk of broken code |
 | 7. review-loop (final) | `#claude_opus` | Final validator; integrates critical-review findings. If Opus finds nothing here, the code is genuinely clean |
 | 8. commit | `#claude_haiku` | Trivial — diff + doc sync + single commit. Escalate to `#claude_sonnet` if the plan spans multiple commits |

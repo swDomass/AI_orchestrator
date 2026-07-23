@@ -19,13 +19,13 @@ def test_claude_tags_resolve_for_claude():
 def test_gemini_tags_resolve_for_gemini():
     assert model_id_for_provider("gemini_flash", "gemini") == "gemini-3.5-flash"
     assert model_id_for_provider("gemini_pro", "gemini") == "gemini-3.1-pro-preview"
-    assert model_id_for_provider("gemini_flash_lite", "gemini") == "gemini-3.1-flash-lite"
+    assert model_id_for_provider("gemini_flash_lite", "gemini") == "gemini-3.5-flash-lite"
 
 
 def test_codex_tags_resolve_for_codex():
-    assert model_id_for_provider("codex_mini", "codex") == "gpt-5.4-mini"
-    assert model_id_for_provider("codex_5", "codex") == "gpt-5.5"
-    assert model_id_for_provider("codex_5_4", "codex") == "gpt-5.4"
+    assert model_id_for_provider("codex_mini", "codex") == "gpt-5.6-luna"
+    assert model_id_for_provider("codex_5", "codex") == "gpt-5.6-sol"
+    assert model_id_for_provider("codex_5_4", "codex") == "gpt-5.6-terra"
 
 
 def test_cross_provider_mismatch_returns_none():
@@ -57,19 +57,22 @@ def test_is_known_model_tag_rejects_unknown():
 
 
 def test_gemini_aliases_match_current_ids():
-    # Drift-checked 2026-06-22 against Google's deprecations page: pro is still the
-    # 3.1 preview (no GA gemini-3.1-pro yet); flash + flash-lite moved to GA. The old
-    # gemini-3-flash-preview is deprecated and gemini-3.1-flash-lite-preview was shut
-    # down 2026-05-25, so both preview IDs are replaced by their GA successors.
+    # Drift-checked 2026-07-23 against Google's deprecations page + the live
+    # /v1beta/models listing: still no GA pro model, so pro stays on the 3.1 preview.
+    # gemini-3.1-flash-lite is deprecated (shutdown 2027-05-07) → replaced by its named
+    # successor gemini-3.5-flash-lite (GA 2026-07-21). gemini-3.5-flash is not
+    # deprecated and stays; gemini-3.6-flash (GA 2026-07-21) is a watch item.
     assert GEMINI_MODEL_ALIASES["gemini_pro"] == "gemini-3.1-pro-preview"
     assert GEMINI_MODEL_ALIASES["gemini_flash"] == "gemini-3.5-flash"
-    assert GEMINI_MODEL_ALIASES["gemini_flash_lite"] == "gemini-3.1-flash-lite"
+    assert GEMINI_MODEL_ALIASES["gemini_flash_lite"] == "gemini-3.5-flash-lite"
 
 
 def test_codex_aliases_match_verified_model_cache():
-    assert CODEX_MODEL_ALIASES["codex_mini"] == "gpt-5.4-mini"
-    assert CODEX_MODEL_ALIASES["codex_5"] == "gpt-5.5"
-    assert CODEX_MODEL_ALIASES["codex_5_4"] == "gpt-5.4"
+    # GPT-5.6 family (2026-07-09) replaced gpt-5.5/gpt-5.4; Codex CLI 0.145.0 migrated
+    # its bundled selections to Terra/Luna. All three IDs probed live on 2026-07-23.
+    assert CODEX_MODEL_ALIASES["codex_mini"] == "gpt-5.6-luna"
+    assert CODEX_MODEL_ALIASES["codex_5"] == "gpt-5.6-sol"
+    assert CODEX_MODEL_ALIASES["codex_5_4"] == "gpt-5.6-terra"
 
 
 # ---------------------------------------------------------------------------

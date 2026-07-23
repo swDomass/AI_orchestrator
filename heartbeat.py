@@ -492,6 +492,7 @@ def _llm_check_for_newer_models() -> str:
             CODEX_MODEL_ALIASES,
             GEMINI_MODEL_ALIASES,
             OPENROUTER_MODEL_ALIASES,
+            VIBE_MODEL_ALIASES,
         )
         from dispatcher import get_provider_by_name, select_provider
         from limits import get_limits
@@ -499,12 +500,15 @@ def _llm_check_for_newer_models() -> str:
         return ""
 
     try:
+        # Phase B costs one LLM call regardless of list length, so it covers ALL
+        # alias dicts — including the pay-per-token ones that Phase A skips.
         ids_block = []
         for label, mapping in (
             ("Claude",     CLAUDE_MODEL_ALIASES),
             ("Gemini",     GEMINI_MODEL_ALIASES),
             ("Codex",      CODEX_MODEL_ALIASES),
             ("OpenRouter", OPENROUTER_MODEL_ALIASES),
+            ("Vibe",       VIBE_MODEL_ALIASES),
         ):
             for tag, model_id in mapping.items():
                 ids_block.append(f"  - {label}/{tag} = {model_id}")

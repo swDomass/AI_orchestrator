@@ -574,6 +574,9 @@ def _check_model_updates() -> Optional[str]:
     dead: list[str] = []
     flaky: list[str] = []
 
+    # Same omission as doctor's Model-IDs check: pay-per-token providers
+    # (vibe, openrouter) are not pinged on a schedule — a monthly drift check
+    # is not worth a recurring API charge.
     for label, mapping in (
         ("claude", CLAUDE_MODEL_ALIASES),
         ("gemini", GEMINI_MODEL_ALIASES),

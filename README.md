@@ -100,6 +100,9 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `OPENROUTER_API_KEY` | No | — | OpenRouter API key. When set, enables `#openrouter`/`#or_*` tags as an opt-in pay-per-token provider for non-agentic tasks (heartbeat checks, summaries). Never enters the default fallback chain. |
 | `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | Override for testing or self-hosted proxy |
 | `OPENROUTER_DEFAULT_MODEL` | No | `minimax/minimax-m2.5:free` | Model used by `#openrouter` without a specific `#or_*` alias |
+| `VIBE_MAX_PRICE_USD` | No | `0.50` | Per-run cost ceiling for the Mistral Vibe provider (vibe interrupts itself above it) |
+| `VIBE_MAX_TURNS` | No | `12` | Assistant-turn budget for tool-enabled Vibe runs (`read_file`/`grep` only) |
+| `VIBE_READONLY_MAX_TURNS` | No | `1` | Turn budget when all tools are disabled — a single turn is all that can happen |
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
 | `TELEGRAM_MAX_TASK_LENGTH` | No | `500` | Max characters for `/task` command |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
@@ -202,11 +205,13 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 
 | Feature | Syntax | Example |
 |---|---|---|
-| Force provider | `#claude`, `#gemini`, `#codex` | `- [ ] Task #codex` |
+| Force provider | `#claude`, `#gemini`, `#codex`, `#vibe` | `- [ ] Task #codex` |
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
 | Gemini model | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
 | Codex model | `#codex_5` (gpt-5.6-sol), `#codex_5_4` (gpt-5.6-terra), `#codex_mini` (gpt-5.6-luna) | `- [ ] Run #codex_mini` |
 | OpenRouter model (opt-in, requires `OPENROUTER_API_KEY`) | Free: `#or_minimax_free`, `#or_deepseek_free`, `#or_qwen_free`, `#or_nemotron_free`. Paid flagships: `#or_glm`, `#or_kimi`, `#or_qwen`, `#or_deepseek`, `#or_minimax`. Generic: `#openrouter` (default model). | `- [ ] Daily summary #or_minimax_free` |
+| Vibe / Mistral (opt-in, requires the `vibe` CLI) | `#vibe` — routes to Vibe using its configured model. Reviewer only: never writes files, never enters the fallback chain, and if the CLI is missing the task is **parked rather than handed to an executor**. | `- [ ] Second opinion #vibe` |
+| Vibe model choice | `#second_opinion:vibe_medium` (mistral-medium-3.5) / `#second_opinion:vibe_small` (devstral-small). **Only as a `#second_opinion:` value** — as bare task tags `#vibe_medium`/`#vibe_small` route to Vibe but do *not* force the model yet (see the `MODEL_TAG_RE` gap under Known Limitations). | `- [ ] Review #tool:review-loop #second_opinion:vibe_small` |
 | Run tool | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
 | Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
 | Working directory | `cwd:<path>` | `cwd:D:\projects\repo` |
@@ -224,6 +229,19 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
 | Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:codex` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
+| Second opinion (review-loop) | `#second_opinion:<alias\|provider>` | `#second_opinion:codex`, `#second_opinion:vibe_small` |
+
+### Known Limitations
+
+**Model tags: only a subset is enforced.** `queue_manager.MODEL_TAG_RE` recognises
+`#claude_haiku/_sonnet/_opus`, `#gemini_pro/_flash` and `#codex_mini`. Every other
+model tag — `#gemini_flash_lite`, `#codex_5`, `#codex_5_4`, `#vibe_medium`,
+`#vibe_small` and all nine `#or_*` — still routes to the right **provider** via the
+dispatcher, but the **model is not forced**: the task runs on that provider's default
+model. `#or_glm` and `#or_kimi` therefore produce the same model today. The
+`#second_opinion:<alias>` path is unaffected — it resolves aliases separately and
+honours every one of them. Fix in progress: derive the pattern from the alias maps
+in `config.py` instead of hard-coding it.
 
 ### Parallel Tasks (`#parallel`)
 

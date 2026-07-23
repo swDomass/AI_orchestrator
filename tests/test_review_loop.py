@@ -134,6 +134,33 @@ def test_resolve_second_opinion_returns_none_for_falsy():
     assert _resolve_second_opinion("") is None
 
 
+def test_resolve_second_opinion_accepts_vibe_bare_and_aliases(monkeypatch):
+    """Vibe is the second non-Claude voice: `#second_opinion:vibe` (CLI default
+    model) and the two model aliases must all resolve to the vibe provider."""
+    import dispatcher
+    from providers.vibe import VibeProvider
+
+    monkeypatch.setitem(dispatcher._providers, "vibe", VibeProvider())
+
+    provider, model_id = _resolve_second_opinion("vibe")
+    assert provider.name == "vibe"
+    assert model_id is None  # bare provider → vibe's own configured model
+
+    for alias in ("vibe_medium", "vibe_small"):
+        provider, model_id = _resolve_second_opinion(alias)
+        assert provider.name == "vibe"
+        assert model_id == alias
+
+
+def test_resolve_second_opinion_vibe_none_when_cli_missing(monkeypatch):
+    """No binary → not registered → phase is skipped, never a crash."""
+    import dispatcher
+
+    monkeypatch.delitem(dispatcher._providers, "vibe", raising=False)
+    assert _resolve_second_opinion("vibe") is None
+    assert _resolve_second_opinion("vibe_medium") is None
+
+
 def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch, tmp_path):
     """Primary finds 1, second-opinion finds 1 extra → both must end up in fix prompt."""
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)

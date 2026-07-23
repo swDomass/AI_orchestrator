@@ -28,6 +28,18 @@ def test_codex_tags_resolve_for_codex():
     assert model_id_for_provider("codex_5_4", "codex") == "gpt-5.6-terra"
 
 
+def test_vibe_tags_resolve_for_vibe():
+    # Values are vibe's own config aliases (`active_model`), not raw model names —
+    # the provider passes them through VIBE_ACTIVE_MODEL and vibe resolves them.
+    assert model_id_for_provider("vibe_medium", "vibe") == "mistral-medium-3.5"
+    assert model_id_for_provider("vibe_small", "vibe") == "devstral-small"
+
+
+def test_vibe_tags_do_not_leak_to_other_providers():
+    assert model_id_for_provider("vibe_medium", "claude") is None
+    assert model_id_for_provider("claude_opus", "vibe") is None
+
+
 def test_cross_provider_mismatch_returns_none():
     # Claude tag on Gemini provider → None (prevents --model claude-opus-4-6 on gemini CLI)
     assert model_id_for_provider("claude_opus", "gemini") is None

@@ -9,6 +9,9 @@ Routing priority:
 A provider is skipped if:
   - cclimits shows < 5% remaining capacity
   - It is in cooldown (unreachable / error within last 30 min)
+
+OpenRouter (pay-per-token) and Vibe (Mistral, pay-per-token) are registered but
+never part of that chain — they run only when a task tags them explicitly.
 """
 
 import re
@@ -16,7 +19,13 @@ import re
 import config
 from limits import AllLimits, ProviderLimits, is_transient_token_refresh
 from providers.base import BaseProvider
-from providers import ClaudeProvider, GeminiProvider, CodexProvider, OpenRouterProvider
+from providers import (
+    ClaudeProvider,
+    CodexProvider,
+    GeminiProvider,
+    OpenRouterProvider,
+    VibeProvider,
+)
 
 # Tag in task text to force a specific provider.
 # Model-specific tags also select their owning provider.
@@ -35,6 +44,9 @@ _TAG_MAP = {
     "#codex_5":           "codex",
     "#codex_5_4":         "codex",
     "#codex_mini":        "codex",
+    "#vibe":              "vibe",
+    "#vibe_medium":       "vibe",
+    "#vibe_small":        "vibe",
     "#openrouter":        "openrouter",
     "#or_minimax_free":   "openrouter",
     "#or_deepseek_free":  "openrouter",
@@ -53,8 +65,9 @@ _TAG_RE_BY_PROVIDER = {
 }
 
 # Singleton provider instances (carry cooldown state across calls).
-# OpenRouter is registered conditionally: without an API key, tagged tasks
-# fall through to the default chain (Claude/Gemini/Codex) automatically.
+# OpenRouter and Vibe are registered conditionally: without an API key resp.
+# without the `vibe` binary on PATH, tagged tasks fall through to the default
+# chain (Claude/Gemini/Codex) automatically.
 _providers: dict[str, BaseProvider] = {
     "claude": ClaudeProvider(),
     "gemini": GeminiProvider(),
@@ -62,17 +75,28 @@ _providers: dict[str, BaseProvider] = {
 }
 if config.OPENROUTER_API_KEY:
     _providers["openrouter"] = OpenRouterProvider()
+if VibeProvider.is_available():
+    _providers["vibe"] = VibeProvider()
 
-# Priority order — OpenRouter is intentionally absent so it NEVER enters the
-# default fallback chain. Activation requires an explicit #openrouter/#or_* tag.
+# Priority order — OpenRouter and Vibe are intentionally absent so they NEVER
+# enter the default fallback chain. Activation requires an explicit
+# #openrouter/#or_* resp. #vibe/#vibe_* tag (or #second_opinion:vibe).
 _PRIORITY = ["claude", "gemini", "codex"]
+
+# Providers whose whole point is that they do NOT write. Falling back from one of
+# these to the default chain would silently swap a non-writing reviewer for a
+# file-writing executor — a wider blast radius than the task asked for. For
+# OpenRouter the same fallback is harmless (executor → executor); here it is not.
+# So: an explicit tag for a reviewer-only provider that isn't registered yields
+# no provider at all, and the task is parked instead of quietly escalated.
+_REVIEWER_ONLY = {"vibe"}
 
 
 def _limits_ok(name: str, limits: AllLimits) -> bool:
     # OpenRouter is pay-per-token and has no subscription quota tracked by
     # cclimits — treat it as always available. Rate-limit recovery happens
     # via the provider's own cooldown on HTTP 429.
-    if name == "openrouter":
+    if name in ("openrouter", "vibe"):
         return True
     # Gemini in HTTP-API mode (GEMINI_API_KEY set) has no pollable subscription
     # quota either — the consumer CLI/OAuth endpoint cclimits reads is dead. Treat
@@ -104,6 +128,22 @@ def resolve_forced_provider(task: str, force_name: str | None = None) -> BasePro
     return None
 
 
+def _tags_unregistered_reviewer_only(task: str) -> bool:
+    """True when the task tags a reviewer-only provider that is not registered.
+
+    That is the one case where falling through to the default chain would hand a
+    deliberately non-writing review job to a file-writing executor. Everything
+    else (unknown tag, unregistered OpenRouter) keeps the existing fall-through.
+    """
+    task_lower = task.lower()
+    for tag, provider_name in _TAG_MAP.items():
+        if provider_name not in _REVIEWER_ONLY or provider_name in _providers:
+            continue
+        if _TAG_RE_BY_PROVIDER[tag].search(task_lower):
+            return True
+    return False
+
+
 def select_provider(
     task: str,
     limits: AllLimits,
@@ -125,6 +165,10 @@ def select_provider(
     # tag). Returns None when a tagged provider isn't registered (e.g. openrouter
     # without an API key), so the task falls through to the default chain.
     forced = resolve_forced_provider(task, force_name)
+
+    # Reviewer-only providers do not degrade into executors — see _REVIEWER_ONLY.
+    if forced is None and _tags_unregistered_reviewer_only(task):
+        return None
 
     # Tool Policy Layering: filter allowed providers for this tool
     allowed_by_policy = None

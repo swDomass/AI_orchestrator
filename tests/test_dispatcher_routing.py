@@ -273,3 +273,91 @@ def test_force_refresh_can_unblock_false_when_nothing_transient():
         codex=limits.ProviderLimits(available=False, remaining_pct=0.0, resets_in_sec=3600),
     )
     assert force_refresh_can_unblock("Fix a bug", all_limits, strict=False) is False
+
+
+# ---------------------------------------------------------------------------
+# Vibe routing — same opt-in contract as OpenRouter: registered but never a fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def with_vibe():
+    """Register Vibe in dispatcher._providers regardless of local CLI presence."""
+    import dispatcher
+    from providers.vibe import VibeProvider
+
+    had_it = "vibe" in dispatcher._providers
+    if not had_it:
+        dispatcher._providers["vibe"] = VibeProvider()
+    yield dispatcher._providers["vibe"]
+    if not had_it:
+        dispatcher._providers.pop("vibe", None)
+
+
+@pytest.fixture
+def without_vibe():
+    import dispatcher
+
+    saved = dispatcher._providers.pop("vibe", None)
+    yield
+    if saved is not None:
+        dispatcher._providers["vibe"] = saved
+
+
+def test_vibe_not_in_default_fallback_chain(with_vibe):
+    """Untagged tasks must never route to Vibe — it is a reviewer, not an executor."""
+    limits_ = _make_limits()
+    provider = select_provider("Fix a bug", limits_)
+    assert provider is not None
+    assert provider.name != "vibe"
+
+
+def test_vibe_not_selected_when_all_others_unavailable(with_vibe):
+    """Vibe must NOT step in as a last resort when claude/gemini/codex are blocked."""
+    limits_ = _make_limits(claude_avail=False, gemini_avail=False, codex_avail=False)
+    assert select_provider("Fix a bug", limits_) is None
+
+
+def test_vibe_tags_select_vibe_when_registered(with_vibe):
+    limits_ = _make_limits()
+    for tag in ("#vibe", "#vibe_medium", "#vibe_small"):
+        provider = select_provider(f"Second opinion {tag}", limits_)
+        assert provider is not None, f"No provider returned for {tag}"
+        assert provider.name == "vibe", f"{tag} did not route to vibe"
+
+
+def test_vibe_tag_does_not_degrade_into_an_executor(without_vibe):
+    """Explicitly asking for the non-writing reviewer must never be answered with
+    a file-writing executor. Without the CLI the task is parked, not escalated —
+    unlike an unregistered #or_* tag, where executor → executor is harmless."""
+    limits_ = _make_limits()
+    assert select_provider("Second opinion #vibe", limits_) is None
+    assert select_provider("Second opinion #vibe_small", limits_) is None
+
+
+def test_unregistered_vibe_does_not_park_untagged_tasks(without_vibe):
+    """The guard is scoped to tasks that actually tag vibe."""
+    limits_ = _make_limits()
+    provider = select_provider("Fix a bug", limits_)
+    assert provider is not None
+    assert provider.name == "claude"
+
+
+def test_explicit_executor_tag_still_wins_alongside_vibe(without_vibe):
+    """#claude next to an inert #vibe is an explicit choice, not an escalation."""
+    limits_ = _make_limits()
+    provider = select_provider("Review this #claude #vibe", limits_)
+    assert provider is not None
+    assert provider.name == "claude"
+
+
+def test_has_explicit_provider_tag_detects_vibe_tags():
+    assert has_explicit_provider_tag("Review #vibe") is True
+    assert has_explicit_provider_tag("Review #vibe_medium") is True
+
+
+def test_limits_ok_returns_true_for_vibe():
+    """Pay-per-token via Mistral's API — no cclimits quota to gate on."""
+    from dispatcher import _limits_ok
+    limits_ = _make_limits(claude_avail=False, gemini_avail=False, codex_avail=False)
+    assert _limits_ok("vibe", limits_) is True

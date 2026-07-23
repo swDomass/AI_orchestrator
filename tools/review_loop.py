@@ -16,6 +16,7 @@ from config import (
     CLAUDE_MODEL_ALIASES,
     CODEX_MODEL_ALIASES,
     OPENROUTER_MODEL_ALIASES,
+    VIBE_MODEL_ALIASES,
     TOOL_MAX_ITERATIONS,
     TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_FIX_TIMEOUT_SEC,
@@ -136,7 +137,10 @@ subtle bugs the primary reviewer might overlook.
 # Gemini removed as a review voice (dead consumer CLI + data-training/privacy
 # concerns); Codex is the external non-Claude second opinion. Gemini stays only
 # as a fallback *execution* provider in the dispatcher chain, not as a reviewer.
-_SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "codex"}
+# Vibe (Mistral) is the second non-Claude voice — a third training lineage next
+# to Claude and GPT. Only registered when the binary exists, so an unresolvable
+# `#second_opinion:vibe` degrades to "skip the phase", never to a crash.
+_SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "codex", "vibe"}
 
 
 def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None] | None:
@@ -158,6 +162,8 @@ def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None
         provider_name, model_id = "claude", alias
     elif alias in CODEX_MODEL_ALIASES:
         provider_name, model_id = "codex", alias
+    elif alias in VIBE_MODEL_ALIASES:
+        provider_name, model_id = "vibe", alias
     elif alias in _SECOND_OPINION_BARE_PROVIDERS:
         provider_name, model_id = alias, None
     else:

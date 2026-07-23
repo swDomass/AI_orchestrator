@@ -65,6 +65,19 @@ def _parse_int_env(key: str, default: int) -> int:
         return default
 
 
+def _parse_positive_float_env(key: str, default: float) -> float:
+    """Parse a float env var, falling back on anything unusable.
+
+    Non-positive values fall back too: they reach a CLI as a cost/limit argument,
+    where "0" or "-1" is either rejected outright or silently means "no budget".
+    """
+    try:
+        value = float(os.getenv(key) or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _parse_bool_env(key: str, default: bool) -> bool:
     raw = os.getenv(key)
     if raw is None or raw == "":
@@ -237,6 +250,19 @@ GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-3.5-flash")
 # return empty text (finishReason=MAX_TOKENS). 16k leaves room for a full review
 # plus reasoning. Free tier is uncharged, so headroom costs nothing.
 GEMINI_MAX_OUTPUT_TOKENS = _parse_int_env("GEMINI_MAX_OUTPUT_TOKENS", 16384)
+
+# --- Mistral Vibe CLI (opt-in second non-Claude voice) ---
+# Registered only when the `vibe` binary is on PATH, and never part of the
+# fallback chain — activation needs an explicit #vibe / #vibe_* tag or a
+# #second_opinion:vibe value. Cost is pay-per-token on Mistral's API, so a run
+# carries its own hard ceiling: vibe interrupts itself above --max-price.
+VIBE_MAX_PRICE_USD = _parse_positive_float_env("VIBE_MAX_PRICE_USD", 0.50)
+# Turn budget for tool-enabled runs (read_file/grep only — the provider never
+# grants write tools). Enough for a reviewer to pull a handful of files.
+VIBE_MAX_TURNS = _parse_int_env("VIBE_MAX_TURNS", 12)
+# read_only runs disable every tool, so a single assistant turn is all that can
+# happen — anything higher would just widen the blast radius of a hang.
+VIBE_READONLY_MAX_TURNS = _parse_int_env("VIBE_READONLY_MAX_TURNS", 1)
 
 # --- Telegram Notifications ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -488,6 +514,16 @@ CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex_5_4":  "gpt-5.6-terra",
     "codex_mini": "gpt-5.6-luna",
 }
+# Mistral Vibe aliases. The VALUES are vibe's own config aliases (`active_model`
+# in ~/.vibe/config.toml), not raw model names — the provider passes them through
+# `VIBE_ACTIVE_MODEL`, and vibe resolves alias → model itself. An unknown value
+# falls back to vibe's configured default silently (no error), so these strings
+# are the single source of truth. `local` (llamacpp) is deliberately absent:
+# no local inference in this workflow.
+VIBE_MODEL_ALIASES: dict[str, str] = {
+    "vibe_medium": "mistral-medium-3.5",   # $1.5/$7.5 per Mtok, thinking=high
+    "vibe_small":  "devstral-small",       # $0.1/$0.3 per Mtok, cheap pass
+}
 # OpenRouter aliases: prefix `or_*` so they cannot collide with native CLI tags.
 # Free models for trivial single-call tasks (heartbeat, summaries). Paid flagships
 # from Chinese open-source families for higher-quality non-agentic calls — all at
@@ -511,6 +547,7 @@ _MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
     "gemini":     GEMINI_MODEL_ALIASES,
     "codex":      CODEX_MODEL_ALIASES,
     "openrouter": OPENROUTER_MODEL_ALIASES,
+    "vibe":       VIBE_MODEL_ALIASES,
 }
 
 

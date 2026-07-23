@@ -165,6 +165,7 @@ def _spawn(
     shell: bool,
     encoding: str,
     errors: str,
+    env: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     kwargs: dict = dict(
         stdin=subprocess.PIPE,
@@ -176,6 +177,13 @@ def _spawn(
         cwd=cwd,
         shell=shell,
     )
+    # env=None → child inherits the parent environment (Popen default). Callers
+    # that need per-run variables (e.g. Vibe's VIBE_ACTIVE_MODEL) pass a full,
+    # already-merged mapping — building it in the caller keeps this thread-safe:
+    # providers are shared singletons run from parallel threads, so mutating
+    # os.environ here would leak one run's model into another's.
+    if env is not None:
+        kwargs["env"] = env
     if os.name == "posix":
         # Own process group so killpg reaps the whole tree.
         kwargs["start_new_session"] = True
@@ -442,6 +450,7 @@ def run_with_watchdog(
     liveness_lines: bool = False,
     encoding: str = "utf-8",
     errors: str = "replace",
+    env: dict[str, str] | None = None,
 ) -> WatchdogResult:
     """Run a CLI command with an idle (hang) + hard (backstop) watchdog.
 
@@ -450,14 +459,17 @@ def run_with_watchdog(
 
     ``liveness_lines=True`` enables NDJSON-event-aware liveness (Claude): a
     running ``tool_use`` pauses the idle timer. ``False`` = pure byte liveness
-    (Gemini/Codex).
+    (Gemini/Codex/Vibe).
+
+    ``env`` replaces the child environment wholesale (Popen semantics) — pass a
+    merged copy of ``os.environ``, not a delta. ``None`` inherits the parent's.
     """
     # Defensive: a non-positive hard_timeout (a 0/None leaking from a caller's
     # extract_timeout default) would make the watchdog hard-kill instantly.
     if not hard_timeout or hard_timeout <= 0:
         hard_timeout = TASK_TIMEOUT_SEC
 
-    proc = _spawn(cmd, cwd, shell, encoding, errors)
+    proc = _spawn(cmd, cwd, shell, encoding, errors, env)
     start = time.monotonic()
     liveness = _Liveness(start)
 

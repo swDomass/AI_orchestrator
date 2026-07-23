@@ -91,6 +91,20 @@ def check_codex_cli() -> CheckResult:
     return _check_cli("Codex CLI", "codex", "npm install -g @openai/codex")
 
 
+def check_vibe_cli() -> CheckResult:
+    """Vibe is optional: a missing binary is a WARN, not a FAIL — the #vibe tag
+    just stays inert. Any OTHER failure keeps its original status, so an
+    installed-but-broken CLI is never disguised as "simply not installed"."""
+    r = _check_cli("Vibe CLI", "vibe", "uv tool install mistral-vibe")
+    if r.status != FAIL or "not found in PATH" not in r.message:
+        return r
+    return CheckResult(
+        WARN, "Vibe CLI",
+        "not installed — #vibe / #second_opinion:vibe unavailable (optional)",
+        fix_hint="uv tool install mistral-vibe",
+    )
+
+
 def check_node() -> CheckResult:
     return _check_cli("Node.js", "node", "https://nodejs.org")
 
@@ -464,6 +478,9 @@ def check_model_aliases() -> CheckResult:
         return CheckResult(WARN, "Model IDs", f"import failed: {e}")
 
     probes: list[tuple[str, str, str]] = []  # (provider, tag, model_id)
+    # Vibe (and OpenRouter) are deliberately not probed: both are pay-per-token,
+    # and a liveness ping on every `--doctor` run would spend real money to learn
+    # something the CLI-presence check already covers.
     for provider, mapping in (
         ("claude", CLAUDE_MODEL_ALIASES),
         ("gemini", GEMINI_MODEL_ALIASES),
@@ -615,6 +632,7 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_claude_cli(),
         check_gemini_cli(),
         check_codex_cli(),
+        check_vibe_cli(),
         check_node(),
         check_git(),
         check_cclimits(),

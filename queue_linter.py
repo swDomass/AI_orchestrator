@@ -10,6 +10,8 @@ Catches bad queue entries before they reach a provider:
   - #needs: references that will never resolve
   - #or_* tag without OPENROUTER_API_KEY configured
   - #parallel with no/single subtask, or subtasks sharing CWD
+  - HTML comments inside the task body (silently truncate the task text), or at the
+    line end without being a valid retry/hang marker (silently dropped on rewrite)
 
 CLI: ``python orchestrator.py --lint-queue``
 Exit codes: 0 = clean, 1 = warnings, 2 = errors.
@@ -34,10 +36,12 @@ from queue_manager import (
     EVERY_TAG_RE,
     FRESHONLY_TAG_RE,
     GRACE_TAG_RE,
+    HANG_COUNT_RE,
     MODEL_TAG_RE,
     NEEDS_TAG_RE,
     PARALLEL_TAG_RE,
     PROVIDER_TAG_RE,
+    RETRY_TAG_RE,
     _collect_completed_ids,
     _decode_queue_bytes,
     _parse_subtask_line,
@@ -53,6 +57,23 @@ from queue_manager import (
 
 # Regex for any open task line (subset of OPEN_TASK_RE — without retry-stripping)
 _OPEN_TASK_LINE_RE = re.compile(r"^- \[ \] (.+?)(?:\s*<!--.*?-->)?\s*$")
+
+# The only HTML comments a task line may legitimately carry: the schedule markers
+# queue_manager appends at the very end of the line. Composed from the queue parser's
+# own patterns rather than hand-copied, so a marker format change cannot drift the two
+# apart — and a marker the parser would NOT recognise (e.g. missing spaces) is correctly
+# treated as a stray comment here. Inherits the two capture groups of the source
+# patterns; only ever used with .sub(), so the groups are inert — a future .search()
+# would get the timestamp or None depending on which alternative matched.
+_TRAILING_MARKER_RE = re.compile(
+    rf"\s*(?:{RETRY_TAG_RE.pattern}|{HANG_COUNT_RE.pattern})\s*$"
+)
+
+# The LAST comment on the line, if the line ends in one. The tempered dot
+# `(?:(?!-->).)*` is load-bearing: a plain lazy `.*?` is still anchored by `$` and would
+# span from the first `<!--` to the last `-->` — the exact defect this module reports —
+# which would misclassify a body comment as a harmless trailing one.
+_TRAILING_COMMENT_RE = re.compile(r"\s*<!--(?:(?!-->).)*-->\s*$")
 
 # Detect any `#or_*` or bare `#openrouter` tag (case-insensitive).
 _OPENROUTER_TAG_RE = re.compile(r"(?i)(?<!\S)#(openrouter|or_[A-Za-z0-9_]+)(?=\s|$)")
@@ -110,18 +131,19 @@ def lint_queue(content: str | None = None) -> list[LintFinding]:
     # Build cross-task indexes once
     completed_ids = _collect_completed_ids(content)
     open_ids: dict[str, list[int]] = {}
-    for line_no, task_text, _subs in open_tasks:
+    for line_no, task_text, _subs, _raw in open_tasks:
         tid = extract_id_tag(task_text)
         if tid:
             open_ids.setdefault(tid, []).append(line_no)
 
     # Per-task checks
     valid_tool_names = _load_tool_names()
-    for line_no, task_text, subtasks in open_tasks:
+    for line_no, task_text, subtasks, raw_line in open_tasks:
         findings.extend(_check_task(
             line_no=line_no,
             task_text=task_text,
             subtasks=subtasks,
+            raw_line=raw_line,
             open_ids=open_ids,
             completed_ids=completed_ids,
             valid_tool_names=valid_tool_names,
@@ -192,7 +214,12 @@ def _load_tool_names() -> set[str]:
 
 
 def _iter_open_tasks(content: str):
-    """Yield (line_no, task_text, subtasks_tuple) for every open task in '## Queue'."""
+    """Yield (line_no, task_text, subtasks_tuple, raw_line) per open task in '## Queue'.
+
+    ``raw_line`` is handed through unparsed because ``task_text`` comes from
+    ``_OPEN_TASK_LINE_RE`` and is therefore already truncated when the line carries an
+    HTML comment inside the body — checks for that defect must see the raw line.
+    """
     in_queue = False
     all_lines = content.splitlines()
     for line_idx, raw in enumerate(all_lines):
@@ -216,7 +243,7 @@ def _iter_open_tasks(content: str):
                     break
                 subs.append(st)
                 j += 1
-        yield line_no, task_text, tuple(subs)
+        yield line_no, task_text, tuple(subs), raw
 
 
 def _check_task(
@@ -224,11 +251,16 @@ def _check_task(
     line_no: int,
     task_text: str,
     subtasks: tuple[str, ...],
+    raw_line: str,
     open_ids: dict[str, list[int]],
     completed_ids: set[str],
     valid_tool_names: set[str],
 ) -> list[LintFinding]:
     out: list[LintFinding] = []
+
+    # Runs before the empty-text guard: a line whose text is empty *because* a comment
+    # ate it needs the cause reported, not just the symptom.
+    out.extend(_check_html_comment(line_no, task_text, raw_line))
 
     if not task_text:
         out.append(LintFinding(LEVEL_ERROR, line_no, task_text,
@@ -248,6 +280,64 @@ def _check_task(
     out.extend(_check_grace_tag(line_no, task_text))
     out.extend(_check_freshonly_tag(line_no, task_text))
     return out
+
+
+def _check_html_comment(line_no: int, task_text: str, raw_line: str) -> list[LintFinding]:
+    """Flag HTML comments a task line must not carry.
+
+    ``OPEN_TASK_RE`` only tolerates comments at the very end of the line, and
+    ``queue_manager`` only ever writes ``retry``/``hang`` markers there. Everything else
+    fails in one of two distinct ways, so they get distinct findings:
+
+    * **In the body** — as soon as the line *ends* in a comment, the parser ends the task
+      text at the first ``<!--`` and treats everything up to the last ``-->`` on the line
+      as the marker. Rewriting the completed line then deletes that swallowed range —
+      typically including the ``#every:``/``#at:``/model tags — from the file for good,
+      and the recurring task silently stops firing. Flagged even while the line does not
+      yet end in ``-->`` and the text still parses in full: on a ``#every:`` task the
+      first successful completion appends a retry marker and arms the defect.
+    * **At the end, but not a marker the parser recognises** — the task text survives,
+      but the comment is dropped on the next rewrite. If it was *meant* as a schedule
+      marker, the framing must be exact (``RETRY_TAG_RE`` requires the spaces after
+      ``<!--``, after ``retry:`` and before ``-->``; extra spaces are tolerated, missing
+      ones are not), and a near-miss means the schedule silently never applies.
+
+    Known blind spot: a body comment that happens to be marker-shaped *and* sits at the
+    line end (``- [ ] Setze auf <!-- hang: 3 -->``) is indistinguishable from a real
+    marker and passes. Truncation still occurs there — but the same string is what the
+    orchestrator legitimately writes, so it cannot be separated by inspection.
+    """
+    body = raw_line.rstrip()
+    while True:
+        stripped = _TRAILING_MARKER_RE.sub("", body)
+        if stripped == body:
+            break
+        body = stripped
+
+    if "<!--" not in body:
+        return []
+
+    without_trailing = _TRAILING_COMMENT_RE.sub("", body)
+    if "<!--" not in without_trailing:
+        return [LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            "HTML-Kommentar am Zeilenende, den der Parser nicht als retry-/hang-Marker "
+            "erkennt — er wird beim nächsten Zurückschreiben der Zeile kommentarlos "
+            "gelöscht. War er als Schedule-Marker gemeint: die Leerzeichen nach '<!--', "
+            "nach 'retry:' und vor '-->' sind Pflicht ('<!-- retry: YYYY-MM-DD HH:MM -->'), "
+            "sonst greift der Zeitplan nie",
+            code="html_comment_trailing",
+        )]
+
+    return [LintFinding(
+        LEVEL_ERROR, line_no, task_text,
+        "HTML-Kommentar im Task-Text — sobald die Zeile in einem Kommentar endet (bei "
+        "#every: spätestens nach dem ersten angehängten retry-Marker), schneidet der "
+        "Parser den Task ab dem ersten '<!--' ab; beim Zurückschreiben der erledigten "
+        "Zeile gehen die dahinter stehenden Tags (#every:, #at:, Modell) dauerhaft "
+        "verloren. Kommentar entfernen oder den Inhalt in eine Skill-Datei auslagern",
+        code="html_comment_in_body",
+    )]
 
 
 def _check_cwd(line_no: int, task_text: str) -> list[LintFinding]:

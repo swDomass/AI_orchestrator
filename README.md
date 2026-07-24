@@ -180,6 +180,8 @@ Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
 - `#needs:` referencing IDs that will never resolve (warning)
 - `#openrouter` / `#or_*` without `OPENROUTER_API_KEY` configured (warning — task falls back to default chain)
 - `#parallel` with 0-1 subtasks (warning) or shared CWD (info)
+- HTML comment inside the task body (`html_comment_in_body`) — truncates the task and deletes the trailing tags on rewrite, see [Retry Markers](#retry-markers)
+- HTML comment at the line end that is not a valid `retry`/`hang` marker (`html_comment_trailing`) — silently dropped on rewrite; a near-miss marker means the schedule never applies
 
 Not yet covered: `#vibe*` tags (neither the unknown-alias check nor a "CLI missing → task will be parked" warning) — the linter shares `extract_model_tag()` with the queue parser and inherits the gap described under [Known Limitations](#known-limitations).
 
@@ -305,6 +307,8 @@ Both schedule tags reuse the existing retry primitive — no separate scheduler.
 ```md
 - [ ] Task <!-- retry: 2026-02-26 23:10 -->
 ```
+
+**Never put an HTML comment inside the task body.** `OPEN_TASK_RE` tolerates comments only at the very end of the line (`retry`/`hang` markers). As soon as the line *ends* in a comment, one sitting earlier in the text makes the parser end the task at the first `<!--` and swallow everything up to the last `-->` on the line — so the provider receives a prompt cut off mid-sentence, and rewriting the completed line deletes the swallowed range (including the `#every:`/`#at:`/model tags) from the file for good. The recurring task then silently stops firing. A body comment on a line that does not yet end in a comment still parses in full — but on an `#every:` task the first completion appends a retry marker and arms it. `--lint-queue` flags this as error `html_comment_in_body`, and a line-end comment the parser does not read as a marker as `html_comment_trailing` (dropped on the next rewrite — and if it was meant as a marker, note that `RETRY_TAG_RE` requires the spaces after `<!--`, after `retry:` and before `-->`; extra spaces are fine, missing ones are not). Put marker syntax and other comment-shaped instructions in a skill file the task points to.
 
 ## Built-in Tools
 
@@ -789,7 +793,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1723 tests, ~90 s)
+# Run all tests (~1748 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file

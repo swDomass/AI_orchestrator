@@ -276,6 +276,144 @@ def test_parallel_subtasks_without_cwd_is_info(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# HTML comments in the task body
+# ---------------------------------------------------------------------------
+
+def test_html_comment_in_body_flagged():
+    content = "## Queue\n- [ ] Write between <!-- block:start --> and the end #every:24h\n"
+    findings = lint_queue(content)
+    assert "html_comment_in_body" in _codes(findings)
+    assert exit_code_for(findings) == 2
+
+
+@pytest.mark.parametrize("markers", [
+    "<!-- retry: 2026-07-25 19:00 -->",
+    "<!-- retry: 19:00 -->",                                   # legacy HH:MM form
+    "<!-- hang: 2 -->",                                        # hang without retry
+    "<!-- retry: 2026-07-25 19:00 --> <!-- hang: 2 -->",
+    "<!-- hang: 2 --> <!-- retry: 2026-07-25 19:00 -->",       # _set_retry_marker append
+])
+def test_trailing_schedule_markers_are_clean(markers):
+    content = f"## Queue\n- [ ] Plain task #every:24h {markers}\n"
+    findings = lint_queue(content)
+    assert not {"html_comment_in_body", "html_comment_trailing"} & _codes(findings)
+
+
+def test_queue_manager_written_lines_lint_clean():
+    """Round-trip: whatever queue_manager writes onto an open line must lint clean.
+
+    Pins the linter's marker pattern to the parser's own — a format change on either
+    side turns every machine-written line into a lint error, which this catches.
+    """
+    from datetime import datetime
+
+    import queue_manager as qm
+
+    task = "Plain task #every:24h"
+    written = [
+        qm._set_retry_marker(f"- [ ] {task}", datetime(2026, 7, 25, 19, 0)),
+        qm._set_retry_marker(
+            f"- [ ] {task} <!-- hang: 2 -->", datetime(2026, 7, 25, 19, 0)
+        ),
+        f"- [ ] {task} <!-- retry: 2026-07-25 19:00 --> <!-- hang: 3 -->",
+    ]
+    for line in written:
+        findings = lint_queue(f"## Queue\n{line}\n")
+        codes = _codes(findings)
+        assert not {"html_comment_in_body", "html_comment_trailing"} & codes, line
+
+
+def test_unrecognised_trailing_comment_flagged_as_trailing():
+    """A comment at the line end that the parser does not read as a marker.
+
+    The task text survives (no truncation), so the body-comment message would be wrong —
+    it gets its own code and its own reason instead.
+    """
+    content = "## Queue\n- [ ] Plain task #every:24h <!-- TODO später ausbauen -->\n"
+    findings = lint_queue(content)
+    hits = [f for f in findings if f.code == "html_comment_trailing"]
+    assert len(hits) == 1
+    assert hits[0].level == LEVEL_ERROR
+    assert "html_comment_in_body" not in _codes(findings)
+
+
+def test_malformed_retry_marker_flagged_as_trailing():
+    """Missing spaces: RETRY_TAG_RE would not match, so the schedule never applies."""
+    content = "## Queue\n- [ ] Plain task #every:24h <!--retry: 2026-07-25 19:00-->\n"
+    findings = lint_queue(content)
+    assert "html_comment_trailing" in _codes(findings)
+
+
+def test_comment_swallowing_whole_task_reports_cause_not_just_empty():
+    """Empty task text caused by a comment must name the comment, not only the symptom.
+
+    The double space after ``- [ ]`` is what actually drives ``task_text`` empty and thus
+    reaches the empty-task guard — with a single space the parsed text is non-empty and
+    the guard is never hit, so the ordering fix would go untested.
+    """
+    content = "## Queue\n- [ ]  <!-- log:start -->\n"
+    codes = _codes(lint_queue(content))
+    assert "empty_task" in codes
+    assert {"html_comment_in_body", "html_comment_trailing"} & codes
+
+
+@pytest.mark.parametrize("line", [
+    # The author's form of the live incident — written before the orchestrator appends
+    # any retry marker. OPEN_TASK_RE already truncates to "Schreibe zwischen".
+    "- [ ] Schreibe zwischen <!-- tagesabschluss:start --> und <!-- tagesabschluss:end -->",
+    "- [ ] A <!-- x --> B #every:24h <!-- note -->",
+    "- [ ] Ersetze zwischen <!-- log:start --> und <!-- log:end -->",
+])
+def test_body_comment_not_downgraded_to_trailing(line):
+    """Several comments, line ending in one: still a body defect, not a trailing note.
+
+    Guards `_TRAILING_COMMENT_RE` against regressing to a plain lazy `.*?`, which would
+    span all comments at once and report the destructive case as the harmless one.
+    """
+    findings = lint_queue(f"## Queue\n{line}\n")
+    assert "html_comment_in_body" in _codes(findings)
+    assert "html_comment_trailing" not in _codes(findings)
+
+
+def test_task_without_any_comment_is_clean():
+    content = "## Queue\n- [ ] Plain task #every:24h #at:19:00\n"
+    findings = lint_queue(content)
+    assert "html_comment_in_body" not in _codes(findings)
+
+
+def test_body_comment_with_trailing_retry_marker_flagged():
+    """The live regression: body marker + retry marker swallowed the schedule tags.
+
+    ``task_text`` reaches the checks already truncated at the first ``<!--`` — the
+    finding must come from the raw line, and the swallowed tags must not be visible
+    in the parsed text.
+    """
+    content = (
+        "## Queue\n"
+        "- [ ] Replace between <!-- log:start --> and <!-- log:end --> in the note "
+        "#every:24h #at:19:00 #claude_sonnet <!-- retry: 2026-07-25 19:00 -->\n"
+    )
+    findings = lint_queue(content)
+    hits = [f for f in findings if f.code == "html_comment_in_body"]
+    assert len(hits) == 1
+    assert hits[0].level == LEVEL_ERROR
+    assert "#every:" not in hits[0].task_text  # proof the parsed text lost the tags
+
+
+def test_body_comment_without_trailing_marker_still_flagged():
+    """No truncation yet, but the first completion appends a retry marker and arms it."""
+    content = "## Queue\n- [ ] Use <!-- log:start --> as the anchor, then stop #every:24h\n"
+    findings = lint_queue(content)
+    assert "html_comment_in_body" in _codes(findings)
+
+
+def test_commented_out_example_line_is_not_a_task():
+    content = "## Queue\n<!-- - [ ] Example task #claude_sonnet -->\n"
+    findings = lint_queue(content)
+    assert "html_comment_in_body" not in _codes(findings)
+
+
+# ---------------------------------------------------------------------------
 # Exit codes & formatting
 # ---------------------------------------------------------------------------
 

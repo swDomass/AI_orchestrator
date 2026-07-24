@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code, Gemini (HTTP API o
 ## Commands
 
 ```bash
-# Run all tests (~1723 tests, ~90 s)
+# Run all tests (~1748 tests, ~90 s)
 python -m pytest tests/ -q
 
 # Run a single test file / single test
@@ -127,6 +127,7 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **Subtask-aware queue mutations** — `mark_done/mark_retry/finalize` accept `subtasks` kwarg
 - **Task dependencies** — `#id:`/`#needs:`, two-pass resolution, blocked-task header
 - **Schedule tags** — `#at:`/`#every:` reuse retry primitive; queue file is single source of truth
+- **Keine HTML-Kommentare im Task-Body** — `OPEN_TASK_RE` duldet Kommentare nur am Zeilenende (`retry`/`hang`). Steht einer mitten im Text und **endet die Zeile in einem Kommentar** (bei `#every:` spätestens nach dem ersten angehängten retry-Marker), endet der Task-Text am ersten `<!--` und alles bis zum letzten `-->` der Zeile gilt als Marker: Provider bekommt einen abgeschnittenen Prompt (antwortet plausibel, `success=true`), und beim Rewrite der erledigten Zeile sind die verschluckten Tags (`#every:`/`#at:`/Modell) dauerhaft aus der Datei weg → Recurring-Task tot (live passiert 23.+24.07.2026, „Daily-Activity-Synthese"). `--lint-queue` meldet das als `html_comment_in_body`, einen nicht als Marker lesbaren Kommentar am Zeilenende als `html_comment_trailing` (beide error); Marker-Syntax gehört in die Skill-Datei, nicht in die Queue-Zeile
 - **Worktree isolation (P1)** — `#worktree` on parent → one `git worktree add --detach` per CWD group; subtask cwd rewritten; failed groups retain the worktree (path appended to error)
 - **Tool Contracts (P3)** — `tool_contracts:` section in `policy.yaml`; `PolicyEngine.get_tool_contract(name)` returns dataclass with `max_iterations`/`max_runtime_sec`/`stop_conditions`/`reporting_path`; tools may fall back to `config.TOOL_*_*` constants for fields the contract omits (staged migration)
 - **`.env` comment stripping** — whitespace-before-`#` rule protects URLs/paths

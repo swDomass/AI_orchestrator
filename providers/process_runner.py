@@ -42,6 +42,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -62,6 +63,10 @@ _TASKKILL_TIMEOUT_SEC = 10.0     # timeout for the taskkill subprocess (Windows)
 # last line — is always retained.
 _MAX_CAPTURE_CHARS = 8_000_000   # ~8 MB per stream
 _READ_CHUNK_BYTES = 65536        # read1() chunk size for byte-granular liveness
+# stdin_via_file prompt temp files: dedicated subdir + self-healing stale sweep.
+_PROMPT_DIR_NAME = "orch_prompts"
+_PROMPT_FILE_PREFIX = "orch_prompt_"
+_PROMPT_STALE_SEC = 3600.0       # a leftover older than this is swept on the next run
 
 # The top-level ``result`` event always means the run is finishing → no tool is
 # running anymore. (``assistant``/``user`` are NOT in here: their meaning depends
@@ -166,9 +171,10 @@ def _spawn(
     encoding: str,
     errors: str,
     env: dict[str, str] | None = None,
+    stdin=subprocess.PIPE,
 ) -> subprocess.Popen:
     kwargs: dict = dict(
-        stdin=subprocess.PIPE,
+        stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -364,6 +370,80 @@ def _feed_stdin(
         _log.error("[stdin] prompt delivery incomplete — %s", delivery.error)
 
 
+def _unlink_quiet(path: str) -> None:
+    """Best-effort remove; a temp-file cleanup must never mask the real result.
+
+    Retries briefly on OSError: after a force-kill the child's handle release can
+    lag its process termination on Windows, so a single immediate remove would
+    leak the temp file. Only failures sleep — the common path removes on the first
+    try. Never raises; a leaked temp file is harmless and must not mask the result.
+    """
+    for attempt in range(3):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if attempt < 2:
+                time.sleep(0.05)
+            else:
+                # Do not swallow it silently — a leftover prompt file (possibly
+                # sensitive) must at least be visible; the next run's sweep clears it.
+                _log.warning("[stdin] could not remove temp prompt file %s: %s", path, exc)
+
+
+def _prompt_tmp_dir() -> str:
+    """Dedicated subdirectory for prompt temp files (keeps the sweep cheap + scoped)."""
+    directory = os.path.join(tempfile.gettempdir(), _PROMPT_DIR_NAME)
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def _sweep_stale_prompts(directory: str) -> None:
+    """Best-effort: remove leftover prompt files older than ``_PROMPT_STALE_SEC``.
+
+    A rare cleanup failure (kill race, permission) would otherwise leave a temp
+    prompt in TEMP indefinitely; this self-heals it on the next run. The age guard
+    keeps the sweep from touching a concurrent run's live file (parallel_runner
+    writes are seconds old, far under the threshold). Never raises.
+    """
+    try:
+        now = time.time()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not entry.name.startswith(_PROMPT_FILE_PREFIX):
+                    continue
+                try:
+                    if now - entry.stat().st_mtime > _PROMPT_STALE_SEC:
+                        os.remove(entry.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _write_temp_prompt(input_text: str, encoding: str) -> str:
+    """Write ``input_text`` to a temp file and return its path (caller unlinks).
+
+    Delivering the prompt as a real file — rather than feeding a pipe from a
+    thread — gives the child a deterministic end-of-file: the whole prompt is on
+    disk before the first read, so the tail cannot be lost to a buffered
+    close/flush race (the silent-failure mode this exists to prevent). ``newline=""``
+    keeps the bytes exactly as written (no Windows ``\\n``→``\\r\\n`` translation).
+    """
+    directory = _prompt_tmp_dir()
+    _sweep_stale_prompts(directory)
+    fd, path = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
+            fh.write(input_text)
+    except BaseException:
+        _unlink_quiet(path)
+        raise
+    return path
+
+
 def _tree_kill(proc: subprocess.Popen) -> None:
     """Kill the whole process tree of ``proc`` (best effort)."""
     if proc.poll() is not None:
@@ -451,6 +531,7 @@ def run_with_watchdog(
     encoding: str = "utf-8",
     errors: str = "replace",
     env: dict[str, str] | None = None,
+    stdin_via_file: bool = False,
 ) -> WatchdogResult:
     """Run a CLI command with an idle (hang) + hard (backstop) watchdog.
 
@@ -463,36 +544,74 @@ def run_with_watchdog(
 
     ``env`` replaces the child environment wholesale (Popen semantics) — pass a
     merged copy of ``os.environ``, not a delta. ``None`` inherits the parent's.
+
+    ``stdin_via_file=True`` delivers ``input_text`` by writing it to a temp file
+    and handing the child that file as stdin (no feeder thread). The whole prompt
+    is on disk before the first read and the child reads to a real end-of-file,
+    so the tail cannot be lost to a buffered close/flush race — the documented
+    sub-pipe-buffer blind spot of the feeder path. Delivery is then guaranteed
+    complete (``stdin_error`` stays ``None``). Default ``False`` keeps the piped
+    feeder path unchanged for every other caller.
     """
     # Defensive: a non-positive hard_timeout (a 0/None leaking from a caller's
     # extract_timeout default) would make the watchdog hard-kill instantly.
     if not hard_timeout or hard_timeout <= 0:
         hard_timeout = TASK_TIMEOUT_SEC
 
-    proc = _spawn(cmd, cwd, shell, encoding, errors, env)
-    start = time.monotonic()
-    liveness = _Liveness(start)
+    # Prompt delivery mode. stdin_via_file hands the child a temp file as stdin
+    # (deterministic EOF, no tail-loss race); the default pipe+feeder path is
+    # untouched for every other caller. prompt_file stays open while the child
+    # reads it and is closed + unlinked in the finally.
+    prompt_file = None
+    prompt_file_path = None
+    use_file = stdin_via_file and input_text is not None
+    if use_file:
+        prompt_file_path = _write_temp_prompt(input_text, encoding)
+        try:
+            prompt_file = open(prompt_file_path, "rb")
+            proc = _spawn(cmd, cwd, shell, encoding, errors, env, stdin=prompt_file)
+        except BaseException:
+            if prompt_file is not None:
+                prompt_file.close()
+            _unlink_quiet(prompt_file_path)
+            raise
+    else:
+        proc = _spawn(cmd, cwd, shell, encoding, errors, env)
 
-    stdout_sink: list[str] = []
-    stderr_sink: list[str] = []
-    delivery = _StdinDelivery(
-        expected_chars=len(input_text) if input_text is not None else 0
-    )
-    threads = [
-        threading.Thread(
-            target=_make_reader(proc.stdout, stdout_sink, liveness, liveness_lines, encoding, errors),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_make_reader(proc.stderr, stderr_sink, liveness, False, encoding, errors),
-            daemon=True,
-        ),
-        threading.Thread(target=_feed_stdin, args=(proc, input_text, delivery), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-
+    # Everything after the spawn runs under the try so the finally cleans up
+    # (process tree, pipe FDs, temp prompt file) if ANY post-spawn setup —
+    # liveness, sinks, delivery, or a reader/feeder thread that fails to start —
+    # raises before the watchdog loop is reached.
     try:
+        start = time.monotonic()
+        liveness = _Liveness(start)
+
+        stdout_sink: list[str] = []
+        stderr_sink: list[str] = []
+        delivery = _StdinDelivery(
+            expected_chars=len(input_text) if input_text is not None else 0
+        )
+        if use_file:
+            # A real file has a deterministic end-of-file → delivery is complete.
+            delivery.delivered = True
+
+        threads = [
+            threading.Thread(
+                target=_make_reader(proc.stdout, stdout_sink, liveness, liveness_lines, encoding, errors),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_make_reader(proc.stderr, stderr_sink, liveness, False, encoding, errors),
+                daemon=True,
+            ),
+        ]
+        if not use_file:
+            threads.append(
+                threading.Thread(target=_feed_stdin, args=(proc, input_text, delivery), daemon=True)
+            )
+        for thread in threads:
+            thread.start()
+
         kind = _watchdog_loop(proc, liveness, idle_timeout, hard_timeout, start)
 
         if kind is not None:
@@ -550,6 +669,13 @@ def run_with_watchdog(
             stdin_error=stdin_error,
         )
     finally:
+        # Abnormal exit with the child still alive (e.g. a thread failed to start
+        # before the watchdog loop): kill the tree so no orphan lingers. On the
+        # normal and timeout paths the child has already exited (poll() != None),
+        # so this is a no-op. Killing first also lets the child release the
+        # inherited temp-file handle before we unlink it below.
+        if proc.poll() is None:
+            _tree_kill(proc)
         # Close the pipe FDs we opened. subprocess.run did this via its context
         # manager; without it every call leaks 2-3 FDs → exhaustion in --watch.
         # Runs after the joins so a reader never loses its stream mid-read.
@@ -559,3 +685,11 @@ def run_with_watchdog(
                     stream.close()
                 except (OSError, ValueError):
                     pass
+        # stdin_via_file: release the prompt handle and remove the temp file.
+        if prompt_file is not None:
+            try:
+                prompt_file.close()
+            except (OSError, ValueError):
+                pass
+        if prompt_file_path is not None:
+            _unlink_quiet(prompt_file_path)

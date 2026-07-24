@@ -10,7 +10,6 @@ estimation. The final type=="result" event carries .result + .usage.
 import json
 import shutil
 import subprocess
-import sys
 from providers.base import BaseProvider, RunResult
 from providers.process_runner import run_with_watchdog
 from config import TASK_TIMEOUT_SEC, TASK_IDLE_TIMEOUT_SEC
@@ -90,8 +89,15 @@ class ClaudeProvider(BaseProvider):
                 cwd=cwd,
                 idle_timeout=TASK_IDLE_TIMEOUT_SEC,
                 hard_timeout=timeout,
-                shell=sys.platform == "win32",
+                # claude resolves to a native executable, so no shell is needed to
+                # launch it. shell=False removes the Windows cmd.exe layer whose
+                # forwarding of a >64 KB stdin stream was a source of the silent
+                # prompt-tail loss. stdin_via_file then delivers the (large) prompt
+                # as a real file with a deterministic EOF instead of a raced pipe
+                # feed, so the task text at the prompt's END can no longer be lost.
+                shell=False,
                 liveness_lines=True,  # NDJSON-event-aware: tool_use pauses idle timer
+                stdin_via_file=True,
             )
 
             stdout = (result.stdout or "").strip()

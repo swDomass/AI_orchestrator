@@ -34,6 +34,7 @@ logs/
 # must ship with the repo, everything else in docs/ is tool output.
 /docs/*
 !/docs/architecture/
+!/docs/adr/
 /.review-loop
 /.dev-loop
 *_FUTURE_IDEAS.md

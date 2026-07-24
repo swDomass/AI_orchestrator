@@ -6,6 +6,7 @@ platform-aware with shell=True on Windows.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -684,3 +685,179 @@ def test_timeout_carries_stdin_diagnosis():
     # timeout, including with value None. Assert the DIAGNOSIS is present.
     assert exc_info.value.stdin_error is not None
     assert str(len(prompt)) in exc_info.value.stdin_error
+
+
+# ---------------------------------------------------------------------------
+# (stdin_via_file) The fix: deliver the prompt via a temp file so the TAIL of a
+# large prompt survives — the silent-failure mode the feeder-pipe path allows.
+# ---------------------------------------------------------------------------
+
+def test_stdin_via_file_delivers_full_prompt_including_tail():
+    """A >64KB prompt reaches the child COMPLETE — the task text at the very end
+    (the part lost intermittently by the piped feeder) must arrive."""
+    code = (
+        "import sys\n"
+        "data = sys.stdin.buffer.read().decode('utf-8')\n"
+        "last = data.rstrip('\\n').splitlines()[-1] if data else ''\n"
+        "sys.stdout.write('LEN:%d LAST:%s\\n' % (len(data), last))\n"
+    )
+    tail = "TAILMARKER_XYZ"
+    prompt = ("Fuelltext-Zeile mit Umlauten äöü\n" * 8000) + tail  # ~250 KB, >> pipe buffer
+    result = run_with_watchdog(
+        _py(code), input_text=prompt, cwd=None,
+        idle_timeout=10.0, hard_timeout=30, shell=False, stdin_via_file=True,
+    )
+    assert result.returncode == 0
+    assert f"LEN:{len(prompt)}" in result.stdout   # every char delivered, no truncation
+    assert f"LAST:{tail}" in result.stdout          # the tail specifically survived
+    assert result.stdin_error is None               # file delivery is complete by construction
+
+
+def test_stdin_via_file_cleans_up_temp_file(monkeypatch):
+    """The temp prompt file must never be left behind."""
+    import providers.process_runner as pr
+    created: list[str] = []
+    real = pr._write_temp_prompt
+
+    def spy(text, enc):
+        path = real(text, enc)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(pr, "_write_temp_prompt", spy)
+    run_with_watchdog(
+        _py("import sys; sys.stdin.buffer.read()"), input_text="hello", cwd=None,
+        idle_timeout=5.0, hard_timeout=20, shell=False, stdin_via_file=True,
+    )
+    assert created, "the file path was supposed to go through _write_temp_prompt"
+    assert all(not os.path.exists(p) for p in created), "temp prompt file leaked"
+
+
+def test_stdin_via_file_cleans_up_after_timeout_kill(monkeypatch):
+    """Acceptance: the temp file is removed even when the child is killed."""
+    import providers.process_runner as pr
+    created: list[str] = []
+    real = pr._write_temp_prompt
+
+    def spy(text, enc):
+        path = real(text, enc)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(pr, "_write_temp_prompt", spy)
+    # Child never reads stdin and never exits → idle-killed while the temp file
+    # is still its stdin. The finally must still close + unlink it.
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_with_watchdog(
+            _py("import time; time.sleep(30)"), input_text="x" * 100_000, cwd=None,
+            idle_timeout=1.0, hard_timeout=20, shell=False, stdin_via_file=True,
+        )
+    assert created, "the file path was supposed to go through _write_temp_prompt"
+    assert all(not os.path.exists(p) for p in created), "temp file leaked after kill"
+
+
+def _boom_spawn(*_args, **_kwargs):
+    raise FileNotFoundError("simulated missing executable")
+
+
+def test_stdin_via_file_cleans_up_on_spawn_failure(monkeypatch):
+    """A spawn failure (e.g. a shim where shell=False can't launch) must not leak
+    the temp prompt file — the early except owns cleanup before the try/finally."""
+    import providers.process_runner as pr
+    created: list[str] = []
+    real = pr._write_temp_prompt
+
+    def spy(text, enc):
+        path = real(text, enc)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(pr, "_write_temp_prompt", spy)
+    monkeypatch.setattr(pr, "_spawn", _boom_spawn)
+    with pytest.raises(FileNotFoundError):
+        run_with_watchdog(
+            _py("print('x')"), input_text="hello world", cwd=None,
+            idle_timeout=5.0, hard_timeout=20, shell=False, stdin_via_file=True,
+        )
+    assert created, "the temp file must have been written before the spawn attempt"
+    assert all(not os.path.exists(p) for p in created), "temp file leaked on spawn failure"
+
+
+def test_stdin_via_file_cleans_up_on_setup_failure(monkeypatch):
+    """A failure at the EARLIEST post-spawn setup step (liveness init, now inside
+    the try) must still clean up the child process AND the temp prompt file via
+    the finally — nothing between the spawn and the try may leak."""
+    import providers.process_runner as pr
+    created: list[str] = []
+    real = pr._write_temp_prompt
+
+    def spy(text, enc):
+        path = real(text, enc)
+        created.append(path)
+        return path
+
+    def boom_liveness(*_args, **_kwargs):
+        raise RuntimeError("simulated post-spawn setup failure")
+
+    monkeypatch.setattr(pr, "_write_temp_prompt", spy)
+    monkeypatch.setattr(pr, "_Liveness", boom_liveness)
+    with pytest.raises(RuntimeError):
+        run_with_watchdog(
+            _py("import time; time.sleep(30)"), input_text="x" * 5000, cwd=None,
+            idle_timeout=5.0, hard_timeout=20, shell=False, stdin_via_file=True,
+        )
+    assert created, "the temp file must have been written before setup"
+    assert all(not os.path.exists(p) for p in created), "temp file leaked on setup failure"
+
+
+def test_sweep_removes_stale_prompt_files_but_keeps_fresh(tmp_path):
+    """The self-healing sweep clears leftovers older than the threshold and — for
+    concurrent-run safety — leaves recent files alone."""
+    import providers.process_runner as pr
+    directory = tmp_path / "orch_prompts"
+    directory.mkdir()
+    stale = directory / "orch_prompt_old.txt"
+    fresh = directory / "orch_prompt_new.txt"
+    unrelated = directory / "keepme.txt"
+    for f in (stale, fresh, unrelated):
+        f.write_text("x")
+    old = time.time() - (pr._PROMPT_STALE_SEC + 60)
+    os.utime(stale, (old, old))
+    pr._sweep_stale_prompts(str(directory))
+    assert not stale.exists(), "stale prompt file should be swept"
+    assert fresh.exists(), "fresh prompt file must be kept (concurrent-run safety)"
+    assert unrelated.exists(), "non-prompt files must never be touched"
+
+
+def test_stdin_via_file_with_none_input_writes_no_file(monkeypatch):
+    """No prompt → no temp file, behaves like the plain None-input path."""
+    import providers.process_runner as pr
+    called: list[int] = []
+    monkeypatch.setattr(pr, "_write_temp_prompt", lambda *a: called.append(1) or "unused")
+    result = run_with_watchdog(
+        _py("print('ok')"), input_text=None, cwd=None,
+        idle_timeout=5.0, hard_timeout=20, shell=False, stdin_via_file=True,
+    )
+    assert result.returncode == 0
+    assert not called  # no file written when there is nothing to deliver
+
+
+def test_claude_provider_uses_file_stdin_without_shell(monkeypatch):
+    """The claude provider must opt into file delivery and drop the shell."""
+    captured: dict = {}
+    json_out = json.dumps({
+        "type": "result", "subtype": "success", "result": "erledigt",
+        "usage": {"input_tokens": 5, "output_tokens": 7},
+    })
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured.update(kw)
+        return SimpleNamespace(returncode=0, stdout=json_out, stderr="", stdin_error=None)
+
+    monkeypatch.setattr("providers.claude.run_with_watchdog", fake_run)
+    result = ClaudeProvider().run("do the thing")
+    assert result.success is True
+    assert captured["stdin_via_file"] is True
+    assert captured["shell"] is False
+    assert captured["input_text"] == "do the thing"

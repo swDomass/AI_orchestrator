@@ -21,6 +21,7 @@ Task format in agent-queue.md:
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -83,8 +84,10 @@ from queue_manager import (
     extract_shutdown_tag,
     extract_timeout,
     extract_hang_count,
+    extract_verify_tag,
     finalize_task_with_result,
     has_cwd_tag,
+    has_verify_tag,
     mark_done,
     mark_retry,
     read_queue,
@@ -92,6 +95,7 @@ from queue_manager import (
     realign_stale_freshonly,
     strip_metadata_tags,
 )
+from providers.process_runner import run_with_watchdog
 import replay
 from telegram_listener import TelegramListener
 from tools import extract_tool_tag, get_tool, list_tools
@@ -429,6 +433,11 @@ class ToolTaskExecutionOutcome:
     error: str = ""
     error_code: str = ""
     output: str = ""
+    # The tool itself succeeded and the queue line is finalized, but the #verify: check
+    # said the promised outcome is missing. Kept apart from `success` on purpose:
+    # flipping that would send the caller into the retry path, and a broken check script
+    # would then requeue a working task forever. This only downgrades the reporting.
+    verify_failed: bool = False
 
 
 @dataclass
@@ -536,6 +545,178 @@ def _mark_done_checked(
     return False
 
 
+# Post-task verify scripts are meant to be cheap outcome checks (does the file the
+# task promised to write actually contain what it should?), not workloads.
+VERIFY_SCRIPT_TIMEOUT_SEC = 60
+# Idle bound for the watchdog: a check that emits nothing for this long is stuck.
+VERIFY_SCRIPT_IDLE_TIMEOUT_SEC = 30
+
+
+@dataclass(frozen=True)
+class VerifyPin:
+    """A ``#verify:`` script as it looked BEFORE the provider ran.
+
+    The provider runs with write access to the task's cwd, and the morning-brief check
+    lives inside exactly that vault. Resolving and hashing the script up front means a
+    provider that goes off the rails — or follows an injected instruction in some vault
+    file — cannot swap the check for its own code and have the orchestrator execute it
+    afterwards, outside the provider sandbox and with the orchestrator's environment.
+    ``tag_present`` carries the fail-closed signal for a tag that has no usable path.
+    """
+
+    tag_present: bool
+    script: str | None = None
+    path: Path | None = None
+    digest: str | None = None
+
+
+def _resolve_verify_path(script: str, cwd: str | None) -> Path:
+    path = Path(script)
+    if not path.is_absolute() and cwd:
+        path = Path(cwd) / script
+    return path
+
+
+def _digest_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _pin_verify_script(task: str, cwd: str | None) -> VerifyPin:
+    """Snapshot the task's verify script before handing control to the provider."""
+    if not has_verify_tag(task):
+        return VerifyPin(tag_present=False)
+    script = extract_verify_tag(task)
+    if not script:
+        return VerifyPin(tag_present=True)
+    path = _resolve_verify_path(script, cwd)
+    return VerifyPin(tag_present=True, script=script, path=path, digest=_digest_file(path))
+
+
+def _run_verify_script(script: str, cwd: str | None, pin: VerifyPin | None = None) -> tuple[bool, str]:
+    """Run a ``#verify:`` post-task check. Returns ``(passed, detail)``.
+
+    Fail-closed: a missing, unlaunchable, tampered-with or timing-out script counts as
+    NOT passed. A check that cannot run tells us nothing, and "tells us nothing" is
+    exactly the state this mechanism exists to eliminate.
+    """
+    path = _resolve_verify_path(script, cwd)
+    if not path.exists():
+        return False, f"Skript nicht gefunden: {path}"
+
+    # Tamper gate: the file must be byte-identical to what it was before the provider
+    # ran. Refusing to execute is the safe direction — running provider-authored code
+    # here would hand it the orchestrator's environment.
+    if pin is not None and pin.digest is not None:
+        current = _digest_file(path)
+        if current != pin.digest:
+            return False, (
+                f"Skript wurde während des Task-Laufs verändert ({path}) — "
+                f"Ausführung verweigert"
+            )
+
+    # Dispatch by suffix. Handing a bare .py to CreateProcess raises WinError 193
+    # ("not a valid Win32 application"), which fail-closed turns into a permanent
+    # Telegram alarm on every SUCCESSFUL run — the check would be worse than none.
+    # scripts/ in this repo is mostly .py, so that is the likely first choice.
+    suffix = path.suffix.lower()
+    if suffix == ".ps1":
+        cmd = ["pwsh", "-NoProfile", "-File", str(path)]
+    elif suffix == ".py":
+        cmd = [sys.executable, "-X", "utf8", str(path)]
+    elif suffix in (".cmd", ".bat", ".exe", ""):
+        cmd = [str(path)]
+    else:
+        return False, f"nicht unterstützter Skript-Typ '{suffix}': {path}"
+
+    # run_with_watchdog, not subprocess.run: the latter's timeout only kills the direct
+    # child, so a lingering grandchild keeps the capture pipes open and the call returns
+    # late or not at all — measured at 3.07 s for a 0.20 s timeout. That would block the
+    # orchestrator AFTER the queue line was already finalized, with no alarm. The
+    # watchdog kills the whole process tree; this is the same reason it exists for
+    # provider calls.
+    try:
+        result = run_with_watchdog(
+            cmd,
+            input_text=None,
+            cwd=cwd,
+            idle_timeout=VERIFY_SCRIPT_IDLE_TIMEOUT_SEC,
+            hard_timeout=VERIFY_SCRIPT_TIMEOUT_SEC,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        kind = getattr(exc, "timeout_kind", "hard")
+        return False, f"Timeout ({kind}) nach {VERIFY_SCRIPT_TIMEOUT_SEC}s"
+    except OSError as e:
+        return False, f"nicht ausführbar: {e}"
+
+    detail = (result.stdout or "").strip() or (result.stderr or "").strip()
+    return result.returncode == 0, detail
+
+
+@dataclass(frozen=True)
+class VerifyOutcome:
+    """Result of the post-task check. ``ok`` is False ONLY when a check actually ran
+    (or should have) and failed — no tag at all leaves ``ok`` True."""
+
+    ok: bool = True
+    note: str = ""
+
+
+def _verify_task_result(
+    task: str, cwd: str | None, provider_name: str, pin: VerifyPin | None = None
+) -> VerifyOutcome:
+    """Run the task's ``#verify:`` script if it has one.
+
+    A provider run can exit 0 with a well-formed result event and still have achieved
+    nothing — the morning-brief died that way on 20., 24. and 25.07.2026 (with a healthy
+    run on the 21st in between), each failure booked as a success. A verify script
+    inspects the OUTCOME instead of trusting the run, so it catches such failures
+    whatever their cause, including causes we have not diagnosed yet.
+
+    The task is still finalized on a failed check — failing it would need its own
+    bounded retry counter (see the hang path), or a broken check script would requeue a
+    working task forever. What a failed check DOES suppress is the success reporting:
+    the caller must not follow a red alarm with a green "task done".
+    """
+    if pin is None:
+        pin = _pin_verify_script(task, cwd)
+    if not pin.tag_present:
+        return VerifyOutcome()
+
+    if not pin.script:
+        # Tag present, path unusable. Treating this like "no tag" would be fail-OPEN —
+        # a typo would switch off the check with nobody noticing. --lint-queue catches
+        # it offline; this is the runtime gate.
+        return _verify_failed(
+            task, provider_name,
+            "#verify: ohne verwertbaren Skript-Pfad — der Post-Task-Check konnte nicht "
+            "ausgeführt werden (Tag prüfen, `--lint-queue` meldet das als "
+            "verify_without_path)",
+        )
+
+    passed, detail = _run_verify_script(pin.script, cwd, pin=pin)
+    if passed:
+        print(f"  [verify] OK — {pin.script}")
+        return VerifyOutcome()
+
+    return _verify_failed(
+        task, provider_name,
+        f"Verify fehlgeschlagen ({pin.script}): {detail or 'kein Output'}. "
+        f"Der Task meldete Erfolg, hat das erwartete Ergebnis aber nicht erzeugt "
+        f"— bitte manuell nachholen.",
+    )
+
+
+def _verify_failed(task: str, provider_name: str, msg: str) -> VerifyOutcome:
+    print(f"  ⚠️  {msg}")
+    append_log(msg)
+    notify_error(task, provider_name, msg)
+    return VerifyOutcome(ok=False, note=f"\n\n[verify] {msg}")
+
+
 def _finalize_task_with_result_checked(
     task: str,
     result: str,
@@ -619,6 +800,8 @@ def _execute_tool_task(
         _git_snapshot(cwd, is_git=is_git)
 
     print(f"  → Tool: {tool.name} ({tool.description})")
+    # Snapshot the verify script before the tool (which may write in this cwd) runs.
+    verify_pin = _pin_verify_script(task, cwd)
     clean_task = strip_metadata_tags(task)
     # Extract pass-provider tags from raw task (before strip removes them)
     pass_providers = extract_pass_providers(task)
@@ -653,6 +836,9 @@ def _execute_tool_task(
 
     if tool_result.success:
         print(f"  ✅ Tool erledigt ({tool_result.iterations} Iteration(en))")
+        # skip_queue means a subtask run: the caller owns finalization AND the parent's
+        # verify check, so this path deliberately leaves the outcome unverified here.
+        verify = VerifyOutcome()
         if not skip_queue:
             if not _finalize_task_with_result_checked(
                 task,
@@ -667,19 +853,27 @@ def _execute_tool_task(
                     error="queue_update_failed",
                     output=tool_result.output,
                 )
+            # After finalization: a re-run on the next poll would otherwise alarm twice.
+            verify = _verify_task_result(task, cwd, provider_tool, pin=verify_pin)
             memory_module.store_result(
-                task, tool_result.output, provider_tool, _tool_duration, cwd=cwd, success=True,
+                task, tool_result.output + verify.note, provider_tool, _tool_duration,
+                cwd=cwd, success=verify.ok,
                 input_tokens=tool_result.input_tokens,
                 output_tokens=tool_result.output_tokens,
                 cache_creation_input_tokens=tool_result.cache_creation_input_tokens,
                 cache_read_input_tokens=tool_result.cache_read_input_tokens,
             )
-            append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
-            notify_task_done(task, provider_tool, tool_result.output, change_summary=change_summary)
+            if verify.ok:
+                append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
+                notify_task_done(
+                    task, provider_tool, tool_result.output,
+                    change_summary=change_summary,
+                )
         return ToolTaskExecutionOutcome(
             success=True,
             finalized=not skip_queue,
             output=tool_result.output,
+            verify_failed=not verify.ok,
         )
     else:
         print(f"  ⚠️ Tool beendet: {tool_result.error}")
@@ -1033,6 +1227,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             _span.provider = "parallel"
             try:
                 from parallel_runner import run_parallel, format_parallel_result
+                # Snapshot before the subtasks (which write in their cwds) run.
+                verify_pin = _pin_verify_script(task, cwd)
                 results = run_parallel(
                     task,
                     task_subtasks,
@@ -1052,13 +1248,25 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _span.error("queue_update_failed")
                     _span.emit()
                     return False
-                memory_module.store_result(task, aggregated, provider_tag, 0.0, cwd=cwd, success=success_all)
+                # Only when every subtask succeeded: a partial run has already reported
+                # its own failure, and a verify alarm on top would just be noise.
+                verify = (
+                    _verify_task_result(task, cwd, provider_tag, pin=verify_pin)
+                    if success_all else VerifyOutcome()
+                )
+                memory_module.store_result(
+                    task, aggregated + verify.note, provider_tag, 0.0, cwd=cwd,
+                    success=success_all and verify.ok,
+                )
                 append_log(f"Parallel-Task erledigt: {task[:60]}")
-                notify_task_done(task, provider_tag, aggregated)
-                if success_all:
-                    _span.ok()
-                else:
+                if verify.ok:
+                    notify_task_done(task, provider_tag, aggregated)
+                if not success_all:
                     _span.error("parallel_subtask_failure")
+                elif not verify.ok:
+                    _span.error("verify_failed")
+                else:
+                    _span.ok()
             except Exception as e:
                 msg = f"Parallel-Ausführung fehlgeschlagen: {e}"
                 print(f"  ❌ {msg}")
@@ -1144,7 +1352,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     setattr(provider, "_forced_model", previous_forced_model)
 
                 if outcome.success:
-                    _span.ok(retry_count=tool_retry_count)
+                    if outcome.verify_failed:
+                        _span.error("verify_failed", retry_count=tool_retry_count)
+                    else:
+                        _span.ok(retry_count=tool_retry_count)
                     break
                 if outcome.finalized:
                     _span.error(outcome.error_code or "tool_internal_error", retry_count=tool_retry_count)
@@ -1364,6 +1575,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             setattr(provider, "_forced_model", model_id)
             _span.provider = provider.name
             _span.model = model_id or ""
+            # Snapshot the verify script BEFORE the provider (which has write access to
+            # this cwd) can touch it — see VerifyPin.
+            verify_pin = _pin_verify_script(task, cwd)
             try:
                 prompt = _build_prompt(task, provider.name, memory_context=memory_context)
                 _span.prompt = prompt
@@ -1409,23 +1623,35 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _span.error("queue_update_failed", retry_count=single_shot_retry_count)
                     _span.emit()
                     return False
+                # After finalization: a re-run on the next poll would otherwise alarm twice.
+                verify = _verify_task_result(task, cwd, provider.name, pin=verify_pin)
                 memory_module.store_result(
-                    task, result.output, provider.name, duration, cwd=cwd, success=True,
+                    task, result.output + verify.note, provider.name, duration, cwd=cwd,
+                    success=verify.ok,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     cache_creation_input_tokens=result.cache_creation_input_tokens,
                     cache_read_input_tokens=result.cache_read_input_tokens,
                 )
-                append_log(f"Task erledigt via {provider.name}: {task[:60]}")
-                notify_task_done(task, provider.name, result.output, change_summary=change_summary)
+                # A failed outcome check must not be followed by a green "task done":
+                # the alarm already went out, and reporting success on both channels is
+                # exactly the contradiction this mechanism exists to remove.
+                if verify.ok:
+                    append_log(f"Task erledigt via {provider.name}: {task[:60]}")
+                    notify_task_done(
+                        task, provider.name, result.output,
+                        change_summary=change_summary,
+                    )
+                    _span.ok(
+                        retry_count=single_shot_retry_count,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        cache_creation_input_tokens=result.cache_creation_input_tokens,
+                        cache_read_input_tokens=result.cache_read_input_tokens,
+                    )
+                else:
+                    _span.error("verify_failed", retry_count=single_shot_retry_count)
                 single_shot_success = True
-                _span.ok(
-                    retry_count=single_shot_retry_count,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                    cache_creation_input_tokens=result.cache_creation_input_tokens,
-                    cache_read_input_tokens=result.cache_read_input_tokens,
-                )
                 break
 
             tried_providers.add(provider.name)

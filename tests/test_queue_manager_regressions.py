@@ -362,3 +362,69 @@ def test_collect_file_context_excludes_the_task_text(tmp_path, monkeypatch):
 
 def test_collect_file_context_returns_empty_without_refs():
     assert queue_manager.collect_file_context("Ein Task ohne Referenzen.") == ""
+
+
+# --- #verify: tag -----------------------------------------------------------
+
+def test_extract_verify_tag_reads_plain_path():
+    task = "Mach was #verify:scripts\\check.ps1 #claude_sonnet"
+    assert queue_manager.extract_verify_tag(task) == "scripts\\check.ps1"
+
+
+def test_extract_verify_tag_reads_quoted_path_with_spaces():
+    task = 'Mach was #verify:"C:\\My Scripts\\check.ps1" #every:24h'
+    assert queue_manager.extract_verify_tag(task) == "C:\\My Scripts\\check.ps1"
+
+
+def test_extract_verify_tag_absent_returns_none():
+    assert queue_manager.extract_verify_tag("Mach was #claude_sonnet") is None
+
+
+def test_extract_verify_tag_stops_at_hash():
+    """An unbounded (\\S+) pulled adjoining tag text into the script path.
+
+    The path then never resolves ("Skript nicht gefunden"), and because the check is
+    fail-closed that means a permanent alarm on every SUCCESSFUL run. Note the glued
+    `#every:` is unusable regardless — every tag regex here has a `(?<!\\S)` lookbehind,
+    so a tag without a leading space is never matched. This bound keeps the damage out
+    of the path; it does not rescue the malformed tag.
+    """
+    assert queue_manager.extract_verify_tag("Task #verify:c.ps1#every:24h") == "c.ps1"
+
+
+def test_verify_tag_leaves_properly_spaced_neighbours_intact():
+    """The realistic layout: space-separated tags all survive side by side."""
+    task = "Task #verify:c.ps1 #every:24h #claude_sonnet"
+    assert queue_manager.extract_verify_tag(task) == "c.ps1"
+    assert queue_manager.EVERY_TAG_RE.search(task) is not None
+    assert queue_manager.extract_model_tag(task) == "claude_sonnet"
+
+
+def test_extract_verify_tag_does_not_swallow_following_cwd():
+    """Unquoted paths stop at whitespace — a trailing cwd: must stay intact."""
+    task = "Mach was #verify:check.ps1 cwd:D:\\Ordner mit Leerzeichen #every:24h"
+    assert queue_manager.extract_verify_tag(task) == "check.ps1"
+    # CWD_RE directly — extract_cwd() would validate the path exists on disk.
+    m = queue_manager.CWD_RE.search(task)
+    assert (m.group(1) or m.group(2)) == "D:\\Ordner mit Leerzeichen"
+
+
+def test_pathless_verify_tag_yields_none_but_is_still_stripped():
+    """A typo'd `#verify:` disables the check (fail-open) — it must at least not leak
+    literal tag text into the prompt. `--lint-queue` flags the fail-open part."""
+    assert queue_manager.extract_verify_tag("Task #verify:") is None
+    assert queue_manager.strip_metadata_tags("Task #verify:") == "Task"
+
+
+def test_empty_quoted_verify_path_yields_none_without_crashing():
+    """group(1) is '' here — truthiness testing would fall through to a None group(2)."""
+    assert queue_manager.extract_verify_tag('Task #verify:""') is None
+    assert queue_manager.strip_metadata_tags('Task #verify:""') == "Task"
+
+
+def test_strip_metadata_tags_removes_verify_tag():
+    task = 'Schreibe den Brief #verify:"scripts\\check.ps1" #claude_sonnet'
+    stripped = queue_manager.strip_metadata_tags(task)
+    assert "#verify" not in stripped
+    assert "check.ps1" not in stripped
+    assert stripped == "Schreibe den Brief"

@@ -42,6 +42,7 @@ from queue_manager import (
     PARALLEL_TAG_RE,
     PROVIDER_TAG_RE,
     RETRY_TAG_RE,
+    VERIFY_TAG_RE,
     _collect_completed_ids,
     _decode_queue_bytes,
     _parse_subtask_line,
@@ -51,6 +52,7 @@ from queue_manager import (
     extract_needs_tags,
     extract_model_tag,
     extract_pass_providers,
+    extract_verify_tag,
     has_cwd_tag,
     _is_whole_day_interval,
 )
@@ -279,6 +281,55 @@ def _check_task(
     out.extend(_check_anchor_interval(line_no, task_text))
     out.extend(_check_grace_tag(line_no, task_text))
     out.extend(_check_freshonly_tag(line_no, task_text))
+    out.extend(_check_verify_tag(line_no, task_text))
+    return out
+
+
+def _check_verify_tag(line_no: int, task_text: str) -> list[LintFinding]:
+    """Flag a ``#verify:`` that carries no script path.
+
+    Fail-OPEN by nature and therefore worth an error: the tag parses, the task runs, and
+    the outcome check simply never happens — a typo silently removes the very safety net
+    that exists because silent failures are hard to notice. The task itself keeps working,
+    so nothing else in the system will ever complain.
+    """
+    if "#verify:" not in task_text.lower():
+        return []
+
+    out: list[LintFinding] = []
+
+    # More than one tag: strip_metadata_tags removes them all, but only the FIRST is
+    # ever executed. The others look like active checks and silently are not.
+    matches = VERIFY_TAG_RE.findall(task_text)
+    if len(matches) > 1:
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            f"{len(matches)}× #verify: in einer Zeile — nur das erste Tag wird "
+            f"ausgeführt, die übrigen sehen aktiv aus und sind es nicht",
+            code="verify_duplicate_tag",
+        ))
+
+    if not extract_verify_tag(task_text):
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            "#verify: ohne erkennbaren Skript-Pfad — der Post-Task-Check wird still "
+            "übersprungen (fail-open). Entweder fehlt der Pfad, oder das Tag klebt am "
+            "vorigen Wort (Tags brauchen ein Leerzeichen davor, sonst greift das "
+            "Lookbehind nicht). Pfade mit Leerzeichen oder '#' in Anführungszeichen setzen",
+            code="verify_without_path",
+        ))
+
+    # Odd number of quotes after the tag → the quoted branch cannot match and the path
+    # is silently read as an unquoted one, truncated at the first space.
+    tail = task_text[task_text.lower().index("#verify:"):]
+    if tail.count('"') % 2 == 1:
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            "#verify: mit unbalancierten Anführungszeichen — der Pfad wird dann als "
+            "unquoted gelesen und am ersten Leerzeichen abgeschnitten",
+            code="verify_unbalanced_quotes",
+        ))
+
     return out
 
 

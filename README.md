@@ -19,7 +19,7 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1720 tests / ~90 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
+- **~1800 tests / ~95 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
@@ -36,7 +36,8 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 - **Two opt-in providers outside the fallback chain**: OpenRouter (pay-per-token, `#openrouter`/`#or_*`) for cheap single-call work, and Mistral Vibe (`#vibe`, `#second_opinion:vibe`) as a read-only second non-Claude reviewer. Both are registered only when their prerequisite exists (API key / binary on `PATH`); a `#vibe` tag without the CLI **parks** the task rather than handing a review job to a file-writing executor.
 - Capacity checking via `cclimits` (with local JSONL fallback on HTTP 429)
 - Retry handling on rate limits / provider failures
-- Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#worktree`, `#keep-worktree`, `#shutdown`, `#approve:*` tags
+- Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#worktree`, `#keep-worktree`, `#shutdown`, `#verify:`, `#approve:*` tags
+- **`#verify:<script>` post-task outcome check**: a provider run can exit 0 with a well-formed result event and still have achieved nothing. The named script runs after success and inspects the *result* (did the file actually get written?); a non-zero exit raises a Telegram alarm and annotates the stored task result. Fail-closed — a missing or unlaunchable script counts as failed. The task itself is still finalized: failing it would need its own bounded retry counter, or a broken check script would requeue a working task forever.
 - **`#worktree` parallel isolation (P1)**: each CWD group of a `#parallel` parent runs in its own `git worktree` under `.worktrees/parallel-<hash>`. Failed groups retain the worktree for inspection. `#keep-worktree` suppresses cleanup on success.
 - Tool loops: `dev-loop`, `review-loop`, `test-loop`, `research-qa`, `security-audit`, `deep-security-audit`, `critical-review`, `knowledge-transfer`, `scientific-investigation`, `brainstorm`, `pr-babysitter`
 - **`#tool:pr-babysitter` (P2/P5)**: polls open PRs via `gh`, queues `#tool:dev-loop` fix-tasks on new comments / CI failures. Two modes via `#pr-mode:queue|report-only` — report-only sends a Telegram summary with `/pr-fix <repo>#N` and `/pr-ignore <repo>#N` slash commands instead of writing the queue directly.
@@ -235,9 +236,12 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Skip stale slot | `#freshonly` | `- [ ] Daily brief #at:08:00 #every:24h #freshonly` |
 | Stale grace window | `#grace:<duration>` | `- [ ] Recap #at:19:00 #every:24h #freshonly #grace:4h` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
+| Post-task outcome check | `#verify:<script>` | `- [ ] Daily brief #verify:scripts\check_brief.ps1` |
 | Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:codex` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
 | Second opinion (review-loop) | `#second_opinion:<alias\|provider>` | `#second_opinion:codex`, `#second_opinion:vibe_small` |
+
+**`#verify:` details.** Relative paths resolve against `cwd:` (without a `cwd:` tag, against the orchestrator process's working directory — prefer absolute paths there). Quote paths containing spaces or `#`. Supported types: `.ps1` (via `pwsh -NoProfile -File`), `.py` (via the running interpreter with `-X utf8`), `.cmd`/`.bat`/`.exe` and extensionless executables; anything else is rejected with a clear message. Exit 0 = passed, non-zero = alarm, and the script's stdout (or stderr when stdout is empty) becomes the alarm text — a PowerShell check should set `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` so umlauts survive the redirect. Runs in all three success paths (single-shot, `#tool:`, `#parallel`), always after the queue line is finalized; for `#parallel` only when every subtask succeeded. A failing check raises the alarm but does not requeue the task — see `--lint-queue` for the `verify_without_path` rule that catches a `#verify:` with no script.
 
 ### Known Limitations
 
@@ -793,7 +797,7 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1748 tests, ~90 s)
+# Run all tests (~1800 tests, ~95 s)
 python -m pytest tests/ -q
 
 # Run a single test file

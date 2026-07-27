@@ -276,6 +276,65 @@ def test_parallel_subtasks_without_cwd_is_info(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #verify: post-task check
+# ---------------------------------------------------------------------------
+
+def test_verify_without_path_flagged():
+    """Fail-open by nature: the tag parses, the task runs, the check never happens.
+    Nothing else in the system would ever complain, hence error level."""
+    content = "## Queue\n- [ ] Daily brief #verify: #every:24h\n"
+    findings = lint_queue(content)
+    assert "verify_without_path" in _codes(findings)
+    assert exit_code_for(findings) == 2
+
+
+def test_verify_with_empty_quotes_flagged():
+    content = '## Queue\n- [ ] Daily brief #verify:"" #every:24h\n'
+    assert "verify_without_path" in _codes(lint_queue(content))
+
+
+def test_verify_with_path_is_clean():
+    content = "## Queue\n- [ ] Daily brief #verify:scripts\\check.ps1 #every:24h\n"
+    assert "verify_without_path" not in _codes(lint_queue(content))
+
+
+def test_verify_with_quoted_spaced_path_is_clean():
+    content = '## Queue\n- [ ] Daily brief #verify:"C:\\My Scripts\\check.ps1" #every:24h\n'
+    assert "verify_without_path" not in _codes(lint_queue(content))
+
+
+def test_task_without_verify_tag_is_clean():
+    content = "## Queue\n- [ ] Daily brief #every:24h\n"
+    assert "verify_without_path" not in _codes(lint_queue(content))
+
+
+def test_duplicate_verify_tags_flagged():
+    """Only the first is ever executed — the rest look active and are not."""
+    content = "## Queue\n- [ ] Brief #verify:a.ps1 #verify:b.ps1 #every:24h\n"
+    codes = _codes(lint_queue(content))
+    assert "verify_duplicate_tag" in codes
+    assert "verify_without_path" not in codes
+
+
+def test_unbalanced_quotes_flagged():
+    """The quoted branch cannot match, so the path is silently cut at the first space."""
+    content = '## Queue\n- [ ] Brief #verify:"C:\\My Scripts\\check.ps1 #every:24h\n'
+    assert "verify_unbalanced_quotes" in _codes(lint_queue(content))
+
+
+def test_balanced_quoted_path_has_no_quote_finding():
+    content = '## Queue\n- [ ] Brief #verify:"C:\\My Scripts\\check.ps1" #every:24h\n'
+    assert "verify_unbalanced_quotes" not in _codes(lint_queue(content))
+
+
+def test_glued_verify_tag_flagged():
+    """Tag without a leading space: the (?<!\\S) lookbehind never matches, so the check
+    would never run — the second fail-open shape."""
+    content = "## Queue\n- [ ] Brief#verify:check.ps1 #every:24h\n"
+    assert "verify_without_path" in _codes(lint_queue(content))
+
+
+# ---------------------------------------------------------------------------
 # HTML comments in the task body
 # ---------------------------------------------------------------------------
 

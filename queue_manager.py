@@ -85,6 +85,28 @@ PREAPPROVE_TAG_RE = re.compile(r"(?i)#approve:([\w,:-]+)")
 # Matches #shutdown tag
 SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
 
+# Matches #verify:<script> — a post-task check run AFTER the provider reports success.
+# The script decides whether the task actually achieved anything; see
+# orchestrator._run_verify_script.
+#
+# The unquoted branch stops at whitespace AND at '#'. Both bounds are load-bearing:
+#   - no whitespace → a following `cwd:D:\Pfad mit Leerzeichen` stays intact (unlike
+#     CWD_RE this tag has no "until the next hashtag" lookahead, which would swallow it)
+#   - no '#' → `#verify:c.ps1#every:24h` yields "c.ps1", not "c.ps1#every:24h". Without
+#     that bound the tag text lands INSIDE the script path, every lookup fails with
+#     "Skript nicht gefunden", and fail-closed turns it into a permanent alarm on every
+#     successful run. (The adjoining `#every:` is unusable either way — every tag regex
+#     here carries a `(?<!\S)` lookbehind, so a tag glued to the previous token is never
+#     matched. Writing tags without a separating space is simply invalid input; this
+#     bound just keeps the damage out of the path.)
+# Quote paths containing spaces or '#': #verify:"C:\My Scripts\check.ps1".
+#
+# The path part is optional (`*`, not `+`) so a pathless `#verify:` still MATCHES and is
+# therefore stripped from the prompt instead of being handed to the model as literal tag
+# text. extract_verify_tag() returns None for it — a typo silently disables the check,
+# which is why `--lint-queue` flags it as verify_without_path.
+VERIFY_TAG_RE = re.compile(r'(?i)(?<!\S)#verify:(?:"([^"]*)"|([^\s#]*))')
+
 # Matches #parallel tag
 PARALLEL_TAG_RE = re.compile(r"(?i)(?<!\S)#parallel(?=\s|$)")
 
@@ -600,6 +622,40 @@ def extract_shutdown_tag(task: str) -> bool:
     return bool(SHUTDOWN_TAG_RE.search(task))
 
 
+def extract_verify_tag(task: str) -> str | None:
+    """Extract the #verify:<script> post-task check path, or None.
+
+    The returned path is passed to orchestrator._run_verify_script after a task
+    reports success. It exists because a provider run can look perfectly clean
+    (exit 0, well-formed result event) while achieving nothing — the failure mode
+    that made three morning-brief runs vanish silently (20./24./25.07.2026, with a
+    healthy run on the 21st in between — they were not consecutive). A verify
+    script checks the RESULT (did the file actually change?) instead of trusting
+    the run, so it catches such failures regardless of their cause.
+    """
+    m = VERIFY_TAG_RE.search(task)
+    if not m:
+        return None
+    # NOTE: a present-but-pathless tag returns None here, which is indistinguishable
+    # from "no tag" at this call site. Runtime code must therefore ask has_verify_tag()
+    # as well — otherwise a typo silently disables the check (fail-OPEN).
+    # group(1) is the quoted branch: "" is a legitimate (empty) match there, so test for
+    # None rather than falsiness — `or` would fall through to group(2), which is None.
+    raw = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+    return raw.strip() or None
+
+
+def has_verify_tag(task: str) -> bool:
+    """True when a ``#verify:`` tag is present — even if it carries no usable path.
+
+    Deliberately separate from extract_verify_tag(): that one returns None both for
+    "no tag" and for "tag without path", and treating those alike is fail-OPEN — a
+    typo would silently switch off the very check that exists because silent failures
+    go unnoticed. Runtime callers pair the two to tell the cases apart.
+    """
+    return bool(VERIFY_TAG_RE.search(task))
+
+
 def extract_worktree_tag(task: str) -> bool:
     """Return True if #worktree tag is present (opt-in isolation for #parallel)."""
     return bool(WORKTREE_TAG_RE.search(task))
@@ -721,6 +777,7 @@ def strip_metadata_tags(task: str) -> str:
     task = PROFILE_TAG_RE.sub("", task)
     task = PREAPPROVE_TAG_RE.sub("", task)
     task = SHUTDOWN_TAG_RE.sub("", task)
+    task = VERIFY_TAG_RE.sub("", task)
     task = PARALLEL_TAG_RE.sub("", task)
     task = KEEP_WORKTREE_TAG_RE.sub("", task)   # must precede WORKTREE_TAG_RE — shared "worktree" stem
     task = WORKTREE_TAG_RE.sub("", task)

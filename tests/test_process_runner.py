@@ -756,6 +756,67 @@ def test_stdin_via_file_cleans_up_after_timeout_kill(monkeypatch):
     assert all(not os.path.exists(p) for p in created), "temp file leaked after kill"
 
 
+# ---------------------------------------------------------------------------
+# (stdin_via_file) Regression 2026-07-25: the file path used to assert
+# `delivery.delivered = True` unconditionally — "a real file has a deterministic
+# EOF, therefore delivery is complete". A deterministic EOF only guarantees the
+# child SEES an end, not that the prompt was written or that input_text held
+# anything. That assertion pinned stdin_error to None for every stdin_via_file
+# caller and turned the detection in claude.py into dead code: a safety net that
+# could not fire. These tests keep the net alive.
+# ---------------------------------------------------------------------------
+
+def test_verify_prompt_file_accepts_intact_file(tmp_path):
+    import providers.process_runner as pr
+    text = "Aufgabe mit Umlauten äöü\n"
+    path = tmp_path / "p.txt"
+    path.write_text(text, encoding="utf-8", newline="")
+    assert pr._verify_prompt_file(str(path), text, "utf-8") is None
+
+
+def test_verify_prompt_file_detects_truncation(tmp_path):
+    import providers.process_runner as pr
+    text = "x" * 5000
+    path = tmp_path / "p.txt"
+    path.write_text(text[:100], encoding="utf-8", newline="")
+    err = pr._verify_prompt_file(str(path), text, "utf-8")
+    assert err is not None
+    assert "100" in err and "5000" in err
+
+
+def test_verify_prompt_file_rejects_empty_prompt(tmp_path):
+    """An empty instruction is never a legitimate payload — fail loudly."""
+    import providers.process_runner as pr
+    path = tmp_path / "p.txt"
+    path.write_text("   \n", encoding="utf-8", newline="")
+    assert "empty" in pr._verify_prompt_file(str(path), "   \n", "utf-8")
+
+
+def test_verify_prompt_file_fails_closed_on_missing_file(tmp_path):
+    import providers.process_runner as pr
+    err = pr._verify_prompt_file(str(tmp_path / "gone.txt"), "content", "utf-8")
+    assert err is not None
+    assert "unreadable" in err
+
+
+def test_stdin_via_file_reports_incomplete_prompt_file(monkeypatch):
+    """The net fires: a short temp file must surface as stdin_error, not as success."""
+    import providers.process_runner as pr
+    real = pr._write_temp_prompt
+
+    def truncating(text, enc):
+        # Write only a prefix — simulates a partial/failed write to the temp file.
+        return real(text[: len(text) // 2], enc)
+
+    monkeypatch.setattr(pr, "_write_temp_prompt", truncating)
+    result = run_with_watchdog(
+        _py("import sys; sys.stdin.buffer.read()"), input_text="y" * 4000, cwd=None,
+        idle_timeout=5.0, hard_timeout=20, shell=False, stdin_via_file=True,
+    )
+    assert result.stdin_error is not None, "truncated prompt file was booked as delivered"
+    assert "incomplete" in result.stdin_error
+
+
 def _boom_spawn(*_args, **_kwargs):
     raise FileNotFoundError("simulated missing executable")
 

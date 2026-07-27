@@ -450,6 +450,35 @@ def _write_temp_prompt(input_text: str, encoding: str) -> str:
     return path
 
 
+def _verify_prompt_file(path: str, input_text: str, encoding: str) -> str | None:
+    """Return an error description if the temp prompt file's BYTE COUNT does not
+    match *input_text*.
+
+    A size check, not a content comparison — re-reading a multi-hundred-KB prompt
+    on every run to compare it against a string we already hold would cost more
+    than it proves. The failure this guards against is a partial or absent write,
+    and that always shows up in the size.
+
+    Fail-closed: an unreadable file, an unencodable payload or a byte-count
+    mismatch all count as a failed delivery. ``_write_temp_prompt`` writes with
+    ``newline=""``, so the on-disk size equals ``len(input_text.encode(encoding))``
+    exactly — no line-ending translation to account for.
+    """
+    if not input_text.strip():
+        return "prompt text is empty — nothing to deliver"
+    try:
+        expected = len(input_text.encode(encoding))
+    except (UnicodeEncodeError, LookupError) as e:
+        return f"prompt not encodable as {encoding}: {e}"
+    try:
+        actual = os.path.getsize(path)
+    except OSError as e:
+        return f"prompt file unreadable ({path}): {e}"
+    if actual != expected:
+        return f"prompt file incomplete: {actual} of {expected} bytes on disk"
+    return None
+
+
 def _tree_kill(proc: subprocess.Popen) -> None:
     """Kill the whole process tree of ``proc`` (best effort)."""
     if proc.poll() is not None:
@@ -555,9 +584,11 @@ def run_with_watchdog(
     and handing the child that file as stdin (no feeder thread). The whole prompt
     is on disk before the first read and the child reads to a real end-of-file,
     so the tail cannot be lost to a buffered close/flush race — the documented
-    sub-pipe-buffer blind spot of the feeder path. Delivery is then guaranteed
-    complete (``stdin_error`` stays ``None``). Default ``False`` keeps the piped
-    feeder path unchanged for every other caller.
+    sub-pipe-buffer blind spot of the feeder path. Delivery is then **verified**
+    against the bytes on disk (``_verify_prompt_file``); a mismatch, an empty
+    payload or an unreadable temp file surfaces as ``stdin_error`` exactly like a
+    feeder failure. Default ``False`` keeps the piped feeder path unchanged for
+    every other caller.
     """
     # Defensive: a non-positive hard_timeout (a 0/None leaking from a caller's
     # extract_timeout default) would make the watchdog hard-kill instantly.
@@ -598,8 +629,17 @@ def run_with_watchdog(
             expected_chars=len(input_text) if input_text is not None else 0
         )
         if use_file:
-            # A real file has a deterministic end-of-file → delivery is complete.
-            delivery.delivered = True
+            # Verify instead of assuming. A deterministic end-of-file guarantees the
+            # child SEES an end — not that the whole prompt was written, nor that
+            # input_text held anything at all. Asserting delivery unconditionally
+            # here (as this did from 2026-07-24 to 2026-07-25) pins stdin_error to
+            # None for every stdin_via_file caller and silently turns the detection
+            # in claude.py into dead code — a safety net that cannot fire. Compare
+            # the bytes actually on disk against the payload instead.
+            delivery.error = _verify_prompt_file(prompt_file_path, input_text, encoding)
+            delivery.delivered = delivery.error is None
+            if delivery.error:
+                _log.error("[stdin] %s", delivery.error)
 
         threads = [
             threading.Thread(

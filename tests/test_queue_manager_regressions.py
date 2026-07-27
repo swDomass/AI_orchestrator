@@ -305,8 +305,8 @@ def test_resolve_note_no_double_md_extension(tmp_path, monkeypatch):
     assert result == note
 
 
-def test_inject_file_context_finds_quoted_spaced_filename(tmp_path, monkeypatch):
-    """inject_file_context must resolve quoted multi-word filenames like '"Foo Bar.md"'."""
+def test_collect_file_context_finds_quoted_spaced_filename(tmp_path, monkeypatch):
+    """collect_file_context must resolve quoted multi-word filenames like '"Foo Bar.md"'."""
     vault = tmp_path / "vault"
     (vault / "notes").mkdir(parents=True)
     note = vault / "notes" / "Bremsenquitschen Suite.md"
@@ -316,13 +316,13 @@ def test_inject_file_context_finds_quoted_spaced_filename(tmp_path, monkeypatch)
     monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
 
     task = 'Analysiere "Bremsenquitschen Suite.md" und erstelle einen Report.'
-    result = queue_manager.inject_file_context(task)
+    result = queue_manager.collect_file_context(task)
     assert "Quitschen" in result
     assert "Details hier." in result
 
 
-def test_inject_file_context_finds_wikilink_with_md_extension(tmp_path, monkeypatch):
-    """inject_file_context must resolve [[Note.md]] wikilinks that already include .md."""
+def test_collect_file_context_finds_wikilink_with_md_extension(tmp_path, monkeypatch):
+    """collect_file_context must resolve [[Note.md]] wikilinks that already include .md."""
     vault = tmp_path / "vault"
     (vault / "notes").mkdir(parents=True)
     note = vault / "notes" / "Bremsenquitschen Suite.md"
@@ -332,6 +332,33 @@ def test_inject_file_context_finds_wikilink_with_md_extension(tmp_path, monkeypa
     monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
 
     task = "Analysiere [[Bremsenquitschen Suite.md]] und erstelle einen Report."
-    result = queue_manager.inject_file_context(task)
+    result = queue_manager.collect_file_context(task)
     assert "Quitschen" in result
     assert "Details hier." in result
+
+
+# --- collect_file_context: blocks WITHOUT the task text (2026-07-25) -------
+#
+# The prompt builder needs the file blocks separately so it can place the
+# instruction last. The former inject_file_context() wrapper ("task + blocks")
+# was removed with its last caller — it was exactly the coupling that buried the
+# task in the middle of the prompt.
+
+def _vault_with_note(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    (vault / "notes").mkdir(parents=True)
+    (vault / "notes" / "Thema.md").write_text("# Thema\nInhalt hier.", encoding="utf-8")
+    monkeypatch.setattr(queue_manager, "VAULT_PATH", vault)
+    monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
+
+
+def test_collect_file_context_excludes_the_task_text(tmp_path, monkeypatch):
+    _vault_with_note(tmp_path, monkeypatch)
+    task = "Analysiere [[Thema]] gruendlich."
+    blocks = queue_manager.collect_file_context(task)
+    assert "Inhalt hier." in blocks
+    assert "Analysiere" not in blocks, "task text must not ride along in the context block"
+
+
+def test_collect_file_context_returns_empty_without_refs():
+    assert queue_manager.collect_file_context("Ein Task ohne Referenzen.") == ""

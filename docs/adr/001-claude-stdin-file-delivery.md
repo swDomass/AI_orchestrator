@@ -1,8 +1,20 @@
 # ADR-001: Claude-Prompt-Zustellung über Temp-Datei statt stdin-Pipe
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-002](002-task-last-in-prompt.md) (2026-07-25)
 - **Datum:** 2026-07-24
 - **Betrifft:** AI_orchestrator / `providers/claude.py` + `providers/process_runner.py`
+
+> ⚠️ **Die Ursachenanalyse in diesem ADR ist widerlegt.** Am 2026-07-25 wurden die
+> tatsächlich angekommenen Prompts aus den Claude-Code-Session-Dateien gemessen:
+> Erfolgs- und Ausfall-Prompt sind strukturell identisch (22.026–22.888 Zeichen, nicht
+> ~70 K Tokens), der Task-Text war in **allen** Läufen vollständig enthalten, und er
+> stand **nicht** am Ende, sondern bei 61–64 % des Prompts. Es ging nie ein Tail
+> verloren. Die hier beschriebene Zustellung über Temp-Datei ist technisch in Ordnung
+> und bleibt in Kraft, hat den Ausfall aber nicht behoben — sie adressierte einen
+> Defekt, den es nicht gab, und setzte zusätzlich das Detektionsnetz außer Kraft
+> (`delivery.delivered = True` bedingungslos). Die reale Ursache und die Korrektur
+> stehen in ADR-002. Diese Datei bleibt unverändert als Beleg dafür, wie eine
+> plausible, aber ungeprüfte Annahme drei Fix-Runden gekostet hat.
 
 ## Kontext
 

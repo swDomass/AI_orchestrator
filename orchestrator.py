@@ -77,6 +77,7 @@ from queue_manager import (
     extract_needs_tags,
     extract_pass_providers,
     extract_preapproved_actions,
+    collect_file_context,
     extract_profile_tag,
     extract_second_opinion_alias,
     extract_shutdown_tag,
@@ -84,7 +85,6 @@ from queue_manager import (
     extract_hang_count,
     finalize_task_with_result,
     has_cwd_tag,
-    inject_file_context,
     mark_done,
     mark_retry,
     read_queue,
@@ -296,7 +296,15 @@ def _build_prompt(
     3. Curated MEMORY.md (layer 1) — long-term patterns, always loaded
     4. Daily log today+yesterday (layer 2) — recent temporal context
     5. TF-IDF memory matches (layer 3) — relevant deep history
-    6. File/wikilink context + task text — budget-capped
+    6. File/wikilink context — budget-capped
+    7. The task itself, under a "## Aufgabe" heading — ALWAYS LAST
+
+    Step 7 is load-bearing, not cosmetic. Until 2026-07-25 the task text rode along
+    inside step 6 (inject_file_context returns "task + blocks"), which put the
+    instruction at ~62 % of the prompt and ended the prompt with whatever files the
+    task happened to reference. Three morning-brief runs died that way: a clean run,
+    exit 0, subtype "success" — and an answer of "I see your configuration but no
+    concrete task". Keep the task last and clearly delimited.
     """
     from skills import build_index, load_skill, progressive_body
 
@@ -330,9 +338,10 @@ def _build_prompt(
     # 5. TF-IDF memory context (layer 3 — pre-filtered by get_context_for_task)
     mem_block = _truncate_tokens(memory_context, PROMPT_MEMORY_TOKENS) if memory_context else ""
 
-    # 6. Wikilink / file context (budget-capped); ~5 chars per token
+    # 6. Wikilink / file context (budget-capped); ~5 chars per token.
+    # Blocks only — the task text is appended separately in step 7 below.
     max_wiki_chars = PROMPT_WIKILINK_TOKENS * 5
-    wiki_ctx = inject_file_context(clean_task, max_chars=max_wiki_chars)
+    wiki_ctx = collect_file_context(clean_task, max_chars=max_wiki_chars)
 
     # Assemble
     parts: list[str] = []
@@ -348,7 +357,17 @@ def _build_prompt(
         parts.append(f"## Heutiger Verlauf\n{daily}")
     if mem_block:
         parts.append(f"## Relevanter vergangener Kontext\n{mem_block}")
-    parts.append(wiki_ctx)
+    if wiki_ctx:
+        parts.append(f"## Referenzierte Dateien\n{wiki_ctx}")
+    # 7. The task LAST — see the docstring for why this position is load-bearing.
+    # A queue line consisting only of routing tags strips down to nothing; emitting a
+    # bare "## Aufgabe" heading would recreate the very state this fix removes (context
+    # with no instruction), just from a different cause. Say so instead of faking one.
+    if clean_task:
+        parts.append(f"## Aufgabe\n{clean_task}")
+    else:
+        print("  [prompt] WARNUNG: Task-Text ist nach dem Strippen der Tags leer")
+        parts.append("## Aufgabe\n(LEER — die Queue-Zeile enthielt nur Metadaten-Tags)")
 
     return "\n\n".join(p for p in parts if p)
 

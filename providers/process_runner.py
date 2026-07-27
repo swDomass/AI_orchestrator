@@ -324,13 +324,19 @@ def _feed_stdin(
     A swallowed failure here is NOT harmless. ``_spawn`` opens stdin with
     ``text=True`` → a buffered ``TextIOWrapper``, so ``write()`` only fills the
     buffer and the *tail* is flushed by ``flush()``/``close()``. If that final
-    flush fails, the child receives a TRUNCATED prompt. The orchestrator builds
-    its prompt as ``core → skills → memory → task`` (orchestrator._build_prompt),
-    i.e. the task text sits at the very END — so a lost tail removes the
-    instruction and leaves a context-only prompt. The CLI then answers "what
-    would you like me to do?", exits 0 with a valid result event, and the run is
-    finalized as a SUCCESS that did nothing. Observed 5×; cost 3 days of vault
-    health data (2026-07-20).
+    flush fails, the child receives a TRUNCATED prompt. Since 2026-07-25
+    ``orchestrator._build_prompt`` appends the task LAST, under a ``## Aufgabe``
+    heading — so a lost tail removes the instruction and leaves a context-only
+    prompt. The CLI then answers "what would you like me to do?", exits 0 with a
+    valid result event, and the run is finalized as a SUCCESS that did nothing.
+
+    Read the ordering claim above as a property of ``_build_prompt``, not as a
+    given: until 2026-07-25 the task actually sat at ~62 % of the prompt (it rode
+    inside the file-context block), and this docstring asserted the opposite. That
+    wrong assertion sent three consecutive fixes hunting a tail-loss bug that did
+    not exist, while the real defect was the prompt layout. If the ordering
+    changes again, fix it there and correct this text — do not infer prompt
+    structure from this comment.
 
     ``flush()`` is therefore called explicitly before ``close()`` so the tail
     flush is its own, attributable failure site, and the outcome is recorded in

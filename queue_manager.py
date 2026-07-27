@@ -770,10 +770,16 @@ def _extract_relevant_section(content: str, task_keywords: set[str], context_lin
     return prefix + excerpt + suffix
 
 
-def inject_file_context(task: str, max_chars: int = 0) -> str:
-    """
-    Finds [[wikilinks]] and file paths in the task text,
-    reads the referenced vault files, and appends their content to the prompt.
+def collect_file_context(task: str, max_chars: int = 0) -> str:
+    """Return ONLY the context blocks for [[wikilinks]]/file paths found in *task*.
+
+    Separated from the task text on purpose: the prompt builder needs to place the
+    file context and the instruction independently, because appending them as one
+    unit buries the instruction in the middle of the prompt. That is exactly what
+    made morning-brief fail silently three times (20./24./25.07.2026) — the model
+    received a prompt ending in ~8.700 characters of foreign config documentation
+    and answered "no concrete task in your message". See
+    orchestrator._build_prompt, which now appends the task LAST.
 
     Args:
         task: The task text containing wikilinks/file refs.
@@ -781,6 +787,9 @@ def inject_file_context(task: str, max_chars: int = 0) -> str:
                    If > 0 and content exceeds budget, smart section extraction
                    is applied first, then hard truncation as fallback.
                    Total injected chars across all wikilinks is capped.
+
+    Returns:
+        The joined context blocks, or "" when the task references no readable files.
 
     Respects MAX_CONTEXT_FILE_SIZE.
     """
@@ -793,7 +802,7 @@ def inject_file_context(task: str, max_chars: int = 0) -> str:
     refs = list(dict.fromkeys(refs))
 
     if not refs:
-        return task
+        return ""
 
     # Compute task keywords for smart section extraction
     task_keywords: set[str] = set()
@@ -852,9 +861,9 @@ def inject_file_context(task: str, max_chars: int = 0) -> str:
         total_injected += len(block)
 
     if not context_blocks:
-        return task
+        return ""
 
-    return task + "\n\n" + "\n\n".join(context_blocks)
+    return "\n\n".join(context_blocks)
 
 
 # --- Queue operations ---

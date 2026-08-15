@@ -20,7 +20,7 @@ from pathlib import Path
 from config import TOOL_DEV_EXEC_TIMEOUT_SEC, TOOL_SA_AUDIT_TIMEOUT_SEC
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import (
     BaseTool,
     ToolResult,
@@ -189,15 +189,18 @@ class SecurityAuditTool(BaseTool):
         in_tok = audit_result.input_tokens
         out_tok = audit_result.output_tokens
 
-        if audit_result.error:
-            print(f"  [security-audit] ✗ Audit fehlgeschlagen: {audit_result.error}")
+        # .success is the canonical status flag — a failure with an empty .error
+        # must not slip through into Phase 2 as if the audit had worked.
+        if not audit_result.success or audit_result.error:
+            err = audit_result.error or "Audit-Phase fehlgeschlagen"
+            print(f"  [security-audit] ✗ Audit fehlgeschlagen: {err}")
             return ToolResult(
                 success=False,
                 output=audit_result.output,
                 iterations=1,
-                error=audit_result.error,
-                error_code=audit_result.error_code,
-                retryable=audit_result.retryable,
+                error=err,
+                error_code=error_code_of(audit_result.error),
+                retryable=is_transient(audit_result.error),
                 input_tokens=in_tok,
                 output_tokens=out_tok,
             )
@@ -262,7 +265,7 @@ class SecurityAuditTool(BaseTool):
         in_tok += fix_result.input_tokens
         out_tok += fix_result.output_tokens
         fix_output = fix_result.output
-        success = not fix_result.error
+        success = fix_result.success and not fix_result.error
 
         # ------------------------------------------------------------------ #
         # Write combined report                                               #
@@ -289,8 +292,8 @@ class SecurityAuditTool(BaseTool):
                 output=f"Report: docs/{filename}\n\n{fix_output}",
                 iterations=2,
                 error=error_msg,
-                error_code=fix_result.error_code,
-                retryable=fix_result.retryable,
+                error_code=error_code_of(fix_result.error),
+                retryable=is_transient(fix_result.error),
                 input_tokens=in_tok,
                 output_tokens=out_tok,
             )

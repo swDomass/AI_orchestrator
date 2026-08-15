@@ -23,6 +23,46 @@ class RunResult:
     cache_read_input_tokens: int = 0
 
 
+# RunResult.error is an unconstrained string: providers put stable codes there
+# ("rate_limit", "hang", ...) but ALSO raw stderr, exception text and prefixed
+# details ("rate_limit: <detail>" from OpenRouter, "http_429: ..." from Gemini).
+# Tools must therefore classify it, not compare it verbatim.
+#
+# Single source of truth: orchestrator.py imports this for its in-run backoff
+# bail-out instead of repeating the tuple. A test pins the identity, so
+# reintroducing a local copy there fails the suite.
+TRANSIENT_ERRORS = ("rate_limit", "unreachable", "timeout", "hang", "stdin_incomplete")
+
+# Codes a provider may emit with a ": <detail>" suffix instead of bare.
+# "model_refusal" is a taxonomy category of its own — without it here, a Gemini
+# refusal loses its code and is booked as a generic tool error.
+# "http_<status>" is deliberately absent: it is not part of the stable taxonomy.
+_KNOWN_ERROR_CODES = TRANSIENT_ERRORS + (
+    "session_missing", "auth_error", "network", "parse_error", "api_error", "model_refusal",
+)
+
+
+def error_code_of(error: str) -> str:
+    """Extract the stable taxonomy code from a RunResult.error string.
+
+    Returns "" for free-form prose (raw stderr, exception text) so the taxonomy
+    falls through to its own classification instead of ingesting a whole
+    stderr dump as an error_code.
+    """
+    if not error:
+        return ""
+    head = error.split(":", 1)[0].strip()
+    return head if head in _KNOWN_ERROR_CODES else ""
+
+
+def is_transient(error: str) -> bool:
+    """True if the provider error is worth retrying.
+
+    Matches bare codes and the "code: detail" form alike.
+    """
+    return error_code_of(error) in TRANSIENT_ERRORS
+
+
 class BaseProvider(ABC):
     name: str = "base"
     # Whether this provider supports CLI-level conversation sessions

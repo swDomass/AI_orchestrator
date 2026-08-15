@@ -64,7 +64,7 @@ from notifier import (
     notify_task_started,
     start_session,
 )
-from providers.base import RunResult
+from providers.base import TRANSIENT_ERRORS, RunResult
 from skills import load_skill, check_requirements
 from config import VAULT_PATH
 import memory as memory_module
@@ -410,7 +410,7 @@ def _run_with_retry(
         # prompt (~26k cache_creation tokens in the 2026-07-20 incident). Bail
         # out of the in-run backoff; the task keeps its past retry marker and is
         # picked up again on the next poll within the grace window.
-        if result.error in ("rate_limit", "unreachable", "timeout", "hang", "stdin_incomplete"):
+        if result.error in TRANSIENT_ERRORS:
             return result, True
 
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:

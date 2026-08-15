@@ -400,6 +400,53 @@ class TestFixPhaseError:
         assert len(combined) >= 1
 
 
+# ── Subagent-Mode Master Prompt ────────────────────────────────────────
+
+
+class TestSubagentModeMasterPrompt:
+    """The subagent-mode master prompt must name a tool that actually spawns subagents.
+
+    That tool is `Agent`. Every `Task*` name in Claude Code is a task-LIST tool —
+    TaskCreate, TaskGet, TaskList, TaskOutput, TaskStop, TaskUpdate — and none of them
+    spawns anything, so a prompt asking for the "Task tool" instructs the model to use
+    something that does not exist and the 6-persona fan-out silently degrades to a
+    monolithic single-perspective audit with every check green.
+
+    Note which mechanism is at fault here: the master call runs `read_only=False`, i.e.
+    `--dangerously-skip-permissions`, so the read-only `--allowedTools Read,Glob,Grep,Agent`
+    list is NOT what blocked it — the wrong tool name in the prompt is. The allowlist
+    variant of this bug lives on the read-only phases and is covered by
+    tests/test_provider_permissions.py. Conflating the two was an earlier misdiagnosis.
+
+    Nothing asserted on the generated prompt, which is why the rename was missed here.
+    """
+
+    def _master_prompt(self, tmp_path, monkeypatch):
+        # `run()` imports the flag locally from config, so config is where it must be set.
+        monkeypatch.setattr("config.CLAUDE_SESSION_ENABLED", True)
+
+        provider = _ScriptedProvider("claude", ["executive summary"])
+        provider.supports_sessions = True
+        DeepSecurityAuditTool().run("Audit this #no-fix", provider, cwd=str(tmp_path))
+
+        assert provider.calls, "subagent mode did not issue a provider call"
+        return provider.calls[0]["task"]
+
+    def test_master_prompt_asks_for_the_agent_tool(self, tmp_path, _patch, monkeypatch):
+        prompt = self._master_prompt(tmp_path, monkeypatch)
+        assert "Agent tool" in prompt
+        assert "6 Agent tool calls" in prompt
+        assert "6 Agent calls" in prompt
+
+    def test_master_prompt_never_names_the_task_tool(self, tmp_path, _patch, monkeypatch):
+        """Every `Task*` name in Claude Code is a task-LIST tool (TaskCreate, TaskGet, …);
+        none of them spawns a subagent. A bare "Task tool"/"Task calls" here is a silent
+        fan-out failure, not a cosmetic wording issue."""
+        prompt = self._master_prompt(tmp_path, monkeypatch)
+        assert "Task tool" not in prompt
+        assert "Task calls" not in prompt
+
+
 # ── Capacity Exhaustion ────────────────────────────────────────────────
 
 

@@ -19,11 +19,13 @@ def test_claude_read_only_disables_write_capable_tools(monkeypatch):
     cmd = calls[0][0]
     assert "--dangerously-skip-permissions" not in cmd
     assert "--allowedTools" in cmd
-    # Read-only scope plus Task (for read-only subagent flows like
-    # deep-security-audit's 6-persona fan-out).
+    # Read-only scope plus Agent (for read-only subagent flows like
+    # deep-security-audit's 6-persona fan-out). The subagent-spawning tool is
+    # `Agent`; `Task*` names are task-list tools and never allowlist a fan-out.
     allowed = cmd[cmd.index("--allowedTools") + 1]
     assert "Read" in allowed and "Glob" in allowed and "Grep" in allowed
-    assert "Task" in allowed
+    assert "Agent" in allowed
+    assert "Task" not in allowed
     assert "Write" not in allowed
     assert "Edit" not in allowed
     assert "Bash" not in allowed

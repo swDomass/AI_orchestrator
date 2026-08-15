@@ -544,12 +544,12 @@ class DeepSecurityAuditTool(BaseTool):
         memory_context: str = "",
         **kwargs,
     ) -> ToolResult:
-        # Phase C: capability switch. When the provider supports Claude's
-        # internal Task-tool subagents AND the session feature flag is on,
-        # delegate the 6 personas + CISO synthesis to a single subprocess
-        # that fans out via Task internally — fewer subprocess calls, full
-        # cache reuse, parallel persona execution. Otherwise: stay on
-        # today's sequential-subprocess path (still works fine).
+        # Phase C: capability switch. When the provider supports Claude's internal
+        # Agent-tool subagents AND the session feature flag is on, delegate the 6
+        # personas + CISO synthesis to a single subprocess that fans out via the
+        # Agent tool internally — fewer subprocess calls, full cache reuse, parallel
+        # persona execution. Otherwise: stay on today's sequential-subprocess path
+        # (still works fine).
         #
         # Round-Table forces sequential mode: the dialogue needs per-persona
         # subprocesses with explicit cross-persona context injection. The
@@ -576,12 +576,18 @@ class DeepSecurityAuditTool(BaseTool):
         timeout: int | None,
         memory_context: str,
     ) -> ToolResult:
-        """Single-subprocess mode: Claude internally spawns 6 personas as
-        Task-tool subagents in parallel, writes per-agent reports + the
-        combined CISO synthesis. Phase 8 (fix) runs in a separate fresh
-        subprocess as before — fix is a write-phase that benefits from a
-        clean read of just-written audit files rather than from session
-        sharing.
+        """Single-subprocess mode: Claude internally spawns 6 personas as **Agent**-tool
+        subagents in parallel, writes per-agent reports + the combined CISO synthesis.
+        Phase 8 (fix) runs in a separate fresh subprocess as before — fix is a
+        write-phase that benefits from a clean read of just-written audit files rather
+        than from session sharing.
+
+        The master call runs with ``read_only=False`` (so `--dangerously-skip-permissions`,
+        not the read-only allowlist). That matters for the fan-out bug fixed on
+        2026-07-30: the prompt asked for a "Task tool", and no such subagent-spawning tool
+        exists — every `Task*` name is a task-LIST tool. The failure was the **wrong tool
+        name in the prompt**, not an allowlist denial; the allowlist story applies to the
+        read-only phases, where `--allowedTools` must name `Agent` explicitly.
         """
         cwd_path = Path(cwd) if cwd else Path(".")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -642,10 +648,10 @@ class DeepSecurityAuditTool(BaseTool):
             system_prompt
             + "\n\n## Role: Multi-Agent Security Audit Orchestrator (CISO)\n\n"
             + "You will perform a deep security audit by spawning 6 expert subagents in "
-              "PARALLEL via the Task tool, then synthesizing their findings as the CISO.\n\n"
+              "PARALLEL via the Agent tool, then synthesizing their findings as the CISO.\n\n"
             + f"## Audit Scope\n\n{clean_task}\n\n"
             + "## Step 1: Spawn 6 subagents in PARALLEL\n\n"
-            + "Issue a single message containing 6 Task tool calls (one per persona below). "
+            + "Issue a single message containing 6 Agent tool calls (one per persona below). "
               "Each subagent gets the full persona prompt + checklist as its task. Use "
               "`subagent_type=\"general-purpose\"` and `description=\"<short persona name>\"`. "
               "Each subagent must produce findings in the structured format described below "
@@ -682,7 +688,7 @@ class DeepSecurityAuditTool(BaseTool):
               "The full reports live in the files you wrote.\n\n"
             + "## Hard Rules\n"
             + "- All persona analysis is READ-ONLY. No file modifications during audit.\n"
-            + "- Spawn personas in PARALLEL (single message, 6 Task calls).\n"
+            + "- Spawn personas in PARALLEL (single message, 6 Agent calls).\n"
             + "- One subagent failure must NOT abort the others — note the failure in the synthesis.\n"
             + "- Write output files via the Write tool, not just in your response.\n"
         )

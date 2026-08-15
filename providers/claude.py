@@ -50,18 +50,30 @@ class ClaudeProvider(BaseProvider):
             else:
                 cmd.extend(["--session-id", session_id])
         if read_only:
-            # Task is included so read-only multi-agent flows (deep-security-audit
+            # Agent is included so read-only multi-agent flows (deep-security-audit
             # _run_subagent_mode style) can fan out to subagents even without
-            # write permissions. Task subagents inherit the parent's tool scope.
-            cmd.extend(["--allowedTools", "Read,Glob,Grep,Task"])
+            # write permissions. Subagents inherit the parent's tool scope.
+            #
+            # The tool is named `Agent`, NOT `Task` (verified 2026-07-30 against the
+            # tools reference: every `Task*` name is a task-LIST tool — TaskCreate,
+            # TaskGet, TaskList, TaskOutput, TaskStop, TaskUpdate — none of them
+            # spawns subagents). An unresolvable name in --allowedTools simply never
+            # matches, so `Task` left the Agent tool un-allowlisted here: headless
+            # runs cannot answer a permission prompt, so the fan-out was denied and
+            # degraded to exactly the monolithic single-perspective run this
+            # allowlist exists to prevent — silently, with every check green.
+            cmd.extend(["--allowedTools", "Read,Glob,Grep,Agent"])
         else:
             cmd.extend([
                 "--dangerously-skip-permissions",
-                # Task is required for tools that orchestrate via Claude's
+                # Agent is required for tools that orchestrate via Claude's
                 # internal subagent system (deep-security-audit subagent-mode).
-                # Without it, the master prompt's "spawn 6 Task subagents in
-                # parallel" silently degrades to monolithic single-perspective.
-                "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep,Task",
+                # Without it, the master prompt's "spawn 6 subagents in parallel"
+                # silently degrades to monolithic single-perspective.
+                # (Here --dangerously-skip-permissions already bypasses the
+                # allowlist; the correct name still matters so this path doesn't
+                # re-seed the wrong one when the bypass is ever dropped.)
+                "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep,Agent",
             ])
         return cmd
 

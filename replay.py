@@ -15,7 +15,7 @@ Schema (one line per run)::
       "task_id":     "...",
       "cwd":         "D:/programmieren/...",
       "provider":    "claude",
-      "model":       "claude-opus-4-7",
+      "model":       "claude-opus-5",
       "tool":        "dev-loop",
       "profile":     "default",
       "prompt_hash": "sha256:abc...",

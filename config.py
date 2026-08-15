@@ -490,8 +490,17 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
     "claude_sonnet": "claude-sonnet-5",    # Sonnet 5 = current Sonnet tier (2026-07)
-    "claude_opus":   "claude-opus-4-8",   # 4.8 = current Opus (2026-06); 4.7 is previous-gen
+    "claude_opus":   "claude-opus-5",      # Opus 5 = current Opus tier (2026-07); 4.8 is
+                                           # previous-gen. Drop-in: same price as 4.8
+                                           # ($5/$25 per Mtok), same CLI surface.
 }
+# Claude drift-check 2026-07-30 against the canonical model table (claude-api skill):
+# `claude-opus-5` supersedes `claude-opus-4-8`; `claude-fable-5` deliberately NOT adopted
+# ($10/$50 per Mtok is above Opus tier — no fallback executor is worth that). Note the
+# heartbeat's `_probe_model` only detects *dead* IDs, and 4.8 is still served — superseded
+# IDs surface only via `_llm_check_for_newer_models()`, so this pair can drift silently
+# while every check stays green. Re-verify on the quarterly Claude Code sweep.
+
 # Gemini model IDs (drift-checked 2026-07-23 against Google's deprecations page and
 # the live `/v1beta/models` listing for this API key): pro stays on the 3.1 preview
 # (still no GA pro model of any generation). `gemini-3.1-flash-lite` is deprecated

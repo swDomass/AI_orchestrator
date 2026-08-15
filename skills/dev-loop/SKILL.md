@@ -9,7 +9,10 @@ requires:
   providers: []
 tags: ["dev", "review", "quality", "issue", "feature", "coding"]
 config:
-  max_iterations: 10
+  # Descriptive only — no production code reads skill.config. The value that actually
+  # applies is config.TOOL_MAX_ITERATIONS (tools/dev_loop.py). Kept in sync so this file
+  # does not state a different number than the loop enforces.
+  max_iterations: 20
   timeout_minutes: 150
 ---
 ## System Prompt Addition

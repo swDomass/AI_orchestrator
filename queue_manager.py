@@ -18,6 +18,7 @@ from typing import Callable
 
 from config import (
     ALLOWED_CWD_ROOTS,
+    CLAUDE_EFFORT_LEVELS,
     MAX_CONTEXT_FILE_SIZE,
     QUEUE_DONE_DELETE_DAYS,
     QUEUE_DONE_MOVE_HOURS,
@@ -124,6 +125,33 @@ KEEP_WORKTREE_TAG_RE = re.compile(r"(?i)(?<!\S)#keep-worktree(?=\s|$)")
 #   Codex:  #codex_mini
 MODEL_TAG_RE = re.compile(
     r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus)|gemini_(?:pro|flash)|codex_mini)(?![\w-])"
+)
+
+# Matches #effort:<level> — reasoning effort for the run (Claude only; see
+# config.CLAUDE_EFFORT_LEVELS). Deliberately LOOSE: it matches any word, so an
+# invalid level (#effort:ultra) still produces a match and can be reported as a
+# lint error instead of vanishing silently. Validation happens in
+# extract_effort_tag(); a strict alternation here would make a typo indistinguishable
+# from "no tag at all".
+EFFORT_TAG_RE = re.compile(r"(?i)(?<!\S)#effort:([A-Za-z0-9_-]+)(?=\s|$)")
+
+# Matches an *attempted* #effort tag — the canonical answer to "did the author try to
+# write an effort tag here?", as opposed to EFFORT_TAG_RE's "is this a usable one?".
+# Group 1 holds the ":value" / "=value" part and is None for a bare "#effort".
+#
+# Three callers need that same answer and used to disagree, which was the bug:
+#   * strip_metadata_tags() — a malformed half ("#effort=high") survived stripping and
+#     reached the provider prompt as literal text.
+#   * queue_linter — reported it, but linting is not an execution gate.
+#   * parallel_runner inheritance — read a malformed child tag as "no tag" and handed
+#     the child the parent's level instead of the session default.
+#
+# The "(?<!\]\()" guard keeps a Markdown fragment link — "[effort docs](#effort:low)" —
+# from being read as a tag; without it an ordinary link produced a spurious lint error AND
+# got mangled by stripping. A leading "(" otherwise still counts, so "(#effort:high)" is
+# caught as malformed.
+EFFORT_ATTEMPT_RE = re.compile(
+    r"(?i)(?<!\]\()(?:^|(?<=[\s(]))#effort(?![\w-])(\s*[:=]\s*[^\s)]*)?"
 )
 
 # Matches #pass1:<provider> and #pass2:<provider> for cross-provider tool support
@@ -678,6 +706,47 @@ def extract_model_tag(task: str) -> str | None:
     return m.group(1).lower() if m else None
 
 
+def extract_effort_tag_raw(task: str) -> str | None:
+    """Return the #effort: value lowercased but UNVALIDATED (may be an unknown level).
+
+    Callers use this to tell "no tag at all" apart from "tag with a bad value" —
+    extract_effort_tag() collapses both to None. Keeps the raw regex inside this
+    module instead of exporting it, matching how has_cwd_tag/has_verify_tag work.
+    """
+    m = EFFORT_TAG_RE.search(task)
+    return m.group(1).lower() if m else None
+
+
+def has_effort_tag_attempt(task: str) -> bool:
+    """True when the line carries an #effort tag *with a value*, valid or not.
+
+    This is what callers need to tell "the author said nothing about effort" apart
+    from "the author said something unusable" — extract_effort_tag() and even
+    extract_effort_tag_raw() collapse "#effort=high" and "#effort: high" to None,
+    so both look identical to no tag at all. A bare "#effort" (no value) does not
+    count; it stays reportable by the linter but is left alone in prose.
+    """
+    return any(m.group(1) for m in EFFORT_ATTEMPT_RE.finditer(task))
+
+
+def extract_effort_tag(task: str) -> str | None:
+    """Extract the reasoning-effort level from a #effort:<level> tag.
+
+    Returns the lowercased level (always a member of config.CLAUDE_EFFORT_LEVELS)
+    or None when the tag is absent OR carries an unknown value.
+
+    An unknown value is a *lint* error — queue_linter reports it loudly via the
+    same loose regex. At runtime we degrade to the session default instead of
+    failing the task, because a typo in an optional tuning knob must not cost a
+    scheduled run. Claude-only: other providers never read the resulting value.
+    """
+    m = EFFORT_TAG_RE.search(task)
+    if not m:
+        return None
+    level = m.group(1).lower()
+    return level if level in CLAUDE_EFFORT_LEVELS else None
+
+
 def extract_tool_providers(task: str) -> list[str] | None:
     """Extract allowed providers for the task's tool from #tool_providers:p1,p2."""
     match = TOOL_PROVIDERS_TAG_RE.search(task)
@@ -782,6 +851,14 @@ def strip_metadata_tags(task: str) -> str:
     task = KEEP_WORKTREE_TAG_RE.sub("", task)   # must precede WORKTREE_TAG_RE — shared "worktree" stem
     task = WORKTREE_TAG_RE.sub("", task)
     task = MODEL_TAG_RE.sub("", task)
+    # Routing metadata like the model tag — must be stripped, or the level ends up in
+    # the prompt as literal text AND the "line was nothing but metadata" guard in
+    # orchestrator.run_once() stops firing (a bare `#tool:x #effort:low` would strip
+    # to `#effort:low` instead of ""). Strips *attempts*, not just usable tags: with
+    # EFFORT_TAG_RE alone, `#effort:low #effort=high` stripped to `#effort=high` and the
+    # broken half went to the provider as text. Only matches carrying a value are removed,
+    # so the word "#effort" in prose survives.
+    task = EFFORT_ATTEMPT_RE.sub(lambda m: "" if m.group(1) else m.group(0), task)
     task = ID_TAG_RE.sub("", task)
     task = NEEDS_TAG_RE.sub("", task)
     task = PASS_PROVIDER_TAG_RE.sub("", task)

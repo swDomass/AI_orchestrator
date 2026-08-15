@@ -6,6 +6,10 @@ Catches bad queue entries before they reach a provider:
   - Unknown #tool:<name>
   - Unknown model alias (#claude_*, #gemini_*, #codex_*, #or_*)
   - Cross-provider model leakage (e.g. #claude_opus on a task tagged #gemini)
+  - #effort: — unknown level, malformed form the strict regex cannot see
+    (#effort: low / #effort=low / trailing punctuation), duplicate tags, and a level on
+    a task routed to a non-Claude provider (warning: --effort is Claude-only). Checked
+    on subtasks too, since SubTask.effort honours the tag.
   - Duplicate #id: values in the open queue
   - #needs: references that will never resolve
   - #or_* tag without OPENROUTER_API_KEY configured
@@ -25,6 +29,7 @@ import re
 import sys
 
 from config import (
+    CLAUDE_EFFORT_LEVELS,
     OPENROUTER_API_KEY,
     QUEUE_FILE,
     _MODEL_ALIASES_BY_PROVIDER,
@@ -33,6 +38,8 @@ from config import (
 from queue_manager import (
     AT_TAG_RE,
     CWD_RE,
+    EFFORT_ATTEMPT_RE,
+    EFFORT_TAG_RE,
     EVERY_TAG_RE,
     FRESHONLY_TAG_RE,
     GRACE_TAG_RE,
@@ -79,6 +86,35 @@ _TRAILING_COMMENT_RE = re.compile(r"\s*<!--(?:(?!-->).)*-->\s*$")
 
 # Detect any `#or_*` or bare `#openrouter` tag (case-insensitive).
 _OPENROUTER_TAG_RE = re.compile(r"(?i)(?<!\S)#(openrouter|or_[A-Za-z0-9_]+)(?=\s|$)")
+
+# The permissive counterpart to queue_manager.EFFORT_TAG_RE lives in queue_manager as
+# EFFORT_ATTEMPT_RE — shared with strip_metadata_tags() and the parallel_runner
+# inheritance rule, which need the identical answer to "was a tag attempted here?".
+# Keeping a private copy here is what let the three drift apart. Its boundaries are
+# deliberately tight, because a false positive here turns a legitimate line into a lint
+# ERROR (exit code 2) — noise in the one report that is supposed to be trustworthy, and
+# worse than the silent-tag hole it closes. It does not stop the queue from running:
+# `--lint-queue` is an opt-in offline command wired to no CI and no hook in this repo, so
+# the exit code only matters to whoever runs it.
+_EFFORT_PROBE_RE = EFFORT_ATTEMPT_RE
+
+
+def _routed_providers(task_text: str) -> set[str]:
+    """Every provider this task explicitly routes to — bare ``#<provider>`` tag or any
+    model alias.
+
+    Derived from ``_MODEL_ALIASES_BY_PROVIDER`` instead of ``PROVIDER_TAG_RE``, which only
+    knows claude|gemini|codex and therefore misses ``#vibe``, ``#openrouter``, ``#or_*``,
+    ``#codex_5`` and ``#gemini_flash_lite``. Completeness matters here: the caller uses the
+    result to decide whether a Claude-only tag is a silent no-op.
+    """
+    found: set[str] = set()
+    for provider, aliases in _MODEL_ALIASES_BY_PROVIDER.items():
+        for tag in (provider, *aliases):
+            if re.search(rf"(?i)(?<!\S)#{re.escape(tag)}(?![\w-])", task_text):
+                found.add(provider)
+                break
+    return found
 
 LEVEL_ERROR = "error"
 LEVEL_WARN = "warning"
@@ -282,6 +318,100 @@ def _check_task(
     out.extend(_check_grace_tag(line_no, task_text))
     out.extend(_check_freshonly_tag(line_no, task_text))
     out.extend(_check_verify_tag(line_no, task_text))
+    out.extend(_check_effort_tag(line_no, task_text))
+    # #effort: is also honoured on subtasks (parallel_runner.SubTask.effort), so the
+    # check has to see them too — otherwise `  - [ ] Teil A #effort:ultra` runs at the
+    # session default with no lint error and no warning, which is exactly the failure
+    # mode the loose regex exists to prevent.
+    # NOTE: the same blind spot pre-exists for model tags on subtasks. Not widened here
+    # on purpose — fixing it would add findings to existing queues, which is a separate
+    # change, not part of introducing #effort:.
+    # KNOWN LIMITATION: the parent's line_no is reported for every subtask, because
+    # _iter_open_tasks() yields subtasks as plain texts without their own line numbers.
+    # With several subtasks the finding therefore points at the parent line. Carrying
+    # per-subtask line numbers means changing _iter_open_tasks and every consumer
+    # (_check_parallel among them) — a separate change, not part of adding #effort:.
+    for subtask_text in subtasks:
+        out.extend(_check_effort_tag(line_no, subtask_text))
+    return out
+
+
+def _check_effort_tag(line_no: int, task_text: str) -> list[LintFinding]:
+    """Flag a malformed or ineffective ``#effort:`` tag.
+
+    Fail-OPEN like ``#verify:``: a bad level parses away to None and the task simply
+    runs at the session default rather than failing the run.
+
+    How visible the mistake is depends on where the tag sits. On a **parent** task
+    ``orchestrator.run_once()`` also logs a warning (unknown level *and* malformed shape),
+    so a scheduled run leaves a trace. On a **subtask** it does not — ``_parse_subtask``
+    calls ``extract_effort_tag`` and warns about nothing — and a bare ``#effort`` without a
+    value is warned about nowhere. For those two, this check is the only place the mistake
+    becomes visible at all.
+
+    The strict regex alone is not enough — it cannot see forms it does not match. So the
+    permissive `_EFFORT_PROBE_RE` runs over **every** occurrence, mirroring _check_at_tag's
+    two-regex approach. Checking "is there any strict match?" first would let a malformed
+    token hide behind a well-formed one (`#effort:low #effort=high` reported nothing, and
+    `strip_metadata_tags()` cannot remove the malformed half either, so it leaked into the
+    prompt).
+    """
+    if "#effort" not in task_text.lower():
+        return []
+
+    out: list[LintFinding] = []
+    strict = list(EFFORT_TAG_RE.finditer(task_text))
+    strict_starts = {m.start() for m in strict}
+
+    # Every #effort-shaped token that is NOT a well-formed tag at that exact position.
+    # Position-based, not text-based: `(#effort:low)` yields a probe token that would
+    # pass a standalone strict match, yet the strict regex finds nothing in the real
+    # string because of the leading paren.
+    for probe in _EFFORT_PROBE_RE.finditer(task_text):
+        if probe.start() in strict_starts:
+            continue
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            f"unbrauchbares Effort-Tag '{probe.group(0).strip()}' — "
+            f"erwartet '#effort:<level>' ohne Leerzeichen und ohne Satzzeichen, "
+            f"Level: {', '.join(CLAUDE_EFFORT_LEVELS)}",
+            code="malformed_effort",
+        ))
+
+    if not strict:
+        return out
+
+    # More than one tag: only the first is applied, the rest look active and are not.
+    if len(strict) > 1:
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            f"{len(strict)}× #effort: in einer Zeile — nur das erste Tag wirkt, "
+            f"die übrigen sehen aktiv aus und sind es nicht",
+            code="effort_duplicate_tag",
+        ))
+
+    raw_level = strict[0].group(1)
+    if raw_level.lower() not in CLAUDE_EFFORT_LEVELS:
+        out.append(LintFinding(
+            LEVEL_ERROR, line_no, task_text,
+            f"unbekanntes Effort-Level '#effort:{raw_level}' — erlaubt: "
+            f"{', '.join(CLAUDE_EFFORT_LEVELS)}",
+            code="unknown_effort",
+        ))
+
+    # --effort exists only on the Claude CLI. On a task explicitly routed elsewhere the
+    # tag is a silent no-op: the user asked for an effort level and gets none. Warning,
+    # not error — the task itself still runs correctly (cf. the OpenRouter missing-key
+    # warning), unlike the cross-provider MODEL leak which is an error.
+    routed = _routed_providers(task_text)
+    if routed and "claude" not in routed:
+        out.append(LintFinding(
+            LEVEL_WARN, line_no, task_text,
+            f"'#effort:' wirkt nur auf Claude, Task ist aber auf {sorted(routed)} geroutet — "
+            f"das Tag bleibt ohne Wirkung",
+            code="effort_non_claude",
+        ))
+
     return out
 
 

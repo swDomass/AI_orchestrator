@@ -176,6 +176,7 @@ Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
 - Invalid / missing `cwd:` (path doesn't exist or outside `ALLOWED_CWD_ROOTS`)
 - Unknown `#tool:<name>`
 - Unknown model alias (`#claude_*`, `#gemini_*`, `#codex_*`, `#or_*`)
+- Unknown `#effort:` level (`unknown_effort`) — the tag regex is deliberately loose so a typo is *reported* here instead of being indistinguishable from no tag at all; at runtime the task falls back to the session default
 - Cross-provider model leakage (`#claude_opus` + explicit `#gemini` = error)
 - Duplicate `#id:` values in the open queue
 - `#needs:` referencing IDs that will never resolve (warning)
@@ -216,6 +217,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 |---|---|---|
 | Force provider | `#claude`, `#gemini`, `#codex`, `#vibe` | `- [ ] Task #codex` |
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
+| Reasoning effort (**Claude only**) | `#effort:low\|medium\|high\|xhigh\|max` → `claude --effort` | `- [ ] Classify inbox #claude_opus #effort:low` |
 | Gemini model | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
 | Codex model | `#codex_5` (gpt-5.6-sol), `#codex_5_4` (gpt-5.6-terra), `#codex_mini` (gpt-5.6-luna) | `- [ ] Run #codex_mini` |
 | OpenRouter model (opt-in, requires `OPENROUTER_API_KEY`) | Free: `#or_minimax_free`, `#or_deepseek_free`, `#or_qwen_free`, `#or_nemotron_free`. Paid flagships: `#or_glm`, `#or_kimi`, `#or_qwen`, `#or_deepseek`, `#or_minimax`. Generic: `#openrouter` (default model). | `- [ ] Daily summary #or_minimax_free` |
@@ -240,6 +242,8 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:codex` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
 | Second opinion (review-loop) | `#second_opinion:<alias\|provider>` | `#second_opinion:codex`, `#second_opinion:vibe_small` |
+
+**`#effort:` details.** As a heuristic (not benchmarked in this repo), try lowering the effort level before dropping a model tier. Without the tag the CLI keeps its own session default; the orchestrator never injects a default of its own. `--effort` exists **only** on the Claude CLI: Codex, Gemini, Vibe and OpenRouter ignore the tag by construction (only `providers/claude.py` reads it), and `--lint-queue` warns (`effort_non_claude`) when a task carrying the tag is explicitly routed elsewhere. An unknown or malformed level is a lint **error**; at runtime it degrades to the session default rather than failing a scheduled run. On a **parent** task the orchestrator also logs a warning naming the offending tag, so a typo leaves a trace in a scheduled run. Two cases stay lint-only: a tag on a **subtask** (the subtask parser warns about nothing) and a bare `#effort` with no value (warned about nowhere, and deliberately not stripped so the word survives in prose). Subtasks honour the tag too and inherit the parent's level when they carry none.
 
 **`#verify:` details.** Relative paths resolve against `cwd:` (without a `cwd:` tag, against the orchestrator process's working directory — prefer absolute paths there). Quote paths containing spaces or `#`. Supported types: `.ps1` (via `pwsh -NoProfile -File`), `.py` (via the running interpreter with `-X utf8`), `.cmd`/`.bat`/`.exe` and extensionless executables; anything else is rejected with a clear message. Exit 0 = passed, non-zero = alarm, and the script's stdout (or stderr when stdout is empty) becomes the alarm text — a PowerShell check should set `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` so umlauts survive the redirect. Runs in all three success paths (single-shot, `#tool:`, `#parallel`), always after the queue line is finalized; for `#parallel` only when every subtask succeeded. A failing check raises the alarm but does not requeue the task — see `--lint-queue` for the `verify_without_path` rule that catches a `#verify:` with no script.
 

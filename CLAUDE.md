@@ -66,7 +66,7 @@ python orchestrator.py --lint-queue   # validate agent-queue.md
 - **`shutdown.py`** — Shutdown state machine + cancellation
 - **`notifier.py`** — Telegram notifications, 3500-char truncation
 - **`telegram_listener.py`** — Bot listener, `/chat` AI mode, slash tool-commands (`/review` `/security` `/audit` `/dev` `/critique` `/brainstorm`), `/approve` SI-Manager routing; P5 `/pr-fix <owner/repo#N>` + `/pr-ignore <owner/repo#N>` for PR-Babysitter report-only mode
-- **`queue_linter.py`** — Offline validator (`--lint-queue`), exit codes 0/1/2; shares `extract_model_tag` with the queue parser, so it inherits the `MODEL_TAG_RE` gap and does not yet validate `#vibe*` tags
+- **`queue_linter.py`** — Offline validator (`--lint-queue`), exit codes 0/1/2; shares `extract_model_tag` with the queue parser, so it inherits the `MODEL_TAG_RE` gap and does not yet validate `#vibe*` tags. `#effort:` is validated with a permissive probe next to the strict regex (`malformed_effort`/`unknown_effort`/`effort_duplicate_tag`/`effort_non_claude`) and on subtasks as well
 - **`idempotency.py`** — Duplicate-trigger dedup (JSONL store, sha256 keys, 30-day retention)
 - **`session_registry.py`** — Append-only JSONL whitelist of orchestrator-created Claude session UUIDs
 - **`replay.py`** — Machine-readable run summaries (`logs/runs.jsonl`), one record per task end (ok/retry/error/blocked), 30-day rotation → gzip archive
@@ -118,6 +118,7 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 
 - **Singletons with threading** — `PolicyEngine`, `UsageSuggester`, providers; own `_lock` + `threading.Event`
 - **Provider-bound model tags** — `config.model_id_for_provider(tag, provider)` returns `None` on mismatch; `_forced_model` via `threading.local()`
+- **Reasoning effort** — `#effort:<level>` (`low|medium|high|xhigh|max`, `config.CLAUDE_EFFORT_LEVELS`) → `_forced_effort` via `threading.local()`, gesetzt/restauriert an denselben Stellen wie `_forced_model` (`orchestrator.py` ×2, `parallel_runner.py`). Nur `providers/claude.py` liest die Property → Nicht-Claude-Provider ignorieren den Tag konstruktionsbedingt, ohne Capability-Abfrage. Ohne Tag **kein** Flag, damit die Session-Einstellung nicht überschrieben wird
 - **OpenRouter/Vibe never in fallback chain** — `dispatcher._PRIORITY` omits beide; `.get(name)` not `[name]` for silent fallback. Registrierung ist bedingt (API-Key bzw. Binary auf dem PATH)
 - **Reviewer-only degradiert nicht zum Executor** — `dispatcher._REVIEWER_ONLY`: ein `#vibe`-Tag ohne registriertes Vibe liefert **keinen** Provider (Task wird geparkt), statt still auf Claude/Gemini/Codex durchzufallen. Bei OpenRouter ist derselbe Fallback harmlos (Executor → Executor), hier wäre er eine Ausweitung des Blast Radius: erbeten war eine nicht-schreibende Zweitmeinung
 - **Child-Env statt `os.environ`** — `run_with_watchdog(..., env=…)` bekommt eine fertig gemergte Kopie (Popen ersetzt, merged nicht). Provider sind geteilte Singletons in Parallel-Threads: `os.environ` mutieren würde das Modell eines Runs in einen anderen lecken

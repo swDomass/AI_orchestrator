@@ -47,6 +47,35 @@ class BaseProvider(ABC):
     def _forced_model(self, value: str | None) -> None:
         self._thread_ctx.forced_model = value
 
+    @property
+    def _forced_effort(self) -> str | None:
+        """Reasoning-effort level for this thread's run, or None for the CLI's own
+        session default. Set by the same callers that set `_forced_model`, with the
+        same finally-restore discipline.
+
+        Claude-only by construction: only providers/claude.py reads this, so every
+        other provider ignores an `#effort:` tag without needing a capability check.
+        Keeping it on BaseProvider (rather than on ClaudeProvider) is what lets the
+        call sites stay provider-agnostic — exactly as with `_forced_model`, where
+        model_id_for_provider() returns None for a non-owning provider.
+
+        KNOWN GAP (do not mistake this for intended behaviour): the second-opinion pass in
+        tools/review_loop.py and the pass-2 provider in tools/critical_review.py override
+        only `_forced_model` for their secondary provider. When that secondary provider is
+        the *same* Claude singleton as the primary, the outer `_forced_effort` is still in
+        effect, so a `#effort:low` meant for a bulk task also lowers the effort of the
+        review that checks it. Arguably it should be snapshotted and cleared around those
+        calls — a review pass exists to add an independent perspective, not to inherit the
+        primary task's cost tuning — but that is a behaviour change in two more tools and
+        is deliberately NOT made here. Decide it separately; until then this docstring
+        describes what the code does, not what it should do.
+        """
+        return getattr(self._thread_ctx, "forced_effort", None)
+
+    @_forced_effort.setter
+    def _forced_effort(self, value: str | None) -> None:
+        self._thread_ctx.forced_effort = value
+
     def is_cooling_down(self) -> bool:
         with self._lock:
             return time.time() < self._cooldown_until

@@ -73,6 +73,9 @@ from queue_manager import (
     cleanup_done_tasks,
     ensure_queue_file,
     extract_cwd,
+    extract_effort_tag,
+    extract_effort_tag_raw,
+    has_effort_tag_attempt,
     extract_id_tag,
     extract_model_tag,
     extract_needs_tags,
@@ -1037,6 +1040,27 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         if model_tag and not is_known_model_tag(model_tag):
             _log.warning("Unknown model tag #%s — ignored, using default model", model_tag)
 
+        # Reasoning effort (#effort:<level>) — Claude-only, see config.CLAUDE_EFFORT_LEVELS.
+        # extract_effort_tag() already dropped an unknown value; the raw variant tells a
+        # typo apart from "no tag", so the log names the offending level and the task.
+        forced_effort = extract_effort_tag(task)
+        raw_effort = extract_effort_tag_raw(task)
+        if raw_effort and forced_effort is None:
+            _log.warning(
+                "Unknown effort level '#effort:%s' — ignored, using session default (task: %.60s)",
+                raw_effort, task,
+            )
+        elif forced_effort is None and has_effort_tag_attempt(task):
+            # Malformed shape (#effort=high, #effort: high): the strict regex misses it, so
+            # raw_effort is None too and the branch above stays quiet. queue_linter reports
+            # it, but linting is not an execution gate — without this the tag is stripped
+            # and does nothing, with no trace in the log of a scheduled run.
+            _log.warning(
+                "Malformed #effort tag — ignored, using session default. Expected "
+                "'#effort:<level>' with no space and no punctuation (task: %.60s)",
+                task,
+            )
+
         # Strict mode: when provider/model is explicitly specified, no fallback
         provider_is_forced = has_explicit_provider_tag(task)
 
@@ -1335,6 +1359,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 model_id = model_id_for_provider(model_tag, provider.name)
                 previous_forced_model = getattr(provider, "_forced_model", None)
                 setattr(provider, "_forced_model", model_id)
+                previous_forced_effort = getattr(provider, "_forced_effort", None)
+                setattr(provider, "_forced_effort", forced_effort)
                 _span.provider = provider.name
                 _span.model = model_id or ""
                 try:
@@ -1350,6 +1376,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     )
                 finally:
                     setattr(provider, "_forced_model", previous_forced_model)
+                    setattr(provider, "_forced_effort", previous_forced_effort)
 
                 if outcome.success:
                     if outcome.verify_failed:
@@ -1573,6 +1600,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             model_id = model_id_for_provider(model_tag, provider.name)
             previous_forced_model = getattr(provider, "_forced_model", None)
             setattr(provider, "_forced_model", model_id)
+            previous_forced_effort = getattr(provider, "_forced_effort", None)
+            setattr(provider, "_forced_effort", forced_effort)
             _span.provider = provider.name
             _span.model = model_id or ""
             # Snapshot the verify script BEFORE the provider (which has write access to
@@ -1587,6 +1616,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 )
             finally:
                 setattr(provider, "_forced_model", previous_forced_model)
+                setattr(provider, "_forced_effort", previous_forced_effort)
 
             # Track estimated usage for 429 capacity estimation
             _task_duration = time.time() - start_time

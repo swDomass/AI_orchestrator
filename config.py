@@ -501,6 +501,26 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
 # IDs surface only via `_llm_check_for_newer_models()`, so this pair can drift silently
 # while every check stays green. Re-verify on the quarterly Claude Code sweep.
 
+# --- Reasoning Effort (Claude only) ---
+# Valid values for `claude --effort <level>`, verified against `claude --help` on
+# 2026-07-30. That verification covers the CLI values only.
+#
+# HEURISTIC (not measured in this repo): try lowering the effort level before dropping a
+# model tier. The claim behind it — that `low`/`medium` on a current-generation model can
+# match an older generation's `xhigh` — comes from the Claude Code workflow notes, not
+# from any benchmark here. Treat it as a default worth trying, not as an invariant, and
+# re-check it when model generations change (quarterly sweep).
+#
+# Selected per task via the `#effort:<level>` queue tag. Claude-exclusive: Codex,
+# Mistral and OpenRouter have no equivalent flag. They ignore the tag *by
+# construction*, because only providers/claude.py reads `_forced_effort` — there is
+# deliberately no `supports_effort` capability check.
+#
+# Ordered tuple, not a set: this is an ordinal scale, and lint/help messages must show
+# it in ascending order. A sorted frozenset would print "high, low, max, medium, xhigh"
+# and mislead anyone picking a level. Membership over 5 items is cheap either way.
+CLAUDE_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
 # Gemini model IDs (drift-checked 2026-07-23 against Google's deprecations page and
 # the live `/v1beta/models` listing for this API key): pro stays on the 3.1 preview
 # (still no GA pro model of any generation). `gemini-3.1-flash-lite` is deprecated

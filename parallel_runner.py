@@ -40,6 +40,10 @@ class SubTask:
     # Alias key (e.g. 'claude_haiku', 'gemini_flash') — resolved to a model ID
     # per-provider at execution time via config.model_id_for_provider().
     model_tag: str | None = None
+    # Reasoning-effort level from #effort:<level> (Claude-only, already validated
+    # against config.CLAUDE_EFFORT_LEVELS). Inherited from the parent task when the
+    # subtask carries no tag of its own — same rule as model_tag.
+    effort: str | None = None
 
 
 @dataclass
@@ -53,7 +57,7 @@ class SubTaskResult:
 
 def _parse_subtask(text: str) -> SubTask:
     """Extract metadata from a subtask line."""
-    from queue_manager import extract_cwd, extract_timeout, extract_model_tag
+    from queue_manager import extract_cwd, extract_timeout, extract_model_tag, extract_effort_tag
     from config import TASK_TIMEOUT_SEC
 
     # Detect forced provider from #claude / #gemini / #codex tags
@@ -72,6 +76,7 @@ def _parse_subtask(text: str) -> SubTask:
     cwd = extract_cwd(text)
     timeout = extract_timeout(text, default=TASK_TIMEOUT_SEC)
     model_tag = extract_model_tag(text)
+    effort = extract_effort_tag(text)
 
     return SubTask(
         text=text,
@@ -80,6 +85,7 @@ def _parse_subtask(text: str) -> SubTask:
         tool_name=tool_name,
         timeout=timeout,
         model_tag=model_tag,
+        effort=effort,
     )
 
 
@@ -127,6 +133,8 @@ def _run_single_subtask(
     model_id = model_id_for_provider(subtask.model_tag, provider.name)
     previous_forced_model = getattr(provider, "_forced_model", None)
     setattr(provider, "_forced_model", model_id)
+    previous_forced_effort = getattr(provider, "_forced_effort", None)
+    setattr(provider, "_forced_effort", subtask.effort)
 
     try:
         # Tool-based subtask
@@ -179,6 +187,7 @@ def _run_single_subtask(
         )
     finally:
         setattr(provider, "_forced_model", previous_forced_model)
+        setattr(provider, "_forced_effort", previous_forced_effort)
 
 
 # ── Worktree isolation (P1) ──────────────────────────────────────────────────
@@ -300,12 +309,15 @@ def run_parallel(
         from queue_manager import (
             extract_cwd,
             has_cwd_tag,
+            extract_effort_tag,
+            has_effort_tag_attempt,
             extract_model_tag,
             extract_worktree_tag,
             extract_keep_worktree_tag,
         )
         parent_cwd = extract_cwd(parent_task)
         parent_model_tag = extract_model_tag(parent_task)
+        parent_effort = extract_effort_tag(parent_task)
         worktree_enabled = extract_worktree_tag(parent_task)
         keep_worktree = extract_keep_worktree_tag(parent_task)
         if parent_cwd:
@@ -319,6 +331,22 @@ def run_parallel(
             subtasks = [
                 replace(st, model_tag=parent_model_tag)
                 if st.model_tag is None
+                else st
+                for st in subtasks
+            ]
+        if parent_effort:
+            # `st.effort is None` is NOT the same as "the subtask carried no tag":
+            # extract_effort_tag() collapses an INVALID level to None too. Inheriting on
+            # that basis would run `Child #effort:ultra` at the parent's level instead of
+            # the session default — silently honouring a typo. So ask whether a tag was
+            # *attempted*; any attempt, valid or not, blocks inheritance.
+            #
+            # has_effort_tag_attempt() rather than extract_effort_tag_raw(): the raw
+            # extractor still uses the strict regex, so `#effort=high`, `#effort: high`
+            # and `(#effort:high)` all returned None and inherited the parent level.
+            subtasks = [
+                replace(st, effort=parent_effort)
+                if st.effort is None and not has_effort_tag_attempt(st.text)
                 else st
                 for st in subtasks
             ]

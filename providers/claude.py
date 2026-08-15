@@ -94,6 +94,12 @@ class ClaudeProvider(BaseProvider):
         cmd = self._build_command(read_only=read_only, session_id=session_id, resume=resume)
         if self._forced_model:
             cmd.extend(["--model", self._forced_model])
+        # `--effort <level>` (low|medium|high|xhigh|max, see config.CLAUDE_EFFORT_LEVELS)
+        # — set via the #effort: queue tag. Appended ONLY when explicitly requested:
+        # without a tag the CLI keeps its own session default, which must not be
+        # silently overridden from here.
+        if self._forced_effort:
+            cmd.extend(["--effort", self._forced_effort])
         try:
             result = run_with_watchdog(
                 cmd,

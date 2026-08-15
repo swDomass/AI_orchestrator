@@ -113,6 +113,74 @@ def test_run_once_marks_tool_task_for_retry_on_timeout_without_provider_fallback
     p2.set_cooldown.assert_not_called()
 
 
+def test_run_once_tool_task_pins_and_restores_forced_effort(monkeypatch):
+    """#effort: must reach the provider on the TOOL-task path and be restored after.
+
+    Regression guard: until 2026-07-30 deleting the `_forced_effort` setattr in
+    run_once() left the whole suite green — the flag was only covered at provider level
+    and on the parallel path, so the normal execution path was untested.
+    """
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    seen: list[str | None] = []
+
+    def capture_exec(*args, **kwargs):
+        seen.append(getattr(p1, "_forced_effort", None))
+        return orchestrator.ToolTaskExecutionOutcome(
+            success=True, finalized=False, retryable=False, error="", error_code="",
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop #effort:low", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", capture_exec)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    assert seen == ["low"], "effort was not pinned on the provider during the tool call"
+    assert getattr(p1, "_forced_effort", None) is None, "effort was not restored afterwards"
+
+
+def test_run_once_tool_task_without_effort_tag_pins_nothing(monkeypatch):
+    """No tag → no pin, so the CLI keeps its own session default."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    seen: list[str | None] = []
+
+    def capture_exec(*args, **kwargs):
+        seen.append(getattr(p1, "_forced_effort", None))
+        return orchestrator.ToolTaskExecutionOutcome(
+            success=True, finalized=False, retryable=False, error="", error_code="",
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", capture_exec)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    assert seen == [None]
+
+
 def test_run_once_tool_task_recovers_from_token_refresh_race(monkeypatch):
     """Tool-path boot race: on the FIRST selection a tool task whose provider is only
     blocked by an in-flight OAuth token refresh must force-refresh limits ONCE and then
@@ -414,6 +482,57 @@ def test_run_once_single_shot_hang_requeues_with_backoff(monkeypatch):
     assert mark_retry_mock.call_args.kwargs["hang_count"] == 1
     next_retry_mock.assert_not_called()  # NOT quota-reset retried
     p1.set_cooldown.assert_not_called()  # hang is not a capacity/health issue
+
+
+def test_run_once_single_shot_pins_and_restores_forced_effort(monkeypatch):
+    """Same guard as the tool path, for the plain (non-tool) single-shot path."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    seen: list[str | None] = []
+
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task #effort:xhigh",
+        provider=p1,
+    )
+    # The stub maps the queue text; effort is read from the task text via the real
+    # extractor, so point it at a tagged string explicitly.
+    monkeypatch.setattr(orchestrator, "extract_effort_tag", lambda _task: "xhigh")
+    monkeypatch.setattr(orchestrator, "extract_effort_tag_raw", lambda _task: "xhigh")
+
+    def capture_run(*a, **kw):
+        seen.append(getattr(p1, "_forced_effort", None))
+        return (orchestrator.RunResult(success=True, output="ok"), False)
+
+    monkeypatch.setattr(orchestrator, "_run_with_retry", capture_run)
+
+    orchestrator.run_once()
+
+    assert seen == ["xhigh"], "effort was not pinned during the single-shot run"
+    assert getattr(p1, "_forced_effort", None) is None, "effort was not restored"
+
+
+def test_run_once_single_shot_restores_forced_effort_on_exception(monkeypatch):
+    """A throwing run must not leak the pinned level onto the shared provider
+    singleton — the restore lives in a `finally`, and this proves it."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    _stub_single_shot_env(
+        monkeypatch,
+        raw_line="- [ ] Plain claude task #effort:max",
+        provider=p1,
+    )
+    monkeypatch.setattr(orchestrator, "extract_effort_tag", lambda _task: "max")
+    monkeypatch.setattr(orchestrator, "extract_effort_tag_raw", lambda _task: "max")
+
+    def boom(*a, **kw):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(orchestrator, "_run_with_retry", boom)
+
+    with pytest.raises(RuntimeError):
+        orchestrator.run_once()
+
+    assert getattr(p1, "_forced_effort", None) is None, "effort leaked after exception"
 
 
 def test_run_once_single_shot_hang_blocks_after_max_retries(monkeypatch):

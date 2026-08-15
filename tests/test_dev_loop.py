@@ -29,6 +29,14 @@ def _patch(monkeypatch):
     monkeypatch.setattr("tools.dev_loop.notify_tool_done", lambda *a, **kw: None)
     monkeypatch.setattr("tools.dev_loop.notify_tool_progress", lambda *a, **kw: None)
     monkeypatch.setattr("tools.dev_loop.time.sleep", lambda _: None)
+    # The capacity gate reads a process-global cache of the REAL provider quota, filled by
+    # limits.py's background refresh thread. Unmocked, 17 of these tests return
+    # `capacity_exhausted` instead of running whenever the actual Claude quota is spent —
+    # so the suite went red for reasons that had nothing to do with the code under test.
+    # `pytest-randomly` only decided whether a test ran before or after the first refresh,
+    # which made a live-state dependency look like test-order dependence. The other five
+    # tools with this gate mock it in their tests; test_dev_loop.py was the only one left.
+    monkeypatch.setattr("tools.dev_loop.is_cached_provider_available", lambda _name: True)
 
 
 # ── _parse_resolution ─────────────────────────────────────────────────────────

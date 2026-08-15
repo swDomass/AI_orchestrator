@@ -579,3 +579,128 @@ class TestEdgeCases:
         # Each agent prompt should mention its title
         for i, agent in enumerate(_AGENTS):
             assert agent.title in provider.calls[i]["task"]
+
+
+# ── Error Classification (error_code / retryable) ──────────────────────
+#
+# Every failing exit of this tool has to hand the taxonomy a *classified*
+# error, not just a message: `error_code` + `retryable` decide whether the
+# orchestrator re-queues the task or books it as a hard failure.
+#
+# RunResult carries neither field — it only has the free-form `.error` string
+# (see providers/base.py). So each exit must classify that string via
+# `error_code_of()` / `is_transient()`. Reading the fields off RunResult
+# directly raises AttributeError, and the `getattr(..., "error_code", "")`
+# spelling silently yields ""/False on *every* real failure — which is how a
+# stale hand-written whitelist (missing `hang` and `unreachable`) survived
+# unnoticed on one of these paths.
+#
+# The failure tests above (TestPartialAgentFailure, TestFixPhaseError) only
+# assert that an error propagates, never how it is classified. These do.
+
+# (RunResult.error, expected error_code, expected retryable)
+_ERROR_CLASSIFICATION_CASES = [
+    # Bare transient codes — both were absent from the stale whitelist.
+    ("hang", "hang", True),
+    ("unreachable", "unreachable", True),
+    # Prefixed "code: detail" form, as OpenRouter emits it.
+    ("rate_limit: 429 slow down", "rate_limit", True),
+    # Free-form prose: no taxonomy code, must not be retried.
+    ("claude CLI not found", "", False),
+]
+
+
+class _FailAtCallProvider:
+    """Succeeds on every provider call except `fail_at` (1-based), which errors."""
+
+    def __init__(self, name: str, fail_at: int, error: str):
+        self.name = name
+        self._fail_at = fail_at
+        self._error = error
+        self.calls: list[dict] = []
+
+    def run(self, task: str, cwd: str | None = None, timeout: int = 0,
+            read_only: bool = False) -> RunResult:
+        self.calls.append({"task": task, "cwd": cwd, "timeout": timeout, "read_only": read_only})
+        if len(self.calls) == self._fail_at:
+            return RunResult(success=False, output="", error=self._error)
+        return RunResult(success=True, output=f"output {len(self.calls)}")
+
+
+def _subagent_provider(monkeypatch, fail_at: int, error: str) -> _FailAtCallProvider:
+    """Provider wired for subagent mode (1 master call, optional fix call)."""
+    # `run()` imports the flag locally from config, so config is where it must be set.
+    monkeypatch.setattr("config.CLAUDE_SESSION_ENABLED", True)
+    provider = _FailAtCallProvider("claude", fail_at, error)
+    provider.supports_sessions = True
+    return provider
+
+
+@pytest.mark.parametrize("error,code,retryable", _ERROR_CLASSIFICATION_CASES)
+class TestSubagentMasterErrorClassification:
+    """Subagent mode, master-audit failure (call 1 of 1)."""
+
+    def test_master_error_classified(self, tmp_path, _patch, monkeypatch,
+                                     error, code, retryable):
+        provider = _subagent_provider(monkeypatch, fail_at=1, error=error)
+        result = DeepSecurityAuditTool().run("Audit #no-fix", provider, cwd=str(tmp_path))
+
+        assert len(provider.calls) == 1, "master call did not fire in subagent mode"
+        assert result.success is False
+        assert "Audit-Master fehlgeschlagen" in result.error
+        assert result.error_code == code
+        assert result.retryable is retryable
+
+
+@pytest.mark.parametrize("error,code,retryable", _ERROR_CLASSIFICATION_CASES)
+class TestSubagentFixErrorClassification:
+    """Subagent mode, fix-phase failure (call 2: master ok, fix errors).
+
+    This is the exit where reading `.error_code` off RunResult crashed.
+    """
+
+    def test_fix_error_classified(self, tmp_path, _patch, monkeypatch,
+                                  error, code, retryable):
+        provider = _subagent_provider(monkeypatch, fail_at=2, error=error)
+        result = DeepSecurityAuditTool().run("Audit", provider, cwd=str(tmp_path))
+
+        assert len(provider.calls) == 2, "fix phase did not run in subagent mode"
+        assert result.success is False
+        assert result.error == error
+        assert result.error_code == code
+        assert result.retryable is retryable
+
+
+@pytest.mark.parametrize("error,code,retryable", _ERROR_CLASSIFICATION_CASES)
+class TestSequentialSynthesisErrorClassification:
+    """Sequential mode, CISO-synthesis failure (call 7: 6 agents ok, synthesis errors).
+
+    A provider without `supports_sessions` takes the sequential path.
+    """
+
+    def test_synthesis_error_classified(self, tmp_path, _patch,
+                                        error, code, retryable):
+        provider = _FailAtCallProvider("claude", fail_at=7, error=error)
+        result = DeepSecurityAuditTool().run("Audit #no-fix", provider, cwd=str(tmp_path))
+
+        assert len(provider.calls) == 7, "synthesis phase did not run"
+        assert result.success is False
+        assert "CISO-Synthese fehlgeschlagen" in result.error
+        assert result.error_code == code
+        assert result.retryable is retryable
+
+
+@pytest.mark.parametrize("error,code,retryable", _ERROR_CLASSIFICATION_CASES)
+class TestSequentialFixErrorClassification:
+    """Sequential mode, fix-phase failure (call 8: 6 agents + synthesis ok, fix errors)."""
+
+    def test_fix_error_classified(self, tmp_path, _patch,
+                                  error, code, retryable):
+        provider = _FailAtCallProvider("claude", fail_at=8, error=error)
+        result = DeepSecurityAuditTool().run("Audit", provider, cwd=str(tmp_path))
+
+        assert len(provider.calls) == 8, "fix phase did not run in sequential mode"
+        assert result.success is False
+        assert result.error == error
+        assert result.error_code == code
+        assert result.retryable is retryable

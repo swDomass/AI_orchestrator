@@ -41,7 +41,7 @@ from config import (
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import (
     BaseTool,
     ToolResult,
@@ -732,8 +732,8 @@ class DeepSecurityAuditTool(BaseTool):
                 output=master_result.output,
                 iterations=1,
                 error=msg,
-                error_code=master_result.error,
-                retryable=master_result.error in ("rate_limit", "timeout", "session_missing", "stdin_incomplete"),
+                error_code=error_code_of(master_result.error),
+                retryable=is_transient(master_result.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
                 cache_creation_input_tokens=total_cache_creation,
@@ -836,8 +836,8 @@ class DeepSecurityAuditTool(BaseTool):
                 output=master_result.output + "\n\n--- FIX ERROR ---\n" + fix_result.error,
                 iterations=2,
                 error=fix_result.error,
-                error_code=fix_result.error_code,
-                retryable=fix_result.retryable,
+                error_code=error_code_of(fix_result.error),
+                retryable=is_transient(fix_result.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
                 cache_creation_input_tokens=total_cache_creation,
@@ -1208,8 +1208,8 @@ class DeepSecurityAuditTool(BaseTool):
                 output=self._format_partial(agent_outputs),
                 iterations=synthesis_phase,
                 error=f"CISO-Synthese fehlgeschlagen: {synthesis_result.error}",
-                error_code=getattr(synthesis_result, "error_code", ""),
-                retryable=getattr(synthesis_result, "retryable", False),
+                error_code=error_code_of(synthesis_result.error),
+                retryable=is_transient(synthesis_result.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
                 cache_creation_input_tokens=total_cache_creation,
@@ -1331,9 +1331,11 @@ class DeepSecurityAuditTool(BaseTool):
 
         notify_tool_done(self.name, iterations, success, output_summary)
 
-        # Propagate error_code/retryable from fix phase (matches security_audit.py)
-        fix_error_code = getattr(fix_result, "error_code", "") if fix_phase_ran else ""
-        fix_retryable = getattr(fix_result, "retryable", False) if fix_phase_ran else False
+        # Propagate error_code/retryable from fix phase (matches security_audit.py).
+        # RunResult has no such fields — classify .error instead, or the getattr
+        # fallbacks silently yield ""/False on every real failure.
+        fix_error_code = error_code_of(fix_result.error) if fix_phase_ran else ""
+        fix_retryable = is_transient(fix_result.error) if fix_phase_ran else False
 
         tracer.emit("run_end", success=success, iterations=iterations, has_roundtable=bool(roundtable_outputs))
 

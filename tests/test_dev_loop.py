@@ -206,6 +206,114 @@ def test_dev_loop_p3_only_quality_does_not_block(monkeypatch, tmp_path):
 
     assert result.success is True
     assert result.iterations == 1
+    # Non-blocking is not the same as invisible — the P3 comes back as a closing offer.
+    assert "P3 offen" in result.output
+    assert "Minor naming issue in utils.py" in result.output
+
+
+def test_dev_loop_deferred_p3_survives_a_later_clean_round(monkeypatch, tmp_path):
+    """Same contract as review-loop: a P3 from round 1 must still be offered when the
+    round-2 review is clean. The executor never sees P3 at all (only `blocking_findings`
+    are passed on), so the closing offer is the only place it can surface."""
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Do it.",
+        "Implementation.",
+        "- [P2] Real bug in utils.py\n- [P3] round one nit",  # quality iter 1
+        "RESOLVED: done.",
+        "Fix applied.",                                        # execute iter 2
+        "No P1/P2/P3 findings.",                               # quality iter 2 — clean
+        "RESOLVED: done.",
+    ])
+    result = DevLoopTool().run("Add feature", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 2
+    # Assert on the OFFER BLOCK, not on the whole output: the iteration-1 quality review
+    # text is part of result.output either way, so `"round one nit" in result.output`
+    # passes even with the accumulation removed and proves nothing.
+    assert "--- P3 offen" in result.output
+    offer = result.output.split("--- P3 offen")[1]
+    assert "round one nit" in offer, (
+        "a P3 reported in an earlier round must still be in the closing offer"
+    )
+    # ...and the P3 was never handed to the executor. Only the EXECUTION prompts matter
+    # here — the resolution reviewer and the lesson summarizer legitimately receive the
+    # full review text, so a blanket check over every later prompt proves nothing.
+    execution_prompts = [
+        p for p in provider.prompts if "Implement the solution exactly as laid out" in p
+    ]
+    assert len(execution_prompts) == 2, "expected one execution prompt per iteration"
+    assert "Real bug in utils.py" in execution_prompts[1], (
+        "the blocking P2 must reach the executor"
+    )
+    assert not any("round one nit" in p for p in execution_prompts), (
+        "P3 must not reach the execution prompt"
+    )
+
+
+def test_dev_loop_p3_in_resolution_feedback_is_not_requested(monkeypatch, tmp_path):
+    """A P3 listed by the RESOLUTION reviewer must not reach the execution prompt.
+
+    Regression: `previous_resolution_output` was stored verbatim and pasted into the next
+    execution prompt under "fix every finding listed above" — so a P3 bullet the resolution
+    reviewer happened to include was explicitly *requested*, making the whole "no P3
+    reaches the executor" contract false through a second door that has nothing to do with
+    session history. The RESOLVED/PARTIAL verdict and every non-P3 line must survive.
+    """
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Do it.",
+        "Implementation.",
+        "No P1/P2/P3 findings.",                                    # quality iter 1 — clean
+        "PARTIAL: logout missing\n- [P3] rename the helper",        # resolution blocks
+        "Fix applied.",                                             # execute iter 2
+        "No P1/P2/P3 findings.",
+        "RESOLVED: done.",
+    ])
+    result = DevLoopTool().run("Add feature", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    execution_prompts = [
+        p for p in provider.prompts if "Implement the solution exactly as laid out" in p
+    ]
+    assert len(execution_prompts) == 2
+    second = execution_prompts[1]
+    assert "rename the helper" not in second, "a resolution-review P3 must not be requested"
+    # ...but the verdict and the functional gap still have to reach the executor.
+    assert "logout missing" in second
+    assert "PARTIAL" in second
+    # ...and the P3 is offered at the end rather than silently dropped.
+    assert "--- P3 offen" in result.output
+    assert "rename the helper" in result.output.split("--- P3 offen")[1]
+
+
+def test_strip_p3_lines_keeps_everything_else():
+    from tools.review_loop import strip_p3_lines
+
+    assert strip_p3_lines("PARTIAL: x\n- [P3] nit\n- [P2] real") == "PARTIAL: x\n- [P2] real"
+    # Alternative provider format must be caught too.
+    assert strip_p3_lines("PARTIAL: x\n1. `P3` nit") == "PARTIAL: x"
+    assert strip_p3_lines("PARTIAL: nothing to drop") == "PARTIAL: nothing to drop"
+
+
+def test_dev_loop_contradictory_quality_output_does_not_pass(monkeypatch, tmp_path):
+    """Blocking finding + clean sentinel in one output: the findings win, the loop keeps
+    going. Regression on `quality_ok = no_quality_findings or not blocking_findings`."""
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Do it.",
+        "Implementation.",
+        "- [P2] Real bug\nNo P1/P2/P3 findings.",  # contradictory
+        "RESOLVED: done.",
+        "Fix applied.",
+        "No P1/P2/P3 findings.",                   # genuinely clean
+        "RESOLVED: done.",
+    ])
+    result = DevLoopTool().run("Add feature", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 2, "the contradictory round must not count as clean"
 
 
 # ── Failure cases ─────────────────────────────────────────────────────────────

@@ -58,9 +58,49 @@ def _parse_findings(text: str) -> list[str]:
     return findings
 
 
+def strip_p3_lines(text: str) -> str:
+    """Drop lines that parse as a P3 finding, keeping everything else verbatim.
+
+    Used on reviewer prose that gets re-injected into a *writing* prompt. The
+    resolution reviewer answers RESOLVED/PARTIAL/UNRESOLVED, but nothing stops it
+    from listing a `- [P3]` bullet alongside — and dev_loop stored that output
+    verbatim and pasted it under "fix every finding listed above", which requested
+    the P3 outright. Filtering the bullets is what makes "no P3 is ever requested"
+    actually true, rather than weakening the promise a second time.
+
+    Recognises both accepted finding shapes (``FINDING_RE`` and ``ALT_FINDING_RE``),
+    so a provider writing ``1. `P3` nit`` is caught as well as ``- [P3] nit``.
+    """
+    kept: list[str] = []
+    for line in text.splitlines():
+        if FINDING_RE.match(line) and "[P3]" in line.upper():
+            continue
+        alt = ALT_FINDING_RE.match(line)
+        if alt and alt.group(1).upper() == "P3":
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def _is_no_findings_output(text: str) -> bool:
-    """Accept the exact sentinel and trivial markdown-wrapped variants."""
+    """Accept the exact sentinel and trivial markdown-wrapped variants.
+
+    Raw sentinel detection only — it says nothing about whether the same output
+    also listed findings. Use ``_is_clean_output()`` for the success gate.
+    """
     return any(NO_FINDINGS_RE.match(line.strip()) for line in text.splitlines())
+
+
+def _is_clean_output(text: str, findings: list[str]) -> bool:
+    """True only when the sentinel is present AND nothing was parsed as a finding.
+
+    A reviewer that prints both ``- [P2] ...`` and ``No P1/P2/P3 findings.`` is
+    contradicting itself, and the sentinel alone used to win: the success gate is
+    ``no_findings or not blocking_findings``, so a real P2 slipped through unfixed
+    while the loop reported clean. The findings win instead — the loop keeps
+    running and the mandatory P1/P2 gets fixed.
+    """
+    return not findings and _is_no_findings_output(text)
 
 
 _REVIEW_PROMPT_BODY = """
@@ -87,7 +127,8 @@ _FIX_PROMPT_STABLE = """
 You are fixing issues found by a code review.
 
 Task:
-- Fix ALL P1, P2, and P3 issues listed below.
+- Fix ALL issues listed below. Only blocking findings (P1, P2) are listed —
+  P3 is collected separately and reported to the user as an offer, not fixed here.
 - Apply changes directly to the files.
 - Run validation/tests if feasible.
 - Summarize what was fixed.
@@ -312,7 +353,7 @@ class ReviewLoopTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return f"Review/Fix-Loop auf uncommitted Changes (max {TOOL_MAX_ITERATIONS}, P1-P3 alle fixen)"
+        return f"Review/Fix-Loop auf uncommitted Changes (max {TOOL_MAX_ITERATIONS}, P1+P2 fixen, P3 als Angebot)"
 
     def _should_verify(self) -> bool:
         """Check policy.yaml whether verification phase is enabled."""
@@ -369,6 +410,9 @@ class ReviewLoopTool(BaseTool):
         seen_signatures: set[tuple[str, ...]] = set()
         last_findings_tuple: tuple[str, ...] = ()
         all_outputs: list[str] = []
+        # Ordered set of every P3 seen in any iteration — emitted once as an offer when
+        # the loop succeeds. Must outlive a single round; see the accumulation below.
+        deferred_p3: dict[str, None] = {}
         drift_check_mode = self._drift_check_mode()
         drift_warning = ""  # injected into next iteration's fix prompt when drift detected
         previous_findings_count = 0  # for "findings grew" drift trigger
@@ -470,7 +514,7 @@ class ReviewLoopTool(BaseTool):
             all_outputs.append(f"--- Review {iteration} ---\n{review_result.output}")
             review_output = review_result.output.strip()
             findings = _parse_findings(review_output)
-            no_findings = _is_no_findings_output(review_output)
+            no_findings = _is_clean_output(review_output, findings)
 
             if not findings and not no_findings:
                 msg = (
@@ -548,8 +592,8 @@ class ReviewLoopTool(BaseTool):
                             )
                         else:
                             extra = _parse_findings(so_result.output.strip())
-                            so_no_findings = _is_no_findings_output(
-                                so_result.output.strip()
+                            so_no_findings = _is_clean_output(
+                                so_result.output.strip(), extra
                             )
                             all_outputs.append(
                                 f"--- Second Opinion ({so_provider.name}) ---\n"
@@ -577,8 +621,21 @@ class ReviewLoopTool(BaseTool):
                                     f"ohne parsbare Findings — ignoriert"
                                 )
 
-            # No findings → run verification phase, then success
-            if no_findings:
+            # P3 is non-blocking: it does NOT keep the loop running. Fixing cosmetics
+            # on working code widens the diff without functional gain, and since each
+            # iteration re-reviews the fresh diff, every P3 fix can surface new P3 —
+            # the loop would feed itself and burn iterations on style. Mirrors
+            # dev_loop.py's `blocking_findings` split; see skills/review-loop/SKILL.md.
+            blocking_findings = [f for f in findings if not f.startswith("- [P3]")]
+            # Accumulate across iterations, deduplicated, insertion order kept. A per-round
+            # list loses them: round 1 reports P2+P3, round 2 comes back clean after the P2
+            # fix, and the round-1 P3 is gone from the final offer — the opposite of the
+            # "collected once at the end" promise. dict.fromkeys is the dedupe.
+            for p3 in (f for f in findings if f.startswith("- [P3]")):
+                deferred_p3.setdefault(p3, None)
+
+            # No blocking findings → run verification phase, then success
+            if no_findings or not blocking_findings:
                 # Verification phase (configurable via policy.yaml)
                 if self._should_verify():
                     print(f"  [review-loop] === VERIFICATION PHASE ===")
@@ -613,7 +670,18 @@ class ReviewLoopTool(BaseTool):
                             # Not a hard failure — log but still succeed
                             # (concerns are informational, findings were already clean)
 
-                msg = f"Keine P1/P2/P3 Findings nach {iteration} Iteration(en)."
+                if deferred_p3:
+                    msg = (
+                        f"Keine P1/P2 Findings nach {iteration} Iteration(en); "
+                        f"{len(deferred_p3)} P3 offen (nicht gefixt)."
+                    )
+                    # Surface the deferred P3 as an offer — the user decides.
+                    all_outputs.append(
+                        "--- P3 offen (nicht-blockierend, Angebot) ---\n"
+                        + "\n".join(deferred_p3)
+                    )
+                else:
+                    msg = f"Keine P1/P2/P3 Findings nach {iteration} Iteration(en)."
                 print(f"  [review-loop] ✅ {msg}")
 
                 # Auto-lesson: generate LLM summary if it took more than 1 iteration
@@ -633,7 +701,10 @@ class ReviewLoopTool(BaseTool):
                 )
 
             # Check for repeated findings (infinite loop detection)
-            signature = tuple(sorted(findings))
+            # Repeat-guard on the BLOCKING set only: P3 no longer drives the loop, so a
+            # round where merely the P3 list shifted must not read as "new findings" and
+            # defeat the no-progress detection below.
+            signature = tuple(sorted(blocking_findings))
             if signature in seen_signatures:
                 msg = f"Findings wiederholen sich nach {iteration} Iterationen. Loop beendet."
                 print(f"  [review-loop] ⚠️ {msg}")
@@ -651,11 +722,14 @@ class ReviewLoopTool(BaseTool):
             # Drift check: gate the next fix prompt with a refocus hint when the
             # reviewer has wandered off the original task. Non-fatal — failures
             # and ambiguous outputs are ignored.
+            # Counts here are BLOCKING counts — the drift heuristic ("findings keep
+            # growing") must compare like with like against previous_findings_count
+            # below, and P3 growth no longer drives the loop.
             if _should_drift_check(
                 drift_check_mode,
                 iteration,
                 TOOL_MAX_ITERATIONS,
-                len(findings),
+                len(blocking_findings),
                 previous_findings_count,
             ):
                 print(f"  [review-loop] === DRIFT CHECK (Iteration {iteration}) ===")
@@ -663,7 +737,7 @@ class ReviewLoopTool(BaseTool):
                     task=task,
                     iteration=iteration,
                     max_iter=TOOL_MAX_ITERATIONS,
-                    findings="\n".join(findings),
+                    findings="\n".join(blocking_findings),
                 )
                 drift_result = provider.run(
                     drift_prompt,
@@ -707,10 +781,11 @@ class ReviewLoopTool(BaseTool):
             print(f"  [review-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: FIX ===")
             notify_tool_progress(
                 self.name, iteration, TOOL_MAX_ITERATIONS,
-                f"{len(findings)} Findings werden gefixt..."
+                f"{len(blocking_findings)} blockierende Findings werden gefixt..."
             )
 
-            findings_text = "\n".join(findings)
+            # Only blocking findings reach the fix prompt — P3 is reported, not fixed.
+            findings_text = "\n".join(blocking_findings)
 
             # Search lessons for hints related to current findings
             lessons_hint = ""
@@ -768,7 +843,7 @@ class ReviewLoopTool(BaseTool):
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
             print(f"  [review-loop] Fix durchgeführt. Starte Re-Review...")
-            previous_findings_count = len(findings)
+            previous_findings_count = len(blocking_findings)
 
             # Phase B: rollover session every cap iterations to bound conversation
             # length. Review prompt always reads `git diff` fresh, so a fresh

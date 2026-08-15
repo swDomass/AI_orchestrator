@@ -35,7 +35,7 @@ from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider
 from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
-from tools.review_loop import _is_no_findings_output, _parse_findings
+from tools.review_loop import _is_clean_output, _parse_findings, strip_p3_lines
 
 DEV_LOOP_DIR = ".dev-loop"
 _STATE_FILE = "state.json"
@@ -179,7 +179,8 @@ RESEARCH AND PLAN:
 {review_context}
 Instructions:
 - Implement the solution exactly as laid out in the Implementation Plan section above.
-- Fix ALL issues raised in previous reviews (listed above, if any).
+- Fix every finding listed above (if any). Only blocking P1/P2 findings are listed —
+  P3 is deliberately withheld, so there is nothing optional in that list.
 - Apply changes directly to the files.
 - Run existing tests if feasible.
 - Do NOT commit, push, or deploy.
@@ -281,6 +282,10 @@ class DevLoopTool(BaseTool):
         dev_loop_dir = Path(cwd or ".") / DEV_LOOP_DIR
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         all_outputs: list[str] = []
+        # Ordered set of every P3 seen in any iteration, emitted once as an offer on
+        # success — same contract as review_loop. Outlives a single round on purpose:
+        # a P3 from round 1 must not vanish because round 2 came back clean.
+        deferred_p3: dict[str, None] = {}
         seen_quality_signatures: set[tuple[str, ...]] = set()
         last_quality_tuple: tuple[str, ...] = ()
         seen_review_signatures: set[tuple[tuple[str, ...], str, str]] = set()
@@ -562,7 +567,7 @@ class DevLoopTool(BaseTool):
             quality_output = quality_result.output.strip()
             all_outputs.append(f"--- Quality Review {iteration} ---\n{quality_output}")
             quality_findings = _parse_findings(quality_output)
-            no_quality_findings = _is_no_findings_output(quality_output)
+            no_quality_findings = _is_clean_output(quality_output, quality_findings)
             if not quality_findings and not no_quality_findings:
                 msg = (
                     "Quality-Review-Output entspricht nicht dem erwarteten Format "
@@ -579,6 +584,8 @@ class DevLoopTool(BaseTool):
                 )
             # P3-only findings are non-blocking; only P1/P2 block progress
             blocking_findings = [f for f in quality_findings if not f.startswith("- [P3]")]
+            for p3 in (f for f in quality_findings if f.startswith("- [P3]")):
+                deferred_p3.setdefault(p3, None)
             quality_ok = no_quality_findings or not blocking_findings
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
@@ -660,6 +667,14 @@ class DevLoopTool(BaseTool):
                     f"Beide Reviews bestanden nach {iteration} Iteration(en). "
                     "Bereit fuer deinen Review + Push."
                 )
+                if deferred_p3:
+                    msg += f" {len(deferred_p3)} P3 offen (nicht gefixt)."
+                    # The P3 never reached the executor — surface it as an offer so it is
+                    # visible rather than silently dropped. The user decides.
+                    all_outputs.append(
+                        "--- P3 offen (nicht-blockierend, Angebot) ---\n"
+                        + "\n".join(deferred_p3)
+                    )
                 print(f"  [dev-loop] {msg}")
                 _write_tool_file(
                     dev_loop_dir,
@@ -728,9 +743,22 @@ class DevLoopTool(BaseTool):
                 )
             seen_review_signatures.add(review_sig)
 
-            # Store context for next execution
+            # Store context for next execution. The resolution output is re-injected
+            # verbatim under "fix every finding listed above", so a P3 bullet the
+            # resolution reviewer happened to list would be *requested* — which would make
+            # the whole "no P3 reaches the executor" contract false through a second door,
+            # independent of session history. Strip them; the RESOLVED/PARTIAL verdict and
+            # every non-P3 line survive untouched.
             previous_quality_findings = blocking_findings
-            previous_resolution_output = resolution_output if not resolution_ok else ""
+            previous_resolution_output = (
+                strip_p3_lines(resolution_output) if not resolution_ok else ""
+            )
+            # Filtered out of the prompt, but not dropped: a P3 the resolution reviewer
+            # raised joins the closing offer like any other. Otherwise the filter above
+            # would just move the silent loss from one place to another.
+            for p3 in (f for f in _parse_findings(resolution_output)
+                       if f.startswith("- [P3]")):
+                deferred_p3.setdefault(p3, None)
 
             # Phase B: rollover session every cap iterations to bound conversation
             # length. The next iteration's exec prompt will inject prev findings

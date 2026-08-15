@@ -318,8 +318,8 @@ Both schedule tags reuse the existing retry primitive — no separate scheduler.
 
 | Tool | Description |
 |---|---|
-| `dev-loop` | Research → Execute → Dual-Review loop (Code Quality + Issue Resolution). Both reviews must pass. Output in `{cwd}/.dev-loop/`. |
-| `review-loop` | Iterative Review → Fix → Re-Review loop. Fixes ALL P1/P2/P3 findings. Max 20 iterations with infinite-loop detection. Optional drift-check (`policy.yaml` `tool_phases.review-loop.drift_check_mode`, default `auto`) injiziert eine Refocus-Warning in den nächsten Fix-Prompt, wenn der Reviewer in unrelated Refactoring abgedriftet ist. |
+| `dev-loop` | Research → Execute → Dual-Review loop (Code Quality + Issue Resolution). Both reviews must pass. Same **P1 + P2** semantics as `review-loop`: only blocking findings reach the executor, P3 is collected across all iterations and appended once as a closing offer. Output in `{cwd}/.dev-loop/`. |
+| `review-loop` | Iterative Review → Fix → Re-Review loop. Fixes all **P1 + P2**; **P3 is non-blocking** and is reported once at the end as an offer instead of being fixed (cosmetics on working code widen the diff, and since each round re-reads the fresh diff, a P3 fix can surface new P3). A reviewer output that lists findings *and* the "no findings" sentinel counts as having findings — the sentinel alone used to pass the success gate with an unfixed blocker. Max 20 iterations with infinite-loop detection. Optional drift-check (`policy.yaml` `tool_phases.review-loop.drift_check_mode`, default `auto`) injiziert eine Refocus-Warning in den nächsten Fix-Prompt, wenn der Reviewer in unrelated Refactoring abgedriftet ist. |
 | `test-loop` | Iterative test / fix loop until tests pass or max iterations. |
 | `research-qa` | Read-only pre-implementation research: Discovery → Analysis → Question catalogue. Output in `{cwd}/.research-qa/`. No code changes. |
 | `knowledge-transfer` | Cross-domain knowledge transfer: Vault expertise → industry applications (via web search) → Obsidian idea note. |

@@ -61,18 +61,53 @@ def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(mo
     assert "UNCOMMITTED changes" in provider.prompts[0]
 
 
-def test_review_loop_fixes_p3_findings_too(monkeypatch, tmp_path):
+def test_review_loop_does_not_fix_p3_and_reports_it_as_offer(monkeypatch, tmp_path):
+    """P3 is non-blocking (changed 2026-07-30): a P3-only round ends the loop instead of
+    triggering a fix. Cosmetics on working code widen the diff for no functional gain,
+    and since each round re-reads the fresh diff, a P3 fix can surface new P3 — the loop
+    would feed itself. The deferred P3 is surfaced as an offer instead.
+
+    Replaces the former test_review_loop_fixes_p3_findings_too, which asserted the old
+    fix-everything contract.
+    """
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
 
     provider = _ScriptedProvider(
         outputs=[
-            "- [P3] docs typo 1",      # review iter 1
-            "Fixed typo 1",             # fix iter 1
-            "No P1/P2/P3 findings.",    # review iter 2
-            "VERIFIED",                 # verification phase
-            "Pattern: typo\nTool-Hint: fix it", # summarizer
+            "- [P3] docs typo 1",   # review iter 1 — P3 only
+            "VERIFIED",             # verification phase runs straight away
+        ]
+    )
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 1, "a P3-only round must not start a second iteration"
+    # Review + verification only — no fix prompt.
+    assert len(provider.prompts) == 2
+    assert "--- Fix 1 ---" not in result.output
+    # ...but the finding is not swallowed: it is reported for the user to decide.
+    assert "P3 offen" in result.output
+    assert "docs typo 1" in result.output
+
+
+def test_review_loop_fixes_blocking_findings_and_defers_p3(monkeypatch, tmp_path):
+    """Mixed round: P1/P2 are fixed, the P3 rides along to the final report untouched
+    and never reaches the fix prompt."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+
+    provider = _ScriptedProvider(
+        outputs=[
+            "- [P2] real problem\n- [P3] naming nit",  # review iter 1
+            "Fixed the P2",                            # fix iter 1
+            "- [P3] naming nit",                       # review iter 2 — P3 only → done
+            "VERIFIED",                                # verification phase
+            "Pattern: x\nTool-Hint: y",                # summarizer (iterations > 1)
         ]
     )
     tool = ReviewLoopTool()
@@ -81,26 +116,32 @@ def test_review_loop_fixes_p3_findings_too(monkeypatch, tmp_path):
 
     assert result.success is True
     assert result.iterations == 2
-    assert len(provider.prompts) == 5
-    assert "docs typo 1" in provider.prompts[1]
-    assert "--- Fix 1 ---" in result.output
+    # The fix prompt (prompts[1]) must carry the P2 and NOT the P3.
+    assert "real problem" in provider.prompts[1]
+    assert "naming nit" not in provider.prompts[1], "P3 must not reach the fix prompt"
+    assert "P3 offen" in result.output
 
-def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch, tmp_path):
+
+def test_deferred_p3_survives_a_later_clean_round(monkeypatch, tmp_path):
+    """The P3 from round 1 must still appear in the closing offer when round 2 comes back
+    completely clean.
+
+    Regression: `deferred_p3` was rebuilt from the *current* round's findings, so the
+    round-1 P3 vanished the moment the reviewer stopped repeating it — which is the normal
+    case, since the P2 fix changes the diff. The earlier test masked it by scripting the
+    same P3 in both rounds.
+    """
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
 
     provider = _ScriptedProvider(
         outputs=[
-            "- [P3] Minor issue 1",      # review iter 1
-            "Fixing 1",                   # fix iter 1
-            "- [P3] Minor issue 2",       # review iter 2
-            "Fixing 2",                   # fix iter 2
-            "- [P3] Minor issue 3",       # review iter 3
-            "Fixing 3",                   # fix iter 3
-            "No P1/P2/P3 findings.",      # review iter 4
-            "VERIFIED",                   # verification phase
-            "Pattern: issues\nTool-Hint: fix issues", # summarizer
+            "- [P2] real problem\n- [P3] round one nit",  # review iter 1
+            "Fixed the P2",                               # fix iter 1
+            "No P1/P2/P3 findings.",                      # review iter 2 — fully clean
+            "VERIFIED",                                   # verification phase
+            "Pattern: x\nTool-Hint: y",                   # summarizer
         ]
     )
     tool = ReviewLoopTool()
@@ -108,8 +149,74 @@ def test_review_loop_keeps_fixing_distinct_p3_findings_until_clean(monkeypatch, 
     result = tool.run("Review now", provider, cwd=str(tmp_path))
 
     assert result.success is True
-    assert result.iterations == 4
-    assert len(provider.prompts) == 9
+    assert result.iterations == 2
+    assert "P3 offen" in result.output
+    assert "round one nit" in result.output, (
+        "a P3 reported in an earlier round must not be lost when a later round is clean"
+    )
+
+
+def test_deferred_p3_is_deduplicated_across_rounds(monkeypatch, tmp_path):
+    """The same P3 repeated in every round is offered once, not once per iteration."""
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+
+    provider = _ScriptedProvider(
+        outputs=[
+            "- [P2] real problem\n- [P3] naming nit",  # review iter 1
+            "Fixed the P2",                            # fix iter 1
+            "- [P3] naming nit",                       # review iter 2 — same P3
+            "VERIFIED",
+            "Pattern: x\nTool-Hint: y",
+        ]
+    )
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    offer = result.output.split("--- P3 offen")[1]
+    assert offer.count("naming nit") == 1
+
+
+def test_contradictory_review_output_does_not_pass_the_success_gate(monkeypatch, tmp_path):
+    """A reviewer that prints a blocking finding AND the clean sentinel is contradicting
+    itself. The sentinel must not win.
+
+    Regression: the gate is `no_findings or not blocking_findings`, and
+    `_is_no_findings_output()` matched any line, so this output satisfied the left side
+    while a real P2 sat unfixed — the loop reported success on a blocking finding.
+    """
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+
+    provider = _ScriptedProvider(
+        outputs=[
+            "- [P2] real bug\nNo P1/P2/P3 findings.",  # review iter 1 — contradictory
+            "Fixed the P2",                            # fix iter 1 must happen
+            "No P1/P2/P3 findings.",                   # review iter 2 — genuinely clean
+            "VERIFIED",
+            "Pattern: x\nTool-Hint: y",
+        ]
+    )
+    tool = ReviewLoopTool()
+
+    result = tool.run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 2, "the contradictory round must not count as clean"
+    assert "real bug" in provider.prompts[1], "the blocking finding must reach the fix prompt"
+
+
+def test_is_clean_output_requires_both_sentinel_and_no_findings():
+    from tools.review_loop import _is_clean_output
+
+    assert _is_clean_output("No P1/P2/P3 findings.", []) is True
+    assert _is_clean_output("- [P2] bug\nNo P1/P2/P3 findings.", ["- [P2] bug"]) is False
+    assert _is_clean_output("- [P3] nit\nNo P1/P2/P3 findings.", ["- [P3] nit"]) is False
+    assert _is_clean_output("some prose", []) is False
 
 # ─── Second-Opinion Phase ──────────────────────────────────────────────
 
@@ -181,7 +288,7 @@ def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch, tmp_path):
         "Pattern: x\nTool-Hint: y", # summarizer
     ])
     so_provider = _ScriptedProvider(
-        outputs=["- [P3] Missed edge case"], name="openrouter",
+        outputs=["- [P2] Missed edge case"], name="openrouter",
     )
     tool = ReviewLoopTool()
 
@@ -201,6 +308,46 @@ def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch, tmp_path):
     assert "Primary bug" in so_provider.prompts[0]  # primary findings injected
     # Forced model was applied and restored
     assert so_provider._forced_model is None
+
+
+def test_second_opinion_p3_only_does_not_reopen_the_loop(monkeypatch, tmp_path):
+    """Interaction of the two features: a second opinion that finds ONLY P3 sets
+    `no_findings = False`, but must not restart the fix loop — the success gate is
+    "no blocking findings", not "no findings at all". Otherwise a P3-only second
+    opinion would spin iterations on cosmetics that never get fixed.
+    """
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(
+        "tools.review_loop._load_git_diff", lambda _cwd, _max: "fake diff"
+    )
+
+    primary = _ScriptedProvider(outputs=[
+        "No P1/P2/P3 findings.",  # review iter 1 — primary sees nothing
+        "VERIFIED",               # verification
+    ])
+    so_provider = _ScriptedProvider(
+        outputs=["- [P3] cosmetic nit"], name="openrouter",
+    )
+    tool = ReviewLoopTool()
+
+    result = tool.run(
+        "Review now", primary, cwd=str(tmp_path),
+        second_opinion=(so_provider, "or_glm"),
+    )
+
+    assert result.success is True
+    assert result.iterations == 1, "a P3-only second opinion must not start iteration 2"
+    # Review + verification only — no fix prompt.
+    assert len(primary.prompts) == 2
+    assert "--- Fix 1 ---" not in result.output
+    # The P3 is not swallowed either: it surfaces as an offer.
+    assert "P3 offen" in result.output
+    assert "cosmetic nit" in result.output
 
 
 def test_second_opinion_skipped_when_provider_unavailable(monkeypatch, tmp_path):
@@ -266,9 +413,9 @@ def test_second_opinion_runs_only_iteration_1(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop._load_git_diff", lambda _cwd, _max: "diff")
 
     primary = _ScriptedProvider(outputs=[
-        "- [P3] Bug 1",              # review iter 1
+        "- [P2] Bug 1",              # review iter 1
         "Fixed 1",                    # fix iter 1
-        "- [P3] Bug 2",               # review iter 2 (still findings)
+        "- [P2] Bug 2",               # review iter 2 (still findings)
         "Fixed 2",                    # fix iter 2
         "No P1/P2/P3 findings.",      # review iter 3
         "VERIFIED",                   # verification
@@ -349,7 +496,7 @@ def test_drift_check_invoked_when_mode_always(monkeypatch, tmp_path):
     monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
 
     provider = _ScriptedProvider(outputs=[
-        "- [P3] Minor issue",            # review iter 1
+        "- [P2] Minor issue",            # review iter 1
         "ON_TOPIC: looks fine",          # drift check iter 1
         "Fixed it",                      # fix iter 1
         "No P1/P2/P3 findings.",         # review iter 2
@@ -375,7 +522,7 @@ def test_drift_check_skipped_when_mode_skip(monkeypatch, tmp_path):
     monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "skip")
 
     provider = _ScriptedProvider(outputs=[
-        "- [P3] Minor issue",            # review iter 1
+        "- [P2] Minor issue",            # review iter 1
         "Fixed it",                      # fix iter 1
         "No P1/P2/P3 findings.",         # review iter 2
         "VERIFIED",                      # verification
@@ -400,7 +547,7 @@ def test_drifted_response_injects_warning_into_next_fix_prompt(monkeypatch, tmp_
     monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
 
     provider = _ScriptedProvider(outputs=[
-        "- [P3] Style nit in unrelated.py",   # review iter 1
+        "- [P2] Style nit in unrelated.py",   # review iter 1
         "DRIFTED: refactoring unrelated.py",  # drift check iter 1
         "Skipped off-topic finding",          # fix iter 1
         "No P1/P2/P3 findings.",              # review iter 2
@@ -429,7 +576,7 @@ def test_on_topic_response_does_not_inject_warning(monkeypatch, tmp_path):
     monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
 
     provider = _ScriptedProvider(outputs=[
-        "- [P3] Minor in target file",   # review iter 1
+        "- [P2] Minor in target file",   # review iter 1
         "ON_TOPIC: matches task",         # drift check iter 1
         "Fixed it",                       # fix iter 1
         "No P1/P2/P3 findings.",          # review iter 2
@@ -474,7 +621,7 @@ def test_drift_check_failure_does_not_abort_loop(monkeypatch, tmp_path):
             self._call_idx += 1
             # call #1 = review, #2 = drift (fail), #3 = fix, #4 = review clean, #5 = verify, #6 = summary
             if self._call_idx == 1:
-                return RunResult(success=True, output="- [P3] Bug")
+                return RunResult(success=True, output="- [P2] Bug")
             if self._call_idx == 2:
                 return RunResult(success=False, output="", error="rate_limit")
             if self._call_idx == 3:
@@ -508,7 +655,7 @@ def test_drift_check_unknown_output_treated_as_no_warning(monkeypatch, tmp_path)
     monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "always")
 
     provider = _ScriptedProvider(outputs=[
-        "- [P3] Issue",                       # review iter 1
+        "- [P2] Issue",                       # review iter 1
         "Some prose without sentinel marker", # drift check iter 1 (UNKNOWN)
         "Fixed",                              # fix iter 1
         "No P1/P2/P3 findings.",              # review iter 2

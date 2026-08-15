@@ -239,6 +239,15 @@ class ClaudeProvider(BaseProvider):
         result). The final result event carries .result (text) and .usage. A
         single-object json payload on one line is parsed as one line too, so the
         legacy json-mode tests still pass through unchanged.
+
+        ⚠️ "LAST result wins" is only safe because subagent events never enter
+        this stream. Forwarding is opt-in via `--forward-subagent-text` (verified
+        against `claude --help`, 2026-07-30) and `_build_command` does NOT pass
+        it. Do NOT add that flag for a better liveness signal without first
+        filtering by session/agent here: a forwarded SUBAGENT result event would
+        be the last `type=="result"` line and silently become the task's answer —
+        a well-formed, subtype=="success" run carrying the wrong output, i.e. the
+        same failure class as the 2026-07-20/24/25 prompt-tail incidents.
         """
         if not stdout:
             return None

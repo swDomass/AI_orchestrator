@@ -160,6 +160,103 @@ MAX_CONTEXT_FILE_SIZE = 1_000_000  # 1 MB
 
 # --- Safety Guardrails ---
 
+# A path prefix that may sit in front of a binary name (`/usr/bin/git`,
+# `./git`, `C:\tools\git`, `/bin/bash`). Must run right up to the binary
+# name with no separator/quote/space in between, so it can't span past a
+# real shell token boundary and swallow an unrelated preceding word.
+_PATH_PREFIX = r"(?:[^\s;&|()\"'`]*[\\/])?"
+
+# Shell interpreters whose "-c" / "-Command" argument is executed as a real
+# shell command line — unlike e.g. `python -c "..."`, where the string is
+# inert Python source that never runs as shell. bash/sh/zsh/dash accept
+# exactly "-c"; PowerShell (pwsh, powershell, powershell.exe) accepts "-c"
+# too, plus "-Command" or any of its unambiguous prefixes ("-Com".."-Command"
+# — bare "-Co" is deliberately NOT accepted: on real PowerShell it is
+# ambiguous with "-ConfigurationName", so it isn't a valid abbreviation there
+# either). IGNORECASE (applied when these patterns are compiled) makes the
+# flag matching case-insensitive.
+_SHELL_INTERP = r"(?:bash|sh|zsh|dash|pwsh|powershell(?:\.exe)?)"
+_SHELL_C_FLAG = r"-(?:c|com(?:m(?:a(?:n(?:d)?)?)?)?)\b"
+
+# Shell builtins that take a COMMAND as their argument rather than data:
+# `eval "git commit -m x"` runs the string as a command line, `exec git push`
+# replaces the shell with that command. Same class as the `bash -c` hole —
+# whatever follows them is a real invocation — but the form differs: they are
+# builtins, so there is no interpreter path and no `-c` flag, just the word,
+# whitespace, and (optionally) an opening quote. The mandatory `\s+` after the
+# word is what keeps "evaluate", "execute" and "retrieval" out.
+_SHELL_CMD_BUILTIN = r"(?:eval|exec)"
+
+# Command-start boundary: the true start of the command string, right after
+# a shell separator (;, &&, ||, |, newline), an opening subshell /
+# command-substitution marker ("(" — covers both a bare subshell and the
+# "(" in "$(...)" — or a backtick), optionally followed by a shell
+# interpreter's -c/-Command argument (`bash -c "`, `pwsh -Command '`) and/or a
+# command-taking builtin (`eval "`, `exec `) — because unlike `python -c "..."`,
+# those arguments ARE executed as a real command line, so whatever starts them
+# is a real invocation too. Both prefixes are optional and composable, so
+# `bash -c "eval 'git commit'"` is covered by the same expression; the builtin
+# repeats at most twice (`eval eval "..."`) rather than unboundedly, which keeps
+# the worst case linear instead of inviting catastrophic backtracking.
+# The interpreter/builtin itself must in turn sit at one of the earlier boundary
+# forms (^ or a separator); a shell name buried inside an unrelated word or
+# string does not open this boundary (the `\s+` required right after the name
+# rules that out — "shellcheck -c" does not match "sh" here, because "sh" is not
+# followed by whitespace, and `find . -exec` does not match either, because "-"
+# is not a boundary character). Python's `re` only supports fixed-width
+# lookbehind, so the boundary is matched as an ordinary prefix rather than a
+# lookbehind. Every git pattern below is anchored to it, so `git commit`/
+# `git push` text sitting inside a quoted string, a `-c` payload of ANOTHER
+# (non-shell) program (`python -c "...git commit..."`), or a shell comment
+# (`# ... git push ...`) no longer counts as a real invocation — only text
+# that actually starts a command does.
+# Known accepted residuals (documented, not fixed — see the caller's report
+# for why): `\n`/`\r` are real command separators, so a heredoc body line
+# that happens to start with "git commit" still matches; extra flags
+# between the interpreter and -c (`bash --norc -c ...`) are not recognized;
+# a command passed to a non-shell wrapper (`find . -exec git commit`,
+# `docker exec c git commit`, `xargs git commit`) is not recognized either —
+# every one of those needs real shell/argv parsing, deliberately not built
+# here. Fail-safe means the ambiguous case stays blocked or, in the wrapper
+# cases, simply isn't specifically covered (out of the required scope).
+_CMD_START = (
+    r"(?:^|[\r\n;&|]|\(|`)\s*"
+    rf"(?:{_PATH_PREFIX}{_SHELL_INTERP}\s+{_SHELL_C_FLAG}\s*[\"']?\s*)?"
+    rf"(?:{_SHELL_CMD_BUILTIN}\s+[\"']?\s*){{0,2}}"
+)
+
+# The git binary itself, optionally reached through a path. See _PATH_PREFIX.
+# (A "repeated slash-terminated segment" variant was measured and rejected:
+# it cost MORE on adversarial deeply-nested-path input because Python's `re`
+# pays more per backtrack step for a repeated group than for a single
+# character-class backtrack — see check_command's has_git prefilter for the
+# optimization that actually matters, and the perf note in the caller's
+# report for measured numbers.)
+_GIT_BIN = rf"{_PATH_PREFIX}git"
+
+# Git global options that may sit between `git` and its subcommand
+# (`git -C <path> commit`, `git -c user.email=x commit`, `git --no-pager push`).
+# Used to build subcommand patterns that match the real command forms without
+# firing on read-only commands that merely contain the word (`git log
+# --grep=commit`, `git show`, `git rev-parse`).
+_GIT_GLOBAL_OPT = (
+    r"(?:-[cC]\s+(?:\"[^\"]*\"|'[^']*'|\S+)"
+    r"|--(?:git-dir|work-tree|namespace|exec-path)(?:=\S+|\s+\S+)"
+    r"|--(?:no-pager|paginate|bare|literal-pathspecs|no-replace-objects|no-optional-locks))"
+)
+
+
+def _git_pattern(rest: str) -> str:
+    """Regex matching `git [global-opts] <rest>` anchored to a real command start.
+
+    `rest` covers the subcommand and anything that must follow it, e.g.
+    `commit(?![\\w-])`, `push\\s+.*--force`, `reset\\s+--hard`. Anchoring
+    through _CMD_START/_GIT_BIN (see their docstrings) is what keeps this
+    out of quoted strings, another program's `-c` argument, and comments.
+    """
+    return rf"{_CMD_START}{_GIT_BIN}(?:\s+{_GIT_GLOBAL_OPT})*\s+{rest}"
+
+
 # Hard-deny patterns — used by Claude Code PreToolUse hook (scripts/safety_hook.py)
 # AND injected into prompts for all providers (Gemini, Codex have no hook system).
 # Each entry: (regex_pattern, human-readable description)
@@ -174,11 +271,16 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     (r"Remove-Item\s.*-Recurse.*-Force", "PowerShell recursive force delete"),
     (r"rd\s+/[sq]", "Windows rd /s /q recursive delete"),
     # Git destructive operations
-    (r"git\s+push\s+.*--force", "git push --force"),
-    (r"git\s+push\s+.*-f\b", "git push -f (force)"),
-    (r"git\s+reset\s+--hard", "git reset --hard"),
-    (r"git\s+clean\s+-[a-zA-Z]*f", "git clean -f (untracked file deletion)"),
-    (r"git\s+checkout\s+--\s+\.", "git checkout -- . (discard all changes)"),
+    (_git_pattern(r"push\s+.*--force"), "git push --force"),
+    (_git_pattern(r"push\s+.*-f\b"), "git push -f (force)"),
+    (_git_pattern(r"reset\s+--hard"), "git reset --hard"),
+    (_git_pattern(r"clean\s+-[a-zA-Z]*f"), "git clean -f (untracked file deletion)"),
+    (_git_pattern(r"checkout\s+--\s+\."), "git checkout -- . (discard all changes)"),
+    # Git state changes — unattended runs stay in the working tree (2026-08-15).
+    # The orchestrator produces changes; committing and pushing stays with the user.
+    # Placed after the force-push patterns so those keep reporting the specific reason.
+    (_git_pattern(r"commit(?![\w-])"), "git commit (unattended runs must not change git state)"),
+    (_git_pattern(r"push(?![\w-])"), "git push (unattended runs must not change remote state)"),
     # Database destruction
     (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE/SCHEMA"),
     (r"TRUNCATE\s+TABLE", "TRUNCATE TABLE"),

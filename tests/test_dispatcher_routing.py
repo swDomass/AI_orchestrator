@@ -35,18 +35,19 @@ def test_default_priority_selects_claude():
     assert provider.name == "claude"
 
 
-def test_fallback_to_gemini_when_claude_unavailable():
+def test_fallback_to_codex_when_claude_unavailable():
+    """Gemini left the chain 2026-08-15 — codex is the only fallback left."""
     limits = _make_limits(claude_avail=False)
     provider = select_provider("Fix a bug", limits)
     assert provider is not None
-    assert provider.name == "gemini"
-
-
-def test_fallback_to_codex_when_claude_and_gemini_unavailable():
-    limits = _make_limits(claude_avail=False, gemini_avail=False)
-    provider = select_provider("Fix a bug", limits)
-    assert provider is not None
     assert provider.name == "codex"
+
+
+def test_gemini_never_in_default_chain():
+    """Even with gemini healthy and claude exhausted, nothing routes there."""
+    limits = _make_limits(claude_avail=False, gemini_avail=True, codex_avail=False)
+    provider = select_provider("Fix a bug", limits)
+    assert provider is None
 
 
 def test_returns_none_when_all_unavailable():
@@ -80,7 +81,7 @@ def test_exclude_provider():
     limits = _make_limits()
     provider = select_provider("Fix bug", limits, exclude={"claude"})
     assert provider is not None
-    assert provider.name == "gemini"
+    assert provider.name == "codex"
 
 
 def test_profile_provider_order():

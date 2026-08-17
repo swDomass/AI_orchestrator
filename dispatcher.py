@@ -3,8 +3,7 @@ Selects the best available provider for a given task.
 
 Routing priority:
   1. Claude  - best quality, default choice
-  2. Gemini  - fallback, great for long context (CLI picks tier internally)
-  3. Codex   - fallback, good for code tasks
+  2. Codex   - fallback, good for code tasks
 
 A provider is skipped if:
   - cclimits shows < 5% remaining capacity
@@ -12,6 +11,10 @@ A provider is skipped if:
 
 OpenRouter (pay-per-token) and Vibe (Mistral, pay-per-token) are registered but
 never part of that chain — they run only when a task tags them explicitly.
+
+Gemini was removed from the chain on 2026-08-15 (IneligibleTierError + data
+protection). The provider stays registered so tagged/legacy paths still resolve,
+but nothing routes there by default.
 """
 
 import re
@@ -81,7 +84,10 @@ if VibeProvider.is_available():
 # Priority order — OpenRouter and Vibe are intentionally absent so they NEVER
 # enter the default fallback chain. Activation requires an explicit
 # #openrouter/#or_* resp. #vibe/#vibe_* tag (or #second_opinion:vibe).
-_PRIORITY = ["claude", "gemini", "codex"]
+# Gemini removed 2026-08-15: an exhausted Claude used to hand untagged tasks
+# straight to it (fallback slot 2) although it cannot execute them
+# (IneligibleTierError) — plus data protection.
+_PRIORITY = ["claude", "codex"]
 
 # Providers whose whole point is that they do NOT write. Falling back from one of
 # these to the default chain would silently swap a non-writing reviewer for a

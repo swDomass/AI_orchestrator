@@ -122,6 +122,38 @@ plan (2026-05-18).
 | 47 | OpenRouter provider — opt-in, pay-per-token, never in the fallback chain | DONE |
 | 48 | External second opinion in `review-loop` (`#second_opinion:`), Gemini retired as reviewer | DONE |
 | 49 | Mistral Vibe provider — second non-Claude voice, reviewer-only | DONE |
+| 50 | Unattended `#tool:` reactivation — git-state freeze, provider ceiling, uniform error classification, effective safety hook | **Built, not yet proven** — see below |
+
+### #50 — Unattended `#tool:` reactivation (2026-08-15)
+
+The orchestrator had run as a briefing runner only since 2026-04-03: not a single
+`#tool:` task in that window. This wave rebuilt the guarantees an unattended tool
+run needs, as four separate changes:
+
+1. **Git state is frozen.** Unattended runs leave work in the working tree; the
+   user commits and pushes. Enforced by `config.SAFETY_DENY_PATTERNS` (hook, Claude
+   path) and by `approve:` entries in `policy.yaml`. *Not* by the prompt layer —
+   `SAFETY_RULES` mentions push only.
+2. **Provider ceiling.** `openrouter` and `vibe` are barred for tool tasks on the
+   chain, on an explicit tag, and on tool-internal lookups; Gemini left the chain
+   entirely.
+3. **Uniform error classification.** All error handling goes through
+   `providers.base.error_code_of()` / `is_transient()`, and a format break is a
+   retryable `format_error` instead of a silently completed task.
+4. **The safety hook actually blocks.** It had emitted an output shape Claude Code
+   recognises as neither "block" nor "deny", so every block since it was written
+   was a no-op.
+
+**Why this is not DONE:** the queue contains **no `#tool:` task**, so none of it has
+executed unattended even once. The path is repaired and tested, not demonstrated.
+The honest status is "ready for a first supervised `#tool:` run", and that run is
+the acceptance criterion.
+
+**Review coverage is partial.** The change set was reviewed by Mistral (`vibe`) —
+four findings, all fixed, one (git aliases) refuted at the system level and
+deliberately not built. **Codex could not run**: usage limit exhausted, free again
+2026-08-20. So this diff has seen *one* external voice, not the usual two. It is
+not "externally reviewed" in the sense the rest of this repo means it.
 
 ---
 
@@ -137,10 +169,30 @@ plan (2026-05-18).
 
 ### Known defects (tracked, unfixed)
 
+Rebuilt 2026-08-15. The two entries this table carried before — `MODEL_TAG_RE`
+covering 6 of 20 aliases, and the `RunResult` attribute crash in
+`tools/security_audit.py` — are both **fixed** and were removed. The table
+itself stays, because the register is what several other docs point at and
+because these took its place. Full prose per item →
+[README → Known Limitations](README.md#known-limitations).
+
+Three more were closed later the same day, in the follow-up pass that finished
+the two unification threads above: **the hang/format counter no longer resets on
+a non-hang park** (`mark_retry()` preserves the marker when handed no count — it
+is now the single writer, and only `hang`/`format_error` increment); **the last
+two raw `get_provider_by_name()` call sites** (`tools/brainstorm.py`,
+`tools/scientific_investigation_phase2.py`) went to `policy_provider_lookup()`;
+and **`knowledge_transfer` + `brainstorm` joined the shared error classifier**.
+
 | Defect | Impact |
 |---|---|
-| `queue_manager.MODEL_TAG_RE` covers 6 of 20 model aliases | The other 14 route to the right *provider* but never force the *model* — `#or_glm` and `#or_kimi` both run on `OPENROUTER_DEFAULT_MODEL`. `queue_linter.py` shares the extractor and cannot flag it. Fix: derive the pattern from the alias dicts in `config.py`. Touches central queue parsing with many callers → needs a full dev-loop, not a single-shot edit. Details: [README → Known Limitations](README.md#known-limitations). |
-| `tools/security_audit.py:199-200` | Reads `error_code`/`retryable` off a `RunResult`, which has neither → `AttributeError` on **any** provider error in that tool. Pre-existing; the path never runs cleanly today, so the fix needs its own test. |
+| `select_provider()` fail-open for a bare `#vibe`/`#openrouter` tag | The pay-per-token ceiling was made fail-closed in `policy_allows_provider()`/`dispatcher._allows()`, but not on the forced-provider path. With `policy.yaml` missing or unreadable, an explicitly tagged task still reaches the uncapped provider. Left open deliberately — the fix reworks ~10 routing tests. |
+| `stdin_incomplete` requeues without bound | `<!-- hang: N -->` is the only persistent per-task counter and only `hang` + `format_error` *increment* it. Every other error code requeues without raising it. Count unbounded, rate still throttled by the 5-min cooldown. Pre-existing. Narrowed 2026-08-15: those parks no longer *reset* the counter either, so a task alternating between real failures and parks does reach the cap. |
+| `realign_stale_freshonly()` skips a slot inside its grace window | A stale `#freshonly` task realigns strictly after now, so today's still-valid slot is skipped. Morning brief fails silently — no log line, no `runs.jsonl` record. Observed 2026-07-23 and 2026-07-27. |
+| Safety-hook residuals | `find . -exec git push`, `docker exec c git push`, `xargs git push` are not recognised (needs real argv parsing, not a regex). A heredoc body line starting with a git write command matches — a deliberate false positive in the safe direction. Hook covers Claude only; Codex relies on its own sandbox flag. |
+| `#pass1:`/`#pass2:` accept only `claude`, `gemini`, `codex` | Own regex, predates the opt-in providers. `#pass2:vibe`/`#pass2:openrouter` are ignored rather than rejected. Use `#second_opinion:`. |
+| `queue_linter.py` does not validate `#vibe*` tags | Its unknown-alias regex enumerates `claude\|gemini\|codex\|or` only, and there is no "CLI missing" warning to match the OpenRouter one. Linter-only since 2026-08-15 — runtime resolves the alias correctly. |
+| `tests/test_telegram_listener.py` order-dependent; `tests/test_usage_suggester.py` environment-dependent | Run with `-p no:randomly`. A red suite in a fresh worktree is more likely one of these two than a real regression. |
 
 ---
 

@@ -52,7 +52,8 @@ except ImportError:
         (_fallback_git_pattern(r"push\s+.*--force"), "git push --force"),
         (_fallback_git_pattern(r"push\s+.*-f\b"), "git push -f"),
         (_fallback_git_pattern(r"reset\s+--hard"), "git reset --hard"),
-        (_fallback_git_pattern(r"commit(?![\w-])"), "git commit"),
+        # No `commit` entry — dropped 2026-08-17 together with config.py's, see the
+        # rationale there. Only the irreversible half (push) stays blocked.
         (_fallback_git_pattern(r"push(?![\w-])"), "git push"),
         (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE"),
         (r"format\s+[A-Za-z]:", "format drive"),

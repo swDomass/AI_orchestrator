@@ -1,6 +1,8 @@
 # AI Orchestrator
 
-Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — driven by a Markdown queue file, with multi-provider fallback, Telegram control, and a security/approval layer.
+Autonomous task executor for the `claude` and `codex` CLI tools — driven by a Markdown queue file, with multi-provider fallback, Telegram control, and a security/approval layer.
+
+> **Provider status (2026-08-15).** The active fallback chain is **Claude → Codex**. Gemini is still implemented (`providers/gemini.py`, HTTP API + legacy CLI) and every `#gemini*` tag still resolves, but it left `dispatcher._PRIORITY` and the shipped `tool_providers:` policy — nothing routes there by default. OpenRouter and Mistral Vibe remain opt-in and never enter the chain. See [Provider status in detail](#provider-status-in-detail).
 
 **Goal:** Run routine work (code, reviews, tests, docs, refactors) from a Markdown queue without managing API keys in your project. Uses existing CLI logins (OAuth/subscription).
 
@@ -8,7 +10,7 @@ Autonomous task executor for `claude`, `gemini`, and `codex` CLI tools — drive
 
 Routine engineering work — code reviews, refactors, test loops, documentation sync, security audits — is the ideal candidate for autonomous execution by an LLM CLI. But the existing tools fall apart at the operational layer:
 
-- **No orchestration across providers.** Claude, Gemini, and Codex are each excellent in isolation, but no tool routes tasks across all three with capacity-aware fallback. When Claude hits a 5 h block, the workflow shouldn't stop — it should silently fail over.
+- **No orchestration across providers.** The vendor CLIs are each excellent in isolation, but none of them routes a task to another vendor with capacity-aware fallback. When Claude hits a 5 h block, the workflow shouldn't stop — it should silently fail over.
 - **Long-running autonomous loops need an audit trail.** Every dev-loop iteration, every security finding, every retry decision should be inspectable after the fact, not lost to stdout.
 - **State should live in plain Markdown**, not in a database. A human edits the queue with a text editor, version-controls it in Git, and reads every result alongside the task that produced it.
 - **Subscription-driven CLIs (OAuth, no API keys) are the cheapest way to run an autonomous agent** for a single user — provided you have a layer on top that respects quota windows, retries 429s, and knows when *not* to run.
@@ -19,8 +21,8 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **~1800 tests / ~95 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls.
-- **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into Gemini/Codex prompts. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
+- **~2100 tests / ~100 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls. Run them with `-p no:randomly`: `tests/test_telegram_listener.py` is order-dependent, so a random seed can turn the suite red without a code change (known, unfixed — see [Known Limitations](#known-limitations)).
+- **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, `git push`, …) even under `--dangerously-skip-permissions`. A second layer (`SAFETY_RULES`) is injected into the non-Claude provider prompts, which have no hook system. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
 - **Auditability built in.** Every task end emits a structured `logs/runs.jsonl` record (19-category failure taxonomy: `rate_limit`, `timeout`, `auth_error`, `model_refusal`, …), per-tool action traces in `{cwd}/.<tool>/traces/*.jsonl`, an offline queue linter (`--lint-queue`, exit codes 0/1/2 for CI gating), and an 18-check `--doctor` with `--fix --yes` auto-repair.
@@ -32,8 +34,8 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 
 ## Features
 
-- Multi-provider routing with fallback (`Claude → Gemini → Codex`)
-- **Two opt-in providers outside the fallback chain**: OpenRouter (pay-per-token, `#openrouter`/`#or_*`) for cheap single-call work, and Mistral Vibe (`#vibe`, `#second_opinion:vibe`) as a read-only second non-Claude reviewer. Both are registered only when their prerequisite exists (API key / binary on `PATH`); a `#vibe` tag without the CLI **parks** the task rather than handing a review job to a file-writing executor.
+- Multi-provider routing with fallback (`Claude → Codex`; Gemini retired from the chain 2026-08-15, code retained)
+- **Two opt-in providers outside the fallback chain**: OpenRouter (pay-per-token, `#openrouter`/`#or_*`) for cheap single-call work, and Mistral Vibe (`#vibe`, `#second_opinion:vibe`) as a read-only second non-Claude reviewer. Both are registered only when their prerequisite exists (API key / binary on `PATH`); a `#vibe` tag without the CLI **parks** the task rather than handing a review job to a file-writing executor. Under the shipped policy both are barred for tool tasks — see [Provider tags are subject to `tool_providers`](#supported-tags).
 - Capacity checking via `cclimits` (with local JSONL fallback on HTTP 429)
 - Retry handling on rate limits / provider failures
 - Obsidian-compatible queue with `cwd:`, `#tool:`, `#agent:`, `#parallel`, `#worktree`, `#keep-worktree`, `#shutdown`, `#verify:`, `#approve:*` tags
@@ -61,8 +63,9 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 
 - Python `3.10+`
 - `cclimits` CLI (`npm install -g cclimits`)
-- Provider CLIs in `PATH`: `claude`, `codex` (and `gemini` unless you use `GEMINI_API_KEY` HTTP mode — the consumer Gemini CLI was retired 2026-06-18)
-- Valid authentication in each CLI (OAuth / subscription login); Gemini alternatively via a `GEMINI_API_KEY`
+- Provider CLIs in `PATH`: `claude`, `codex`
+- Valid authentication in each CLI (OAuth / subscription login)
+- Optional, retired by default: `gemini`. The provider code is still shipped, but it is out of the fallback chain and out of the default policy since 2026-08-15 — re-enabling it means putting `gemini` back into `dispatcher._PRIORITY` **and** into the relevant `tool_providers:` entry, plus either the `gemini` CLI (Standard/Enterprise only — the consumer CLI was retired 2026-06-18) or a `GEMINI_API_KEY`.
 - Optional, opt-in only: `vibe` (Mistral Vibe CLI) as a second non-Claude reviewer, and an `OPENROUTER_API_KEY` for pay-per-token single-call tasks. Neither is required, and neither ever enters the default fallback chain.
 
 ## Installation
@@ -96,7 +99,7 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `CODEX_PRIMARY_MIN_CAPACITY_PCT` | No | `10` | Per-window override for Codex primary |
 | `CODEX_SECONDARY_MIN_CAPACITY_PCT` | No | `3` | Per-window override for Codex secondary |
 | `CLAUDE_PLAN` | No | — | Claude subscription plan for local 429 fallback: `pro`, `max5`, `max20`, `custom` |
-| `GEMINI_API_KEY` | No | — | Google AI Studio key. When set, the Gemini provider uses the HTTP REST API instead of the CLI (the consumer Gemini CLI was shut down 2026-06-18). HTTP mode stays in the fallback chain but has no pollable quota — availability is cooldown-driven. Without a key, falls back to the legacy `gemini` CLI (Standard/Enterprise only). |
+| `GEMINI_API_KEY` | No | *(commented out since 2026-08-15)* | Google AI Studio key. When set, the Gemini provider uses the HTTP REST API instead of the CLI (the consumer Gemini CLI was shut down 2026-06-18); without a key it falls back to the legacy `gemini` CLI (Standard/Enterprise only). **Setting the key no longer puts Gemini back in the chain** — that needs `dispatcher._PRIORITY` and `tool_providers:` as well. What the key *does* control is the capacity gate: with it set, `dispatcher._limits_ok("gemini", …)` short-circuits to `True` (the REST API exposes no pollable quota), so Gemini would be reported unconditionally available. Leaving it unset is what disarms that. |
 | `GEMINI_BASE_URL` | No | `https://generativelanguage.googleapis.com/v1beta` | Override for testing or a proxy |
 | `GEMINI_DEFAULT_MODEL` | No | `gemini-3.5-flash` | Model for HTTP mode without a `#gemini_*` tag (free-tier-safe GA Flash) |
 | `GEMINI_MAX_OUTPUT_TOKENS` | No | `16384` | Output cap for HTTP mode; generous because gemini-3.x thinking tokens count toward it |
@@ -185,7 +188,7 @@ Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
 - HTML comment inside the task body (`html_comment_in_body`) — truncates the task and deletes the trailing tags on rewrite, see [Retry Markers](#retry-markers)
 - HTML comment at the line end that is not a valid `retry`/`hang` marker (`html_comment_trailing`) — silently dropped on rewrite; a near-miss marker means the schedule never applies
 
-Not yet covered: `#vibe*` tags (neither the unknown-alias check nor a "CLI missing → task will be parked" warning) — the linter shares `extract_model_tag()` with the queue parser and inherits the gap described under [Known Limitations](#known-limitations).
+Not yet covered: `#vibe*` tags — the linter's unknown-alias check enumerates the `claude|gemini|codex|or` prefixes only, and there is no counterpart to the OpenRouter "missing key" warning for a `#vibe` tag without the CLI (which the dispatcher answers by parking the task). This is a *linter* gap only: since 2026-08-15 `extract_model_tag()` itself resolves `#vibe_medium`/`#vibe_small` correctly, so the model really is forced at runtime.
 
 Exit codes: **0** = clean, **1** = warnings only, **2** = errors. Wire into CI / pre-commit if you have a shared queue file.
 
@@ -215,16 +218,16 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 
 | Feature | Syntax | Example |
 |---|---|---|
-| Force provider | `#claude`, `#gemini`, `#codex`, `#vibe` | `- [ ] Task #codex` |
+| Force provider | `#claude`, `#codex`, `#vibe`, `#openrouter` (`#gemini` still parses but is barred by the shipped policy) | `- [ ] Task #codex` |
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
 | Reasoning effort (**Claude only**) | `#effort:low\|medium\|high\|xhigh\|max` → `claude --effort` | `- [ ] Classify inbox #claude_opus #effort:low` |
-| Gemini model | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
+| Gemini model *(retired — parses, but barred by the shipped policy)* | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
 | Codex model | `#codex_5` (gpt-5.6-sol), `#codex_5_4` (gpt-5.6-terra), `#codex_mini` (gpt-5.6-luna) | `- [ ] Run #codex_mini` |
 | OpenRouter model (opt-in, requires `OPENROUTER_API_KEY`) | Free: `#or_minimax_free`, `#or_deepseek_free`, `#or_qwen_free`, `#or_nemotron_free`. Paid flagships: `#or_glm`, `#or_kimi`, `#or_qwen`, `#or_deepseek`, `#or_minimax`. Generic: `#openrouter` (default model). | `- [ ] Daily summary #or_minimax_free` |
 | Vibe / Mistral (opt-in, requires the `vibe` CLI) | `#vibe` — routes to Vibe using its configured model. Reviewer only: never writes files, never enters the fallback chain, and if the CLI is missing the task is **parked rather than handed to an executor**. | `- [ ] Second opinion #vibe` |
-| Vibe model choice | `#second_opinion:vibe_medium` (mistral-medium-3.5) / `#second_opinion:vibe_small` (devstral-small). **Only as a `#second_opinion:` value** — as bare task tags `#vibe_medium`/`#vibe_small` route to Vibe but do *not* force the model yet (see the `MODEL_TAG_RE` gap under Known Limitations). | `- [ ] Review #tool:review-loop #second_opinion:vibe_small` |
+| Vibe model choice | `#second_opinion:vibe_medium` (mistral-medium-3.5) / `#second_opinion:vibe_small` (devstral-small). Since 2026-08-15 the bare task tags `#vibe_medium`/`#vibe_small` force the model too — `MODEL_TAG_RE` is generated from `dispatcher._TAG_MAP` and covers all 20 model aliases. | `- [ ] Review #tool:review-loop #second_opinion:vibe_small` |
 | Run tool | `#tool:<name>` | `- [ ] Review #tool:review-loop` |
-| Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,gemini` |
+| Restrict providers (task-level) | `#tool_providers:<p1,p2>` | `#tool_providers:claude,codex` |
 | Working directory | `cwd:<path>` | `cwd:D:\projects\repo` |
 | Working directory with spaces | `cwd:"<path>"` | `cwd:"D:\My Projects\App"` |
 | Timeout (hard backstop, not aggressive deadline; for tools an upper cap) | `#timeout:<n>[s\|m\|h]` | `#timeout:30s`, `#timeout:15m`, `#timeout:1h` |
@@ -243,26 +246,30 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
 | Second opinion (review-loop) | `#second_opinion:<alias\|provider>` | `#second_opinion:codex`, `#second_opinion:vibe_small` |
 
+**Provider tags are subject to `tool_providers`.** Every routing tag above is filtered through the `tool_providers:` section of `policy.yaml` (task-level `#tool_providers:` → profile → global). A tag naming a barred provider does **not** quietly fall back to another one: the task fails with a logged `provider_not_allowed`, because in an unattended run a silent swap hides which model actually did the work. The same filter applies to **every** provider lookup **inside** tools (second opinion, `#pass2:`, cross-provider persona allocation *and* the step that resolves an allocation into a provider instance), all of which previously bypassed it entirely — all seven raw call sites are converted. The two resolution sites (`tools/brainstorm.py`, `tools/scientific_investigation_phase2.py`) are a second gate, not a duplicate one: they resolve from an allocation list that a persisted state file or the degraded fallback path can outlive, so a name that was legal when written is re-checked against today's policy before a prompt goes out over it. The one deliberately raw call left is `tools/critical_review.py`, which asks `policy_allows_provider()` first so that "policy said no" and "unknown provider" produce different log lines. Under the shipped policy (`[claude, codex]`, `review-loop`/`test-loop`: `[claude]`) this makes `#gemini*`, `#openrouter`/`#or_*` and `#vibe*` inert — including `#second_opinion:vibe_small` and `#second_opinion:codex` for `review-loop`. Widen the relevant `tool_providers:` entry to use them.
+
+**If `policy.yaml` is missing or unreadable, the pay-per-token providers stay barred.** The file cannot be assumed present — it lives in a synced folder — and an absent one is indistinguishable from an empty one. So the fallback is asymmetric: the capped providers (`claude`, `codex`, `gemini`) stay allowed, because a lost config file must not take the orchestrator offline, while `openrouter` and `vibe` stay blocked, because they are billed per token and have no cost ceiling to fall back on. Only an explicit allow-list re-enables them. A task whose policy allows nothing routable is finalized with `no_provider_allowed` rather than parked — no quota reset can lift a policy restriction, so parking it would mean waiting forever.
+
 **`#effort:` details.** As a heuristic (not benchmarked in this repo), try lowering the effort level before dropping a model tier. Without the tag the CLI keeps its own session default; the orchestrator never injects a default of its own. `--effort` exists **only** on the Claude CLI: Codex, Gemini, Vibe and OpenRouter ignore the tag by construction (only `providers/claude.py` reads it), and `--lint-queue` warns (`effort_non_claude`) when a task carrying the tag is explicitly routed elsewhere. An unknown or malformed level is a lint **error**; at runtime it degrades to the session default rather than failing a scheduled run. On a **parent** task the orchestrator also logs a warning naming the offending tag, so a typo leaves a trace in a scheduled run. Two cases stay lint-only: a tag on a **subtask** (the subtask parser warns about nothing) and a bare `#effort` with no value (warned about nowhere, and deliberately not stripped so the word survives in prose). Subtasks honour the tag too and inherit the parent's level when they carry none.
 
 **`#verify:` details.** Relative paths resolve against `cwd:` (without a `cwd:` tag, against the orchestrator process's working directory — prefer absolute paths there). Quote paths containing spaces or `#`. Supported types: `.ps1` (via `pwsh -NoProfile -File`), `.py` (via the running interpreter with `-X utf8`), `.cmd`/`.bat`/`.exe` and extensionless executables; anything else is rejected with a clear message. Exit 0 = passed, non-zero = alarm, and the script's stdout (or stderr when stdout is empty) becomes the alarm text — a PowerShell check should set `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` so umlauts survive the redirect. Runs in all three success paths (single-shot, `#tool:`, `#parallel`), always after the queue line is finalized; for `#parallel` only when every subtask succeeded. A failing check raises the alarm but does not requeue the task — see `--lint-queue` for the `verify_without_path` rule that catches a `#verify:` with no script.
 
 ### Known Limitations
 
-**Model tags: only 6 of 20 are enforced.** `queue_manager.MODEL_TAG_RE` recognises
-`#claude_haiku/_sonnet/_opus`, `#gemini_pro/_flash` and `#codex_mini`. The other
-fourteen — `#gemini_flash_lite`, `#codex_5`, `#codex_5_4`, `#vibe_medium`,
-`#vibe_small` and all nine `#or_*` — still route to the right **provider** via the
-dispatcher, but the **model is not forced**: the task runs on that provider's default
-model. `#or_glm` and `#or_kimi` therefore produce the same model today. The
-`#second_opinion:<alias>` path is unaffected — it resolves aliases separately and
-honours every one of them. Fix vector: derive the pattern from the alias maps in
-`config.py` instead of hard-coding it, so it cannot drift again.
-
 **`#pass1:` / `#pass2:` accept only `claude`, `gemini`, `codex`.** The
 cross-provider `critical-review` tags are matched by their own regex, which
 predates the opt-in providers — `#pass2:vibe` and `#pass2:openrouter` are ignored
 rather than rejected. Use `#second_opinion:` for those.
+
+**`select_provider()` is still fail-open for a bare `#vibe`/`#openrouter` tag when the policy is missing.** The fail-closed rule described above lives in `policy_allows_provider()` / `dispatcher._allows()`. The *forced-provider* path in `select_provider()` was not converted in the same pass, so a task carrying a bare `#vibe` or `#openrouter` tag can still reach that provider if `policy.yaml` is absent or unreadable. Deliberately left open — closing it means reworking roughly ten routing tests — but it is the one hole left in the pay-per-token ceiling, and it matters exactly in the scenario the ceiling was built for (a synced `policy.yaml` that failed to arrive before an unattended run).
+
+**The safety hook cannot see a git write handed to a non-shell wrapper.** `find . -exec git push …`, `docker exec c git push …` and `xargs git push` are accepted residuals: `_CMD_START` treats `-` as a non-boundary character, and recognising these would need real argv parsing rather than a regex. Likewise, a **heredoc body line** that begins with a git write command matches, because `\n` is a genuine command separator and the hook cannot tell body text from a command — a deliberate false-positive trade in the safe direction. The hook also only covers Claude; the Codex path is fenced by its own sandbox, which depends on `experimental_windows_sandbox = true` in `~/.codex/config.toml`.
+
+**`stdin_incomplete` can requeue without bound.** `<!-- hang: N -->` is the queue's only persistent per-task counter, and only `hang` and `format_error` *increment* it. Every other `error_code` — `stdin_incomplete` included — requeues without raising it, so a task failing that way indefinitely is retried indefinitely across polls. The retry *count* is unbounded; the *rate* is still throttled by the 5-minute provider cooldown and the park cycle, so this burns polls rather than spinning. Pre-existing, not introduced by the 2026-08-15 work. (Since 2026-08-15 those parks at least no longer *reset* the counter — see the note under `MAX_HANG_RETRIES` — so a task that alternates between real failures and parks does reach the cap.)
+
+**`tests/test_telegram_listener.py` is order-dependent** and `tests/test_usage_suggester.py` depends on environment/live state absent in a fresh worktree. Run the suite with `-p no:randomly`; a red run in a fresh worktree is more likely these two than a real regression.
+
+**`realign_stale_freshonly()` skips a slot still inside its grace window.** After a day with the machine off, a stale `#freshonly` task is realigned to the *next* anchor strictly after now, so today's slot is skipped even when the grace window would still cover it — the morning brief then fails silently, with no log line and no `runs.jsonl` record. Observed 2026-07-23 and 2026-07-27. Unfixed.
 
 ### Parallel Tasks (`#parallel`)
 
@@ -394,6 +401,8 @@ CLI provider calls run through a liveness/hang watchdog (`providers/process_runn
 | `HANG_RETRY_BACKOFF_SEC` | 300 (5 min) | Backoff before requeueing a hung task |
 | `TOOL_DEFAULT_MAX_RUNTIME_SEC` | 3600 (60 min) | Fallback total-runtime deadline for an iterative tool when its ToolContract omits `max_runtime_sec` |
 
+**The `<!-- hang: N -->` counter survives parks, and only real failures raise it.** `mark_retry()` is the single writer of that marker and it rebuilds the whole queue line, so "the caller passed no count" has to mean *keep what is there* — until 2026-08-15 it meant *erase it*, and every capacity, timeout, strict-mode or approval park silently reset the count to 0. A task alternating between format errors and capacity parks therefore never reached `MAX_HANG_RETRIES` and requeued forever, unseen. The rule now: `hang` and `format_error` pass `previous + 1` because they are unsuccessful attempts **at the task**; every other park passes nothing and the counter is carried forward unchanged, because capacity or a quota reset says nothing about the task. A successful run clears it (the line is rewritten by `finalize_task_with_result()`).
+
 ## Research-QA (`#tool:research-qa`)
 
 ```
@@ -472,7 +481,10 @@ Phase 0 — Topic-Analyse + Persona-Generierung
 
 Phase 0.5 — Provider-Allocation
   Default: alle Personas auf Primary-Provider.
-  Mit #cross-provider: Round-Robin über (claude, gemini, codex, openrouter).
+  Mit #cross-provider: Round-Robin über die Kandidaten-Tupel
+  (claude, gemini, codex, openrouter) — jeder Kandidat läuft aber
+  durch den tool_providers-Filter, ein gesperrter fällt raus.
+  Unter der ausgelieferten Policy bleiben claude + codex übrig.
   Degradiert sauber auf primary-only wenn keine Cross-Provider verfügbar.
 
 Phase 1 — Initial Idea Generation
@@ -574,7 +586,17 @@ Step 6 (`#tool:critical-review #pass2:codex`) runs Codex as an independent, read
 
 For high-risk changes a **second** non-Claude voice is available: `#second_opinion:vibe` (or `:vibe_medium` / `:vibe_small`) on a `#tool:review-loop` task routes to the Mistral Vibe CLI, which runs strictly read-only — all tools disabled, or `read_file`+`grep` at most. It is opt-in, pay-per-token (`VIBE_MAX_PRICE_USD` caps a run), and never joins the fallback chain. Reserve it for cases where one external opinion is not enough; two paid reviewers on trivial diffs is waste.
 
-Gemini is **no longer used as a reviewer**: the consumer CLI was retired (2026-06-18) and data-training/privacy concerns rule out the HTTP mode for review content. Gemini remains available only as a fallback *execution* provider in the routing chain, never as a reviewer in `dev-loop`/`review-loop`/`critical-review`.
+Gemini is **not used at all any more** (2026-08-15). It was dropped as a reviewer first — consumer CLI retired 2026-06-18, and data-training/privacy concerns rule out the HTTP mode for review content — and then, after an `IneligibleTierError` left the remaining path unusable, out of execution too. It is out of `dispatcher._PRIORITY`, out of the shipped `tool_providers:` policy, and `GEMINI_API_KEY` is commented out in `.env`. The provider code is retained but no active path reaches it.
+
+### Provider status in detail
+
+| Provider | In fallback chain | Reachable by tag | Notes |
+|---|---|---|---|
+| `claude` | yes (first) | `#claude`, `#claude_*` | Only provider that honours `#effort:` |
+| `codex` | yes (second) | `#codex`, `#codex_*` | Default external second opinion |
+| `gemini` | **no** (left `_PRIORITY` 2026-08-15) | tag parses, then barred by the shipped `tool_providers:` | Code retained; re-enabling needs `_PRIORITY` **and** policy **and** a key/CLI |
+| `openrouter` | never (by design) | `#openrouter`, `#or_*` | Pay-per-token; barred by the shipped policy, and fail-**closed** when `policy.yaml` is missing |
+| `vibe` | never (by design) | `#vibe`, `#vibe_*`, `#second_opinion:vibe*` | Reviewer-only; same fail-closed treatment as OpenRouter |
 
 ## Skills (`SKILL.md`)
 
@@ -756,7 +778,8 @@ With `--fix` (optionally `--yes`) simple problems are auto-created/repaired.
 ```text
 orchestrator.py
   → dispatcher.py          (provider selection + fallback)
-      → providers/         claude, gemini (HTTP or CLI), codex  ← fallback chain
+      → providers/         claude, codex                        ← fallback chain
+                           gemini (HTTP or CLI)                 ← retired 2026-08-15, code retained
                            openrouter, vibe                     ← opt-in only, tag-gated
   → queue_manager.py       (queue read/write, tags, atomic updates)
   → parallel_runner.py     (#parallel subtasks)
@@ -801,12 +824,14 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (~1800 tests, ~95 s)
-python -m pytest tests/ -q
+# Run all tests (~2100 tests, ~100 s) — fixed order, see below
+python -m pytest tests/ -q -p no:randomly
 
 # Run a single test file
 python -m pytest tests/test_parallel_runner.py -v
 ```
+
+`-p no:randomly` is not cosmetic: `tests/test_telegram_listener.py` leaks state under some orderings, so `pytest-randomly` can colour the suite red without a code change. Last measured green run: **2098 passed in 99 s** (2026-08-15).
 
 ## Contributing
 

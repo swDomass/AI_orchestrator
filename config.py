@@ -276,10 +276,15 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     (_git_pattern(r"reset\s+--hard"), "git reset --hard"),
     (_git_pattern(r"clean\s+-[a-zA-Z]*f"), "git clean -f (untracked file deletion)"),
     (_git_pattern(r"checkout\s+--\s+\."), "git checkout -- . (discard all changes)"),
-    # Git state changes — unattended runs stay in the working tree (2026-08-15).
-    # The orchestrator produces changes; committing and pushing stays with the user.
+    # Publishing stays with the user — committing no longer does (revised 2026-08-17).
+    # The original rule (2026-08-15) blocked `git commit` too, reasoning that
+    # unattended runs should leave their changes in the working tree. It was dropped
+    # because nothing here actually tests for "unattended": the hook is wired to every
+    # Bash call, so it blocked interactive sessions just as hard — including ones where
+    # the user had explicitly asked for the commit, with no way to override it from
+    # inside the session. The asymmetry that remains is deliberate: a commit is local
+    # and revertible (`git reset`), a push leaves the machine and cannot be taken back.
     # Placed after the force-push patterns so those keep reporting the specific reason.
-    (_git_pattern(r"commit(?![\w-])"), "git commit (unattended runs must not change git state)"),
     (_git_pattern(r"push(?![\w-])"), "git push (unattended runs must not change remote state)"),
     # Database destruction
     (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE/SCHEMA"),

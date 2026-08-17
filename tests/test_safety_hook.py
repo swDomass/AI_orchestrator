@@ -79,9 +79,21 @@ class TestCheckCommandDeny:
         "cd /d/repo && git commit -m x",
         "/usr/bin/git commit -m x",
     ])
-    def test_git_commit(self, cmd):
-        """Unattended runs must not change git state (decision 2026-08-15)."""
-        assert check_command(cmd) is not None
+    def test_git_commit_is_allowed(self, cmd):
+        """`git commit` is NOT blocked (revised 2026-08-17).
+
+        The 2026-08-15 rule blocked it so unattended runs would leave their work
+        in the working tree. Nothing in the hook tests for "unattended", though —
+        it is wired to every Bash call, so it hit interactive sessions just as
+        hard, including ones where the user had explicitly asked for the commit.
+        A commit is local and revertible (`git reset`); only `git push` leaves the
+        machine and stays blocked.
+
+        These cases stay in the suite inverted rather than deleted: re-introducing
+        the pattern then fails loudly here instead of silently locking interactive
+        sessions again.
+        """
+        assert check_command(cmd) is None
 
     @pytest.mark.parametrize("cmd", [
         "git push",
@@ -95,19 +107,21 @@ class TestCheckCommandDeny:
         assert check_command(cmd) is not None
 
     @pytest.mark.parametrize("cmd", [
-        # Real command chains around git commit/push — each of these must
-        # still trigger the block despite git not sitting at position 0.
-        "echo done; git commit -m x",
+        # Real command chains around git push — each of these must still trigger
+        # the block despite git not sitting at position 0. These were a mix of
+        # commit and push until 2026-08-17; converted to push-only when the commit
+        # rule was dropped, so the separator coverage itself survives unchanged.
+        "echo done; git push origin main",
         "echo done ; git push origin main",
-        "(git commit -m x)",
-        "(cd /tmp && git commit -m x)",
-        "`git commit -m x`",
+        "(git push origin main)",
+        "(cd /tmp && git push origin main)",
+        "`git push origin main`",
         "true || git push origin main",
-        "ls -la | git commit -m x",
-        "line one\ngit commit -m x",
+        "ls -la | git push origin main",
+        "line one\ngit push origin main",
         "echo hi &&\ngit push origin main",
     ])
-    def test_git_commit_push_real_chains(self, cmd):
+    def test_git_push_real_chains(self, cmd):
         """A real invocation after ;, &&, ||, |, newline, or a subshell/
         backtick opener is still an invocation and must be blocked."""
         assert check_command(cmd) is not None
@@ -116,16 +130,16 @@ class TestCheckCommandDeny:
         # A shell interpreter's -c/-Command argument IS executed as a real
         # shell command line (unlike e.g. `python -c "..."`), so a git
         # write command inside it is a real invocation and must be blocked.
-        'bash -c "git commit -m x"',
+        'bash -c "git push origin main"',
         "/bin/sh -c 'git push origin main'",
-        'pwsh -Command "git commit -m x"',
+        'pwsh -Command "git push origin main"',
         "powershell -Command 'git push'",
-        'pwsh -c "git commit -m x"',
+        'pwsh -c "git push origin main"',
         'powershell.exe -Command "git push origin main"',
-        'zsh -c "git commit -m x"',
+        'zsh -c "git push origin main"',
         'dash -c "git push -f origin main"',
-        'pwsh -Com "git commit -m x"',
-        'pwsh -Comm "git commit -m x"',
+        'pwsh -Com "git push origin main"',
+        'pwsh -Comm "git push origin main"',
     ])
     def test_shell_interpreter_c_flag_is_a_real_invocation(self, cmd):
         """bash/sh/zsh/dash -c and pwsh/powershell -Command (and its
@@ -136,22 +150,22 @@ class TestCheckCommandDeny:
         # `eval` runs its argument as a command line, `exec` replaces the shell
         # with it — same class as the `bash -c` hole, different syntax (builtins,
         # so no interpreter path and no -c flag).
-        'eval "git commit -m x"',
-        "eval 'git commit -m x'",
-        "eval git commit",                       # unquoted
-        "exec git commit -m x",
+        'eval "git push origin main"',
+        "eval 'git push origin main'",
+        "eval git push",                         # unquoted
+        "exec git push",
         "exec git push origin main",
         "eval 'git push --force'",
-        'EVAL "git commit -m x"',                # case-insensitive
+        'EVAL "git push origin main"',           # case-insensitive
         "Exec git push",
         # ...after a separator, not only at the start of the line
-        'echo hi && eval "git commit -m x"',
+        'echo hi && eval "git push origin main"',
         "echo hi ; exec git push origin main",
-        "true || eval 'git commit'",
+        "true || eval 'git push'",
         # ...and composed with the interpreter boundary
-        """bash -c "eval 'git commit -m x'" """,
+        """bash -c "eval 'git push origin main'" """,
         'pwsh -Command "eval \'git push origin main\'"',
-        'eval eval "git commit -m x"',
+        'eval eval "git push origin main"',
     ])
     def test_command_taking_builtins_are_a_real_invocation(self, cmd):
         """`eval`/`exec` execute their argument, so a git write command behind
@@ -270,16 +284,18 @@ class TestCheckCommandAllow:
 
     @pytest.mark.parametrize("cmd", [
         # git-command text that is only a STRING/argument/comment, not a
-        # real invocation — must not be blocked.
-        'python -c "import os; os.system(\'git commit -m wip\')"',
+        # real invocation — must not be blocked. All phrased with `push`
+        # since 2026-08-17: a `commit` case would pass here even with the
+        # boundary logic entirely broken, because commit is allowed anyway.
+        'python -c "import os; os.system(\'git push origin main\')"',
         'python3 -c "print(\'git push origin main\')"',
         'echo "git push when ready"',
-        'echo "remember to git commit later"',
-        "ls -la  # TODO: git commit these once reviewed",
+        'echo "remember to git push later"',
+        "ls -la  # TODO: git push these once reviewed",
         "cat notes.txt  # note: git push happens elsewhere",
-        "grep -r 'git commit' src/",
+        "grep -r 'git push' src/",
         "echo 'git push origin main' > readme_snippet.txt",
-        'foo -c "git commit -m draft"',  # -c belongs to `foo`, not git
+        'foo -c "git push origin main"',  # -c belongs to `foo`, not git
     ])
     def test_git_words_not_a_real_invocation(self, cmd):
         """git-command text inside a string, comment, or another program's
@@ -289,17 +305,17 @@ class TestCheckCommandAllow:
     @pytest.mark.parametrize("cmd", [
         # Not a shell interpreter at all — its -c string is inert, same
         # class as python -c.
-        'python -c "import os; os.system(\'git commit -m wip\')"',
+        'python -c "import os; os.system(\'git push origin main\')"',
         'echo "git push when ready"',
-        "grep -r 'git commit' src/",
+        "grep -r 'git push' src/",
         # A program whose name merely CONTAINS "sh" must not be mistaken
         # for the `sh` interpreter — the required whitespace right after
         # the interpreter name rules this out.
-        'shellcheck -c "git commit -m x"',
-        'bashful -c "git commit -m x"',
+        'shellcheck -c "git push origin main"',
+        'bashful -c "git push origin main"',
         # "-Co" alone is ambiguous on real PowerShell (Command vs.
         # ConfigurationName) and is deliberately not accepted here either.
-        'pwsh -Co "git commit -m x"',
+        'pwsh -Co "git push origin main"',
     ])
     def test_shell_c_flag_false_positive_guards(self, cmd):
         """Things that look adjacent to the shell -c boundary but aren't
@@ -366,10 +382,10 @@ class TestFallbackPatternsStayInSync:
         assert len(patterns) < len(SAFETY_DENY_PATTERNS)
 
     @pytest.mark.parametrize("cmd", [
-        'eval "git commit -m x"',
+        'eval "git push origin main"',
         "exec git push origin main",
-        'bash -c "git commit -m x"',
-        "cd /tmp && git commit -m x",
+        'bash -c "git push origin main"',
+        "cd /tmp && git push origin main",
         "git push --force",
     ])
     def test_fallback_blocks_what_config_blocks(self, cmd):
@@ -378,9 +394,12 @@ class TestFallbackPatternsStayInSync:
         assert check_command(cmd) is not None, cmd
 
     @pytest.mark.parametrize("cmd", [
-        'python -c "import os; os.system(\'git commit -m wip\')"',
-        "grep -r 'git commit' src/",
-        'evaluate "git commit -m x"',
+        # Phrased with `push`, not `commit`: since 2026-08-17 a bare `git commit`
+        # is allowed anyway, so a commit case here would pass even if the
+        # string/boundary logic these assertions exist for were broken.
+        'python -c "import os; os.system(\'git push origin main\')"',
+        "grep -r 'git push' src/",
+        'evaluate "git push origin main"',
         "git status",
     ])
     def test_fallback_allows_what_config_allows(self, cmd):
@@ -428,13 +447,14 @@ class TestHookProtocol:
         assert resp["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-    def test_git_commit_denied(self):
+    def test_git_commit_approved(self):
+        """End-to-end counterpart to test_git_commit_is_allowed: since 2026-08-17
+        a commit passes the hook instead of being denied."""
         resp = self._run_hook({
             "tool_name": "Bash",
             "tool_input": {"command": "git commit -m 'wip'"},
         })
-        assert resp["decision"] == "block"
-        assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert resp["decision"] == "approve"
 
     def test_git_push_denied(self):
         resp = self._run_hook({
@@ -443,20 +463,20 @@ class TestHookProtocol:
         })
         assert resp["decision"] == "block"
 
-    def test_chained_git_commit_denied(self):
-        """A git commit reached through a real shell chain is still blocked."""
+    def test_chained_git_push_denied(self):
+        """A git push reached through a real shell chain is still blocked."""
         resp = self._run_hook({
             "tool_name": "Bash",
-            "tool_input": {"command": "cd /tmp && git commit -m x"},
+            "tool_input": {"command": "cd /tmp && git push origin main"},
         })
         assert resp["decision"] == "block"
         assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-    def test_eval_git_commit_denied(self):
+    def test_eval_git_push_denied(self):
         """End-to-end: the `eval` boundary blocks through the JSON protocol too."""
         resp = self._run_hook({
             "tool_name": "Bash",
-            "tool_input": {"command": 'eval "git commit -m x"'},
+            "tool_input": {"command": 'eval "git push origin main"'},
         })
         assert resp["decision"] == "block"
         assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -473,15 +493,15 @@ class TestHookProtocol:
         invocation and must not be blocked."""
         resp = self._run_hook({
             "tool_name": "Bash",
-            "tool_input": {"command": 'python -c "import os; os.system(\'git commit -m wip\')"'},
+            "tool_input": {"command": 'python -c "import os; os.system(\'git push origin main\')"'},
         })
         assert resp["decision"] == "approve"
 
-    def test_bash_c_git_commit_denied(self):
+    def test_bash_c_git_push_denied(self):
         """bash -c executes its argument as a real shell command line."""
         resp = self._run_hook({
             "tool_name": "Bash",
-            "tool_input": {"command": 'bash -c "git commit -m x"'},
+            "tool_input": {"command": 'bash -c "git push origin main"'},
         })
         assert resp["decision"] == "block"
         assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"

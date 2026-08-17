@@ -783,6 +783,25 @@ def _patch_review_loop(monkeypatch):
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _s: None)
 
 
+def test_review_loop_format_break_is_retryable_and_capped(monkeypatch, tmp_path):
+    """Unparseable review output must not finalize the queue item.
+
+    The path returned a ToolResult without error_code and without retryable, so
+    orchestrator.py skipped the retry (:883) and finalized the task (:897) — a
+    format hiccup was booked as finished work. "format_error" is retryable and
+    shares the persistent hang counter, so it is bounded by MAX_HANG_RETRIES.
+    """
+    _patch_review_loop(monkeypatch)
+    provider = _ScriptedProvider(outputs=["Looks fine to me overall."])
+
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is False
+    assert "Review-Output entspricht nicht" in result.error
+    assert result.error_code == "format_error"
+    assert result.retryable is True
+
+
 def test_review_loop_classifies_provider_error_instead_of_passing_it_through(monkeypatch, tmp_path):
     """RunResult.error is an unconstrained string, not a taxonomy code."""
     _patch_review_loop(monkeypatch)

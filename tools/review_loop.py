@@ -536,6 +536,11 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    # Malformed review output is a model hiccup, not a finished task.
+                    # Without a code the orchestrator ticked the queue item off as
+                    # done. Retryable but capped via the persistent hang counter.
+                    error_code="format_error",
+                    retryable=True,
                     **tokens.as_kwargs(),
                 )
 

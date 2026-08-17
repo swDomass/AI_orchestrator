@@ -1520,20 +1520,48 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 elif outcome.error_code == "rate_limit":
                     limits = get_limits(force_refresh=True)
                     provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
-                elif outcome.error_code in ("timeout", "hang"):
+                elif outcome.error_code in ("timeout", "hang", "format_error"):
                     pass  # not a provider-capacity problem → no cooldown
                 elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
 
-                # Hang (idle-kill): the process froze, not a capacity issue. Do NOT
-                # take the quota-reset retry path (that would re-run the same hanging
-                # task forever). Requeue with a short backoff up to MAX_HANG_RETRIES,
-                # then BLOCK the task so it stops looping silently.
-                if outcome.error_code == "hang":
+                # Hang (idle-kill) and format_error (tool produced unparseable output)
+                # share one shape: the process/model produced nothing usable, it is not
+                # a capacity issue, and a fresh attempt often succeeds — but a
+                # permanently broken model must not loop. Do NOT take the quota-reset
+                # retry path (that would re-run forever). Requeue with a short backoff
+                # up to MAX_HANG_RETRIES, then BLOCK the task so it stops looping
+                # silently. Both codes share the persistent `<!-- hang: N -->` counter,
+                # which is the only per-task retry counter the queue has — a separate
+                # marker would be a second parser to keep in sync for no gain.
+                #
+                # The shared counter is deliberate, and so is the wording below.
+                # Because it is shared, `hang_count` counts "attempts that produced
+                # nothing usable", NOT hangs: two format errors followed by a first
+                # real hang blocks at count 3. Blocking there is right (three dead
+                # attempts on one task is exactly what the cap is for) — but the
+                # message must not claim it was the third HANG, or the 03:00 Telegram
+                # alert sends you hunting a hang that never happened. So the label
+                # names what happened THIS time and the count is spelled out as the
+                # joint one it is. A second marker was weighed and rejected: it would
+                # split the queue's only persistent state across two markers that every
+                # rewrite has to keep in sync, bought for a nicer ordinal, and it would
+                # RAISE the unattended budget from 3 dead attempts to 5.
+                #
+                # These two paths are the ONLY ones that pass a hang_count, because they
+                # are the only ones that judge the task. Every other park goes through
+                # _mark_retry_checked() without one, and mark_retry() then carries the
+                # existing counter forward — see its docstring for why "no count" must
+                # mean "preserve" rather than "erase".
+                if outcome.error_code in ("hang", "format_error"):
+                    is_hang = outcome.error_code == "hang"
+                    label = "Tool-Hang" if is_hang else "Tool-Format-Fehler"
                     hang_count = extract_hang_count(getattr(queue_task, "raw_line", "")) + 1
+                    joint = "Hang/Format-Fehler zusammen gezählt"
                     if hang_count > MAX_HANG_RETRIES:
                         msg = (
-                            f"Tool-Hang ({provider.name}/{tool_name}) zum {hang_count}. Mal "
+                            f"{label} ({provider.name}/{tool_name}) — "
+                            f"{hang_count}. erfolgloser Versuch ({joint}) "
                             f"→ Task blockiert (kein weiterer Retry)"
                         )
                         print(f"  🚫 {msg}")
@@ -1543,12 +1571,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                             task, msg, f"{provider.name}+{tool_name}",
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
                         )
-                        _span.error("hang_blocked", retry_count=tool_retry_count)
+                        _span.error(f"{outcome.error_code}_blocked", retry_count=tool_retry_count)
                         break
                     reset_dt = datetime.now() + timedelta(seconds=HANG_RETRY_BACKOFF_SEC)
                     reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
                     msg = (
-                        f"Tool-Hang ({provider.name}/{tool_name}) #{hang_count} "
+                        f"{label} ({provider.name}/{tool_name}) — Versuch "
+                        f"{hang_count}/{MAX_HANG_RETRIES} ({joint}) "
                         f"→ Requeue um ~{reset_dt.strftime('%H:%M')}"
                     )
                     print(f"  {msg}")
@@ -1560,7 +1589,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _span.error("queue_update_failed", retry_count=tool_retry_count)
                         _span.emit()
                         return False
-                    _span.retry("hang", retry_count=tool_retry_count)
+                    _span.retry(outcome.error_code, retry_count=tool_retry_count)
                     break
 
                 # Timeout: task-complexity issue — don't fall back to other providers.

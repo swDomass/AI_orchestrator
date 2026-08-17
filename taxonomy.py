@@ -94,6 +94,13 @@ _ERROR_CODE_MAP: dict[str, str] = {
     # differentiable in analytics/dashboards.
     "hang":                   CAT_HANG,
     "hang_blocked":           CAT_HANG,
+    # The tool ran to completion but the model's output did not satisfy the
+    # tool's own output contract (no P1/P2/P3 findings and no clean-sentinel,
+    # no RESOLVED/PARTIAL/UNRESOLVED verdict). Not a provider health problem —
+    # the run itself worked. Retried under the same cap as hang, hence the
+    # matching `_blocked` variant when the cap is reached.
+    "format_error":           CAT_TOOL_INTERNAL,
+    "format_error_blocked":   CAT_TOOL_INTERNAL,
     "tool_runtime_exceeded":  CAT_RUNTIME,
     "auth_error":             CAT_AUTH,
     "auth":                   CAT_AUTH,

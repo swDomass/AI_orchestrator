@@ -417,6 +417,92 @@ def test_run_once_hang_blocks_task_after_max_retries(monkeypatch):
     mark_retry_mock.assert_not_called()
 
 
+def test_run_once_format_error_requeues_under_the_hang_cap(monkeypatch):
+    """A tool that returns unparseable output must be retried, not ticked off.
+
+    Before, the three format-break paths returned ToolResult without error_code
+    and without retryable → the orchestrator skipped the retry and finalized the
+    queue item as if the work were done. The retry has to be capped, and the
+    persistent `<!-- hang: N -->` counter is the only per-task counter the queue
+    has, so format_error shares it.
+    """
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="Review-Output entspricht nicht dem erwarteten Format",
+        error_code="format_error",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+    next_retry_mock = Mock(return_value=99999)  # quota-reset path must NOT be used
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:review-loop", line_no=1,
+                                 raw_line="- [ ] Task #tool:review-loop")],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:review-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "review-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", next_retry_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    assert orchestrator.run_once() is False
+    mark_retry_mock.assert_called_once()
+    assert mark_retry_mock.call_args.kwargs["hang_count"] == 1
+    next_retry_mock.assert_not_called()
+    # A format break says nothing about provider health → no cooldown.
+    p1.set_cooldown.assert_not_called()
+
+
+def test_run_once_format_error_blocks_task_after_max_retries(monkeypatch):
+    """A model that keeps breaking format gets blocked, not looped forever."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="Quality-Review-Output entspricht nicht dem erwarteten Format",
+        error_code="format_error",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+    finalize_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(
+            task_text="Task #tool:dev-loop", line_no=1,
+            raw_line="- [ ] Task #tool:dev-loop <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->",
+        )],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:dev-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "dev-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    finalize_mock.assert_called_once()
+    mark_retry_mock.assert_not_called()
+    assert "Format" in finalize_mock.call_args.args[1]
+
+
 def test_run_once_tool_task_stops_on_policy_barred_provider_tag(monkeypatch):
     """A #provider tag the policy bars is terminal — no endless quota-reset park.
 
@@ -1222,3 +1308,113 @@ def test_run_once_still_parks_when_providers_are_merely_exhausted(monkeypatch, t
     mark_retry_mock.assert_called_once()
     exhausted_mock.assert_called_once()
     finalize_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Shared hang/format counter: the cap is joint on purpose, the WORDING must say so
+# ---------------------------------------------------------------------------
+
+def _blocked_message_for(monkeypatch, error_code, raw_line):
+    """Run one tool task into the blocked branch; return the finalize/retry mocks."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="x", error_code=error_code,
+    ))
+    finalize_mock = Mock(return_value=True)
+    mark_retry_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:dev-loop", line_no=1,
+                                 raw_line=raw_line)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:dev-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "dev-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+    return finalize_mock, mark_retry_mock
+
+
+def test_blocked_message_does_not_claim_a_hang_that_never_happened(monkeypatch):
+    """Two format errors + a FIRST real hang blocks at count 3 — say that honestly.
+
+    hang and format_error share the persistent `<!-- hang: N -->` counter (the
+    queue's only per-task counter). Blocking on the third dead attempt is the
+    intended, safe behaviour and stays. The old message reported it as
+    "Tool-Hang ... zum 3. Mal", which at 03:00 sends you hunting two earlier hangs
+    that never existed. The count is joint, so the text has to say joint.
+    """
+    finalize_mock, mark_retry_mock = _blocked_message_for(
+        monkeypatch, "hang",
+        "- [ ] Task #tool:dev-loop <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->",
+    )
+    finalize_mock.assert_called_once()
+    mark_retry_mock.assert_not_called()
+
+    msg = finalize_mock.call_args.args[1]
+    assert "Tool-Hang" in msg                  # what happened THIS time
+    assert "zum 3. Mal" not in msg             # the false ordinal is gone
+    assert "3. erfolgloser Versuch" in msg     # what the counter actually counts
+    assert "Hang/Format-Fehler" in msg         # and that it is shared
+
+
+def test_blocked_format_error_message_names_the_shared_counter(monkeypatch):
+    """Mirror case: a format error must not be reported as a hang either."""
+    finalize_mock, _ = _blocked_message_for(
+        monkeypatch, "format_error",
+        "- [ ] Task #tool:dev-loop <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->",
+    )
+    msg = finalize_mock.call_args.args[1]
+    assert "Tool-Format-Fehler" in msg
+    assert "Tool-Hang" not in msg
+    assert "Hang/Format-Fehler" in msg
+
+
+def test_requeue_message_shows_the_joint_attempt_budget(monkeypatch):
+    """The non-blocking requeue line carries the same honesty (n/MAX)."""
+    logged: list[str] = []
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True,
+        error="x", error_code="format_error",
+    ))
+    mark_retry_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:dev-loop", line_no=1,
+                                 raw_line="- [ ] Task #tool:dev-loop")],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:dev-loop"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "dev-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda m, *a, **kw: logged.append(str(m)))
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    assert mark_retry_mock.call_args.kwargs["hang_count"] == 1
+    line = next(m for m in logged if "Tool-Format-Fehler" in m)
+    assert "Versuch 1/2" in line
+    assert "Hang/Format-Fehler" in line

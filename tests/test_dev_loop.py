@@ -418,6 +418,11 @@ def test_dev_loop_fails_on_invalid_quality_review_output(monkeypatch, tmp_path):
 
     assert result.success is False
     assert "Quality-Review-Output" in result.error
+    # A format break is a model hiccup, not a finished task: without a code and
+    # retryable=True the orchestrator ticked the queue item off as done
+    # (orchestrator.py: retryable → skip retry, then finalize).
+    assert result.error_code == "format_error"
+    assert result.retryable is True
 
 
 def test_dev_loop_fails_on_invalid_resolution_review_output(monkeypatch, tmp_path):
@@ -433,6 +438,8 @@ def test_dev_loop_fails_on_invalid_resolution_review_output(monkeypatch, tmp_pat
 
     assert result.success is False
     assert "Resolution-Review-Output" in result.error
+    assert result.error_code == "format_error"
+    assert result.retryable is True
 
 
 def test_dev_loop_detects_repeated_resolution_feedback(monkeypatch, tmp_path):

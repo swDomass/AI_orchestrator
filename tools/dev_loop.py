@@ -580,6 +580,13 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    # A malformed review is a one-off model hiccup, not a permanent
+                    # failure — without a code the orchestrator finalized the queue
+                    # item as if the work were done. "format_error" is retryable but
+                    # capped: it shares the persistent hang counter (MAX_HANG_RETRIES)
+                    # so a model that keeps breaking format gets blocked, not looped.
+                    error_code="format_error",
+                    retryable=True,
                     **tokens.as_kwargs(),
                 )
             # P3-only findings are non-blocking; only P1/P2 block progress
@@ -637,6 +644,8 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
+                    error_code="format_error",  # retryable, capped — see quality-review above
+                    retryable=True,
                     **tokens.as_kwargs(),
                 )
             resolution_ok = resolution_status == "RESOLVED"

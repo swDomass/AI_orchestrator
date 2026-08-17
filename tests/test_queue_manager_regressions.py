@@ -4,6 +4,7 @@ import pytest
 
 
 with patch("config._load_dotenv"):
+    import queue_healing
     import queue_manager
 
 
@@ -177,6 +178,164 @@ def test_mark_retry_handles_backslashes_in_task_text(mock_queue_file):
 
     content = mock_queue_file.read_text(encoding="utf-8")
     assert f"- [ ] {task} <!-- retry: 12:34 -->" in content
+
+
+# ── mark_retry and the queue's only persistent counter ────────────────────────
+# `<!-- hang: N -->` is the sole per-task counter the queue carries across polls.
+# mark_retry() rebuilds the whole line, so "caller passed no count" MUST mean
+# "keep what is there" — it used to mean "erase it", which zeroed the counter on
+# every capacity/timeout/strict-mode park.
+
+
+def test_mark_retry_preserves_an_existing_hang_counter(mock_queue_file):
+    """A park without a hang_count must carry the counter forward, not drop it."""
+    task = "Task #tool:dev-loop"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->\n",
+        encoding="utf-8",
+    )
+
+    assert queue_manager.mark_retry(task, "2026-01-01 03:00", line_no=2) is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert f"- [ ] {task} <!-- retry: 2026-01-01 03:00 --> <!-- hang: 2 -->" in content
+    assert queue_manager.extract_hang_count(content) == 2
+
+
+def test_mark_retry_preserves_the_counter_on_the_lineless_fallback_path(mock_queue_file):
+    """Same guarantee without line_no — that path rebuilds the line via regex sub."""
+    task = "Task #tool:dev-loop"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 1 -->\n",
+        encoding="utf-8",
+    )
+
+    assert queue_manager.mark_retry(task, "2026-01-01 03:00") is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert queue_manager.extract_hang_count(content) == 1
+    assert "<!-- retry: 2026-01-01 03:00 -->" in content
+
+
+def test_mark_retry_reads_the_counter_off_the_resolved_line_not_the_stale_one(mock_queue_file):
+    """Line numbers shift while a task runs; the counter must follow the task.
+
+    Reading the old count in the CALLER would read it off whatever now sits at the
+    remembered line number. Resolution and read have to happen together, which is
+    why mark_retry hands _replace_open_task_line a builder instead of a string.
+    """
+    task = "Target task"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->\n",
+        encoding="utf-8",
+    )
+    items = queue_manager.read_queue_items()
+    target = next(i for i in items if i.task_text == task)
+    assert target.line_no == 2
+
+    # Concurrent Telegram /task prepend pushes the target down one line; the line
+    # the caller remembers now holds a task with NO counter.
+    assert queue_manager.append_task("Concurrent task") is True
+
+    assert queue_manager.mark_retry(task, "2026-01-01 03:00", line_no=target.line_no) is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert f"- [ ] {task} <!-- retry: 2026-01-01 03:00 --> <!-- hang: 2 -->" in content
+    assert "- [ ] Concurrent task\n" in content  # untouched, still counter-free
+
+
+def test_mark_retry_sets_the_counter_when_one_is_passed(mock_queue_file):
+    """The hang / format_error paths pass previous+1 and that value must win."""
+    task = "Task #tool:dev-loop"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 1 -->\n",
+        encoding="utf-8",
+    )
+
+    assert queue_manager.mark_retry(task, "2026-01-01 03:00", line_no=2, hang_count=2) is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert queue_manager.extract_hang_count(content) == 2
+    assert content.count("<!-- hang:") == 1  # replaced, not appended twice
+
+
+def test_mark_retry_with_hang_count_zero_clears_the_counter(mock_queue_file):
+    """0 stays an explicit reset — 'preserve' is None, not falsy-int."""
+    task = "Task #tool:dev-loop"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->\n",
+        encoding="utf-8",
+    )
+
+    assert queue_manager.mark_retry(task, "2026-01-01 03:00", line_no=2, hang_count=0) is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- hang:" not in content
+    assert f"- [ ] {task} <!-- retry: 2026-01-01 03:00 -->" in content
+
+
+def test_mark_retry_adds_no_counter_when_the_line_never_had_one(mock_queue_file):
+    """Preservation must not invent a marker on an untouched task line."""
+    task = "Task #tool:dev-loop"
+    mock_queue_file.write_text(f"## Queue\n- [ ] {task}\n", encoding="utf-8")
+
+    assert queue_manager.mark_retry(task, "2026-01-01 03:00", line_no=2) is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- hang:" not in content
+
+
+def test_realign_stale_freshonly_keeps_the_hang_counter(mock_queue_file):
+    """The other queue-line rewriter must not drop the marker either.
+
+    `realign_stale_freshonly` moves a missed `#freshonly` slot forward. It edits the
+    retry marker in place (`_set_retry_marker`) rather than rebuilding the line, so
+    the counter survives — pinned here because "it happens to rebuild differently"
+    is not a guarantee, and this is the queue's only persistent state.
+    """
+    task = "Briefing #tool:dev-loop #at:08:00 #every:24h #freshonly"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2020-01-01 08:00 --> <!-- hang: 2 -->\n",
+        encoding="utf-8",
+    )
+
+    assert queue_manager.realign_stale_freshonly() == 1
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert queue_manager.extract_hang_count(content) == 2, content
+    assert "2020-01-01" not in content  # the slot really did move
+
+
+def test_queue_healing_drop_keeps_the_line_comments(mock_queue_file):
+    """queue_healing edits only the status box, so markers ride along."""
+    task = "Task #tool:dev-loop #id:t1"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->\n",
+        encoding="utf-8",
+    )
+
+    ok, _msg = queue_healing.apply_drop("t1")
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert ok is True
+    assert "- [-]" in content            # dropped...
+    assert "<!-- hang: 2 -->" in content  # ...without losing the counter
+
+
+def test_finalize_resets_the_counter_for_a_recurring_task(mock_queue_file):
+    """A successful run clears the counter — the requeue of an #every: task is a
+    fresh start, not a continuation of earlier dead attempts."""
+    task = "Briefing #tool:dev-loop #every:24h"
+    mock_queue_file.write_text(
+        f"## Queue\n- [ ] {task} <!-- retry: 2026-01-01 00:00 --> <!-- hang: 2 -->\n",
+        encoding="utf-8",
+    )
+
+    assert queue_manager.finalize_task_with_result(task, "ok", "claude", line_no=2) is True
+
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- hang:" not in content
+    assert f"- [ ] {task} <!-- retry:" in content  # #every: keeps it open
 
 
 def test_append_log_writes_to_events_log_not_queue_md(mock_queue_file, tmp_path, monkeypatch):

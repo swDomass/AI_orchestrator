@@ -753,7 +753,16 @@ def _mark_retry_checked(
     queue_line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
 ) -> bool:
-    """Mark task for retry and return False if queue mutation failed."""
+    """Mark task for retry and return False if queue mutation failed.
+
+    Used by every park that says NOTHING about the task itself: capacity /
+    provider-unreachable, mid-loop capacity exhaustion, timeout, strict-mode,
+    approval denied/timeout/skipped, parallel error. Deliberately passes no
+    `hang_count` — mark_retry() then carries the existing `<!-- hang: N -->`
+    counter forward unchanged, so such a park neither raises nor resets it.
+    The two paths that DO judge the task (hang, format_error) bypass this helper
+    and call mark_retry(hang_count=previous+1) directly.
+    """
     if mark_retry(task, retry_at, line_no=queue_line_no, subtasks=subtasks):
         return True
     msg = f"Queue-Update fehlgeschlagen: Task konnte nicht für Retry ({retry_at}) markiert werden"

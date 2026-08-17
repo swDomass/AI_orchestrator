@@ -1418,3 +1418,139 @@ def test_requeue_message_shows_the_joint_attempt_budget(monkeypatch):
     line = next(m for m in logged if "Tool-Format-Fehler" in m)
     assert "Versuch 1/2" in line
     assert "Hang/Format-Fehler" in line
+
+
+# ---------------------------------------------------------------------------
+# The counter has to SURVIVE the parks that say nothing about the task
+# ---------------------------------------------------------------------------
+
+def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1):
+    """Drive run_once() over a REAL queue file, one outcome per call.
+
+    Every neighbouring test mocks `mark_retry`, which makes the counter bug
+    invisible by construction: the defect is in what gets WRITTEN to the queue
+    line, so it only shows against a real file and the real mark_retry.
+    Returns a reader for the current queue content.
+    """
+    import queue_manager
+
+    q_file = tmp_path / "agent-queue.md"
+    q_file.write_text("## Queue\n- [ ] Task #tool:dev-loop\n", encoding="utf-8")
+    monkeypatch.setattr(queue_manager, "QUEUE_FILE", q_file)
+
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    pending = list(outcomes)
+
+    def next_outcome(*_a, **_kw):
+        return pending.pop(0)
+
+    monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", max_hang_retries)
+    # Negative backoff → the retry marker lands in the past, so the next poll
+    # picks the task up again instead of the test having to sleep.
+    monkeypatch.setattr(orchestrator, "HANG_RETRY_BACKOFF_SEC", -120)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: -120)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", next_outcome)
+    monkeypatch.setattr(orchestrator, "cleanup_done_tasks", lambda *a, **kw: 0)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    return q_file
+
+
+def _outcome(code):
+    return orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True, error=code, error_code=code,
+    )
+
+
+def test_capacity_park_preserves_the_hang_counter(tmp_path, monkeypatch):
+    """A capacity park must carry the counter forward — it is not a failed attempt.
+
+    `<!-- hang: N -->` is the queue's only persistent per-task counter. Every park
+    rewrites the queue line from scratch, and until 2026-08-15 a park that was
+    handed no count wrote the line WITHOUT the marker — silently resetting the
+    counter to 0. Capacity is the common case at 03:00, so the reset was the rule,
+    not the exception.
+    """
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        [_outcome("format_error"), _outcome("capacity_exhausted")],
+        max_hang_retries=3,
+    )
+    import queue_manager
+
+    orchestrator.run_once()
+    assert queue_manager.extract_hang_count(q_file.read_text(encoding="utf-8")) == 1
+
+    orchestrator.run_once()  # capacity park — says nothing about the task
+    content = q_file.read_text(encoding="utf-8")
+    assert queue_manager.extract_hang_count(content) == 1, (
+        "capacity park reset the counter: " + content
+    )
+    # Preserved, NOT incremented — the park is not an unsuccessful attempt.
+    assert "<!-- hang: 2 -->" not in content
+
+
+def test_task_alternating_between_format_errors_and_parks_still_reaches_the_cap(
+    tmp_path, monkeypatch,
+):
+    """The unbounded-requeue case, end to end.
+
+    With the counter reset on every park, a task that fails, gets parked for
+    capacity, fails again, gets parked again ... never reaches MAX_HANG_RETRIES and
+    requeues forever. Nobody is watching at 03:00, so "forever" means until the
+    quota is gone. MAX_HANG_RETRIES=1 here: attempt 1 requeues, the park in between
+    must change nothing, attempt 2 exceeds the cap and BLOCKS the task.
+    """
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        [_outcome("format_error"), _outcome("capacity_exhausted"), _outcome("format_error")],
+        max_hang_retries=1,
+    )
+
+    orchestrator.run_once()   # attempt 1 → hang: 1, requeued
+    orchestrator.run_once()   # capacity park → counter untouched
+    orchestrator.run_once()   # attempt 2 → 2 > MAX_HANG_RETRIES → blocked
+
+    content = q_file.read_text(encoding="utf-8")
+    assert "- [x] Task #tool:dev-loop" in content, (
+        "task was requeued instead of blocked: " + content
+    )
+    assert "Task blockiert" in content or "- [ ] Task #tool:dev-loop" not in content
+
+
+def test_timeout_and_strict_mode_parks_preserve_the_counter_too(tmp_path, monkeypatch):
+    """Same guarantee for the other two parks named in the fix.
+
+    A timeout park is bounded by nothing of its own; a strict-mode park waits on a
+    quota reset. Neither is an unsuccessful attempt AT the task, so both preserve.
+    """
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        [_outcome("format_error"), _outcome("timeout"), _outcome("rate_limit")],
+        max_hang_retries=5,
+    )
+    import queue_manager
+
+    orchestrator.run_once()
+    assert queue_manager.extract_hang_count(q_file.read_text(encoding="utf-8")) == 1
+
+    orchestrator.run_once()  # timeout park
+    assert queue_manager.extract_hang_count(q_file.read_text(encoding="utf-8")) == 1
+
+    # Strict mode: a #provider tag pins the provider, so a rate_limit parks
+    # instead of rotating.
+    q_file.write_text(
+        q_file.read_text(encoding="utf-8").replace(
+            "Task #tool:dev-loop", "Task #tool:dev-loop #claude",
+        ),
+        encoding="utf-8",
+    )
+    orchestrator.run_once()
+    content = q_file.read_text(encoding="utf-8")
+    assert queue_manager.extract_hang_count(content) == 1, content

@@ -1216,10 +1216,19 @@ def _replace_open_task_line(
     *,
     line_no: int,
     task_text: str,
-    replacement: str,
+    replacement: str | Callable[[str], str],
     subtasks: tuple[str, ...] | None = None,
 ) -> str | None:
-    """Replace an open queue line, tolerating line shifts caused by concurrent inserts."""
+    """Replace an open queue line, tolerating line shifts caused by concurrent inserts.
+
+    ``replacement`` may be a plain string or a callable that receives the resolved
+    line's body (without its newline) and returns the new body. The callable form
+    exists so a rewrite can carry state forward that only the OLD line knows —
+    today that is the persistent ``<!-- hang: N -->`` counter, see ``mark_retry``.
+    Resolving the line and reading it must stay in one place: the line number can
+    have shifted, so a caller that re-searched the line itself would risk reading
+    the counter off a different line than the one it then overwrites.
+    """
     lines = content.splitlines(keepends=True)
     preferred_idx = line_no - 1
     idx = preferred_idx
@@ -1298,7 +1307,8 @@ def _replace_open_task_line(
 
     original_line = lines[idx]
     newline = "\r\n" if original_line.endswith("\r\n") else "\n" if original_line.endswith("\n") else ""
-    lines[idx] = replacement + newline
+    new_body = replacement(original_line.rstrip("\r\n")) if callable(replacement) else replacement
+    lines[idx] = new_body + newline
     if line_shifted:
         print(f"Hinweis: Queue-Task '{task_text}' von Zeile {line_no} auf Zeile {idx + 1} re-synchronisiert.")
     return "".join(lines)
@@ -1401,11 +1411,30 @@ def mark_retry(
 ) -> bool:
     """Add retry annotation to a task (stays open, shows when it will retry).
 
-    ``hang_count`` (when set) appends a persistent ``<!-- hang: N -->`` marker so
-    the orchestrator can block a task that hangs repeatedly instead of looping.
+    The persistent ``<!-- hang: N -->`` marker is the queue's ONLY per-task counter,
+    and this function is the only place that writes it. Because every park rebuilds
+    the line from scratch, "not passing the counter" used to mean "erase it":
+
+    * ``hang_count=<int>`` SETS the counter. Only the two paths that judge the task
+      itself pass one — hang and format_error, each with previous+1. Those are the
+      unsuccessful attempts the cap in MAX_HANG_RETRIES exists to bound.
+    * ``hang_count=None`` PRESERVES whatever the line already carries. This is every
+      other park — capacity, provider cooldown, timeout, strict-mode, approval
+      denied/timeout/skipped, parallel error. None of them say anything about the
+      task, so they must neither raise the counter nor reset it.
+    * ``hang_count=0`` clears it explicitly. Nothing does today; success resets the
+      counter by rewriting the line via finalize_task_with_result() instead.
+
+    Before 2026-08-15 None meant "drop the marker". A task alternating between
+    format errors and capacity parks therefore never reached MAX_HANG_RETRIES and
+    requeued forever — invisible in an unattended night run, which is the only kind
+    of run this counter exists for.
     """
-    hang_suffix = f" <!-- hang: {hang_count} -->" if hang_count else ""
-    replacement = f"- [ ] {task_text} <!-- retry: {retry_at} -->{hang_suffix}"
+
+    def _build(previous_line: str) -> str:
+        count = extract_hang_count(previous_line) if hang_count is None else hang_count
+        hang_suffix = f" <!-- hang: {count} -->" if count else ""
+        return f"- [ ] {task_text} <!-- retry: {retry_at} -->{hang_suffix}"
 
     def update(content: str) -> str | None:
         if line_no is not None:
@@ -1413,7 +1442,7 @@ def mark_retry(
                 content,
                 line_no=line_no,
                 task_text=task_text,
-                replacement=replacement,
+                replacement=_build,
                 subtasks=subtasks,
             )
             if updated is None:
@@ -1430,7 +1459,7 @@ def mark_retry(
         if not pattern.search(content):
             print(f"Warnung: Task '{task_text}' konnte nicht für Retry markiert werden (nicht gefunden).")
             return None
-        return pattern.sub(lambda _m: replacement, content, count=1)
+        return pattern.sub(lambda m: _build(m.group(0)), content, count=1)
 
     return _apply_update(update)
 

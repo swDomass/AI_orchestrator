@@ -254,7 +254,10 @@ def test_discovery_failure_returns_error(monkeypatch, tmp_path):
     assert result.success is False
     assert result.iterations == 0
     assert "Discovery fehlgeschlagen" in result.error
-    assert result.retryable is True
+    # "no scripted output left" is free-form prose, not a taxonomy code: it must
+    # neither be passed on as an error_code nor be treated as transient.
+    assert result.error_code == ""
+    assert result.retryable is False
 
 
 def test_analysis_failure_returns_error(monkeypatch, tmp_path):
@@ -266,7 +269,8 @@ def test_analysis_failure_returns_error(monkeypatch, tmp_path):
     assert result.success is False
     assert result.iterations == 1
     assert "Analysis fehlgeschlagen" in result.error
-    assert result.retryable is True
+    assert result.error_code == ""
+    assert result.retryable is False
 
 
 def test_questions_failure_returns_error(monkeypatch, tmp_path):
@@ -278,7 +282,44 @@ def test_questions_failure_returns_error(monkeypatch, tmp_path):
     assert result.success is False
     assert result.iterations == 2
     assert "Fragen-Generierung fehlgeschlagen" in result.error
-    assert result.retryable is True
+    assert result.error_code == ""
+    assert result.retryable is False
+
+
+class _FailingProvider(_ScriptedProvider):
+    """Fails the first call with a caller-supplied provider error string."""
+
+    def __init__(self, error: str):
+        super().__init__([])
+        self._error = error
+
+    def run(self, task, cwd=None, timeout=0, read_only=False) -> RunResult:
+        self.prompts.append(task)
+        self.read_only_flags.append(read_only)
+        return RunResult(success=False, error=self._error)
+
+
+@pytest.mark.parametrize(
+    "provider_error, expected_code, expected_retryable",
+    [
+        ("rate_limit", "rate_limit", True),
+        # "code: detail" form — OpenRouter/Gemini prefix their codes.
+        ("rate_limit: upstream 429", "rate_limit", True),
+        ("hang", "hang", True),
+        ("auth_error: token expired", "auth_error", False),
+        ("Traceback (most recent call last): boom", "", False),
+    ],
+)
+def test_discovery_error_is_classified(
+    monkeypatch, tmp_path, provider_error, expected_code, expected_retryable
+):
+    """Provider errors go through providers.base classification, not verbatim."""
+    _patch(monkeypatch)
+    result = ResearchQATool().run("Task X", _FailingProvider(provider_error), cwd=str(tmp_path))
+
+    assert result.success is False
+    assert result.error_code == expected_code
+    assert result.retryable is expected_retryable
 
 
 def test_research_qa_fails_on_workspace_mutation(monkeypatch, tmp_path):

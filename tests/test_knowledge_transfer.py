@@ -1,4 +1,5 @@
-"""Tests for tools/knowledge_transfer.py — pure-function unit tests."""
+"""Tests for tools/knowledge_transfer.py — pure functions plus the phase-failure
+error classification (the only part of run() that decides queue behaviour)."""
 
 import sys
 from pathlib import Path
@@ -9,7 +10,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 with patch("config._load_dotenv"):
+    from providers.base import RunResult
     from tools.knowledge_transfer import (
+        KnowledgeTransferTool,
         _extract_note_title,
         _extract_topic,
         _make_slug,
@@ -194,3 +197,81 @@ class TestScanVault:
         with patch("tools.knowledge_transfer.VAULT_PATH", tmp_path):
             result = _scan_vault(None, 1_000)
         assert len(result) <= 1_100  # small buffer for block headers
+
+
+# ── Phase-failure classification ──────────────────────────────────────────────
+
+
+class _FailingAtPhase:
+    """Succeeds for the first `fail_on - 1` calls, then fails with `error`."""
+
+    name = "claude"
+    supports_sessions = False
+
+    def __init__(self, fail_on: int, error: str):
+        self._fail_on = fail_on
+        self._error = error
+        self._calls = 0
+
+    def run(self, prompt, cwd=None, timeout=0, **kwargs):
+        self._calls += 1
+        if self._calls == self._fail_on:
+            return RunResult(success=False, error=self._error)
+        return RunResult(success=True, output=f"# Ergebnis Phase {self._calls}\n\nInhalt.")
+
+
+@pytest.fixture
+def _kt_env(tmp_path, monkeypatch):
+    """Vault with one substantial note, no notifier traffic, no inter-step sleep."""
+    (tmp_path / "note.md").write_text(
+        "# Bremsen\n\n" + "Technical simulation content. " * 20, encoding="utf-8",
+    )
+    monkeypatch.setattr("tools.knowledge_transfer.VAULT_PATH", tmp_path)
+    monkeypatch.setattr("tools.knowledge_transfer.TOOL_INTER_STEP_SLEEP_SEC", 0)
+    monkeypatch.setattr("tools.knowledge_transfer.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.knowledge_transfer.notify_tool_done", lambda *a, **kw: None)
+    return tmp_path
+
+
+class TestPhaseFailureClassification:
+    """knowledge-transfer must classify via providers/base, not with `retryable=True`.
+
+    All three phase-failure returns hardcoded `retryable=True` and set no
+    `error_code`. Unconditional retry means an auth_error or a model refusal
+    re-parks the task on every poll forever — unbounded, and invisible at 03:00
+    because nobody is watching. The missing code also left the taxonomy guessing
+    from free-form prose.
+    """
+
+    @pytest.mark.parametrize("fail_on, iterations", [(1, 1), (2, 2), (3, 3)])
+    def test_transient_provider_error_stays_retryable(self, _kt_env, fail_on, iterations):
+        provider = _FailingAtPhase(fail_on, "rate_limit: 429 upstream")
+        result = KnowledgeTransferTool().run("Transfer test", provider, cwd=str(_kt_env))
+        assert result.success is False
+        assert result.iterations == iterations
+        assert result.error_code == "rate_limit"
+        assert result.retryable is True
+
+    @pytest.mark.parametrize("fail_on", [1, 2, 3])
+    def test_permanent_provider_error_is_not_retried(self, _kt_env, fail_on):
+        provider = _FailingAtPhase(fail_on, "auth_error: token expired")
+        result = KnowledgeTransferTool().run("Transfer test", provider, cwd=str(_kt_env))
+        assert result.success is False
+        assert result.error_code == "auth_error"
+        assert result.retryable is False, (
+            "an auth error requeues the task on every poll forever"
+        )
+
+    @pytest.mark.parametrize("fail_on", [1, 2, 3])
+    def test_model_refusal_is_terminal(self, _kt_env, fail_on):
+        provider = _FailingAtPhase(fail_on, "model_refusal: prompt blocked (SAFETY)")
+        result = KnowledgeTransferTool().run("Transfer test", provider, cwd=str(_kt_env))
+        assert result.error_code == "model_refusal"
+        assert result.retryable is False
+
+    def test_free_form_stderr_yields_no_error_code_and_no_retry(self, _kt_env):
+        provider = _FailingAtPhase(1, "Traceback (most recent call last): boom")
+        result = KnowledgeTransferTool().run("Transfer test", provider, cwd=str(_kt_env))
+        assert result.error_code == ""       # prose never becomes a taxonomy code
+        assert result.retryable is False
+        assert "boom" in result.error        # ...but it stays visible in `error`

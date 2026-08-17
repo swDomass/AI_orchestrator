@@ -28,7 +28,7 @@ from config import (
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_progress, notify_tool_done
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result
 
 # Matches priority findings like: - [P1] Some issue
@@ -514,8 +514,8 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    error_code=review_result.error,
-                    retryable=True,
+                    error_code=error_code_of(review_result.error),
+                    retryable=is_transient(review_result.error),
                     **tokens.as_kwargs(),
                 )
 
@@ -844,8 +844,8 @@ class ReviewLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    error_code=fix_result.error,
-                    retryable=True,
+                    error_code=error_code_of(fix_result.error),
+                    retryable=is_transient(fix_result.error),
                     **tokens.as_kwargs(),
                 )
 

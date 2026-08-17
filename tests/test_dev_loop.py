@@ -356,7 +356,35 @@ def test_dev_loop_fails_on_execution_error(monkeypatch, tmp_path):
 
     assert result.success is False
     assert "Execution" in result.error
-    assert result.error_code == "exec error"
+    # RunResult.error is an unconstrained string. Free-form prose ("exec error",
+    # a raw stderr dump) is NOT a taxonomy code and must not be handed on as one —
+    # it used to land verbatim in orchestrator.py's error_code branch and fall into
+    # the generic 5-minute cooldown instead of a real classification.
+    assert result.error_code == ""
+    assert result.retryable is False
+
+
+def test_dev_loop_classifies_transient_execution_error(monkeypatch, tmp_path):
+    """A provider error in "code: detail" form keeps its code and stays retryable."""
+    _patch(monkeypatch)
+
+    class _RateLimited:
+        name = "claude"
+        supports_sessions = False
+        _calls = 0
+        def run(self, task, cwd=None, timeout=0, **kwargs):
+            self._calls += 1
+            if self._calls == 1:
+                return RunResult(
+                    success=True,
+                    output="## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+                )
+            return RunResult(success=False, error="rate_limit: 429 from upstream")
+
+    result = DevLoopTool().run("Fix bug", _RateLimited(), cwd=str(tmp_path))
+
+    assert result.success is False
+    assert result.error_code == "rate_limit"
     assert result.retryable is True
 
 

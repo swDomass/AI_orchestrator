@@ -26,7 +26,7 @@ from config import (
     TOOL_RQA_QUESTIONS_TIMEOUT_SEC,
 )
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider, RunResult
+from providers.base import BaseProvider, RunResult, error_code_of, is_transient
 from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _write_tool_file
 
 RQA_DIR = ".research-qa"
@@ -486,7 +486,8 @@ class ResearchQATool(BaseTool):
             notify_tool_done(self.name, 0, False, msg)
             return ToolResult(
                 success=False, output="", iterations=0,
-                error=msg, error_code=discovery_result.error, retryable=True,
+                error=msg, error_code=error_code_of(discovery_result.error),
+                retryable=is_transient(discovery_result.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
             )
@@ -546,7 +547,8 @@ class ResearchQATool(BaseTool):
             notify_tool_done(self.name, 1, False, msg)
             return ToolResult(
                 success=False, output="\n\n".join(all_outputs), iterations=1,
-                error=msg, error_code=analysis_result.error, retryable=True,
+                error=msg, error_code=error_code_of(analysis_result.error),
+                retryable=is_transient(analysis_result.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
             )
@@ -606,7 +608,8 @@ class ResearchQATool(BaseTool):
             notify_tool_done(self.name, 2, False, msg)
             return ToolResult(
                 success=False, output="\n\n".join(all_outputs), iterations=2,
-                error=msg, error_code=questions_result.error, retryable=True,
+                error=msg, error_code=error_code_of(questions_result.error),
+                retryable=is_transient(questions_result.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
             )

@@ -33,7 +33,7 @@ from config import (
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
 from tools.review_loop import _is_clean_output, _parse_findings, strip_p3_lines
 
@@ -376,8 +376,8 @@ class DevLoopTool(BaseTool):
                     output="",
                     iterations=0,
                     error=msg,
-                    error_code=rp_result.error,
-                    retryable=True,
+                    error_code=error_code_of(rp_result.error),
+                    retryable=is_transient(rp_result.error),
                     **tokens.as_kwargs(),
                 )
 
@@ -522,8 +522,8 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    error_code=exec_result.error,
-                    retryable=True,
+                    error_code=error_code_of(exec_result.error),
+                    retryable=is_transient(exec_result.error),
                     **tokens.as_kwargs(),
                 )
 
@@ -559,8 +559,8 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    error_code=quality_result.error,
-                    retryable=True,
+                    error_code=error_code_of(quality_result.error),
+                    retryable=is_transient(quality_result.error),
                     **tokens.as_kwargs(),
                 )
 
@@ -617,8 +617,8 @@ class DevLoopTool(BaseTool):
                     output="\n\n".join(all_outputs),
                     iterations=iteration,
                     error=msg,
-                    error_code=resolution_result.error,
-                    retryable=True,
+                    error_code=error_code_of(resolution_result.error),
+                    retryable=is_transient(resolution_result.error),
                     **tokens.as_kwargs(),
                 )
 

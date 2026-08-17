@@ -559,6 +559,61 @@ class TestBrainstormRun:
         assert len(provider.calls) == 0
 
 
+# ── Synthesis failure: central error classification ──────────────────
+
+
+def _run_to_synthesis_failure(tmp_path, monkeypatch, provider_error):
+    """Drive BrainstormTool.run() into the synthesis-failure branch."""
+    from providers.base import RunResult as _RR
+
+    monkeypatch.setattr(
+        "tools.brainstorm.phase_synthesis",
+        lambda *_a, **_kw: ("", _RR(success=False, error=provider_error)),
+    )
+    outputs = [_PERSONAS_YAML] + [
+        _ideas_block("stabile idee alpha beta gamma", "zweite idee delta epsilon")
+    ] * 12
+    provider = _ScriptedProvider("claude", outputs)
+    return BrainstormTool().run("Pricing-Strategie WhiteLady", provider, cwd=str(tmp_path))
+
+
+class TestSynthesisFailureClassification:
+    """Brainstorm must classify via providers/base, not with its own rules.
+
+    It used to write the RAW `RunResult.error` string into `error_code` (so the
+    taxonomy could ingest a whole stderr dump as a code) and treat only a bare
+    "stdin_incomplete" as transient — an exact-match test that a real
+    "stdin_incomplete: 3 of 12 KB" fails, while rate_limit / unreachable / timeout
+    were classed as permanent and closed the task.
+    """
+
+    def test_rate_limit_is_transient_and_carries_the_taxonomy_code(self, tmp_path, _patch, monkeypatch):
+        result = _run_to_synthesis_failure(tmp_path, monkeypatch, "rate_limit: 429 upstream")
+        assert result.success is False
+        assert result.error_code == "rate_limit"
+        assert result.retryable is True
+
+    def test_stdin_incomplete_with_detail_suffix_still_retries(self, tmp_path, _patch, monkeypatch):
+        result = _run_to_synthesis_failure(
+            tmp_path, monkeypatch, "stdin_incomplete: 3 of 12 KB written",
+        )
+        assert result.error_code == "stdin_incomplete"
+        assert result.retryable is True
+
+    def test_auth_error_is_permanent_and_does_not_requeue(self, tmp_path, _patch, monkeypatch):
+        result = _run_to_synthesis_failure(tmp_path, monkeypatch, "auth_error: token expired")
+        assert result.error_code == "auth_error"
+        assert result.retryable is False
+
+    def test_free_form_stderr_never_becomes_an_error_code(self, tmp_path, _patch, monkeypatch):
+        noise = "Traceback (most recent call last): File x, line 3\n  boom"
+        result = _run_to_synthesis_failure(tmp_path, monkeypatch, noise)
+        # Falls back to the tool's own code — the stderr dump stays in `error`.
+        assert result.error_code == "synthesis_failed"
+        assert noise not in (result.error_code or "")
+        assert result.retryable is False
+
+
 class TestPersonaProviderResolutionPolicy:
 
     def test_resolution_step_obeys_tool_provider_policy(self, tmp_path, _patch, monkeypatch):

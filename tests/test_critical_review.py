@@ -568,6 +568,48 @@ class TestPass1Failure:
         if docs.exists():
             assert len(list(docs.glob("*.md"))) == 0
 
+    @pytest.mark.parametrize(
+        "provider_error, expected_code, expected_retryable",
+        [
+            ("timeout", "timeout", True),
+            # Missing from the inline list this replaced.
+            ("hang", "hang", True),
+            # "code: detail" form never matched the verbatim comparison.
+            ("rate_limit: upstream said 429", "rate_limit", True),
+            ("http_429: quota", "", False),  # not part of the stable taxonomy
+            ("auth_error", "auth_error", False),
+            ("Traceback: boom", "", False),
+        ],
+    )
+    def test_pass1_error_is_classified_centrally(
+        self, tmp_path, _patch, provider_error, expected_code, expected_retryable
+    ):
+        """The inline `error in (...)` list missed "hang" and never matched the
+        "code: detail" form, so those failures fell into the generic 5-minute
+        cooldown instead of their own handling."""
+        result = CriticalReviewTool().run(
+            "Review", _ErrorProvider("claude", provider_error), cwd=str(tmp_path)
+        )
+        assert result.success is False
+        assert result.error_code == expected_code
+        assert result.retryable is expected_retryable
+
+    def test_pass1_failure_without_error_string_does_not_continue(self, tmp_path, _patch):
+        """success=False with an empty .error used to pass for a successful Pass 1."""
+        class _SilentFailure:
+            name = "claude"
+            def __init__(self):
+                self.calls = 0
+            def run(self, task, cwd=None, timeout=0, read_only=False):
+                self.calls += 1
+                return RunResult(success=False, output="", error="")
+
+        provider = _SilentFailure()
+        result = CriticalReviewTool().run("Review", provider, cwd=str(tmp_path))
+
+        assert result.success is False
+        assert provider.calls == 1, "must not continue into Pass 2"
+
 
 class TestPass2Failure:
 

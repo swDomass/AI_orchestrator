@@ -11,7 +11,7 @@ import time
 
 from config import TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC, TOOL_INTER_STEP_SLEEP_SEC
 from notifier import notify_tool_progress, notify_tool_done
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, ToolResult, _build_system_prompt
 
 _TEST_PROMPT_BODY = """
@@ -128,7 +128,8 @@ class TestLoopTool(BaseTool):
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
                                   iterations=iteration, error=msg,
-                                  error_code=test_result.error, retryable=True,
+                                  error_code=error_code_of(test_result.error),
+                                  retryable=is_transient(test_result.error),
                                   input_tokens=total_input_tokens,
                                   output_tokens=total_output_tokens)
 
@@ -171,7 +172,8 @@ class TestLoopTool(BaseTool):
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
                                   iterations=iteration, error=msg,
-                                  error_code=fix_result.error, retryable=True,
+                                  error_code=error_code_of(fix_result.error),
+                                  retryable=is_transient(fix_result.error),
                                   input_tokens=total_input_tokens,
                                   output_tokens=total_output_tokens)
 

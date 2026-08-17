@@ -67,3 +67,48 @@ def test_test_loop_phase_cap_does_not_raise_above_constant():
     assert tool._phase_cap(5, TOOL_FIX_TIMEOUT_SEC) == 5
     # No task timeout → the phase default.
     assert tool._phase_cap(None, TOOL_FIX_TIMEOUT_SEC) == TOOL_FIX_TIMEOUT_SEC
+
+
+class _FailingProvider:
+    """Fails every call with a caller-supplied provider error string."""
+    name = "claude"
+    supports_sessions = False
+
+    def __init__(self, error: str):
+        self._error = error
+        self.prompts: list[str] = []
+
+    def run(self, prompt, **kwargs):
+        from providers.base import RunResult
+        self.prompts.append(prompt)
+        return RunResult(success=False, error=self._error)
+
+
+import pytest  # noqa: E402 — kept next to the parametrized test it serves
+
+
+@pytest.mark.parametrize(
+    "provider_error, expected_code, expected_retryable",
+    [
+        ("rate_limit", "rate_limit", True),
+        ("rate_limit: upstream 429", "rate_limit", True),
+        ("hang", "hang", True),
+        ("auth_error", "auth_error", False),
+        ("pytest: command not found", "", False),
+    ],
+)
+def test_test_loop_classifies_provider_errors(
+    monkeypatch, tmp_path, provider_error, expected_code, expected_retryable
+):
+    """RunResult.error was passed through verbatim as error_code with a hardcoded
+    retryable=True — a raw stderr dump then fell into orchestrator.py's generic
+    5-minute cooldown instead of a real classification."""
+    monkeypatch.setattr("tools.test_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.test_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.test_loop.time.sleep", lambda _s: None)
+
+    result = TestLoopTool().run("Run tests", _FailingProvider(provider_error), cwd=str(tmp_path))
+
+    assert result.success is False
+    assert result.error_code == expected_code
+    assert result.retryable is expected_retryable

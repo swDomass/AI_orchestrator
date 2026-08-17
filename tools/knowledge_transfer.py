@@ -27,7 +27,7 @@ from config import (
     VAULT_PATH,
 )
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from queue_manager import strip_metadata_tags
 from tools.base_tool import BaseTool, ToolResult, _build_system_prompt, _write_tool_file
 
@@ -392,9 +392,15 @@ class KnowledgeTransferTool(BaseTool):
         if not r1.success:
             msg = f"Know-How-Extraktion fehlgeschlagen: {r1.error}"
             notify_tool_done(self.name, 1, False, msg)
+            # Central classification (providers/base) instead of a blanket
+            # retryable=True: an auth_error or a model refusal is not transient, and
+            # an unconditional retry re-parks the task on every poll forever — the
+            # unattended failure mode nobody sees at 03:00. No error_code at all
+            # also left the taxonomy guessing from free-form prose.
             return ToolResult(
                 success=False, output="", iterations=1, error=msg,
-                retryable=True, input_tokens=total_in, output_tokens=total_out,
+                error_code=error_code_of(r1.error), retryable=is_transient(r1.error),
+                input_tokens=total_in, output_tokens=total_out,
             )
         knowhow = r1.output.strip()
         print("  [knowledge-transfer] Know-How-Extraktion abgeschlossen")
@@ -421,7 +427,8 @@ class KnowledgeTransferTool(BaseTool):
             notify_tool_done(self.name, 2, False, msg)
             return ToolResult(
                 success=False, output=knowhow, iterations=2, error=msg,
-                retryable=True, input_tokens=total_in, output_tokens=total_out,
+                error_code=error_code_of(r2.error), retryable=is_transient(r2.error),
+                input_tokens=total_in, output_tokens=total_out,
             )
         applications = r2.output.strip()
         print("  [knowledge-transfer] Cross-Domain-Recherche abgeschlossen")
@@ -453,7 +460,9 @@ class KnowledgeTransferTool(BaseTool):
             notify_tool_done(self.name, 3, False, msg)
             return ToolResult(
                 success=False, output=f"{knowhow}\n\n{applications}", iterations=3,
-                error=msg, retryable=True, input_tokens=total_in, output_tokens=total_out,
+                error=msg, error_code=error_code_of(r3.error),
+                retryable=is_transient(r3.error),
+                input_tokens=total_in, output_tokens=total_out,
             )
         note_content = r3.output.strip()
         print("  [knowledge-transfer] Synthese abgeschlossen")

@@ -53,7 +53,7 @@ from config import (
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import (
     BaseTool,
     TokenCounter,
@@ -535,18 +535,21 @@ class BrainstormTool(BaseTool):
             state["report_path"] = str(report_path)
             state["phase"] = "synthesis_failed"
             _atomic_write_json(state_path, state)
-            err_code = getattr(synth_result, "error", "") or "synthesis_failed"
             notify_tool_done(self.name, iterations_used, False,
                              f"Synthese fehlgeschlagen, Raw-Report: {report_path.name}")
+            # Central classification (providers/base). The hand-rolled version here
+            # put the RAW error string into error_code — so the taxonomy ingested a
+            # stderr dump as a code — and treated only a bare "stdin_incomplete" as
+            # transient: a rate_limit or an unreachable provider closed the task as
+            # permanently failed, and "stdin_incomplete: 3 of 12 KB" missed the
+            # exact-match check it was written for.
             return ToolResult(
                 success=False,
                 output=f"Synthese fehlgeschlagen — Raw-Report: {report_path}",
                 iterations=iterations_used,
                 error=err,
-                error_code=err_code,
-                # A prompt that never fully reached the CLI is the most clearly
-                # repeatable failure class there is — it must not close the task.
-                retryable=err_code in ("stdin_incomplete",),
+                error_code=error_code_of(err) or "synthesis_failed",
+                retryable=is_transient(err),
                 **counter.as_kwargs(),
             )
 

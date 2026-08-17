@@ -34,7 +34,7 @@ from config import (
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
-from providers.base import BaseProvider
+from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import (
     BaseTool,
     SessionContext,
@@ -568,16 +568,21 @@ class CriticalReviewTool(BaseTool):
         total_input_tokens += result1.input_tokens
         total_output_tokens += result1.output_tokens
 
-        if result1.error:
-            print(f"  [critical-review] ✗ Pass 1 Fehler: {result1.error}")
-            retryable = result1.error in ("rate_limit", "unreachable", "timeout", "stdin_incomplete")
+        # .success is the canonical status flag — a failure with an empty .error
+        # must not slip through into Pass 2 as if Pass 1 had produced a review.
+        if not result1.success or result1.error:
+            err1 = result1.error or "Pass 1 fehlgeschlagen"
+            print(f"  [critical-review] ✗ Pass 1 Fehler: {err1}")
+            # Classify centrally instead of comparing the raw string: the local
+            # list missed "hang" entirely and never matched the "code: detail"
+            # form ("rate_limit: <detail>" from OpenRouter, "http_429: …").
             return ToolResult(
                 success=False,
                 output=result1.output,
                 iterations=1,
-                error=result1.error,
-                error_code=result1.error,
-                retryable=retryable,
+                error=err1,
+                error_code=error_code_of(result1.error),
+                retryable=is_transient(result1.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
             )
@@ -704,20 +709,20 @@ class CriticalReviewTool(BaseTool):
         total_input_tokens += result2.input_tokens
         total_output_tokens += result2.output_tokens
 
-        if result2.error:
-            print(f"  [critical-review] ⚠ Pass 2 Fehler: {result2.error}")
+        if not result2.success or result2.error:
+            err2 = result2.error or "Pass 2 fehlgeschlagen"
+            print(f"  [critical-review] ⚠ Pass 2 Fehler: {err2}")
             print(f"  [critical-review] Pass 1 gespeichert: {docs_dir / pass1_filename}")
-            retryable2 = result2.error in ("rate_limit", "unreachable", "timeout", "stdin_incomplete")
             return ToolResult(
                 success=False,
                 output=(
                     f"Pass 1 gespeichert: docs/{pass1_filename}\n\n"
-                    f"Pass 2 Fehler: {result2.error}"
+                    f"Pass 2 Fehler: {err2}"
                 ),
                 iterations=1,
-                error=result2.error,
-                error_code=result2.error,
-                retryable=retryable2,
+                error=err2,
+                error_code=error_code_of(result2.error),
+                retryable=is_transient(result2.error),
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
             )

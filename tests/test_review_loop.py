@@ -775,3 +775,41 @@ def test_phase_cap_does_not_raise_above_constant():
     assert tool._phase_cap(60, TOOL_REVIEW_TIMEOUT_SEC) == 60
     # no task timeout -> phase default
     assert tool._phase_cap(None, TOOL_REVIEW_TIMEOUT_SEC) == TOOL_REVIEW_TIMEOUT_SEC
+
+
+def _patch_review_loop(monkeypatch):
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _s: None)
+
+
+def test_review_loop_classifies_provider_error_instead_of_passing_it_through(monkeypatch, tmp_path):
+    """RunResult.error is an unconstrained string, not a taxonomy code."""
+    _patch_review_loop(monkeypatch)
+
+    class _Failing:
+        name = "codex"
+        _forced_model = None
+
+        def __init__(self, error):
+            self._error = error
+            self.prompts = []
+
+        def run(self, task, cwd=None, timeout=0, read_only=False):
+            self.prompts.append(task)
+            return RunResult(success=False, error=self._error)
+
+    # "code: detail" form must still yield the bare code.
+    result = ReviewLoopTool().run("Review", _Failing("rate_limit: upstream 429"), cwd=str(tmp_path))
+    assert result.error_code == "rate_limit"
+    assert result.retryable is True
+
+    # "hang" was missing from the inline lists that used to do this by hand.
+    result = ReviewLoopTool().run("Review", _Failing("hang"), cwd=str(tmp_path))
+    assert result.error_code == "hang"
+    assert result.retryable is True
+
+    # Raw stderr is not a code and is not transient.
+    result = ReviewLoopTool().run("Review", _Failing("Traceback: boom"), cwd=str(tmp_path))
+    assert result.error_code == ""
+    assert result.retryable is False

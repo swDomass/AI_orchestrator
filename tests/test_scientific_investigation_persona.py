@@ -222,6 +222,42 @@ def test_persona_allocation_methodiker_falls_back_when_no_extra_provider(tmp_pat
     assert allocations[2].cross_provider_satisfied is False
 
 
+def test_persona_allocation_default_lookup_obeys_tool_provider_policy(tmp_path, monkeypatch):
+    """Without an injected lookup, cross-provider allocation must honour policy.yaml.
+
+    The default was dispatcher.get_provider_by_name (policy-blind), so the
+    Devil's-Advocate / Methodiker personas could land on openrouter even where
+    policy.yaml bars it. With [claude, codex] only one cross-provider remains:
+    the DA takes codex, the Methodiker degrades back to the primary.
+    """
+    import policy as policy_module
+    from policy import PolicyEngine
+
+    policy_file = tmp_path / "vault" / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(
+        "tool_providers:\n  scientific-investigation: [claude, codex]\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        policy_module, "_engine", PolicyEngine(vault_path=tmp_path / "vault")
+    )
+    # Every candidate resolves at registry level — only the policy may filter.
+    monkeypatch.setattr("dispatcher.get_provider_by_name", lambda name: object())
+
+    rd = tmp_path / "run"
+    (rd / "audit").mkdir(parents=True)
+    allocations = phase_persona_allocation(
+        _ScriptedProvider(name="claude"),
+        run_dir=rd,
+        run_id="run-policy",
+        cross_provider_none=False,
+    )
+    assert allocations[1].provider_name == "codex"       # DA — gemini/openrouter barred
+    assert allocations[1].cross_provider_satisfied is True
+    assert allocations[2].provider_name == "claude"      # Methodiker degrades to primary
+    assert allocations[2].cross_provider_satisfied is False
+
+
 def test_persona_allocation_writes_audit_entries(tmp_path):
     rd = tmp_path / "run"
     (rd / "audit").mkdir(parents=True)

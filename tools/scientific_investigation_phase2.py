@@ -43,6 +43,11 @@ from tools.scientific_investigation_phases import (
 
 logger = logging.getLogger(__name__)
 
+# Policy key for tool_providers lookups. Mirrors the sibling phase modules
+# (scientific_investigation_phases.py, _phase7.py) — all phases of one tool share
+# one policy entry.
+_TOOL_NAME = "scientific-investigation"
+
 
 Severity = Literal["P1", "P2", "P3"]
 
@@ -434,8 +439,14 @@ def phase_investigation_plan_review(
     to test.
     """
     if provider_lookup is None:
-        from dispatcher import get_provider_by_name as _lookup
-        provider_lookup = _lookup
+        # Policy-aware default, same as phase_persona_allocation and Phase 7: a
+        # provider barred by tool_providers for "scientific-investigation" resolves
+        # to None and _resolve_persona_provider falls back to the primary. The
+        # allocations handed in were filtered once already; re-checking here is the
+        # point, since they can outlive the policy that was in force when they were
+        # made (resumed run, audit-trail replay).
+        from dispatcher import policy_provider_lookup
+        provider_lookup = policy_provider_lookup(_TOOL_NAME)
     if max_iterations is None:
         max_iterations = TOOL_SI_PHASE2_MAX_ITERATIONS
 

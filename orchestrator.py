@@ -54,7 +54,14 @@ from config import (
     TRACK_FILE_CHANGES,
     get_system_prompt,
 )
-from dispatcher import select_provider, earliest_cooldown_reset, has_explicit_provider_tag, force_refresh_can_unblock
+from dispatcher import (
+    select_provider,
+    earliest_cooldown_reset,
+    has_explicit_provider_tag,
+    force_refresh_can_unblock,
+    forced_provider_policy_violation,
+    policy_dead_end,
+)
 from limits import get_limits, set_queue_idle, set_paused, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
     notify_error,
@@ -756,6 +763,40 @@ def _mark_retry_checked(
     return False
 
 
+def _policy_violation_message(name: str, allowed: list[str], tool_name: str | None) -> str:
+    """Message for a #provider tag the tool_providers policy bars.
+
+    Terminal on purpose: retrying cannot change a policy, and silently routing the
+    task to a different provider would hide which model actually did the work —
+    the worst outcome in an unattended run.
+    """
+    scope = f"Tool '{tool_name}'" if tool_name else "diesen Task"
+    return (
+        f"Provider '{name}' ist für {scope} per tool_providers-Policy nicht zugelassen "
+        f"(erlaubt: {', '.join(allowed)}). Kein Fallback auf einen anderen Provider — "
+        f"Task abgebrochen."
+    )
+
+
+def _policy_dead_end_message(allowed: list[str], tool_name: str | None) -> str:
+    """Message for "the policy leaves no routable provider" — no #provider tag involved.
+
+    Terminal for the same reason as _policy_violation_message, but it has to say
+    something different: there is no tag to blame, the allow-list itself and the
+    fallback chain simply do not intersect. Reported instead of parked, because
+    the park path promises a quota reset that cannot lift a policy restriction —
+    the task would sit in the queue forever, re-announcing a wait that never ends.
+    """
+    scope = f"Tool '{tool_name}'" if tool_name else "diesen Task"
+    listed = ", ".join(allowed) if allowed else "keiner"
+    return (
+        f"Kein Provider für {scope} zugelassen: die tool_providers-Policy erlaubt "
+        f"[{listed}], davon ist keiner in der Fallback-Kette registriert und "
+        f"routebar. Das ist keine Kapazitätsfrage — kein Quota-Reset ändert es. "
+        f"Task abgebrochen (policy.yaml oder Profil prüfen)."
+    )
+
+
 def _execute_tool_task(
     task: str,
     tool_name: str,
@@ -808,8 +849,9 @@ def _execute_tool_task(
     clean_task = strip_metadata_tags(task)
     # Extract pass-provider tags from raw task (before strip removes them)
     pass_providers = extract_pass_providers(task)
-    # Second-opinion (review-loop opt-in): pass raw alias; the tool resolves
-    # it via dispatcher.get_provider_by_name so other tools stay unaffected.
+    # Second-opinion (review-loop opt-in): pass the raw alias; the tool resolves it
+    # via the policy-aware dispatcher.get_provider_for_tool so other tools stay
+    # unaffected and `#second_opinion:` cannot slip past tool_providers.
     second_opinion_alias = extract_second_opinion_alias(task)
     _tool_start = time.time()
     tool_result = tool.run(
@@ -1324,6 +1366,42 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             while True:
                 provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
                 if provider is None:
+                    # Policy rejection of a forced #provider tag is terminal and must be
+                    # told apart from "everything is capacity-exhausted" — both surface
+                    # as None here, but only the latter is worth waiting for.
+                    violation = forced_provider_policy_violation(
+                        task, tool_name=tool_name, profile=profile,
+                    )
+                    if violation:
+                        msg = _policy_violation_message(violation[0], violation[1], tool_name)
+                        print(f"  🚫 {msg}")
+                        append_log(msg)
+                        notify_error(task, violation[0], msg)
+                        _finalize_task_with_result_checked(
+                            task, msg, violation[0],
+                            queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        )
+                        _span.error("provider_not_allowed", retry_count=tool_retry_count)
+                        break
+                    # Same terminal shape without a #provider tag: the policy (or the
+                    # profile's provider list) leaves NO routable provider at all. Also
+                    # not a capacity problem — parking it would wait on a quota reset
+                    # that can never lift a policy restriction, so the task would sit
+                    # here forever, unattended and silent.
+                    dead_end = policy_dead_end(
+                        task, tool_name=tool_name, strict=provider_is_forced, profile=profile,
+                    )
+                    if dead_end is not None:
+                        msg = _policy_dead_end_message(dead_end, tool_name)
+                        print(f"  🚫 {msg}")
+                        append_log(msg)
+                        notify_error(task, "policy", msg)
+                        _finalize_task_with_result_checked(
+                            task, msg, "policy",
+                            queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        )
+                        _span.error("no_provider_allowed", retry_count=tool_retry_count)
+                        break
                     # Boot-race recovery (mirrors the single-shot path): on the FIRST
                     # selection, if the provider this task can route to is only blocked
                     # by an in-flight OAuth token refresh, wait for it once via a
@@ -1556,6 +1634,39 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             provider = select_provider(task, limits, exclude=tried_providers, profile=profile, strict=provider_is_forced, tool_name=tool_name)
 
             if provider is None:
+                # Same terminal case as the tool path: a #provider tag the
+                # tool_providers policy bars is not a capacity problem.
+                violation = forced_provider_policy_violation(
+                    task, tool_name=tool_name, profile=profile,
+                )
+                if violation:
+                    msg = _policy_violation_message(violation[0], violation[1], tool_name)
+                    print(f"  🚫 {msg}")
+                    append_log(msg)
+                    notify_error(task, violation[0], msg)
+                    _finalize_task_with_result_checked(
+                        task, msg, violation[0],
+                        queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                    )
+                    _span.error("provider_not_allowed", retry_count=single_shot_retry_count)
+                    break
+                # ...and the untagged variant: the policy leaves nothing routable.
+                # Permanent, so finalize with a clear reason instead of parking the
+                # task on a quota reset that cannot lift a policy restriction.
+                dead_end = policy_dead_end(
+                    task, tool_name=tool_name, strict=provider_is_forced, profile=profile,
+                )
+                if dead_end is not None:
+                    msg = _policy_dead_end_message(dead_end, tool_name)
+                    print(f"  🚫 {msg}")
+                    append_log(msg)
+                    notify_error(task, "policy", msg)
+                    _finalize_task_with_result_checked(
+                        task, msg, "policy",
+                        queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                    )
+                    _span.error("no_provider_allowed", retry_count=single_shot_retry_count)
+                    break
                 if not tried_providers:
                     # Boot-race recovery: a strict/forced task can hit an expired
                     # OAuth token that the background limits thread is still

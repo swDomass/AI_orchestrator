@@ -64,6 +64,7 @@ from tools.base_tool import (
     _write_tool_file,
 )
 from tools.brainstorm_phases import (
+    _TOOL_NAME,
     BrainstormAllocation,
     BrainstormIdea,
     BrainstormPersona,
@@ -294,9 +295,16 @@ class BrainstormTool(BaseTool):
 
         # Resolve providers once. For primary-only mode, all entries point to
         # the same `provider` instance.
+        #
+        # Policy-aware, exactly like the allocation step above: a barred provider
+        # resolves to None and falls back to the primary. Resolution is a SECOND
+        # gate, not a duplicate one — `allocations` can come from the state file of
+        # an earlier run (or from the degraded path above), so a name that was legal
+        # when it was written must still be re-checked against today's policy before
+        # a prompt goes out over it.
         if provider_lookup is None:
-            from dispatcher import get_provider_by_name as _lookup
-            provider_lookup = _lookup
+            from dispatcher import policy_provider_lookup
+            provider_lookup = policy_provider_lookup(_TOOL_NAME)
 
         provider_by_alloc: list[BaseProvider] = []
         for alloc in allocations:

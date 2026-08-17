@@ -184,13 +184,17 @@ subtle bugs the primary reviewer might overlook.
 _SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "codex", "vibe"}
 
 
-def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None] | None:
+def _resolve_second_opinion(
+    alias: str | None,
+    tool_name: str = "review-loop",
+) -> tuple[BaseProvider, str | None] | None:
     """Resolve a #second_opinion:<alias> value to (provider, model_id | None).
 
     Returns None when:
       - alias is falsy
       - alias is unknown (not a model alias and not a bare provider name)
       - the resolved provider is not registered (e.g. OpenRouter without API key)
+      - the tool_providers policy bars the resolved provider for *tool_name*
 
     The caller logs a warning and skips the second-opinion phase on None.
     """
@@ -210,8 +214,11 @@ def _resolve_second_opinion(alias: str | None) -> tuple[BaseProvider, str | None
     else:
         return None
 
-    from dispatcher import get_provider_by_name
-    provider = get_provider_by_name(provider_name)
+    # Policy-aware lookup: a second opinion is still a provider run and must obey
+    # tool_providers, otherwise `#second_opinion:vibe` reaches a pay-per-token
+    # provider that policy.yaml bars from unattended runs.
+    from dispatcher import get_provider_for_tool
+    provider = get_provider_for_tool(provider_name, tool_name)
     if provider is None:
         return None
     return provider, model_id
@@ -393,11 +400,12 @@ class ReviewLoopTool(BaseTool):
         second_opinion_alias: str | None = kwargs.get("second_opinion_alias")
         second_opinion: tuple[BaseProvider, str | None] | None = kwargs.get("second_opinion")
         if second_opinion is None and second_opinion_alias:
-            second_opinion = _resolve_second_opinion(second_opinion_alias)
+            second_opinion = _resolve_second_opinion(second_opinion_alias, self.name)
             if second_opinion is None:
                 print(
                     f"  [review-loop] ⚠️ Second-Opinion alias '{second_opinion_alias}' "
-                    f"unbekannt oder Provider nicht konfiguriert — wird übersprungen"
+                    f"unbekannt, Provider nicht konfiguriert oder per tool_providers-"
+                    f"Policy nicht zugelassen — wird übersprungen"
                 )
 
         tracer = ToolTracer.create(self.name, cwd)

@@ -18,6 +18,7 @@ but nothing routes there by default.
 """
 
 import re
+from typing import Callable
 
 import config
 from limits import AllLimits, ProviderLimits, is_transient_token_refresh
@@ -97,12 +98,292 @@ _PRIORITY = ["claude", "codex"]
 # no provider at all, and the task is parked instead of quietly escalated.
 _REVIEWER_ONLY = {"vibe"}
 
+# Providers billed per token with NO cost ceiling anywhere in this codebase:
+# _limits_ok() below returns True for them unconditionally (there is no cclimits
+# quota to poll), and nothing else caps them either. The subscription providers
+# (claude, codex) are capped by their own quota and cost nothing extra when they
+# run — so "spent money while nobody was watching" is a risk that exists for
+# exactly this set.
+#
+# Single source of truth for that property: _limits_ok() reads it, and
+# _allows() below fails CLOSED for these when no policy could be loaded. Adding a
+# pay-per-token provider means adding it here once, not in two places that can
+# drift apart.
+_UNCAPPED_PROVIDERS = frozenset({"openrouter", "vibe"})
+
+
+def _sanitize_allowed(allowed) -> list[str] | None:
+    """Coerce whatever the policy engine yielded into ``list[str] | None``.
+
+    ``tool_providers:`` is raw YAML — nothing validates its shape on load, so a
+    hand-edited or half-synced file can hand back a number, a mapping, or a
+    string where a list belongs. Downstream this list is only ever membership-
+    tested (``p in allowed``), which raises TypeError on a non-container and
+    would take the whole nightly run down over a typo.
+
+    Anything unusable degrades to None = "no usable restriction", which routes
+    into _allows() and therefore stays fail-open for capped providers and
+    fail-closed for the uncapped ones. Non-string entries are dropped rather
+    than stringified, so `[claude, 5]` allows claude and ignores the 5.
+    """
+    if allowed is None:
+        return None
+    if isinstance(allowed, str):
+        # `dev-loop: claude` (scalar instead of a list) — the obvious intent.
+        # Note PolicyEngine.get_allowed_providers() already list()s its entry, so
+        # a scalar normally arrives here pre-exploded into characters; this
+        # branch catches the paths that hand the raw scalar through.
+        return [allowed]
+    if not isinstance(allowed, (list, tuple, set, frozenset)):
+        return None
+    names = [p.strip() for p in allowed if isinstance(p, str) and p.strip()]
+    return names or None
+
+
+def _policy_allowed_providers(tool_name: str | None) -> list[str] | None:
+    """Global tool-provider policy for *tool_name* (policy.yaml), or None.
+
+    None means "no restriction configured" — see _allows() for what callers do
+    with that (fail-open for capped providers, fail-closed for uncapped ones).
+    A missing, unreadable, malformed or half-synced policy.yaml all land here as
+    None rather than as an exception: this runs unattended, so a broken config
+    file must degrade, not crash.
+    """
+    try:
+        from policy import get_engine
+        allowed = get_engine().get_allowed_providers(tool_name)
+    except (ImportError, ValueError, AttributeError, TypeError):
+        return None
+    return _sanitize_allowed(allowed)
+
+
+def _allowed_by_policy(
+    task: str = "",
+    profile=None,  # ProfileConfig | None
+    tool_name: str | None = None,
+) -> list[str] | None:
+    """Resolve the allowed-provider list through the three policy layers.
+
+    1. Task level  (``#tool_providers:p1,p2`` in the queue line)
+    2. Profile level (``profile.tool_providers[tool_name]``)
+    3. Global level (``tool_providers:`` in policy.yaml)
+
+    Returns None when no layer restricts anything.
+    """
+    if task:
+        try:
+            from queue_manager import extract_tool_providers
+            allowed = extract_tool_providers(task)
+            if allowed is not None:
+                return allowed
+        except (ImportError, ValueError, AttributeError):
+            pass
+
+    if profile and tool_name and hasattr(profile, "tool_providers"):
+        allowed = profile.tool_providers.get(tool_name)
+        if allowed is not None:
+            return allowed
+
+    return _policy_allowed_providers(tool_name)
+
+
+def _allows(provider_name: str, allowed: list[str] | None) -> bool:
+    """Decide one provider against an already-resolved allow-list.
+
+    ``allowed`` is None/empty when no policy layer restricts anything — which is
+    also what a MISSING, unreadable or syntactically broken policy.yaml produces
+    (PolicyEngine swallows both: _reload_if_changed returns early on a missing
+    file, _load_rules_locked logs and returns on a parse error, so
+    get_allowed_providers() reports "no restriction" either way). The file lives
+    in a OneDrive-synced folder, so a half-written or conflicted state is a real
+    operating condition, not a thought experiment.
+
+    That case is split, deliberately asymmetrically:
+
+    * fail-OPEN for the capped providers (claude, codex, gemini) — a policy file
+      that failed to load must not take the whole orchestrator offline at 03:00.
+    * fail-CLOSED for _UNCAPPED_PROVIDERS — those are pay-per-token with no cost
+      ceiling anywhere (_limits_ok returns True for them unconditionally), so a
+      lost policy file would otherwise turn "barred from unattended runs" into
+      "billable and unsupervised". Losing them costs a second opinion; keeping
+      them costs money nobody authorised.
+
+    An explicit allow-list that names an uncapped provider still permits it —
+    that is a deliberate authorisation (policy.yaml entry, profile, or a
+    ``#tool_providers:`` tag on the queue line), not an accident.
+    """
+    if not allowed:
+        return provider_name not in _UNCAPPED_PROVIDERS
+    return provider_name in allowed
+
+
+def _effective_allowed(allowed: list[str] | None) -> list[str]:
+    """The allow-list to SHOW a human, resolving the implicit one.
+
+    When no policy loaded there is no list to print, yet the effective rule is
+    not "everything" (see _allows). Report what actually remains reachable so a
+    log line never claims a provider was allowed when it was not.
+    """
+    if allowed:
+        return list(allowed)
+    return sorted(n for n in _providers if n not in _UNCAPPED_PROVIDERS)
+
+
+def policy_allows_provider(provider_name: str, tool_name: str | None) -> bool:
+    """True when the global tool policy permits *provider_name* for *tool_name*.
+
+    The single gate every tool-internal provider lookup goes through. Without it
+    a tool that resolves its own provider (second opinion, pass 2, cross-provider
+    persona allocation) bypasses policy.yaml entirely — which is how OpenRouter
+    and Vibe kept being reachable in unattended runs even after they were barred
+    there (neither has a cost ceiling: _limits_ok returns True for both).
+
+    A missing/broken policy fails open for capped providers and closed for
+    uncapped ones — see _allows() for why the two halves differ.
+    """
+    return _allows(provider_name, _policy_allowed_providers(tool_name))
+
+
+def get_provider_for_tool(name: str, tool_name: str | None) -> BaseProvider | None:
+    """Policy-aware ``get_provider_by_name()``.
+
+    Returns None both when the provider is unknown/unregistered AND when the tool
+    policy bars it, so callers keep their existing "None → skip / fall back"
+    handling. Use ``policy_allows_provider()`` first when the two cases need to be
+    told apart in a log line.
+    """
+    if not policy_allows_provider(name, tool_name):
+        return None
+    # Deliberately routed through the module-level get_provider_by_name rather
+    # than _providers directly: it stays the single registry access point, so a
+    # test that stubs it out (hermeticity patches do exactly that) still governs
+    # what tools can resolve.
+    return get_provider_by_name(name)
+
+
+def policy_provider_lookup(tool_name: str | None) -> "Callable[[str], BaseProvider | None]":
+    """Return a ``(name) -> provider | None`` lookup bound to *tool_name*'s policy.
+
+    Drop-in replacement for the ``provider_lookup`` callables that the
+    cross-provider allocation phases (brainstorm personas, scientific-investigation
+    personas, Phase 7 reviewer) default to. Candidate tuples in those modules stay
+    as they are — a barred provider simply resolves to None and the loop moves on,
+    which preserves the cross-provider diversity logic instead of hardcoding it.
+    """
+    def _lookup(name: str) -> BaseProvider | None:
+        return get_provider_for_tool(name, tool_name)
+    return _lookup
+
+
+def forced_provider_policy_violation(
+    task: str,
+    *,
+    tool_name: str | None = None,
+    force_name: str | None = None,
+    profile=None,  # ProfileConfig | None
+) -> tuple[str, list[str]] | None:
+    """Return ``(provider_name, allowed)`` when the task forces a provider the tool
+    policy bars — otherwise None.
+
+    Lets the orchestrator tell "policy rejected the #tag" apart from "everything is
+    capacity-exhausted", which both surface as ``select_provider() -> None``. The
+    former is terminal (retrying cannot change a policy), the latter is not.
+    """
+    forced = resolve_forced_provider(task, force_name)
+    if forced is None:
+        return None
+    allowed = _allowed_by_policy(task, profile, tool_name)
+    if not allowed or forced.name in allowed:
+        return None
+    return forced.name, list(allowed)
+
+
+def _selection_order(
+    task: str,
+    profile,  # ProfileConfig | None
+    force_name: str | None,
+    strict: bool,
+    tool_name: str | None,
+) -> tuple[list[str], list[str] | None]:
+    """The provider names select_provider() will walk, plus the resolved allow-list.
+
+    Capacity, cooldown and ``exclude`` are deliberately NOT applied here: those
+    are the temporary reasons a provider drops out, and they are what the caller
+    loops over. What IS applied is every permanent reason — the policy layers,
+    the profile's provider list, and registration.
+
+    So an EMPTY order means "nothing may be routed to, ever", which is a
+    different animal from "everything is busy right now": no quota reset and no
+    cooldown expiry can turn it non-empty. Shared with policy_dead_end() so the
+    two can never disagree about what select_provider() would have tried.
+    """
+    forced = resolve_forced_provider(task, force_name)
+    allowed = _allowed_by_policy(task, profile, tool_name)
+
+    # A forced provider the policy bars stops the selection outright — no
+    # fallback (see select_provider), so nothing is routable.
+    if forced and allowed and forced.name not in allowed:
+        return [], allowed
+
+    # Profile provider order overrides _PRIORITY
+    if profile and getattr(profile, "providers", None):
+        base_order = [p for p in profile.providers if p in _providers]
+    else:
+        base_order = _PRIORITY[:]
+
+    if allowed:
+        base_order = [p for p in base_order if p in allowed]
+
+    if forced:
+        if strict:
+            # Strict mode: only the forced provider, no fallback
+            return [forced.name], allowed
+        return [forced.name] + [n for n in base_order if n != forced.name], allowed
+
+    return base_order, allowed
+
+
+def policy_dead_end(
+    task: str,
+    *,
+    tool_name: str | None = None,
+    force_name: str | None = None,
+    strict: bool = False,
+    profile=None,  # ProfileConfig | None
+) -> list[str] | None:
+    """Return the effective allow-list when NO provider is routable at all — else None.
+
+    Separates the two states that both surface as ``select_provider() -> None``:
+
+    * no provider **available** — capacity exhausted, cooldown running. Temporary;
+      parking the task until the quota resets is the right answer.
+    * no provider **allowed** — the policy/profile layers leave an empty order.
+      Permanent. The orchestrator used to read this as the first case and park the
+      task waiting for a quota reset that could never lift a policy restriction,
+      so the task sat in the queue forever, silently, every poll.
+
+    ``forced_provider_policy_violation()`` already covers the same dead end for a
+    task that carries a #provider tag; this covers the untagged case (a policy
+    naming only providers that are not in the fallback chain, or a profile whose
+    provider list and the policy do not intersect).
+    """
+    # A task tagging an unregistered reviewer-only provider is parked on purpose
+    # (see _REVIEWER_ONLY) — not a policy dead end, so leave that path alone.
+    if resolve_forced_provider(task, force_name) is None and _tags_unregistered_reviewer_only(task):
+        return None
+    order, allowed = _selection_order(task, profile, force_name, strict, tool_name)
+    if order:
+        return None
+    return _effective_allowed(allowed)
+
 
 def _limits_ok(name: str, limits: AllLimits) -> bool:
-    # OpenRouter is pay-per-token and has no subscription quota tracked by
-    # cclimits — treat it as always available. Rate-limit recovery happens
-    # via the provider's own cooldown on HTTP 429.
-    if name in ("openrouter", "vibe"):
+    # OpenRouter and Vibe are pay-per-token and have no subscription quota
+    # tracked by cclimits — treat them as always available. Rate-limit recovery
+    # happens via the provider's own cooldown on HTTP 429. This unconditional
+    # True is exactly what makes them uncapped, which is why _allows() fails
+    # closed for the same set — one constant, so the two cannot drift.
+    if name in _UNCAPPED_PROVIDERS:
         return True
     # Gemini in HTTP-API mode (GEMINI_API_KEY set) has no pollable subscription
     # quota either — the consumer CLI/OAuth endpoint cclimits reads is dead. Treat
@@ -176,48 +457,26 @@ def select_provider(
     if forced is None and _tags_unregistered_reviewer_only(task):
         return None
 
-    # Tool Policy Layering: filter allowed providers for this tool
-    allowed_by_policy = None
-    
-    # 1. Task level (#tool_providers:p1,p2)
-    try:
-        from queue_manager import extract_tool_providers
-        allowed_by_policy = extract_tool_providers(task)
-    except (ImportError, ValueError, AttributeError):
-        pass
-    
-    # 2. Profile level (profile.tool_providers)
-    if allowed_by_policy is None:
-        if profile and tool_name and hasattr(profile, "tool_providers"):
-            allowed_by_policy = profile.tool_providers.get(tool_name)
-    
-    # 3. Global level (policy.yaml)
-    if allowed_by_policy is None:
-        try:
-            from policy import get_engine
-            allowed_by_policy = get_engine().get_allowed_providers(tool_name)
-        except (ImportError, ValueError, AttributeError):
-            pass
+    # Tool Policy Layering: task tag → profile → policy.yaml (see _allowed_by_policy),
+    # profile provider order, strict/forced handling — all of it lives in
+    # _selection_order() so policy_dead_end() judges the exact same order.
+    order, allowed_by_policy = _selection_order(task, profile, force_name, strict, tool_name)
 
-    # Profile provider order overrides _PRIORITY
-    if profile and getattr(profile, "providers", None):
-        base_order = [p for p in profile.providers if p in _providers]
-    else:
-        base_order = _PRIORITY[:]
-
-    # Filter base_order by policy if applicable
-    if allowed_by_policy:
-        base_order = [p for p in base_order if p in allowed_by_policy]
-
-    if forced:
-        if strict:
-            # Strict mode: only try the forced provider, no fallback
-            order = [forced.name]
-        else:
-            # Move forced provider to front within the allowed order
-            order = [forced.name] + [n for n in base_order if n != forced.name]
-    else:
-        order = base_order
+    # A forced provider (#openrouter / #vibe / force_name) used to be prepended
+    # AFTER the policy filter, which made the filter a no-op for exactly the two
+    # providers it exists to bar. Reject instead of quietly routing elsewhere: in
+    # an unattended run a silent swap to a different provider is worse than a
+    # clean stop, because nobody sees which model actually did the work.
+    # (A forced provider that IS allowed always heads a non-empty order, so an
+    # empty one here can only mean the policy barred it.)
+    if forced and not order:
+        print(
+            f"  [policy] Provider '{forced.name}' ist für "
+            f"{'Tool ' + tool_name if tool_name else 'diesen Task'} nicht zugelassen "
+            f"(erlaubt: {', '.join(_effective_allowed(allowed_by_policy))}) — kein "
+            f"Fallback auf einen anderen Provider."
+        )
+        return None
 
     excluded = exclude or set()
 
@@ -264,7 +523,10 @@ def force_refresh_can_unblock(
 def get_provider_by_name(name: str) -> BaseProvider | None:
     """Return a provider instance by name, or None if unknown.
 
-    Used by tools that need cross-provider support (e.g. critical-review multi-pass).
+    POLICY-BLIND on purpose — this is the raw registry lookup. Tool code must use
+    ``get_provider_for_tool()`` / ``policy_provider_lookup()`` instead, otherwise the
+    tool_providers policy is bypassed (that is how OpenRouter and Vibe stayed
+    reachable in six tools after being barred from unattended runs).
     """
     return _providers.get(name)
 

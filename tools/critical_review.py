@@ -46,6 +46,11 @@ from tools.base_tool import (
     _write_tool_file,
 )
 
+# Tool name this module registers under — the tool_providers policy key used when
+# resolving the Pass 2 provider. A constant rather than a `self.name` argument so
+# the resolver keeps its two-argument call shape.
+_TOOL_NAME = "critical-review"
+
 # ── Prompt Templates ─────────────────────────────────────────────────
 
 _REVIEWER_PERSONA = """
@@ -390,13 +395,28 @@ def _plan_v2_path(plan_path: Path) -> Path:
 def _resolve_pass2_provider(
     pass_providers: dict[int, str],
     default_provider: BaseProvider,
+    tool_name: str = _TOOL_NAME,
 ) -> BaseProvider:
-    """Resolve the Pass 2 provider from task tags, falling back to the primary provider."""
+    """Resolve the Pass 2 provider from task tags, falling back to the primary provider.
+
+    The tag is filtered through the tool_providers policy: `#pass2:openrouter` on a
+    tool that policy.yaml restricts to [claude, codex] must not reach OpenRouter.
+    Policy rejection and an unknown name are logged differently so the fallback is
+    traceable in an unattended run.
+    """
     pass2_name = pass_providers.get(2)
     if not pass2_name:
         return default_provider
 
-    from dispatcher import get_provider_by_name
+    from dispatcher import get_provider_by_name, policy_allows_provider
+    if not policy_allows_provider(pass2_name, tool_name):
+        print(
+            f"  [critical-review] Warnung: Pass 2 Provider '{pass2_name}' ist per "
+            f"tool_providers-Policy für '{tool_name}' nicht zugelassen — "
+            f"verwende {default_provider.name}"
+        )
+        return default_provider
+
     resolved = get_provider_by_name(pass2_name)
     if resolved is None:
         print(

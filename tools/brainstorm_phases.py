@@ -29,6 +29,11 @@ from tools.scientific_investigation_phases import (
 
 logger = logging.getLogger(__name__)
 
+# Tool this module's phases belong to — the key the tool_providers policy is
+# looked up under. Kept as a constant so the default provider lookup can be
+# policy-bound without threading the name through every phase signature.
+_TOOL_NAME = "brainstorm"
+
 
 # ── Data classes ──────────────────────────────────────────────────────
 
@@ -370,8 +375,12 @@ def phase_provider_allocation(
             for p in personas
         ]
     if provider_lookup is None:
-        from dispatcher import get_provider_by_name as _lookup
-        provider_lookup = _lookup
+        # Policy-aware lookup: candidate_names stays as-is, but a provider the
+        # tool_providers policy bars for "brainstorm" now resolves to None and
+        # simply drops out of the round-robin — cross-provider diversity keeps
+        # working, it just spans fewer providers.
+        from dispatcher import policy_provider_lookup
+        provider_lookup = policy_provider_lookup(_TOOL_NAME)
     available: list[str] = [primary_provider_name]
     for name in candidate_names:
         if name == primary_provider_name:

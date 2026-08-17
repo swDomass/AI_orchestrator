@@ -417,6 +417,47 @@ def test_run_once_hang_blocks_task_after_max_retries(monkeypatch):
     mark_retry_mock.assert_not_called()
 
 
+def test_run_once_tool_task_stops_on_policy_barred_provider_tag(monkeypatch):
+    """A #provider tag the policy bars is terminal — no endless quota-reset park.
+
+    select_provider() returns None both for "policy said no" and "everything is
+    capacity-exhausted"; only the latter is worth waiting for, so the orchestrator
+    has to distinguish them or the task parks and re-parks forever.
+    """
+    finalize_mock = Mock(return_value=True)
+    mark_retry_mock = Mock(return_value=True)
+
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:dev-loop #vibe", line_no=1,
+                                 raw_line="- [ ] Task #tool:dev-loop #vibe")],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:dev-loop #vibe"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "dev-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        orchestrator, "forced_provider_policy_violation",
+        lambda *a, **kw: ("vibe", ["claude", "codex"]),
+    )
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    finalize_mock.assert_called_once()
+    msg = finalize_mock.call_args.args[1]
+    assert "vibe" in msg and "nicht zugelassen" in msg
+    mark_retry_mock.assert_not_called()  # not parked for a quota reset
+
+
 def _stub_single_shot_env(monkeypatch, *, raw_line, provider):
     """Common monkeypatching so run_once reaches the single-shot provider loop
     for a plain (non-tool) task without hitting policy/memory/limits I/O."""
@@ -1080,3 +1121,104 @@ def test_run_with_retry_still_retries_generic_errors(monkeypatch):
         _Provider(), task="t", prompt="p", cwd=None, timeout=60,
     )
     assert len(calls) > 1, "generic errors must still be retried in-run"
+
+
+# ---------------------------------------------------------------------------
+# Policy dead end: "no provider ALLOWED" is permanent and must not be parked
+# as if it were "no provider AVAILABLE" (which waits for a quota reset).
+# ---------------------------------------------------------------------------
+
+def _dead_end_queue(monkeypatch, tool="dev-loop"):
+    """Common run_once() wiring for the policy-dead-end tests."""
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text=f"Task #tool:{tool}", line_no=1,
+                                 raw_line=f"- [ ] Task #tool:{tool}")],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [f"Task #tool:{tool}"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: tool)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+
+def _install_policy(monkeypatch, tmp_path, yaml_text):
+    from policy import PolicyEngine
+    policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(yaml_text, encoding="utf-8")
+    monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+
+
+def test_run_once_finalizes_when_policy_leaves_no_provider(monkeypatch, tmp_path):
+    """A policy allowing only out-of-chain providers is a DEAD END, not a queue.
+
+    select_provider() returns None for this exactly as it does for "all providers
+    exhausted", and the orchestrator used to take the second reading: mark_retry
+    until the quota resets, notify "providers exhausted". No quota reset can lift a
+    policy restriction, so the task was re-parked on every poll, forever, with a
+    message naming the wrong cause. It must be finalized with a clear reason
+    instead — driven through the real dispatcher and a real policy engine, with no
+    select_provider stub, so the wiring is what is under test.
+
+    The trigger here is a misspelled provider name, which is the realistic way to
+    reach this state: it matches nothing in the profile's provider order, so the
+    filter empties the chain. (A first draft of this test used `[gemini]` and did
+    NOT reproduce — the default profile's providers are ["claude", "gemini",
+    "codex"], so gemini stays routable even though it left `_PRIORITY`. Worth
+    knowing: with the shipped policy — claude/codex only — this dead end needs a
+    misconfiguration to occur at all.)
+    """
+    _install_policy(monkeypatch, tmp_path, "tool_providers:\n  dev-loop: [claudee]\n")
+    _dead_end_queue(monkeypatch)
+
+    finalize_mock = Mock(return_value=True)
+    mark_retry_mock = Mock(return_value=True)
+    exhausted_mock = Mock()
+    exec_mock = Mock()
+
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", exhausted_mock)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+
+    orchestrator.run_once()
+
+    finalize_mock.assert_called_once()
+    mark_retry_mock.assert_not_called()      # NOT parked
+    exhausted_mock.assert_not_called()       # NOT reported as a capacity problem
+    exec_mock.assert_not_called()            # nothing ran
+
+    msg = finalize_mock.call_args.args[1]
+    assert "claudee" in msg                  # names what the policy DOES allow
+    assert "Quota-Reset" in msg              # and says why waiting cannot help
+
+
+def test_run_once_still_parks_when_providers_are_merely_exhausted(monkeypatch, tmp_path):
+    """Guard the other side: capacity exhaustion keeps its wait-and-retry path.
+
+    Without this the dead-end branch could swallow every None and turn an ordinary
+    "come back after the quota resets" into a finalized (dead) task.
+    """
+    _install_policy(monkeypatch, tmp_path, "tool_providers:\n  dev-loop: [claude, codex]\n")
+    _dead_end_queue(monkeypatch)
+
+    finalize_mock = Mock(return_value=True)
+    mark_retry_mock = Mock(return_value=True)
+    exhausted_mock = Mock()
+
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "force_refresh_can_unblock", lambda *a, **kw: False)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 3600)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", exhausted_mock)
+
+    assert orchestrator.run_once() is False
+    mark_retry_mock.assert_called_once()
+    exhausted_mock.assert_called_once()
+    finalize_mock.assert_not_called()

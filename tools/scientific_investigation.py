@@ -608,8 +608,14 @@ class ScientificInvestigationTool(BaseTool):
         phase5b_provider_name = None
         if provider_lookup is not None:
             # Try to pick a cross-provider reviewer; silently skip if none.
+            # The candidate order still tries OpenRouter first, but the
+            # tool_providers policy decides whether it may be used at all — an
+            # injected lookup (tests, callers) does not get to bypass that.
+            from dispatcher import policy_allows_provider
             for candidate in ("openrouter", "gemini", "codex", "claude"):
                 if candidate == provider.name:
+                    continue
+                if not policy_allows_provider(candidate, self.name):
                     continue
                 reviewer = provider_lookup(candidate)
                 if reviewer is not None:

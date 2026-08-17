@@ -241,12 +241,29 @@ def test_resolve_second_opinion_returns_none_for_falsy():
     assert _resolve_second_opinion("") is None
 
 
-def test_resolve_second_opinion_accepts_vibe_bare_and_aliases(monkeypatch):
+def test_resolve_second_opinion_accepts_vibe_bare_and_aliases(tmp_path, monkeypatch):
     """Vibe is the second non-Claude voice: `#second_opinion:vibe` (CLI default
-    model) and the two model aliases must all resolve to the vibe provider."""
+    model) and the two model aliases must all resolve to the vibe provider.
+
+    Now needs a policy that actually authorises vibe. Registration alone stopped
+    being enough on 2026-08-15: vibe is pay-per-token with no cost ceiling, so an
+    ABSENT policy fails closed for it (dispatcher._allows). This test used to pass
+    on the hermetic empty-vault fixture — i.e. on the absence of a policy, which is
+    exactly the state the fail-closed rule exists for. Naming vibe explicitly is
+    also what production would require: the shipped policy.yaml has
+    `review-loop: [claude, codex]`.
+    """
     import dispatcher
+    import policy as policy_module
+    from policy import PolicyEngine
     from providers.vibe import VibeProvider
 
+    policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(
+        "tool_providers:\n  review-loop: [claude, codex, vibe]\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
     monkeypatch.setitem(dispatcher._providers, "vibe", VibeProvider())
 
     provider, model_id = _resolve_second_opinion("vibe")
@@ -259,6 +276,32 @@ def test_resolve_second_opinion_accepts_vibe_bare_and_aliases(monkeypatch):
         assert model_id == alias
 
 
+def test_resolve_second_opinion_vibe_blocked_when_no_policy_loaded(tmp_path, monkeypatch):
+    """Registered but unauthorised: a missing policy.yaml must NOT open vibe.
+
+    The counterpart to the test above. policy.yaml lives in a OneDrive-synced
+    folder, so "file missing / half-written / conflicted" is an operating state,
+    and PolicyEngine reports it as "no restriction configured" — indistinguishable
+    from a deliberately unrestricted policy. Since vibe is pay-per-token with no
+    cost ceiling anywhere, that ambiguity used to be resolved in favour of
+    spending money in an unattended 03:00 run. It is now resolved against it.
+    """
+    import dispatcher
+    import policy as policy_module
+    from policy import PolicyEngine
+    from providers.vibe import VibeProvider
+
+    # No policy.yaml written at all.
+    monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+    monkeypatch.setitem(dispatcher._providers, "vibe", VibeProvider())
+
+    assert _resolve_second_opinion("vibe") is None
+    assert _resolve_second_opinion("vibe_medium") is None
+    # The capped providers stay reachable — a lost policy must not halt everything.
+    provider, _ = _resolve_second_opinion("codex")
+    assert provider.name == "codex"
+
+
 def test_resolve_second_opinion_vibe_none_when_cli_missing(monkeypatch):
     """No binary → not registered → phase is skipped, never a crash."""
     import dispatcher
@@ -266,6 +309,36 @@ def test_resolve_second_opinion_vibe_none_when_cli_missing(monkeypatch):
     monkeypatch.delitem(dispatcher._providers, "vibe", raising=False)
     assert _resolve_second_opinion("vibe") is None
     assert _resolve_second_opinion("vibe_medium") is None
+
+
+def test_resolve_second_opinion_respects_tool_provider_policy(tmp_path, monkeypatch):
+    """A second opinion is a provider run and must obey tool_providers.
+
+    It resolved through the policy-blind dispatcher.get_provider_by_name before,
+    so `#second_opinion:vibe` reached a pay-per-token provider that policy.yaml
+    bars from unattended runs (dispatcher._limits_ok returns True for vibe
+    unconditionally — there is no capacity gate behind it either).
+    """
+    import dispatcher
+    import policy as policy_module
+    from policy import PolicyEngine
+    from providers.vibe import VibeProvider
+
+    monkeypatch.setitem(dispatcher._providers, "vibe", VibeProvider())
+
+    policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(
+        "tool_providers:\n  review-loop: [claude]\n  other-tool: [claude, vibe]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+
+    # Barred for review-loop → phase is skipped, not silently rerouted.
+    assert _resolve_second_opinion("vibe", "review-loop") is None
+    # Allowed elsewhere → still resolves, so the policy decides and not the code.
+    resolved = _resolve_second_opinion("vibe", "other-tool")
+    assert resolved is not None and resolved[0].name == "vibe"
 
 
 def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch, tmp_path):

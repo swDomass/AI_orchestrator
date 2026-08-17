@@ -161,6 +161,31 @@ class TestResolvePass2Provider:
         result = _resolve_pass2_provider({2: "nonexistent"}, default)
         assert result is default
 
+    def test_pass2_tag_barred_by_policy_falls_back(self, tmp_path, monkeypatch):
+        """`#pass2:openrouter` must not slip past tool_providers.
+
+        The resolver used the policy-blind dispatcher.get_provider_by_name, so a
+        pass-2 tag reached any registered provider regardless of policy.yaml.
+        """
+        import policy as policy_module
+        from policy import PolicyEngine
+
+        policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+        policy_file.parent.mkdir(parents=True, exist_ok=True)
+        policy_file.write_text(
+            "tool_providers:\n  critical-review: [claude, codex]\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+
+        monkeypatch.setattr(
+            "dispatcher.get_provider_by_name", lambda name: SimpleNamespace(name=name)
+        )
+        default = SimpleNamespace(name="claude")
+
+        assert _resolve_pass2_provider({2: "openrouter"}, default) is default
+        # An allowed tag still resolves — the policy decides, not the code.
+        assert _resolve_pass2_provider({2: "codex"}, default).name == "codex"
+
 
 # ── Plan File Resolution ─────────────────────────────────────────────
 

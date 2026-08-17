@@ -140,6 +140,32 @@ def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
     return rules
 
 
+def _coerce_provider_list(raw) -> list[str] | None:
+    """Normalize one `tool_providers:` entry into a provider-name list, or None.
+
+    Nothing validates that section's shape when policy.yaml loads, and the file is
+    hand-edited, so the entry is whatever YAML produced. A plain ``list(raw)`` —
+    what this used to be — turns the two most likely mistakes into silent nonsense:
+    the scalar form ``dev-loop: claude`` becomes ``['c','l','a','u','d','e']``
+    (matching no provider, so the tool is barred from everything), and a mapping
+    becomes a list of its keys. Both then read downstream as a deliberate,
+    perfectly well-formed allow-list.
+
+    Returns None for anything unusable, which callers read as "no restriction
+    configured" rather than "nothing allowed" — see dispatcher._allows() for the
+    asymmetric fail-open/fail-closed split that applies from there.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        name = raw.strip()
+        return [name] if name else None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return None
+    names = [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+    return names or None
+
+
 def _freeze_policy_data(data):
     """Convert policy dict/list structures into a hashable, content-based cache key."""
     if isinstance(data, dict):
@@ -230,7 +256,15 @@ class PolicyEngine:
             return
 
         self._rules = _parse_rules_from_dict(data)
-        self._tool_providers = data.get("tool_providers") or {}
+
+        providers_raw = data.get("tool_providers") or {}
+        if not isinstance(providers_raw, dict):
+            logger.warning(
+                "policy: tool_providers is not a mapping (got %s) — ignored",
+                type(providers_raw).__name__,
+            )
+            providers_raw = {}
+        self._tool_providers = providers_raw
 
         contracts_raw = data.get("tool_contracts") or {}
         contracts: dict[str, ToolContract] = {}
@@ -305,10 +339,10 @@ class PolicyEngine:
                 return None
 
             if tool_name and tool_name in self._tool_providers:
-                return list(self._tool_providers[tool_name])
+                return _coerce_provider_list(self._tool_providers[tool_name])
 
             if "default" in self._tool_providers:
-                return list(self._tool_providers["default"])
+                return _coerce_provider_list(self._tool_providers["default"])
 
         return None
 

@@ -117,6 +117,13 @@ _ERROR_CODE_MAP: dict[str, str] = {
     "cwd_invalid":            CAT_CWD,
     "invalid_cwd":            CAT_CWD,
     "policy_denied":          CAT_POLICY,
+    # A #provider tag the tool_providers policy bars — terminal, and deliberately
+    # NOT rerouted to another provider.
+    "provider_not_allowed":   CAT_POLICY,
+    # Same policy layer, no tag involved: the allow-list and the routable chain
+    # do not intersect, so nothing can run. Terminal too — unlike an exhausted
+    # quota, waiting cannot clear it.
+    "no_provider_allowed":    CAT_POLICY,
     "profile_denied":         CAT_PROFILE,
     "approval_denied":        CAT_APPROVAL,
     "approval_timeout":       CAT_APPROVAL,

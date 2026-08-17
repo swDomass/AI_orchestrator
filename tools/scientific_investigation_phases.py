@@ -65,6 +65,10 @@ from tools.scientific_investigation_approvals import get_manager
 
 logger = logging.getLogger(__name__)
 
+# Tool this module's phases belong to — the tool_providers policy key used by the
+# default (policy-bound) provider lookup for cross-provider persona allocation.
+_TOOL_NAME = "scientific-investigation"
+
 
 # ── Prompts ────────────────────────────────────────────────────────────────
 
@@ -618,12 +622,16 @@ def phase_persona_allocation(
     verify cross-provider coverage deterministically.
 
     ``provider_lookup`` is an optional callable ``(name) -> BaseProvider | None``
-    used in tests to avoid touching the real dispatcher singleton. Defaults
-    to ``dispatcher.get_provider_by_name``.
+    used in tests to avoid touching the real dispatcher singleton. Defaults to the
+    policy-aware ``dispatcher.policy_provider_lookup(_TOOL_NAME)``, never the raw
+    registry lookup.
     """
     if provider_lookup is None:
-        from dispatcher import get_provider_by_name as _lookup
-        provider_lookup = _lookup
+        # Policy-aware default: candidate_names below stays a static probe list,
+        # but a provider barred by tool_providers for "scientific-investigation"
+        # resolves to None and drops out of cross_candidates.
+        from dispatcher import policy_provider_lookup
+        provider_lookup = policy_provider_lookup(_TOOL_NAME)
 
     primary_name = primary_provider.name
     # Candidates we'd consider for "cross" — anything other than the primary.

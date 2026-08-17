@@ -73,3 +73,32 @@ def _isolate_active_runs_dir(tmp_path: Path, monkeypatch):
         return
     monkeypatch.setattr(base_tool, "ACTIVE_RUNS_DIR", tmp_path / "active_runs")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_policy_engine(tmp_path: Path, monkeypatch):
+    """Point the PolicyEngine singleton at an empty vault so the suite is hermetic
+    against the developer's real ``99_System/AI/policy.yaml``.
+
+    Without this the live file decides test outcomes: since provider lookups are
+    filtered through ``tool_providers`` (dispatcher.policy_allows_provider and the
+    forced-tag gate), a machine whose policy.yaml bars gemini/openrouter/vibe gets
+    different routing results than a machine without a policy file at all — and the
+    failure looks like a routing bug, not a fixture leak.
+
+    Tests that need a policy build their own engine and monkeypatch
+    ``policy._engine`` themselves; that assignment simply wins over this one.
+    """
+    try:
+        import policy as policy_module
+    except ImportError:
+        yield
+        return
+    # Path deliberately not created: PolicyEngine tolerates a missing policy.yaml
+    # (_reload_if_changed returns early), so this costs one stat() per test.
+    monkeypatch.setattr(
+        policy_module,
+        "_engine",
+        policy_module.PolicyEngine(vault_path=tmp_path / "_empty_vault"),
+    )
+    yield

@@ -40,6 +40,10 @@ from tools.scientific_investigation_phase2 import _parse_review_findings
 logger = logging.getLogger(__name__)
 
 
+# Tool this module belongs to — tool_providers policy key for the default
+# (policy-bound) reviewer lookup.
+_TOOL_NAME = "scientific-investigation"
+
 ReviewerStatus = Literal["passed", "needs_revision", "skipped"]
 ProviderLookup = Callable[[str], BaseProvider | None]
 
@@ -246,8 +250,13 @@ def phase_engineering_reviewer(
     interpret that as "MEDIUM not achievable".
     """
     if provider_lookup is None:
-        from dispatcher import get_provider_by_name as _lookup
-        provider_lookup = _lookup
+        # Policy-aware default: the reviewer probe list in
+        # _resolve_reviewer_provider() stays unchanged, but a provider barred by
+        # tool_providers for "scientific-investigation" resolves to None and is
+        # skipped — including an explicit `engineering_reviewer=` name, which then
+        # takes the documented "falling back to primary" path.
+        from dispatcher import policy_provider_lookup
+        provider_lookup = policy_provider_lookup(_TOOL_NAME)
     if max_iterations is None:
         max_iterations = TOOL_SI_PHASE7_MAX_REWORK_ITERATIONS
     if timeout_per_call is None:

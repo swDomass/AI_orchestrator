@@ -356,6 +356,54 @@ def test_phase2_falls_back_to_primary_when_lookup_returns_none(tmp_path):
     assert len(primary.calls) == 3  # all three persona calls went to primary
 
 
+def test_phase2_default_lookup_obeys_tool_provider_policy(tmp_path, monkeypatch):
+    """Without an injected lookup, persona routing must honour tool_providers.
+
+    The default was dispatcher.get_provider_by_name, which is policy-blind — so a
+    provider barred from unattended runs still received the DA / Methodiker
+    prompts. The allocations handed in were filtered once already, but they can
+    outlive the policy that produced them (resumed run, replayed audit trail), so
+    the resolution step has to re-check. A barred name resolves to None and
+    _resolve_persona_provider degrades to the primary, exactly like an
+    unregistered one.
+    """
+    import policy as policy_module
+    from policy import PolicyEngine
+
+    policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(
+        "tool_providers:\n  scientific-investigation: [claude]\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+
+    barred_da = _QueueProvider([_REVIEW_EMPTY])
+    barred_meth = _QueueProvider([_REVIEW_EMPTY])
+    # Both resolve fine at registry level — only the policy may filter them out.
+    monkeypatch.setattr(
+        "dispatcher.get_provider_by_name",
+        lambda name: {"gemini": barred_da, "codex": barred_meth}.get(name),
+    )
+
+    primary = _QueueProvider([_PLAN_OK, _REVIEW_EMPTY, _REVIEW_EMPTY])
+    allocations = [
+        PersonaAllocation(AUTHOR, "claude", cross_provider_satisfied=False),
+        PersonaAllocation(DEVILS_ADVOCATE, "gemini", cross_provider_satisfied=True),
+        PersonaAllocation(METHODIKER, "codex", cross_provider_satisfied=True),
+    ]
+    rd = tmp_path / "rd"
+    rd.mkdir()
+    result = phase_investigation_plan_review(
+        _make_framing(), _make_prereg(), allocations, primary,
+        run_dir=rd, run_id="r1",   # no provider_lookup → the default is under test
+    )
+
+    assert result.converged is True
+    assert barred_da.calls == [], "policy-barred provider received the DA prompt"
+    assert barred_meth.calls == [], "policy-barred provider received the Methodiker prompt"
+    assert len(primary.calls) == 3  # degraded to primary, did not abort
+
+
 # ── Output writers ─────────────────────────────────────────────────────────
 
 

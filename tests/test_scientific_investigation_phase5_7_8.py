@@ -292,6 +292,43 @@ def test_phase7_uses_explicit_reviewer_provider(tmp_path):
     assert len(primary.calls) == 0
 
 
+def test_phase7_default_lookup_obeys_tool_provider_policy(tmp_path, monkeypatch):
+    """The reviewer probe list tries openrouter first — the policy must still win.
+
+    The default lookup was dispatcher.get_provider_by_name (policy-blind), so the
+    Phase-7 reviewer landed on openrouter whenever it was registered, regardless
+    of policy.yaml. With [claude, codex] the probe skips openrouter and gemini and
+    settles on codex — cross-provider is still satisfied, just with less choice.
+    """
+    import policy as policy_module
+    from policy import PolicyEngine
+
+    policy_file = tmp_path / "vault" / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(
+        "tool_providers:\n  scientific-investigation: [claude, codex]\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        policy_module, "_engine", PolicyEngine(vault_path=tmp_path / "vault")
+    )
+    reviewer = _ScriptedProvider(["```yaml\nfindings: []\n```"], name="codex")
+    monkeypatch.setattr(
+        "dispatcher.get_provider_by_name",
+        lambda name: reviewer if name == "codex" else _ScriptedProvider([], name=name),
+    )
+
+    rd = tmp_path / "run"
+    (rd / "audit").mkdir(parents=True)
+    primary = _ScriptedProvider([], name="claude")
+    result = phase_engineering_reviewer(
+        "# Proof", {"checks": []}, [], primary, run_dir=rd, run_id="r1",
+    )
+
+    assert result.reviewer_provider_name == "codex"
+    assert result.cross_provider_satisfied is True
+    assert len(primary.calls) == 0
+
+
 def test_phase7_writes_audit_entries(tmp_path):
     rd = tmp_path / "run"
     (rd / "audit").mkdir(parents=True)

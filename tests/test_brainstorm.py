@@ -288,6 +288,37 @@ class TestProviderAllocation:
         )
         assert all(a.provider_name == "claude" for a in allocs)
 
+    def test_default_lookup_obeys_tool_provider_policy(self, tmp_path, monkeypatch):
+        """Without an injected lookup, the round-robin must honour tool_providers.
+
+        The default was dispatcher.get_provider_by_name, which is policy-blind —
+        so `#cross_provider` reached openrouter even where policy.yaml bars it.
+        The candidate tuple is unchanged; a barred provider simply resolves to
+        None and drops out, so diversity degrades instead of breaking.
+        """
+        import policy as policy_module
+        from policy import PolicyEngine
+
+        policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+        policy_file.parent.mkdir(parents=True, exist_ok=True)
+        policy_file.write_text(
+            "tool_providers:\n  brainstorm: [claude, codex]\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+        # Every candidate resolves at registry level — only the policy may filter.
+        monkeypatch.setattr(
+            "dispatcher.get_provider_by_name", lambda name: object()
+        )
+
+        allocs = phase_provider_allocation(
+            _personas(4),
+            primary_provider_name="claude",
+            cross_provider=True,
+        )
+        names = [a.provider_name for a in allocs]
+        # gemini and openrouter are barred → round-robin over claude + codex only.
+        assert names == ["claude", "codex", "claude", "codex"]
+
 
 # ── cluster_ideas ────────────────────────────────────────────────────
 
@@ -526,3 +557,54 @@ class TestBrainstormRun:
         assert result.error_code == "capacity_exhausted"
         assert result.retryable is True
         assert len(provider.calls) == 0
+
+
+class TestPersonaProviderResolutionPolicy:
+
+    def test_resolution_step_obeys_tool_provider_policy(self, tmp_path, _patch, monkeypatch):
+        """Resolving an allocation is a provider run and must obey tool_providers.
+
+        The allocation step was made policy-aware; this second step still used the
+        policy-blind registry lookup. It is not a redundant gate: `allocations` can
+        come from an earlier run's state file or from the degraded fallback path, so
+        a name that was legal when written must be re-checked before a prompt goes
+        out over it.
+        """
+        import policy as policy_module
+        from policy import PolicyEngine
+        from tools.brainstorm_phases import BrainstormAllocation
+
+        policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+        policy_file.parent.mkdir(parents=True, exist_ok=True)
+        policy_file.write_text(
+            "tool_providers:\n  brainstorm: [claude]\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(policy_module, "_engine", PolicyEngine(vault_path=tmp_path))
+
+        barred = _ScriptedProvider("codex", [_ideas_block("verbotene idee alpha beta")] * 20)
+        monkeypatch.setattr(
+            "dispatcher.get_provider_by_name",
+            lambda name: barred if name == "codex" else None,
+        )
+        # A stale allocation pointing every persona at the barred provider.
+        monkeypatch.setattr(
+            "tools.brainstorm.phase_provider_allocation",
+            lambda personas, **_kw: [
+                BrainstormAllocation(persona=p, provider_name="codex") for p in personas
+            ],
+        )
+        from providers.base import RunResult as _RR
+        monkeypatch.setattr(
+            "tools.brainstorm.phase_synthesis",
+            lambda *_a, **_kw: ("## Top-3\n\n### 1. Foo", _RR(success=True, output="ok")),
+        )
+
+        outputs = [_PERSONAS_YAML] + [
+            _ideas_block("stabile idee alpha beta gamma", "zweite idee delta epsilon")
+        ] * 12
+        primary = _ScriptedProvider("claude", outputs)
+        BrainstormTool().run("Pricing-Strategie WhiteLady", primary, cwd=str(tmp_path))
+
+        assert barred.calls == [], "a policy-barred provider received persona prompts"
+        # The run still happened — it degraded to the primary, it did not abort.
+        assert len(primary.calls) > 1

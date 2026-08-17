@@ -46,6 +46,9 @@ def test_review_loop_reviews_uncommitted_changes_prompt_and_finishes_on_clean(mo
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
 
     provider = _ScriptedProvider(outputs=[
         "No P1/P2/P3 findings.",  # review
@@ -73,6 +76,9 @@ def test_review_loop_does_not_fix_p3_and_reports_it_as_offer(monkeypatch, tmp_pa
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
 
     provider = _ScriptedProvider(
         outputs=[
@@ -100,6 +106,9 @@ def test_review_loop_fixes_blocking_findings_and_defers_p3(monkeypatch, tmp_path
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
 
     provider = _ScriptedProvider(
         outputs=[
@@ -134,6 +143,9 @@ def test_deferred_p3_survives_a_later_clean_round(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
 
     provider = _ScriptedProvider(
         outputs=[
@@ -161,6 +173,9 @@ def test_deferred_p3_is_deduplicated_across_rounds(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
 
     provider = _ScriptedProvider(
         outputs=[
@@ -191,6 +206,9 @@ def test_contradictory_review_output_does_not_pass_the_success_gate(monkeypatch,
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
 
     provider = _ScriptedProvider(
         outputs=[
@@ -592,6 +610,9 @@ def test_drift_check_skipped_when_mode_skip(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
     monkeypatch.setattr(ReviewLoopTool, "_drift_check_mode", lambda self: "skip")
 
     provider = _ScriptedProvider(outputs=[
@@ -781,6 +802,7 @@ def _patch_review_loop(monkeypatch):
     monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
     monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
     monkeypatch.setattr("tools.review_loop.time.sleep", lambda _s: None)
+    monkeypatch.setattr("tools.review_loop.is_cached_provider_available", lambda _n: True)
 
 
 def test_review_loop_format_break_is_retryable_and_capped(monkeypatch, tmp_path):

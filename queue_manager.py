@@ -29,6 +29,12 @@ from config import (
     LOG_SECTION,
     VAULT_PATH,
 )
+# dispatcher._TAG_MAP is the maßgebliche list of every routing tag (provider-only
+# AND model-specific). Imported at module level, not deferred like the local
+# `from dispatcher import _TAG_MAP` in parallel_runner._parse_subtask() — dispatcher's
+# own module-level imports (config, limits, providers.*) never reach back into
+# queue_manager, so there is no cycle to defer here.
+from dispatcher import _TAG_MAP as _PROVIDER_TAG_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -119,12 +125,30 @@ WORKTREE_TAG_RE = re.compile(r"(?i)(?<!\S)#worktree(?=\s|$)")
 # after a successful subtask run, so the user can inspect the working copy.
 KEEP_WORKTREE_TAG_RE = re.compile(r"(?i)(?<!\S)#keep-worktree(?=\s|$)")
 
-# Matches model selection tags across all providers:
-#   Claude: #claude_haiku, #claude_sonnet, #claude_opus
-#   Gemini: #gemini_pro, #gemini_flash
-#   Codex:  #codex_mini
+# Matches model selection tags across ALL providers (claude/gemini/codex/vibe/openrouter).
+# Derived from dispatcher._TAG_MAP instead of hand-copied, so this cannot silently fall
+# behind again — that drift is exactly how this regex used to cover only 6 of the 20
+# aliases (claude_{haiku,sonnet,opus}, gemini_{pro,flash}, codex_mini) for months, while
+# gemini_flash_lite, codex_5/_5_4, vibe_medium/_small and all nine or_* aliases routed to
+# the right *provider* but never forced a *model* (model_id_for_provider() returned None,
+# so the provider's default model ran instead).
+#
+# Excludes the 5 bare provider-selection tags (#claude, #gemini, #codex, #vibe,
+# #openrouter — where the tag text equals the provider name) since those route without
+# forcing any specific model; PROVIDER_TAG_RE already covers #claude/#gemini/#codex.
+#
+# Sorted longest-first before joining: with two aliases where one is a literal prefix of
+# the other (codex_5 / codex_5_4), a naive alternation risks the shorter one winning the
+# match for input meant for the longer one. The `(?![\w-])` boundary below makes the
+# backtracking engine recover via the next alternative either way, but sorting removes
+# the reliance on that backtrack — the match is right on the first try, order-independent.
+_MODEL_ALIAS_TAGS = sorted(
+    (tag[1:] for tag, provider in _PROVIDER_TAG_MAP.items() if tag[1:] != provider),
+    key=len,
+    reverse=True,
+)
 MODEL_TAG_RE = re.compile(
-    r"(?i)(?<!\S)#(claude_(?:haiku|sonnet|opus)|gemini_(?:pro|flash)|codex_mini)(?![\w-])"
+    r"(?i)(?<!\S)#(" + "|".join(re.escape(t) for t in _MODEL_ALIAS_TAGS) + r")(?![\w-])"
 )
 
 # Matches #effort:<level> — reasoning effort for the run (Claude only; see
@@ -697,7 +721,9 @@ def extract_keep_worktree_tag(task: str) -> bool:
 def extract_model_tag(task: str) -> str | None:
     """Extract a model alias tag for any provider.
 
-    Supported tags: #claude_haiku/_sonnet/_opus, #gemini_pro/_flash, #codex_mini.
+    Supported tags: every model-specific alias in dispatcher._TAG_MAP (all of
+    claude_{haiku,sonnet,opus}, gemini_{pro,flash,flash_lite}, codex_{5,5_4,mini},
+    vibe_{medium,small}, and the nine or_* OpenRouter aliases) — see MODEL_TAG_RE.
     Returns the lowercased alias key (e.g. 'gemini_flash') or None.
     Resolution to a full model ID happens via config.model_id_for_provider(),
     which enforces that a tag only applies to its owning provider.

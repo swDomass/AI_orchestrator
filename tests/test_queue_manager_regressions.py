@@ -103,6 +103,27 @@ def test_extract_model_tag_provider_only_tags_return_none():
     assert queue_manager.extract_model_tag("Run #codex now") is None
 
 
+def test_model_tag_re_covers_every_dispatcher_alias():
+    """MODEL_TAG_RE is derived from dispatcher._TAG_MAP so the two cannot drift apart
+    again (regression for the gap where it hand-covered only 6 of 20 model aliases —
+    gemini_flash_lite, codex_5/_5_4, vibe_medium/_small and all nine or_* aliases routed
+    to the right provider but silently ran on that provider's default model)."""
+    from dispatcher import _TAG_MAP
+
+    model_aliases = {tag[1:] for tag, provider in _TAG_MAP.items() if tag[1:] != provider}
+    assert len(model_aliases) == 20  # guards against a silently shrunk _TAG_MAP too
+
+    for alias in model_aliases:
+        assert queue_manager.extract_model_tag(f"Run #{alias} now") == alias
+
+
+def test_model_tag_re_disambiguates_prefix_aliases():
+    """codex_5 is a literal prefix of codex_5_4 — each tag must resolve to itself,
+    not get truncated to (or swallowed by) the other."""
+    assert queue_manager.extract_model_tag("Run #codex_5 now") == "codex_5"
+    assert queue_manager.extract_model_tag("Run #codex_5_4 now") == "codex_5_4"
+
+
 def test_extract_cwd_stops_before_non_metadata_hashtag(tmp_path, monkeypatch):
     project_dir = tmp_path / "project"
     project_dir.mkdir()

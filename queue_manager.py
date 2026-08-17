@@ -540,6 +540,58 @@ def _next_anchor_occurrence(
     return candidate
 
 
+def _next_runnable_anchor_slot(
+    anchor: tuple[int, int],
+    every_sec: int,
+    grace_sec: int,
+    now: datetime | None = None,
+) -> datetime:
+    """Slot a stale `#freshonly` task should be realigned to.
+
+    Prefers the MOST RECENT past anchor slot while it is still inside its own grace
+    window. That slot remains runnable, so moving past it drops a whole day of
+    automation for no reason — a single day with the machine off would otherwise cost
+    two: the day itself, plus the day the realign skips on the way back up.
+
+    "Most recent past", not "today's": with an anchor shortly before midnight the still
+    valid slot belongs to *yesterday* (anchor 23:30, realign at 00:30, grace 4h), and
+    reaching only for today's would miss it.
+
+    **Daily cadence only.** `#every:Nd` with N > 1 has no well-defined "slot for today":
+    _next_anchor_occurrence() measures such a cadence from `now` rather than from a
+    fixed calendar phase (see its docstring), so any day-grid slot picked here would be
+    invented. Recovering one would produce exactly the catch-up `#freshonly` exists to
+    prevent — a 7-day task found six days late would fire ~169h after its slot.
+
+    **The recovery window is capped at half the cadence.** A grace window reaching
+    further would put the late run closer to the NEXT slot than to its own: `#grace:1d`
+    on a daily task would otherwise recover yesterday's slot at 05:00 and then run
+    again at today's 06:50, two dispatches within two hours.
+
+    No explicit "never fall back onto the slot we just rejected" guard is needed, and
+    an earlier version of this function carried one that could not fire: the only
+    caller enters this branch with `now - scheduled > grace` (see
+    realign_stale_freshonly), so a candidate at or before that slot is necessarily
+    older than the window and fails the check below anyway.
+
+    Known limitation: times are naive local, so on the two DST switch days the window
+    is measured against the wall clock instead of elapsed time (up to 1h off, for
+    anchors between 00:00 and 03:00). Fixing that means carrying an offset in the
+    marker format, which this module does without throughout.
+    """
+    now = now or datetime.now()
+    if every_sec != _ONE_DAY_SEC:
+        return _next_anchor_occurrence(anchor, every_sec, now)
+
+    recent = now.replace(hour=anchor[0], minute=anchor[1], second=0, microsecond=0)
+    if recent > now:
+        recent -= timedelta(days=1)  # today's anchor is still ahead → yesterday's
+    window = min(grace_sec, every_sec // 2)
+    if (now - recent).total_seconds() <= window:
+        return recent
+    return _next_anchor_occurrence(anchor, every_sec, now)
+
+
 # --- Note resolution ---
 
 def _is_within_vault(path: Path) -> bool:
@@ -1054,8 +1106,10 @@ def realign_stale_freshonly(now: datetime | None = None) -> int:
 
     A `#freshonly` task is "stale" when its scheduled slot (retry marker, else `#at:`
     anchor) lies more than its grace window (#grace:, default 2h) in the past. For such
-    tasks the retry marker is rewritten to the next anchor occurrence so that
-    read_queue_items() filters them out this cycle — no provider call, no side effects.
+    tasks the retry marker is rewritten to the next RUNNABLE slot — today's anchor if
+    that one is still inside its own grace window, otherwise the next occurrence — so
+    read_queue_items() either releases it late today or filters it out this cycle. No
+    provider call and no side effects happen here either way.
 
     Tasks without `#freshonly` are never touched (they keep catch-up semantics, e.g.
     weekly/monthly maintenance). Run this once per poll cycle BEFORE read_queue_items().
@@ -1104,10 +1158,11 @@ def realign_stale_freshonly(now: datetime | None = None) -> int:
                 out.append(line)  # fresh enough → let read_queue_items run it
                 continue
 
-            # Stale → realign to the next slot, do NOT run.
+            # Stale → realign, do NOT run. Today's slot wins while its own grace
+            # window is still open, so a missed day does not also cost the current one.
             anchor = _anchor_time_of_day(task_text)
             if anchor is not None and _is_whole_day_interval(every_sec):
-                next_dt = _next_anchor_occurrence(anchor, every_sec, now)
+                next_dt = _next_runnable_anchor_slot(anchor, every_sec, grace, now)
             else:
                 next_dt = now + timedelta(seconds=every_sec)
             out.append(_set_retry_marker(body, next_dt) + newline)

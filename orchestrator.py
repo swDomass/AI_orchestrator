@@ -1011,7 +1011,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         try:
             realigned = realign_stale_freshonly()
             if realigned:
-                _log.debug("Realigned %d stale #freshonly task(s) to next slot", realigned)
+                # INFO, not debug: this moves a task by up to a day. It stayed
+                # invisible through three silent outage days (2026-07-23, 07-27,
+                # 08-17) because nothing else logs it either.
+                _log.info("Realigned %d stale #freshonly task(s) to next slot", realigned)
         except (OSError, ValueError) as e:
             _log.warning("realign_stale_freshonly failed: %s", e)
 

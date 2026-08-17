@@ -442,6 +442,198 @@ def test_realign_first_run_no_marker_uses_at_anchor(mock_queue_file):
 
 
 # ---------------------------------------------------------------------------
+# Realign must not step over a slot whose grace window is still open
+#
+# Observed three times in production (2026-07-23, 07-27, 08-17): after a day with
+# the machine off, the realign moved the task to the NEXT anchor strictly after
+# now — skipping today's slot even while its grace window still had hours to run.
+# One day of downtime therefore cost two days of automation, silently.
+# ---------------------------------------------------------------------------
+
+def test_realign_recovers_todays_slot_while_grace_is_open(mock_queue_file):
+    """The regression this branch exists for.
+
+    Machine off on the 28th, orchestrator back up on the 29th at 08:07. The 06:50
+    slot of the 29th is 1h17m old and its 4h window runs to 10:50 — the task is
+    still runnable TODAY and must not be pushed to tomorrow.
+    """
+    now = datetime(2026, 6, 29, 8, 7)
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-28 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- retry: 2026-06-29 06:50 -->" in content  # today's slot, recovered
+    assert "2026-06-30" not in content                    # NOT pushed to tomorrow
+    assert "- [x]" not in content                         # realign still never runs it
+
+
+def test_realign_moves_on_once_todays_window_closed(mock_queue_file):
+    """Counter-probe to the test above: same task, same stale marker, later clock.
+
+    At 12:00 the 06:50 slot is 5h10m old and past its 4h grace, so tomorrow is the
+    correct answer. Without this case the matrix would only confirm the happy path.
+    """
+    now = datetime(2026, 6, 29, 12, 0)
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-28 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- retry: 2026-06-30 06:50 -->" in content
+
+
+def test_realign_recovery_includes_the_exact_grace_boundary(mock_queue_file):
+    """Boundary: exactly grace seconds old still counts as open (<=, not <)."""
+    now = datetime(2026, 6, 29, 10, 50)  # 06:50 + 4h, to the second
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-28 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    assert "<!-- retry: 2026-06-29 06:50 -->" in mock_queue_file.read_text(encoding="utf-8")
+
+
+def test_realign_recovery_stops_one_second_past_grace(mock_queue_file):
+    """One second later the window is shut and the task moves to tomorrow."""
+    now = datetime(2026, 6, 29, 10, 50, 1)
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-28 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    assert "<!-- retry: 2026-06-30 06:50 -->" in mock_queue_file.read_text(encoding="utf-8")
+
+
+def test_realign_never_falls_back_onto_the_slot_it_rejected(mock_queue_file):
+    """The stale slot IS the most recent anchor: it must not be written back.
+
+    The grace check alone rules this out — the caller only reaches the realign branch
+    when `now - scheduled > grace`, so that same slot is necessarily outside the
+    recovery window too. This test pins the resulting behaviour (marker moves forward,
+    never sideways or back), not a dedicated guard: an earlier draft carried an
+    explicit `recent > stale_slot` condition that no input could ever trigger.
+    """
+    now = datetime(2026, 6, 29, 13, 0)  # 06:50 today is 6h10m old, grace 4h
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-29 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    assert "<!-- retry: 2026-06-30 06:50 -->" in mock_queue_file.read_text(encoding="utf-8")
+
+
+def test_realign_recovery_is_idempotent_and_does_not_churn(mock_queue_file):
+    """After recovering today's slot a second realign must be a no-op.
+
+    The recovered marker sits inside its grace window, so the staleness check bails
+    out first. Without that property every poll cycle would rewrite the queue file.
+    """
+    now = datetime(2026, 6, 29, 8, 7)
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-28 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    after_first = mock_queue_file.read_text(encoding="utf-8")
+
+    assert queue_manager.realign_stale_freshonly(now=now) == 0  # no second rewrite
+    assert mock_queue_file.read_text(encoding="utf-8") == after_first
+
+
+def test_realign_recovers_yesterdays_slot_across_midnight(mock_queue_file):
+    """Anchor shortly before midnight: the still-valid slot belongs to YESTERDAY.
+
+    At 00:30 the 23:30 anchor of the previous day is one hour old and well inside a
+    4h window. Reaching only for "today's" 23:30 (which is still ahead) would miss
+    it and cost the run.
+    """
+    now = datetime(2026, 6, 30, 0, 30)
+    _write_queue(
+        mock_queue_file,
+        "- [ ] Late recap #at:23:30 #every:24h #freshonly #grace:4h "
+        "<!-- retry: 2026-06-28 23:30 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    assert "<!-- retry: 2026-06-29 23:30 -->" in mock_queue_file.read_text(encoding="utf-8")
+
+
+def test_realign_recovery_does_not_apply_to_multiday_intervals(mock_queue_file):
+    """A #every:Nd task must NOT be recovered onto a day-grid slot.
+
+    _next_anchor_occurrence() measures a multi-day cadence from `now`, not from a fixed
+    calendar phase, so "today's slot" does not exist for #every:7d — picking one would
+    invent it. Recovering it would also reintroduce catch-up: a weekly task found six
+    days late would fire ~169h after its actual slot, which is precisely what
+    #freshonly exists to prevent.
+    """
+    now = datetime(2026, 6, 29, 9, 0)  # 08:00 anchor is 1h old — tempting, but wrong
+    _write_queue(
+        mock_queue_file,
+        "- [ ] Weekly audit #at:08:00 #every:7d #freshonly #grace:4h "
+        "<!-- retry: 2026-06-22 08:00 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- retry: 2026-07-06 08:00 -->" in content  # now + 7d, cadence intact
+    assert "2026-06-29 08:00" not in content              # no invented day-grid slot
+
+
+def test_realign_recovery_window_is_capped_at_half_the_cadence(mock_queue_file):
+    """A grace window wider than half the interval must not trigger a recovery.
+
+    With #grace:1d on a daily task the raw window would reach back to yesterday's
+    06:50 even at 05:00 — the task would run, and _completion_replacement would then
+    schedule today's 06:50 only 110 minutes later: two dispatches, two provider calls,
+    two briefs. The cap keeps the late run closer to its own slot than to the next.
+    """
+    now = datetime(2026, 6, 29, 5, 0)
+    _write_queue(
+        mock_queue_file,
+        "- [ ] HA snapshot #at:06:50 #every:24h #freshonly #grace:1d "
+        "<!-- retry: 2026-06-27 06:50 -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "<!-- retry: 2026-06-29 06:50 -->" in content  # today's slot, still ahead
+    assert "2026-06-28" not in content                    # yesterday NOT recovered
+
+
+def test_realign_recovered_slot_is_released_by_read_queue_items(mock_queue_file):
+    """End-to-end: the recovered marker actually makes the task runnable again.
+
+    Rewriting the marker is only half the fix — read_queue_items() has to hand the
+    task back out. Uses wall-clock-relative values because read_queue_items() reads
+    the real clock, and an anchor 1h in the past that is still inside a 4h grace.
+    """
+    now = datetime.now().replace(second=0, microsecond=0)
+    anchor_dt = now - timedelta(hours=1)
+    anchor = anchor_dt.strftime("%H:%M")
+    stale = (anchor_dt - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
+    _write_queue(
+        mock_queue_file,
+        f"- [ ] Recoverable #at:{anchor} #every:24h #freshonly #grace:4h "
+        f"<!-- retry: {stale} -->",
+    )
+    assert queue_manager.realign_stale_freshonly(now=now) == 1
+    assert anchor_dt.strftime("<!-- retry: %Y-%m-%d %H:%M -->") in mock_queue_file.read_text(
+        encoding="utf-8"
+    )
+
+    items = queue_manager.read_queue_items()
+    assert len(items) == 1
+    assert "Recoverable" in items[0].task_text
+
+
+# ---------------------------------------------------------------------------
 # Linter: #freshonly / #grace
 # ---------------------------------------------------------------------------
 

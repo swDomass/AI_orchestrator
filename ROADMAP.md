@@ -184,11 +184,19 @@ two raw `get_provider_by_name()` call sites** (`tools/brainstorm.py`,
 `tools/scientific_investigation_phase2.py`) went to `policy_provider_lookup()`;
 and **`knowledge_transfer` + `brainstorm` joined the shared error classifier**.
 
+A fourth was closed on 2026-08-17: **`realign_stale_freshonly()` no longer steps
+over a slot whose grace window is still open.** A stale `#freshonly` task was
+realigned to the next anchor strictly after `now`, so one day with the machine
+off cost two days of automation — the day itself, plus the day the realign
+skipped on the way back up. It now recovers the most recent anchor while that
+one is still within grace (daily cadence only, window capped at half the
+interval), and the realign is logged at INFO: the defect ran three times
+(2026-07-23, 07-27, 08-17) without leaving a single trace.
+
 | Defect | Impact |
 |---|---|
 | `select_provider()` fail-open for a bare `#vibe`/`#openrouter` tag | The pay-per-token ceiling was made fail-closed in `policy_allows_provider()`/`dispatcher._allows()`, but not on the forced-provider path. With `policy.yaml` missing or unreadable, an explicitly tagged task still reaches the uncapped provider. Left open deliberately — the fix reworks ~10 routing tests. |
 | `stdin_incomplete` requeues without bound | `<!-- hang: N -->` is the only persistent per-task counter and only `hang` + `format_error` *increment* it. Every other error code requeues without raising it. Count unbounded, rate still throttled by the 5-min cooldown. Pre-existing. Narrowed 2026-08-15: those parks no longer *reset* the counter either, so a task alternating between real failures and parks does reach the cap. |
-| `realign_stale_freshonly()` skips a slot inside its grace window | A stale `#freshonly` task realigns strictly after now, so today's still-valid slot is skipped. Morning brief fails silently — no log line, no `runs.jsonl` record. Observed 2026-07-23 and 2026-07-27. |
 | Safety-hook residuals | `find . -exec git push`, `docker exec c git push`, `xargs git push` are not recognised (needs real argv parsing, not a regex). A heredoc body line starting with a git write command matches — a deliberate false positive in the safe direction. Hook covers Claude only; Codex relies on its own sandbox flag. |
 | `#pass1:`/`#pass2:` accept only `claude`, `gemini`, `codex` | Own regex, predates the opt-in providers. `#pass2:vibe`/`#pass2:openrouter` are ignored rather than rejected. Use `#second_opinion:`. |
 | `queue_linter.py` does not validate `#vibe*` tags | Its unknown-alias regex enumerates `claude\|gemini\|codex\|or` only, and there is no "CLI missing" warning to match the OpenRouter one. Linter-only since 2026-08-15 — runtime resolves the alias correctly. |

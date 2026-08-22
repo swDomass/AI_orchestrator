@@ -525,6 +525,33 @@ MEMORY_LESSONS_RETENTION_DAYS      = 180  # prune lessons.md entries after 180 d
 MEMORY_TOP_K             = 5
 MEMORY_SUMMARY_MAX_CHARS = 700   # first 500 + "...\n" + last 200
 MEMORY_MIN_SCORE         = 0.10  # discard matches below this threshold (avoids noise injection)
+MEMORY_TASK_LABEL_CHARS  = 60    # how much of a past task is quoted in the injected history
+
+# A "no-op" run: the provider answered that it found no task to do. Such an answer carries
+# zero information, and re-injecting it teaches the next run the same answer — the memory
+# block becomes a few-shot prompt for doing nothing (measured 2026-08-19: 3 of 5 injected
+# examples were exactly that). Both thresholds must be met at once, see
+# memory._is_noninformative — a long, substantive report that happens to use the phrase
+# stays in.
+# Measured 2026-08-19 over 206 stored results carrying a token count (task_results/ AND
+# archive/ — note that only the 69 in task_results/ are ever injected; the threshold is
+# calibrated on the wider set). The no-ops the filter recognises run 71–772 tokens; the
+# smallest genuine run is 329 (daily-activity-synthese, archive/2026-05-29). The two
+# classes overlap, so this gate never separates them cleanly — below it the addressee
+# anchor decides alone. Set to 900 rather than 1500 for exactly that reason: it keeps every
+# recognised no-op (128 tokens of headroom above the largest) while shrinking the
+# population where the regex is the only judge from 39 of 197 genuine runs to 29.
+# Raising it on the assumption of a wide gap would be wrong — the gap is not there.
+#
+# `codex` and `vibe` report no token counts at all, so for those providers this gate is
+# never satisfied and the layer-3 filter stays inactive by design (fail-open).
+MEMORY_NOOP_MAX_OUTPUT_TOKENS = 900
+
+# Heading over the injected TF-IDF block. Lives here because two prompt builders emit it —
+# orchestrator._build_prompt and tools.base_tool._build_system_prompt — and a heading that
+# says "past" in one path and "relevant" in the other is exactly the kind of drift that
+# makes injected history readable as a live instruction.
+MEMORY_HISTORY_HEADING = "## Historie abgeschlossener Läufe (nur Kontext, kein Auftrag)"
 
 # --- Heartbeat ---
 HEARTBEAT_FILE           = VAULT_PATH / "99_System" / "AI" / "HEARTBEAT.md"

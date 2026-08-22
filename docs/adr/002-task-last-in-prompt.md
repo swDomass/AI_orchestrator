@@ -80,3 +80,38 @@ einmal gemessen. Die Session-Dateien, die den tatsächlich angekommenen Prompt e
 lagen die ganze Zeit vor. Wer die Reihenfolge in `_build_prompt` ändert, korrigiert
 bitte auch die Aussagen darüber in `process_runner` — und leitet Prompt-Struktur nie aus
 einem Kommentar ab.
+
+## Nachtrag 2026-08-19 — die Entscheidung hielt, die Annahme darunter nicht
+
+Nach diesem ADR starben **vier weitere** Läufe an derselben Antwort (vault-gardener
+11./14./19.08., morning-brief 17.08.). Die hier getroffene Entscheidung war richtig, aber
+sie beruhte auf der stillschweigenden Annahme, die **Position** am Prompt-Ende mache die
+Instruktion erkennbar. Das tut sie nicht, wenn der Block direkt davor vergangene Läufe als
+nummerierte Liste rendert und deren Aufgabentext wörtlich zitiert: der abschließende
+`## Aufgabe` mit demselben Wortlaut ist dann der nächste Listeneintrag. Ergänzt wurde
+deshalb `PROMPT_TASK_DELIMITER` — die Grenze steht jetzt als Text im Prompt, nicht nur in
+der Reihenfolge. Am Beschluss „Task zuletzt, nichts dahinter" ändert das nichts.
+
+**Zur oben verworfenen Alternative „Heuristische Fingerabdruck-Erkennung am Antworttext".**
+Der Einwand bleibt gültig und die Alternative bleibt verworfen — *als Urteil über den Lauf*.
+Ob ein Lauf erfolgreich war, entscheidet weiterhin ausschließlich `#verify:` am Ergebnis.
+
+Neu hinzugekommen ist derselbe Fingerabdruck in einer anderen Rolle: als **Filter für die
+Memory-Injektion** (`memory._is_noninformative`, `_is_noop_log_entry`). Er entscheidet
+nicht, ob ein Lauf gelungen ist, sondern nur, ob dessen gespeicherte Antwort es wert ist,
+dem nächsten Lauf als Kontext vorgelegt zu werden. Drei Eigenschaften trennen ihn vom
+verworfenen Ansatz:
+
+- **fail-open** — verfehlt er einen Fall, wird der Eintrag injiziert wie bisher; er kann
+  keinen Lauf als gescheitert markieren;
+- **Lesezeit statt Schreibzeit** — der gespeicherte Datensatz bleibt unangetastet und
+  vollständig, gefiltert wird nur die Prompt-Sicht darauf;
+- **verankert statt geraten** — die Absageformel zählt nur neben einem Adressaten-Marker
+  („von dir", „in this message"). Ohne diesen Anker trat der Einwand dieses ADR sofort ein:
+  eine erste, unverankerte englische Fassung verwarf im Review 4 von 6 legitimen Ergebnissen
+  („I see no tasks overdue today"). Der Anker ist also keine Politur, sondern die Bedingung,
+  unter der die Unterscheidung überhaupt trägt.
+
+Der Grund für den Filter ist gemessen, nicht vermutet: am 19.08. bestanden **3 von 5**
+injizierten Memory-Beispielen aus genau dieser Absage — die Historie war zum Few-Shot-Prompt
+fürs Nichtstun geworden und hielt den Ausfall über drei Wochen am Leben.

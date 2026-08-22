@@ -53,6 +53,11 @@ class SubTaskResult:
     success: bool
     output: str
     error: str = ""
+    # Summed by the caller and handed to memory.store_result. Without it the aggregate is
+    # stored with output_tokens=0, and memory._is_noninformative then declines to judge —
+    # which would leave #parallel as the one path where a no-op answer is still stored as
+    # a success and re-injected as context.
+    output_tokens: int = 0
 
 
 def _parse_subtask(text: str) -> SubTask:
@@ -156,6 +161,7 @@ def _run_single_subtask(
                 success=outcome.success,
                 output=(outcome.output or "done") if outcome.success else "",
                 error=outcome.error if not outcome.success else "",
+                output_tokens=outcome.output_tokens,
             )
 
         # Plain single-shot subtask
@@ -184,6 +190,7 @@ def _run_single_subtask(
             success=result.success,
             output=result.output if result.success else "",
             error=result.error if not result.success else "",
+            output_tokens=getattr(result, "output_tokens", 0),
         )
     finally:
         setattr(provider, "_forced_model", previous_forced_model)

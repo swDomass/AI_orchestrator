@@ -53,7 +53,9 @@ from config import (
     MEMORY_LESSONS_RETENTION_DAYS,
     MEMORY_MAX_AGE_DAYS,
     MEMORY_MIN_SCORE,
+    MEMORY_NOOP_MAX_OUTPUT_TOKENS,
     MEMORY_SUMMARY_MAX_CHARS,
+    MEMORY_TASK_LABEL_CHARS,
     MEMORY_TOP_K,
     PROMPT_CURATED_MEMORY_TOKENS,
     PROMPT_DAILY_LOG_TOKENS,
@@ -125,6 +127,176 @@ def _truncate_summary(text: str) -> str:
     return text[:first] + "\n...\n" + text[-tail:]
 
 
+# A provider answering "there is no task in this message" produced no work and carries no
+# information. Re-injecting such an answer as "relevant past context" turns the memory block
+# into a few-shot prompt for the same non-answer — measured 2026-08-19, when 3 of the 5
+# injected examples were exactly that and the run did nothing for the third time in a row.
+#
+# The shape that matters is the REFUSAL, not the words "no task": a legitimate short result
+# like "Keine Aufgaben überfällig" (daily-task-status) or its English counterpart "I see no
+# tasks overdue today" must survive. So the absence phrase has to sit next to an ADDRESSEE
+# marker ("von dir", "in this message") — that combination only occurs when the model is
+# telling the user it found nothing to execute.
+#
+# ADR-002 rejected "heuristic fingerprint detection on the answer text" as a way to judge a
+# RUN, on the grounds that it misfires on legitimate follow-up questions. That objection is
+# correct and still stands. What happens here is a different thing: the fingerprint decides
+# only whether a stored result is worth RE-INJECTING as context. The run verdict stays with
+# `#verify:`. That distinction is only worth anything while the pattern is actually precise,
+# which is why the anchors below are mandatory on both languages — an unanchored English
+# branch discarded 4 of 6 legitimate results in review, i.e. exactly ADR-002's objection.
+# Only markers that place the absence IN THE MESSAGE. "von dir" / "from you" were in this
+# list and had to go: they mean "concerning you", not "in what you sent me", and every one
+# of seven realistic results was discarded because of them — including "Es gab keine
+# Aufgabe von dir, die gegen die Leitplanken verstößt". Removing them changed nothing on
+# real data: 8 hits across the 206 stored results before and after.
+#
+# It does NOT fully close the self-deletion case, and saying otherwise would overstate it:
+# a SHORT report (≤ MEMORY_NOOP_MAX_OUTPUT_TOKENS) that quotes the complete refusal wording
+# including "in dieser Nachricht" is still discarded — measured. Accepted rather than fixed,
+# because excluding quoted text would mean parsing intent out of the wording, which is where
+# ADR-002's objection to fingerprinting starts. The loss is one memory entry, fail-open.
+#
+# "in it" only counts at the end of a sentence — as in "…but no concrete task in it." A word
+# boundary is not enough, it still fires on "no tasks in it that are overdue", where "in it"
+# refers to a file. Missing "no concrete task in it, only background" is the fail-open side.
+_ADDRESSEE = (
+    r"(?:in (?:dieser|deiner) nachricht|in (?:this|your) message"
+    r"|in it(?=\s*[.!?]|\s*$))"
+)
+_NOUN_DE = r"(?:konkrete[nr]?\s+)?(?:frage\s+oder\s+)?(?:aufgabe|anweisung|auftrag)\w*"
+_ABSENCE_DE = (
+    # No "aufgabenstellung" alternative: "aufgabe" matches first and the trailing \w*
+    # swallows the rest, so the longer spelling is covered and a separate branch is dead.
+    # "es fehlt eine …" is a second real phrasing of the same refusal, found by an
+    # independent sweep of the store (see _is_noninformative for the recall figure).
+    rf"kein(?:e|en)?\s+{_NOUN_DE}"
+    rf"|(?:es\s+)?fehlt\s+(?:eine|ein)\s+{_NOUN_DE}"
+)
+_ABSENCE_EN = r"no\s+(?:concrete|actual|specific|explicit)?\s*(?:task|instruction|request|question)s?\b"
+_RE_NO_TASK_ANSWER = re.compile(
+    rf"(?:{_ABSENCE_DE}|{_ABSENCE_EN})[^.]{{0,60}}?{_ADDRESSEE}"
+    rf"|{_ADDRESSEE}[^.]{{0,60}}?(?:{_ABSENCE_DE}|{_ABSENCE_EN})",
+    re.IGNORECASE,
+)
+
+# Layer 2 (the daily log) stores only the first 80 characters of a result, and the real
+# no-op line gets cut mid-phrase: "…, aber keine konkrete …" — the addressee marker that
+# _RE_NO_TASK_ANSWER needs is gone, so that pattern alone cannot see it (measured). This
+# one recognises the truncated stump instead, and only the stump: the ellipsis anchor at
+# the end is what keeps it from matching prose that merely says "keine konkrete Aussage".
+_RE_NO_TASK_TRUNCATED = re.compile(
+    r"(?:kein(?:e|en)?\s+konkrete[nr]?|no\s+(?:concrete|specific))\s*…\s*$",
+    re.IGNORECASE,
+)
+
+# Only the opening of a result is searched. A long report may legitimately quote such a
+# sentence somewhere in the middle; the refusal, if it is one, is the first thing said.
+_NO_TASK_SCAN_CHARS = 400
+
+# Written into a daily-log entry's status line when the run was recognised as a no-op, and
+# the sole signal the read side filters on. Deliberately human-readable: the daily note is
+# what a person scrolls to see what ran overnight, and for queue lines without a `#verify:`
+# tag it is the only place this failure class is visible at all.
+_NOOP_MARKER = "Leerlauf (nicht injiziert)"
+
+
+def _looks_like_no_task_answer(text: str) -> bool:
+    """True when `text` opens with a "there is no task in this message" refusal."""
+    if not text:
+        return False
+    # Collapse whitespace so a line break inside the phrase does not defeat the proximity
+    # window between the absence phrase and the addressee marker.
+    opening = " ".join(text[:_NO_TASK_SCAN_CHARS].split())
+    return bool(_RE_NO_TASK_ANSWER.search(opening))
+
+
+# A #parallel aggregate (parallel_runner.format_parallel_result) is a series of
+# "**Subtask N** (provider): STATUS — …" blocks. It has to be judged per block, not as one
+# text: with two subtasks the second one's refusal still falls inside the 400-char scan
+# window, so one lazy subtask would discard the other's real work from memory.
+_RE_SUBTASK_BLOCK = re.compile(r"(?m)^\*\*Subtask \d+\*\*")
+
+
+def _is_noninformative(summary: str, output_tokens: int = 0) -> bool:
+    """True when a stored task result is a "I found no task" non-answer (layer 3).
+
+    Requires BOTH the refusal wording AND a small output. Either alone is not enough:
+    substantive reports discuss this very failure mode (this repo's own do), and plenty of
+    real results are short.
+
+    ``output_tokens == 0`` means "unknown", not "short", and returns False — declining to
+    judge is the fail-open direction. That case is NOT exotic: `codex` and `vibe` report no
+    token counts at all (vibe says so in its own docstring), so on layer 3 this filter is
+    effectively Claude-only, and a fallback run under Claude quota pressure lands exactly
+    there. The daily-log layer covers those through its own, token-free rule.
+
+    A character-length fallback cannot stand in for the missing count: `store_result` caps
+    every body at MEMORY_SUMMARY_MAX_CHARS (700, measured maximum across the live store:
+    705), so any threshold above that is unconditionally true and adds no second condition.
+
+    RECALL, honestly stated: **9 of 13**. The figure once quoted here — "all eight known
+    no-ops" — was circular: that set had been collected with this very pattern. An
+    independent sweep (runtime under 30 s plus a closing question back to the user) turns
+    up five more runs of the same class, one of them in `task_results/`, i.e. in the
+    active injection pool. One of the five was recoverable and is now covered:
+
+      • "Es fehlt eine konkrete Aufgabe in deiner Nachricht" — covered, phrasing added
+        to _ABSENCE_DE.
+      • "Guten Morgen! … Was möchtest Du als nächstes tun?"    ┐ no absence phrase at all;
+      • "Ich bin bereit … Gib mir eine konkrete Aufgabe"        │ a different fingerprint,
+      • "Kontext geladen. Ich sehe: …"                          │ deliberately NOT chased
+      • "Deine Nachricht endet mitten im Satz … ohne Frage"    ┘ with a wider regex.
+
+    Widening the pattern to catch a cheerful "I'm ready, what would you like?" would mean
+    matching on tone rather than on a stated absence, which is where ADR-002's objection
+    starts to bite. Those runs are the job of `#verify:`, which checks the artefact instead
+    of the wording — that division of labour is the point, not a gap in it.
+    """
+    if not (0 < output_tokens <= MEMORY_NOOP_MAX_OUTPUT_TOKENS):
+        return False
+
+    blocks = _RE_SUBTASK_BLOCK.split(summary)
+    if len(blocks) > 1:  # at least one subtask marker → an aggregate, not a plain answer
+        # Only the part after the block's own header line: that header carries a 60-char
+        # preview of the SUBTASK TEXT (parallel_runner.format_parallel_result), and in this
+        # repo a queue line may well quote the refusal wording itself.
+        bodies = [b.partition("\n")[2].strip() for b in blocks[1:]]
+        bodies = [b for b in bodies if b]
+        # `all()` over an empty sequence is True — an aggregate of nothing but empty blocks
+        # would otherwise count as a no-op.
+        return bool(bodies) and all(_looks_like_no_task_answer(b) for b in bodies)
+    return _looks_like_no_task_answer(summary)
+
+
+def _task_label(task: str) -> str:
+    """Shorten a past task to a LABEL, visibly marked as an excerpt.
+
+    Used by both injection layers. The quoted task used to run to 80 chars in the history
+    block and 120 in the daily log, which for a long queue line reproduced the opening of
+    the very task being dispatched — and the real "## Aufgabe" section then read as the
+    next entry of the same list. The trailing "…" is what says "excerpt" rather than
+    "complete instruction", so a hard cut without it recreates half the problem.
+    """
+    label = task[:MEMORY_TASK_LABEL_CHARS].rstrip()
+    return f"{label} …" if len(task) > MEMORY_TASK_LABEL_CHARS else label
+
+
+def _is_noop_log_entry(summary_line: str) -> bool:
+    """True when a daily-log summary line (layer 2) is a no-op refusal.
+
+    Separate from _is_noninformative because layer 2 has neither a token count nor the full
+    text — just 80 characters and an ellipsis. The rule is therefore looser, and that is a
+    deliberate asymmetry: dropping a daily-log line costs a two-day rolling prompt buffer
+    entry, while the authoritative record stays in task_results/. Dropping a task_results
+    entry would lose the memory itself, so that side keeps the strict rule.
+    """
+    if not summary_line:
+        return False
+    line = " ".join(summary_line.split())
+    return bool(_RE_NO_TASK_TRUNCATED.search(line)) or _looks_like_no_task_answer(line)
+
+
 def _tokenize(text: str) -> set[str]:
     """Lowercase, split on delimiters and camelCase, keep words ≥3 chars, remove stopwords."""
     text = _RE_CAMEL_SPLIT.sub(r"\1 \2", text)
@@ -150,7 +322,7 @@ def _temporal_score(sim: float, age_days: float, half_life: float = MEMORY_HALF_
 
 def _parse_memory_file(path: Path) -> Optional[dict]:
     """Parse a memory .md file. Returns dict with keys: task, provider, cwd,
-    duration_sec, timestamp, success, summary, path."""
+    duration_sec, timestamp, success, summary, output_tokens, noninformative, path."""
     try:
         content = path.read_text(encoding="utf-8")
     except OSError:
@@ -187,6 +359,11 @@ def _parse_memory_file(path: Path) -> Optional[dict]:
     except ValueError:
         ts = datetime.fromtimestamp(path.stat().st_mtime)
 
+    try:
+        output_tokens = int(meta.get("output_tokens", 0) or 0)
+    except ValueError:
+        output_tokens = 0
+
     return {
         "task": meta.get("task", ""),
         "provider": meta.get("provider", ""),
@@ -195,6 +372,11 @@ def _parse_memory_file(path: Path) -> Optional[dict]:
         "timestamp": ts,
         "success": meta.get("success", "true").lower() not in ("false", "0"),
         "summary": body,
+        "output_tokens": output_tokens,
+        # Judged at read time, not at write time: that way the filter also covers the
+        # no-op runs already sitting in the store without a migration or a new frontmatter
+        # field, and store_result never has to overrule its callers.
+        "noninformative": _is_noninformative(body, output_tokens),
         "path": path,
     }
 
@@ -257,7 +439,10 @@ def store_result(
         logger.debug("Memory stored: %s", dest.name)
 
         # Also append to today's daily log
-        append_daily_log(task, result, provider, duration_sec, cwd=cwd, success=success)
+        append_daily_log(
+            task, result, provider, duration_sec, cwd=cwd, success=success,
+            output_tokens=output_tokens,
+        )
 
         return dest
     except Exception as e:
@@ -275,6 +460,9 @@ def search_memory(
     Uses TF-IDF keyword similarity + temporal decay.
     CWD bonus: same-cwd memories get 1.2× multiplier.
     Returns up to top_k dicts with keys: task, summary, score, timestamp, cwd.
+
+    Entries classified as non-informative (`_is_noninformative` — a run that answered it
+    found no task) are excluded, so they cannot occupy one of the top_k slots.
     """
     if not _TASK_RESULTS_DIR.exists():
         return []
@@ -286,6 +474,11 @@ def search_memory(
     for path in _TASK_RESULTS_DIR.glob("*.md"):
         mem = _parse_memory_file(path)
         if not mem:
+            continue
+        # Dropped here, not in get_context_for_task: a no-op that merely loses its slot
+        # later would still have consumed one of the top_k, so the prompt would carry four
+        # real memories instead of five.
+        if mem["noninformative"]:
             continue
 
         doc_text = mem["task"] + " " + mem["summary"]
@@ -368,8 +561,11 @@ def get_context_for_task(task_text: str, cwd: Optional[str] = None) -> str:
     for i, mem in enumerate(results, 1):
         ts = mem["timestamp"].strftime("%Y-%m-%d")
         status = "✅" if mem["success"] else "❌"
+        label = _task_label(mem["task"])
+        # Tied to the outcome: a fixed "(erledigt)" behind a ❌ read as "failed (done)".
+        outcome = "erledigt" if mem["success"] else "fehlgeschlagen"
         lines.append(
-            f"{i}. [{ts}] {status} {mem['task'][:80]}\n"
+            f"{i}. [{ts}] {status} ({outcome}) {label}\n"
             f"   Provider: {mem['provider']}\n"
             f"   {mem['summary'][:200]}"
         )
@@ -385,7 +581,10 @@ def _get_recent_memories(cwd: Optional[str] = None, n: int = MEMORY_TOP_K) -> li
     mems = []
     for path in _TASK_RESULTS_DIR.glob("*.md"):
         mem = _parse_memory_file(path)
-        if mem:
+        # Same exclusion as in search_memory — this is the fallback path taken when nothing
+        # scores above the threshold, which is exactly when a recent no-op would otherwise
+        # be the freshest thing in the store and win a slot by recency alone.
+        if mem and not mem["noninformative"]:
             mems.append(mem)
 
     # Filter by cwd if we have enough matches
@@ -456,10 +655,18 @@ def append_daily_log(
     cwd: Optional[str] = None,
     *,
     success: bool = True,
+    output_tokens: int = 0,
 ) -> bool:
     """Append a task entry to today's daily log.
 
     Format is Obsidian-friendly Markdown. Returns True on success.
+
+    A no-op answer is not written at all. This log is a prompt-injection layer by design
+    (see the 80-char cap below), and injecting "the last run answered: there is no task"
+    teaches the next run to answer the same. Judged here, where the FULL result is still
+    available — by the time the entry is read back it has been cut to 80 characters, which
+    removes the very phrase the strict pattern keys on. The authoritative record of the run
+    stays in task_results/ either way, so nothing is lost, only un-injected.
     """
     try:
         _ensure_dirs()
@@ -473,17 +680,53 @@ def append_daily_log(
         first_line = result.partition("\n")[0].strip()
         summary = (first_line[:80] + "…") if len(first_line) > 80 else first_line
 
+        # Three rules, and each covers a hole the others leave:
+        #  - the full-text rule has the most signal (8 of 8 real no-ops vs. 3 of 8 for the
+        #    80-char view) but is capped at MEMORY_NOOP_MAX_OUTPUT_TOKENS;
+        #  - the truncation stump runs regardless of that cap — without it a no-op just
+        #    above the cap passed both layers, which was a regression, not an old state;
+        #  - the full loose rule only where there is no token count at all (codex, vibe).
+        #    Letting it run unconditionally made it overrule a justified "no": a
+        #    40 000-token report whose first line quotes the refusal wording disappeared.
+        if _is_noninformative(result, output_tokens) or _RE_NO_TASK_TRUNCATED.search(summary):
+            noop = True
+        elif not output_tokens and _looks_like_no_task_answer(summary):
+            noop = True
+        else:
+            noop = False
+
+        # A recognised no-op is MARKED, not dropped. Dropping it kept the prompt clean and
+        # made the failure class less visible than before this fix: the daily note is where
+        # a human looks to see what ran overnight, and for the three recurring queue lines
+        # without a `#verify:` tag that entry is the only symptom there is. The read side
+        # filters on this marker, so the prompt stays clean either way — and the marker,
+        # unlike a token count, is written by the same decision that read side honours.
+        if noop:
+            status += f" · {_NOOP_MARKER}"
+            logger.warning("No-op answer detected, not injected: %s", task[:60])
+
+        # Same label helper as the layer-3 history block. At 120 chars and without the
+        # excerpt marker this heading reproduced more of the live queue line than the
+        # memory block it was meant to complement, and read as a complete instruction.
         entry = (
-            f"\n## {ts} — {task[:120]}\n"
+            f"\n## {ts} — {_task_label(task)}\n"
             f"- **Provider:** {provider}\n"
         )
         if cwd:
             entry += f"- **CWD:** {cwd}\n"
-        entry += (
-            f"- **Duration:** {duration_sec:.0f}s\n"
-            f"- **Status:** {status}\n"
-            f"- {summary}\n"
-        )
+        entry += f"- **Duration:** {duration_sec:.0f}s\n- **Status:** {status}\n"
+        # Two distinct signals, and both are needed:
+        #  - the status marker above says "this IS a no-op" (for the human, and for the
+        #    read side to drop it);
+        #  - this line says "this entry was judged when it was written", which is what lets
+        #    the read side leave a KEPT entry alone. Without it an entry the write side
+        #    deliberately kept was re-judged on 80 characters and dropped anyway — present
+        #    in the file, never in a prompt.
+        # Absent for providers that report no counts (codex, vibe); there the read side
+        # applies the same loose rule the write side used, so the two still agree.
+        if output_tokens:
+            entry += f"- **Tokens:** {output_tokens}\n"
+        entry += f"- {summary}\n"
 
         # Parallel subtasks run in threads within the same orchestrator process.
         # Guard creation so only one writer emits the daily header.
@@ -499,6 +742,64 @@ def append_daily_log(
     except Exception as e:
         logger.warning("Daily log append failed: %s", e)
         return False
+
+
+def _strip_noop_entries(log_text: str) -> str:
+    """Drop no-op entries from a daily log's text.
+
+    The write path already refuses to add them, but entries written before that existed
+    are still inside the two-day window this log feeds into the prompt — the one from
+    2026-08-19 08:58 would have been handed to the next morning's briefing as "yesterday".
+    Filtering on read covers those without rewriting the file, which stays the honest
+    record of what ran.
+
+    An entry is `## HH:MM — task` followed by its `- ` bullets; the last bullet holds the
+    result summary. Anything before the first `## ` (the `# Memory <date>` header) is kept.
+    """
+    # re.split on a line-anchored "## ", not partition("\n## "): the latter needs a
+    # preceding newline, so an entry sitting at the very start of the file — a log written
+    # without the "# Memory <date>" header, e.g. after hand-editing in Obsidian — ended up
+    # in the head and was kept unexamined.
+    parts = re.split(r"(?m)^## ", log_text)
+    if len(parts) == 1:
+        return log_text
+
+    head = parts[0].rstrip("\n")
+    kept = [head] if head.strip() else []
+    for chunk in parts[1:]:
+        bullets = [ln for ln in chunk.splitlines() if ln.startswith("- ")]
+        # The summary is the last bullet; the ones before it are Provider/CWD/Duration/
+        # Status/Tokens.
+        summary_line = bullets[-1][2:] if bullets else ""
+        # An entry the write side already recognised says so in its status line. That verdict
+        # was reached on the full result — far more signal than 80 characters allow — so it
+        # is honoured as-is rather than re-derived here. Entries without the marker are the
+        # backlog written before it existed; those are what the loose rule is for.
+        if any(_NOOP_MARKER in ln for ln in bullets):
+            continue
+        # No `Tokens:` line means the entry predates this mechanism (or came from a provider
+        # without counts) — only then does the read side form its own opinion. An entry that
+        # WAS judged is left alone; re-deriving the verdict from 80 characters would drop
+        # results the write side deliberately kept.
+        already_judged = any(ln.startswith("- **Tokens:**") for ln in bullets)
+        if not already_judged and _is_noop_log_entry(summary_line):
+            continue
+        # Entries written before _task_label existed still carry up to 120 characters of
+        # the queue line in their heading — the very thing the label was introduced against.
+        # Shorten on read as well, so the backlog does not keep feeding it into prompts for
+        # two more days.
+        head_line, _, body = chunk.partition("\n")
+        ts_part, sep, task_part = head_line.partition(" — ")
+        if sep and len(task_part) > MEMORY_TASK_LABEL_CHARS:
+            head_line = f"{ts_part}{sep}{_task_label(task_part)}"
+        kept.append("## " + (f"{head_line}\n{body}" if body else head_line).rstrip("\n"))
+
+    # Nothing but the header left: return empty so `if daily:` in _build_prompt stays false
+    # and the prompt does not carry an empty "## Heutiger Verlauf" section.
+    if not any(part.startswith("## ") for part in kept):
+        return ""
+
+    return "\n\n".join(kept).strip()
 
 
 def get_daily_context(max_chars: int = 0) -> str:
@@ -518,7 +819,7 @@ def get_daily_context(max_chars: int = 0) -> str:
         if not path.exists():
             return ""
         try:
-            return path.read_text(encoding="utf-8").strip()
+            return _strip_noop_entries(path.read_text(encoding="utf-8").strip())
         except Exception as e:
             logger.warning("Failed to read daily log %s: %s", path.name, e)
             return ""

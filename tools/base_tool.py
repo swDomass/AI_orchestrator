@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from config import get_system_prompt
+from config import MEMORY_HISTORY_HEADING, get_system_prompt
 from providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -553,7 +553,7 @@ def _build_system_prompt(
             logger.warning("Tool prompt daily memory load failed: %s", exc)
 
     if memory_context:
-        prompt += f"\n\n## Relevanter vergangener Kontext\n{memory_context}"
+        prompt += f"\n\n{MEMORY_HISTORY_HEADING}\n{memory_context}"
 
     # Preflight (#35) — deterministic per-tool context injection. Cached on
     # disk per (tool, cwd, day) so the LLM doesn't pay re-discovery costs on

@@ -982,6 +982,34 @@ def _extract_relevant_section(content: str, task_keywords: set[str], context_lin
     return prefix + excerpt + suffix
 
 
+_TRUNCATION_MARKER = "\n...[truncated]"
+
+
+def _block_overhead(name: str) -> int:
+    """Chars a context block costs on top of its content (the frame)."""
+    return len(f"--- Inhalt von '{name}' ---\n\n--- Ende ---")
+
+
+def _share_budget(needs: list[int], total: int) -> list[int]:
+    """Split *total* across *needs*, smallest need first (water filling).
+
+    A file that wants less than its equal share releases the difference to the
+    others, so the budget is actually spent instead of expiring. Order matters:
+    handing shares out in reference order can only pass slack forward, never back.
+    Measured 2026-08-28 on the live morning-brief task, where the large SKILL.md
+    happens to be the first ref -- it stayed capped at its 1/3 share (2545 of
+    13336 chars) while 1447 chars went unused behind it.
+
+    Returns the share per index, in the original order of *needs*.
+    """
+    shares = [0] * len(needs)
+    rest = total
+    for rank, i in enumerate(sorted(range(len(needs)), key=lambda i: needs[i])):
+        shares[i] = min(needs[i], rest // (len(needs) - rank))
+        rest -= shares[i]
+    return shares
+
+
 def collect_file_context(task: str, max_chars: int = 0) -> str:
     """Return ONLY the context blocks for [[wikilinks]]/file paths found in *task*.
 
@@ -999,6 +1027,8 @@ def collect_file_context(task: str, max_chars: int = 0) -> str:
                    If > 0 and content exceeds budget, smart section extraction
                    is applied first, then hard truncation as fallback.
                    Total injected chars across all wikilinks is capped.
+                   The budget is shared only among refs that actually resolve
+                   and read, and an unused share rolls over to the next file.
 
     Returns:
         The joined context blocks, or "" when the task references no readable files.
@@ -1024,49 +1054,103 @@ def collect_file_context(task: str, max_chars: int = 0) -> str:
                       "und", "die", "der", "das", "ein", "eine", "ist"}
         task_keywords -= _stopwords
 
-    # Per-file budget: split max_chars evenly across refs (if budget set)
-    per_file_chars = (max_chars // len(refs)) if (max_chars > 0 and refs) else 0
-    total_injected = 0
-
-    context_blocks = []
+    # Phase A -- resolve and read first, so the budget divisor counts only files
+    # that actually made it. Splitting across ALL refs let a dead reference claim
+    # a full share and expire unused: measured 2026-08-28 on the live
+    # vault-gardener task, 4 refs of which 3 were unresolvable (two YYYY-MM-DD
+    # placeholders and a [[Projekt]] lifted out of explanatory prose) left the one
+    # real file with 1875 instead of 7500 chars, and 1940 of 7500 were injected.
+    # Reading here rather than in phase B is deliberate: a file that resolves can
+    # still fail to read, and a stat-only pass would count it and mis-divide again.
+    # Known limit, left open on purpose: the prefetch is capped per file
+    # (MAX_CONTEXT_FILE_SIZE) but not in aggregate, so N refs hold up to N MB at once
+    # while at most max_chars is ever used. Real queue lines carry fewer than five
+    # refs; bounding it would need a second mechanism and is not part of this fix.
+    readable: list[tuple[Path, str]] = []
     for ref in refs:
-        # Check overall budget remaining
-        if max_chars > 0 and total_injected >= max_chars:
-            print(f"  [context] Budget erschöpft, überspringe: {ref}")
-            break
-
         path = _resolve_note(ref)
         if not path:
-            print(f"  [context] Datei nicht gefunden: {ref}")
+            logger.info("[context] Datei nicht gefunden: %s", ref)
             continue
 
         try:
             if not path.exists():
-                print(f"  [context] Datei nicht gefunden: {ref}")
+                logger.info("[context] Datei nicht gefunden: %s", ref)
                 continue
 
             size = path.stat().st_size
             if size > MAX_CONTEXT_FILE_SIZE:
-                print(f"  [context] Datei zu groß ({size // 1024}KB), übersprungen: {path.name}")
+                logger.warning(
+                    "[context] Datei zu groß (%dKB), übersprungen: %s",
+                    size // 1024,
+                    path.name,
+                )
                 continue
 
             content = _read_file_safe(path)
         except OSError as e:
-            print(f"  [context] Datei konnte nicht gelesen werden ({path}): {e}")
+            logger.warning("[context] Datei konnte nicht gelesen werden (%s): %s", path, e)
             continue
 
-        # Apply budget truncation
-        remaining_budget = max_chars - total_injected if max_chars > 0 else 0
-        file_budget = min(per_file_chars, remaining_budget) if max_chars > 0 else 0
+        readable.append((path, content))
+
+    # Phase B -- budget across the survivors. Shares are handed out by
+    # _share_budget (smallest need first), so a small file releases what it does
+    # not use to the larger ones rather than letting it expire.
+    #
+    # Frame, truncation marker and the blank-line joins are reserved BEFORE the
+    # split, not added afterwards. Distributing the full max_chars as pure content
+    # and appending frames later pushes total_injected past the ceiling, and the
+    # break below then discards files that had already been granted a share.
+    # Measured 2026-08-28 with contents 10000/1/1 at max_chars=7500: HEAD returned
+    # 2644 chars containing all three files, the content-only split returned 7556
+    # containing only the large one. Because shares now cover the whole block,
+    # len(result) <= max_chars actually holds.
+    overheads = [_block_overhead(path.name) for path, _ in readable]
+    joins = 2 * max(len(readable) - 1, 0)
+    block_budget = max(max_chars - joins, 0) if max_chars > 0 else 0
+    shares = (
+        _share_budget(
+            [len(content) + ov for (_, content), ov in zip(readable, overheads)],
+            block_budget,
+        )
+        if max_chars > 0
+        else [0] * len(readable)
+    )
+
+    total_injected = 0
+    context_blocks = []
+    for (path, content), share, overhead in zip(readable, shares, overheads):
+        # No running budget check here: sum(shares) <= block_budget and every block
+        # is <= its share, so total_injected can no longer overshoot. The former
+        # "Budget erschöpft" break was measured dead once the frame moved into the
+        # share (2026-08-28: removing it left 60 of 61 tests green, and the only red
+        # one asserted the message itself). A file that cannot be served now says so
+        # below, per file, instead of silently ending the loop for everything after it.
+        file_budget = share - overhead if max_chars > 0 else 0
+
+        if max_chars > 0 and file_budget <= 0:
+            logger.warning(
+                "[context] Budget reicht nicht einmal für den Rahmen, übersprungen: %s",
+                path.name,
+            )
+            continue
 
         if file_budget > 0 and len(content) > file_budget:
             # Smart: find the most relevant section first
             content = _extract_relevant_section(content, task_keywords)
             if len(content) > file_budget:
-                content = content[:file_budget] + "\n...[truncated]"
-            print(f"  [context] Datei eingelesen (gekürzt): {path.name}")
+                keep = file_budget - len(_TRUNCATION_MARKER)
+                if keep <= 0:
+                    logger.warning(
+                        "[context] Budget zu klein für Inhalt plus Marker, übersprungen: %s",
+                        path.name,
+                    )
+                    continue
+                content = content[:keep] + _TRUNCATION_MARKER
+            logger.warning("[context] Datei eingelesen (gekürzt): %s", path.name)
         else:
-            print(f"  [context] Datei eingelesen: {path.name}")
+            logger.info("[context] Datei eingelesen: %s", path.name)
 
         block = f"--- Inhalt von '{path.name}' ---\n{content}\n--- Ende ---"
         context_blocks.append(block)

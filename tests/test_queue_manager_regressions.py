@@ -608,3 +608,233 @@ def test_strip_metadata_tags_removes_verify_tag():
     assert "#verify" not in stripped
     assert "check.ps1" not in stripped
     assert stripped == "Schreibe den Brief"
+
+# --- collect_file_context: the budget path (2026-08-28) -------------------
+#
+# Until now NO test passed max_chars, so every one of them ran the unlimited
+# branch and the budget arithmetic was never executed. That is precisely how the
+# divisor came to count unresolvable refs: measured on the live vault-gardener
+# task, 4 refs of which 3 were dead left the one real file with 1875 of 7500
+# chars, and 1940 of 7500 were injected at all.
+
+
+def _vault(tmp_path, monkeypatch):
+    """Vault whose notes/ dir is the search root, mirroring the helpers above."""
+    vault = tmp_path / "vault"
+    (vault / "notes").mkdir(parents=True)
+    monkeypatch.setattr(queue_manager, "VAULT_PATH", vault)
+    monkeypatch.setattr(queue_manager, "_is_within_vault", lambda _path: True)
+    return vault
+
+
+def _write(vault, name, chars):
+    """A note of *chars* length in few long lines.
+
+    Long lines on purpose: _extract_relevant_section keeps +/-50 lines around the
+    best keyword hit, so a many-short-lines file would be swallowed whole by the
+    extractor and never reach the hard-truncation branch this test targets.
+    """
+    zeile = "Inhalt " + "x" * 493
+    text = "\n".join([zeile] * max(1, chars // 500))
+    (vault / "notes" / name).write_text(text, encoding="utf-8")
+    return len(text)
+
+
+def test_budget_divisor_ignores_unresolvable_refs(tmp_path, monkeypatch):
+    """The real file must get the whole budget, not a share held back for dead refs.
+
+    Regression for the measured vault-gardener case: three of the four refs never
+    resolve (two YYYY-MM-DD placeholders, one [[Projekt]] out of prose).
+    """
+    vault = _vault(tmp_path, monkeypatch)
+    _write(vault, "common-fixes.md", 10_000)
+
+    task = (
+        "Report nach 99_System/reports/YYYY-MM-DD_health-validate.md schreiben, "
+        "Scan aus common-fixes.md nutzen, Telegram siehe [[YYYY-MM-DD_health-validate]], "
+        "Tasks ohne [[Projekt]]-Link pruefen."
+    )
+    result = queue_manager.collect_file_context(task, max_chars=7500)
+
+    assert "...[truncated]" in result, "the file is larger than the budget, so it must be cut"
+    # Under the old split (7500 // 4 refs) this was ~1875 chars plus frame.
+    assert len(result) > 5000, (
+        f"only {len(result)} chars injected - the divisor is still counting dead refs"
+    )
+    # Strict: frame, marker and joins are reserved inside the shares, so the
+    # ceiling holds exactly. HEAD overshot it by +81/+87/+97/+111 chars at
+    # n=2/5/10/20; that overhead is gone rather than merely tolerated.
+    assert len(result) <= 7500, "the budget ceiling must hold exactly"
+
+
+def test_unused_budget_rolls_over_to_the_next_file(tmp_path, monkeypatch):
+    """A small file hands its unused share on instead of letting it expire."""
+    vault = _vault(tmp_path, monkeypatch)
+    _write(vault, "klein.md", 500)
+    _write(vault, "gross.md", 10_000)
+
+    result = queue_manager.collect_file_context(
+        "Lies klein.md und gross.md", max_chars=4000
+    )
+
+    gross_block = result.split("--- Inhalt von 'gross.md' ---")[1]
+    # A static split would have capped gross.md at 4000 // 2 = 2000.
+    assert len(gross_block) > 2500, (
+        f"gross.md got only {len(gross_block)} chars - the freed budget expired"
+    )
+
+
+def test_oversized_file_is_skipped_and_leaves_the_divisor_alone(tmp_path, monkeypatch):
+    """A file above MAX_CONTEXT_FILE_SIZE must not claim a share of the budget."""
+    vault = _vault(tmp_path, monkeypatch)
+    (vault / "notes" / "riesig.md").write_text(
+        "y" * (queue_manager.MAX_CONTEXT_FILE_SIZE + 1), encoding="utf-8"
+    )
+    _write(vault, "normal.md", 10_000)
+
+    result = queue_manager.collect_file_context(
+        "Lies riesig.md und normal.md", max_chars=6000
+    )
+
+    assert "riesig.md" not in result
+    # Splitting across both would have left normal.md at 3000.
+    assert len(result) > 4000, (
+        f"normal.md got only {len(result)} chars - the oversized file still counted"
+    )
+
+
+def test_missing_file_leaves_the_divisor_alone(tmp_path, monkeypatch):
+    """An unresolvable ref must not shrink the share of the files that do exist."""
+    vault = _vault(tmp_path, monkeypatch)
+    _write(vault, "da.md", 10_000)
+
+    result = queue_manager.collect_file_context(
+        "Lies da.md und gibt-es-nicht.md", max_chars=6000
+    )
+
+    assert "gibt-es-nicht" not in result
+    assert len(result) > 4000, f"only {len(result)} chars - the missing ref still counted"
+
+
+def test_budget_too_small_says_so_per_file(tmp_path, monkeypatch, caplog):
+    """A file that cannot be served is reported by name, not silently dropped.
+
+    Replaces the former break-path test: since the frame is reserved inside the
+    share, total_injected can no longer overshoot and the loop-wide break was
+    measured dead. Each unservable file now reports itself, which is strictly more
+    information than one message followed by silence.
+    """
+    import logging
+
+    vault = _vault(tmp_path, monkeypatch)
+    for name in ("a.md", "b.md", "c.md"):
+        _write(vault, name, 5_000)
+
+    with caplog.at_level(logging.INFO, logger="queue_manager"):
+        result = queue_manager.collect_file_context(
+            "Lies a.md, b.md und c.md", max_chars=120
+        )
+
+    gemeldet = [r.message for r in caplog.records if "übersprungen" in r.message]
+    assert len(gemeldet) == 3, f"every unservable file must report itself, got {gemeldet}"
+    assert result == ""
+
+
+def test_context_messages_go_to_the_logger_not_stdout(tmp_path, monkeypatch, caplog, capsys):
+    """Every message must survive an unattended --watch run.
+
+    run_orchestrator.ps1 starts the orchestrator without redirecting stdout, so a
+    print() is gone in exactly the run where it matters. The truncation notice is
+    the important one: it is the only signal that material did not arrive whole.
+    """
+    import logging
+
+    vault = _vault(tmp_path, monkeypatch)
+    _write(vault, "gross.md", 10_000)
+
+    with caplog.at_level(logging.INFO, logger="queue_manager"):
+        queue_manager.collect_file_context(
+            "Lies gross.md und fehlt-nicht-da.md", max_chars=3000
+        )
+
+    meldungen = [r.message for r in caplog.records]
+    assert any("gek" in m and "gross.md" in m for m in meldungen), (
+        "the truncation notice must reach the log"
+    )
+    assert any("nicht gefunden" in m for m in meldungen)
+
+    assert capsys.readouterr().out == "", "nothing may go to stdout any more"
+
+
+def test_unused_budget_also_rolls_backwards(tmp_path, monkeypatch):
+    """A large file listed FIRST must still profit from small files behind it.
+
+    This is the morning-brief shape and the reason shares are handed out by need
+    rather than in reference order: SKILL.md is the first ref there, so a
+    forward-only carry left it on its 1/3 share while 1447 chars expired behind it.
+    """
+    vault = _vault(tmp_path, monkeypatch)
+    _write(vault, "a_gross.md", 10_000)
+    _write(vault, "b_klein.md", 500)
+    _write(vault, "c_klein.md", 500)
+
+    result = queue_manager.collect_file_context(
+        "Lies a_gross.md, b_klein.md und c_klein.md", max_chars=6000
+    )
+
+    gross_block = result.split("--- Inhalt von 'a_gross.md' ---")[1].split("--- Ende ---")[0]
+    # An equal split would have been 6000 // 3 = 2000; the two small files need
+    # ~500 each, so the large one must get clearly more than its nominal third.
+    assert len(gross_block) > 3000, (
+        f"a_gross.md got only {len(gross_block)} chars - slack behind it expired"
+    )
+
+
+def test_share_budget_gives_slack_to_the_hungry():
+    """_share_budget: a file under its equal share releases the rest."""
+    assert queue_manager._share_budget([100, 100], 1000) == [100, 100]
+    assert queue_manager._share_budget([100, 5000], 1000) == [100, 900]
+    assert queue_manager._share_budget([5000, 100], 1000) == [900, 100]
+    assert queue_manager._share_budget([5000, 5000], 1000) == [500, 500]
+    assert sum(queue_manager._share_budget([1, 2, 9999], 100)) <= 100
+    # The divisor len(needs) - rank is only ever non-zero because the loop does not
+    # run on an empty list. That is an implicit invariant, so pin it: a later guard
+    # clause or prefetch could bring ZeroDivisionError back with the suite still green.
+    assert queue_manager._share_budget([], 7500) == []
+    # Discriminating: an equal split would cap the third at 30 // 3 = 10.
+    assert queue_manager._share_budget([1, 1, 3000], 30) == [1, 1, 28]
+
+
+def test_all_refs_dead_with_budget_returns_empty(tmp_path, monkeypatch):
+    """The one production path that reaches _share_budget([], total).
+
+    Edge of exactly the defect being fixed: every ref unresolvable AND a budget set.
+    """
+    _vault(tmp_path, monkeypatch)
+    result = queue_manager.collect_file_context(
+        "Nur tote Refs: [[Projekt]] und fehlt.md", max_chars=7500
+    )
+    assert result == ""
+
+def test_large_first_file_does_not_starve_the_small_ones(tmp_path, monkeypatch):
+    """Regression: a big early file must not push later small files out entirely.
+
+    Found by the external review, 2026-08-28. Distributing max_chars as pure content
+    and appending frames afterwards let the first file's block overshoot the ceiling,
+    and the loop-wide break then discarded the two small files that had already been
+    granted a share. Measured at max_chars=7500 with contents 10000/1/1: HEAD kept
+    all three files (2644 chars), the content-only split kept only the large one
+    (7556 chars, over budget).
+    """
+    vault = _vault(tmp_path, monkeypatch)
+    _write(vault, "gross.md", 10_000)
+    (vault / "notes" / "k1.md").write_text("a", encoding="utf-8")
+    (vault / "notes" / "k2.md").write_text("b", encoding="utf-8")
+
+    result = queue_manager.collect_file_context(
+        "Lies gross.md k1.md k2.md", max_chars=7500
+    )
+
+    for name in ("gross.md", "k1.md", "k2.md"):
+        assert f"'{name}'" in result, f"{name} was starved out by the large file"
+    assert len(result) <= 7500, f"ceiling broken: {len(result)} chars"

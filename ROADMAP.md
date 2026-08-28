@@ -241,9 +241,10 @@ interval ≥ 1 day persist their last run in `logs/heartbeat-state.json`, so a
 `## Every 30 days` check does not re-fire on every restart.
 
 ### 5. Selective prompt injection
-Everything injected is truncated to the *useful* block, never raw-dumped: a
-10 000-token wikilink file contributes the 500–1000 tokens that matter. Budgets
-per category are in [README → Prompt Budget](README.md#prompt-budget-token-allocation).
+Everything injected is truncated to the *useful* block, never raw-dumped: a large
+wikilink file contributes at most its share of ~1 500 tokens (7 500 chars), and often
+less because TF-IDF section extraction cuts it further. Budgets per category are in
+[README → Prompt Budget](README.md#prompt-budget-token-allocation).
 
 ### 6. Execution profiles
 Profile settings win over global `policy.yaml`. That is intentional: a profile

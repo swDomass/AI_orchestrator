@@ -744,14 +744,14 @@ The calibrated factors are plan- and workload-specific (env-overridable, not uni
 
 | Component | Budget | Source |
 |---|---|---|
-| Core (task + safety) | ~200 tokens | `config.py` / `SOUL.md` |
+| Core (task + safety) | uncapped | `SOUL.md`, falling back to `SYSTEM_PROMPTS` (`config.py:325`) — `get_system_prompt` (`config.py:906`), called without truncation in `orchestrator.py:371` |
 | Curated Memory (L1) | ~500 tokens | `MEMORY.md` |
-| Lessons (L2) | ~1000 tokens | `lessons.md` (cwd-filtered) |
-| Daily Log (L3) | ~500 tokens | `daily/` |
-| TF-IDF Memory (L4) | ~2000 tokens | `memory.py` |
+| Daily Log (L2) | ~500 tokens | `daily/` |
+| TF-IDF Memory (L3) | ~2000 tokens | `memory.py` |
+| Lessons (L4) | ~2000 **chars** | `memory.get_lessons_context` (`memory.py:873`); `#tool:` path only (`tools/base_tool.py:542`), not `_build_prompt` |
 | Wikilink context | ~1500 tokens | `queue_manager.py` |
 | Skill prompt | ~2000 tokens | `SKILL.md` body (only with `#tool:`) |
-| **Total** | **~7 500 tokens** | (under `PROMPT_BUDGET_TOKENS=10000`) |
+| **Sum of the caps above** | **6 500 tokens** | the five `PROMPT_*_TOKENS` that have a caller. This is an addition, **not** an enforced ceiling: Core and the task text are uncapped, and the five do not all apply on every path (Skill only with `#tool:`). Nothing checks the total. |
 
 ## Doctor (`--doctor`)
 

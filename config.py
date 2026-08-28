@@ -588,8 +588,10 @@ QUEUE_DONE_MOVE_HOURS  = 48  # move done tasks to erledigt.md after this many ho
 QUEUE_DONE_DELETE_DAYS = 7   # delete from erledigt.md after this many days
 
 # --- Prompt Budget (token ≈ word heuristic) ---
-PROMPT_BUDGET_TOKENS          = 10_000
-PROMPT_CORE_TOKENS            = 200
+# Per-component caps only; there is deliberately no aggregate ceiling. Two unused
+# constants (PROMPT_BUDGET_TOKENS, PROMPT_CORE_TOKENS) were removed on 2026-08-28 --
+# neither had a single caller, while README claimed the first was an enforced limit.
+# Wiring one up now would let a new ceiling truncate prompts that pass today.
 PROMPT_CURATED_MEMORY_TOKENS  = 500    # Layer 1: curated MEMORY.md (always loaded)
 PROMPT_DAILY_LOG_TOKENS       = 500    # Layer 2: today + yesterday daily log (80-char entries)
 PROMPT_MEMORY_TOKENS          = 2_000  # Layer 3: TF-IDF deep search

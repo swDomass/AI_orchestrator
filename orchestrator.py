@@ -39,6 +39,11 @@ from logging_setup import setup_logging
 
 from config import (
     GIT_AUTO_STASH,
+    GIT_SNAPSHOT_MAX_AGE_DAYS,
+    GIT_SNAPSHOT_MAX_COUNT,
+    GIT_SNAPSHOT_PROTECT_DAYS,
+    GIT_SNAPSHOT_REF_MAX_ATTEMPTS,
+    GIT_SNAPSHOT_REF_PREFIX,
     MAX_HANG_RETRIES,
     HANG_RETRY_BACKOFF_SEC,
     MAX_RETRIES_PER_PROVIDER,
@@ -209,11 +214,120 @@ def _is_git_repo(cwd: str) -> bool:
         return False
 
 
-def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
-    """Create a non-destructive git stash snapshot as rollback point.
+def _snapshot_refs(cwd: str) -> list[tuple[str, int, str]]:
+    """List orchestrator snapshot refs as (refname, committerdate_unix, sha), newest first.
 
-    Uses `git stash create` + `git stash store` so the current worktree is not
-    modified before the task runs.
+    Age comes from the commit date, not from the ref name: a hand-made or foreign
+    ref that happens to sit in the namespace still gets a real timestamp instead of
+    an unparseable one. Returns [] on any git/OS error -- pruning is best-effort and
+    must never take a task run down with it.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "for-each-ref",
+             "--format=%(refname)%09%(committerdate:unix)%09%(objectname)",
+             GIT_SNAPSHOT_REF_PREFIX],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        if result.returncode != 0:
+            return []
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    refs: list[tuple[str, int, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, raw_ts, sha = (part.strip() for part in parts)
+        # for-each-ref is already prefix-scoped; re-checked here so the invariant
+        # "we only ever touch our own namespace" lives in one place.
+        if not name.startswith(GIT_SNAPSHOT_REF_PREFIX) or not sha:
+            continue
+        try:
+            refs.append((name, int(raw_ts), sha))
+        except ValueError:
+            continue
+
+    refs.sort(key=lambda item: item[1], reverse=True)
+    return refs
+
+
+def _prune_snapshot_refs(cwd: str, now: float | None = None) -> list[str]:
+    """Cap the orchestrator snapshot namespace by age and by count.
+
+    Deletion rule::
+
+        age >= GIT_SNAPSHOT_PROTECT_DAYS
+        AND (age > GIT_SNAPSHOT_MAX_AGE_DAYS OR outside the newest GIT_SNAPSHOT_MAX_COUNT)
+
+    The protect window is a VETO over both caps, not a third condition among equals:
+    night tasks do not commit, so a young snapshot is the only undo for work still
+    waiting in the working tree. In a high-churn repo that lets the count cap be
+    starved -- more than MAX_COUNT snapshots survive because they are all young.
+    That is the deliberate trade: the undo guarantee outranks tidiness.
+
+    Only refs under GIT_SNAPSHOT_REF_PREFIX are ever considered; branches, tags and
+    refs/stash are out of reach by construction. Never raises.
+    """
+    deleted: list[str] = []
+    try:
+        refs = _snapshot_refs(cwd)
+        if not refs:
+            return deleted
+
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        now_ts = time.time() if now is None else now
+        protect_cutoff = now_ts - GIT_SNAPSHOT_PROTECT_DAYS * 86400
+        max_age_cutoff = now_ts - GIT_SNAPSHOT_MAX_AGE_DAYS * 86400
+
+        for index, (name, ts, sha) in enumerate(refs):  # newest first
+            if not name.startswith(GIT_SNAPSHOT_REF_PREFIX):
+                continue  # belt and braces: never leave our own namespace
+            if ts > protect_cutoff:
+                continue  # inside the protection window -- vetoes both caps
+            if ts >= max_age_cutoff and index < GIT_SNAPSHOT_MAX_COUNT:
+                continue  # within both caps
+
+            try:
+                # Passing the old sha makes the delete a compare-and-swap, so a ref
+                # that changed since the listing is left alone.
+                result = subprocess.run(
+                    ["git", "update-ref", "-d", name, sha],
+                    cwd=cwd, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                deleted.append(name)
+                # sha is logged so a wrongly-pruned snapshot stays recoverable
+                # (`git stash apply <sha>`) until the next `git gc`.
+                _log.info("Snapshot-Ref geloescht: %s (%s)", name, sha)
+    except Exception as e:  # noqa: BLE001 - pruning must never break a task run
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).debug("snapshot prune failed: %s", e)
+        except Exception:  # noqa: BLE001
+            pass
+    return deleted
+
+
+def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
+    """Create a non-destructive git snapshot as rollback point, return its ref name.
+
+    `git stash create` builds the commit without touching the worktree; the commit
+    is then written to ``refs/orchestrator-backup/<timestamp>`` via `git update-ref`.
+
+    Invariant: **refs/stash is the user's and is never written.** The old code used
+    `git stash store`, which put orchestrator snapshots into the user's stash list,
+    where nothing ever removed them (11 had piled up by 2026-09-03) and where a user
+    `git stash pop` would pop an orchestrator snapshot instead of their own work.
+
+    Note: `git stash create` does not capture untracked files, so the snapshot
+    restores modifications to tracked files only.
     """
     if not GIT_AUTO_STASH or not cwd:
         return None
@@ -234,13 +348,38 @@ def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
         if not stash_commit:
             return None
 
-        store = subprocess.run(
-            ["git", "stash", "store", "-m", msg, stash_commit],
-            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        ref_name: str | None = None
+        for attempt in range(GIT_SNAPSHOT_REF_MAX_ATTEMPTS):
+            suffix = "" if attempt == 0 else f"_{attempt + 1}"
+            candidate = f"{GIT_SNAPSHOT_REF_PREFIX}{timestamp}{suffix}"
+            # Empty oldvalue = "must not exist yet": two snapshots in the same second
+            # fail to create instead of silently overwriting the earlier one.
+            update = subprocess.run(
+                ["git", "update-ref", candidate, stash_commit, ""],
+                cwd=cwd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
+            if update.returncode == 0:
+                ref_name = candidate
+                break
+
+        if ref_name is None:
+            return None
+
+        # `git stash list` no longer shows this, so the ref name is the only way the
+        # user can find the snapshot -- log it to BOTH sinks. run_orchestrator.ps1
+        # starts --watch without stdout redirection, so a print alone is lost in
+        # exactly the unattended run that needs it.
+        print(f"  [safety] Git Snapshot gespeichert (nicht-destruktiv): {ref_name}"
+              f"  |  Wiederherstellen: git stash apply {ref_name}")
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "Git Snapshot: %s (%s) -- Wiederherstellen: git stash apply %s",
+            ref_name, stash_commit, ref_name,
         )
-        if store.returncode == 0:
-            print(f"  [safety] Git Snapshot gespeichert (nicht-destruktiv): {msg}")
-            return msg
+
+        _prune_snapshot_refs(cwd)
+        return ref_name
     except (OSError, subprocess.TimeoutExpired):
         pass
     return None

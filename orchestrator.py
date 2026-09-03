@@ -306,11 +306,11 @@ def _prune_snapshot_refs(cwd: str, now: float | None = None) -> list[str]:
                 # sha is logged so a wrongly-pruned snapshot stays recoverable
                 # (`git stash apply <sha>`) until the next `git gc`.
                 _log.info("Snapshot-Ref geloescht: %s (%s)", name, sha)
-    except Exception as e:  # noqa: BLE001 - pruning must never break a task run
+    except Exception as e:  # pruning must never break a task run
         try:
             import logging as _logging
             _logging.getLogger(__name__).debug("snapshot prune failed: %s", e)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return deleted
 

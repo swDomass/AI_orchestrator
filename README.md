@@ -287,7 +287,12 @@ namespace by `age >= 14 d AND (age > 30 d OR outside the newest 50)`. The 14-day
 window is a veto over both caps — night tasks do not commit, so a young snapshot is
 the only undo for work still waiting in the working tree — which means the count cap
 can be starved in a high-churn repo. Nothing outside `refs/orchestrator-backup/` is
-ever touched, so moving a ref elsewhere keeps it forever.
+ever touched, so moving a ref elsewhere keeps it forever. Age is the commit date, not
+the date the ref appeared: a ref moved into the namespace by hand keeps the *old*
+commit's age and can therefore be pruned on the very first run. Every deletion is
+logged with ref name and sha (recoverable with `git stash apply <sha>` until `git gc`);
+deleting more than one ref in a single pass is logged at `WARNING`, because routine
+ageing retires at most one at a time.
 
 **`select_provider()` is still fail-open for a bare `#vibe`/`#openrouter` tag when the policy is missing.** The fail-closed rule described above lives in `policy_allows_provider()` / `dispatcher._allows()`. The *forced-provider* path in `select_provider()` was not converted in the same pass, so a task carrying a bare `#vibe` or `#openrouter` tag can still reach that provider if `policy.yaml` is absent or unreadable. Deliberately left open — closing it means reworking roughly ten routing tests — but it is the one hole left in the pay-per-token ceiling, and it matters exactly in the scenario the ceiling was built for (a synced `policy.yaml` that failed to arrive before an unattended run).
 

@@ -269,8 +269,14 @@ def _prune_snapshot_refs(cwd: str, now: float | None = None) -> list[str]:
 
     Only refs under GIT_SNAPSHOT_REF_PREFIX are ever considered; branches, tags and
     refs/stash are out of reach by construction. Never raises.
+
+    Every deletion is logged with ref name AND sha (recoverable until the next
+    `git gc`); deleting more than one ref in a single pass is logged at WARNING,
+    because that is the mass-loss shape rather than routine ageing -- see the
+    comment at the log call.
     """
     deleted: list[str] = []
+    deleted_pairs: list[tuple[str, str]] = []
     try:
         refs = _snapshot_refs(cwd)
         if not refs:
@@ -303,9 +309,31 @@ def _prune_snapshot_refs(cwd: str, now: float | None = None) -> list[str]:
                 continue
             if result.returncode == 0:
                 deleted.append(name)
+                deleted_pairs.append((name, sha))
                 # sha is logged so a wrongly-pruned snapshot stays recoverable
                 # (`git stash apply <sha>`) until the next `git gc`.
                 _log.info("Snapshot-Ref geloescht: %s (%s)", name, sha)
+
+        # A ROUTINE prune retires at most one ref: snapshots accrue one per dirty run
+        # and therefore cross the age cap one at a time. Several in a single pass means
+        # a whole batch aged out together -- the mass-loss shape. It is the expected
+        # shape for refs that entered the namespace by other means (hand-archived from
+        # refs/stash, imported from an older mechanism): those carry their ORIGINAL
+        # commit dates, so the age rule reads them as ancient on the very first prune,
+        # however recently they were archived. Ageing by ref name would not help --
+        # the names carry the same old timestamps. That deserves to stand out from
+        # housekeeping in an unattended 03:00 run, so it goes out at WARNING, to both
+        # sinks (the .ps1 watch run has no stdout redirection, print alone is lost).
+        if len(deleted_pairs) > 1:
+            detail = ", ".join(f"{name} ({sha})" for name, sha in deleted_pairs)
+            _log.warning(
+                "Snapshot-Kappung: %d Refs auf einmal geloescht: %s. "
+                "Was davon erhalten bleiben soll, gehoert VOR dem naechsten Lauf aus "
+                "%s heraus verschoben; bis zum naechsten `git gc` sind die Commits "
+                "ueber die Shas oben noch erreichbar (git stash apply <sha>).",
+                len(deleted_pairs), detail, GIT_SNAPSHOT_REF_PREFIX,
+            )
+            print(f"  [safety] Snapshot-Kappung: {len(deleted_pairs)} Refs geloescht: {detail}")
     except Exception as e:  # pruning must never break a task run
         try:
             import logging as _logging

@@ -201,6 +201,16 @@ deletion is logged with ref name *and* sha (recoverable via `git stash apply
 <sha>` until `git gc` runs). To keep any of them, move them out of
 `refs/orchestrator-backup/` first.
 
+Ageing runs on `committerdate`, i.e. on the age of the *content*, not on when a
+ref entered the namespace — the ref *names* carry the same March timestamps, so
+name-based ageing would not help either. That is the general case behind the 11
+refs: anything imported into the namespace from an older mechanism reads as
+ancient on its first prune. Because a *routine* prune retires at most one ref
+(snapshots accrue one per dirty run and cross the cap one at a time), deleting
+**more than one ref in a single pass** is logged at `WARNING` — with all names
+and shas, and the hint to move keepers out of the namespace — instead of
+disappearing into the `INFO` housekeeping stream of an unattended 03:00 run.
+
 ---
 
 ## Open items

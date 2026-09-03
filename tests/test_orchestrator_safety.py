@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import subprocess
@@ -253,6 +254,52 @@ def test_count_cap_is_starved_by_the_protect_window_deliberately():
               for i in range(GIT_SNAPSHOT_MAX_COUNT + 5)]
 
     assert _prune_with(listed, now) == []
+
+
+def _prune_with_logs(listed, now, caplog):
+    with caplog.at_level(logging.INFO, logger="orchestrator"), \
+         patch("orchestrator._snapshot_refs", return_value=listed), \
+         patch("orchestrator.subprocess.run", return_value=_completed()):
+        deleted = orchestrator._prune_snapshot_refs("C:/repo", now=now)
+    return deleted, caplog.records
+
+
+def test_bulk_prune_is_logged_at_warning_not_as_housekeeping(caplog):
+    """Several refs at once is the mass-loss shape, not routine ageing.
+
+    Refs that entered the namespace by other means (hand-archived out of refs/stash)
+    carry their ORIGINAL commit dates, so they all age out on the very first prune.
+    An unattended 03:00 run must not report that at the same level as one ref
+    retiring on schedule.
+    """
+    now = time.time()
+    old = int(now - (GIT_SNAPSHOT_MAX_AGE_DAYS + 100) * 86400)
+    listed = [(f"{GIT_SNAPSHOT_REF_PREFIX}a", old, "sha_a"),
+              (f"{GIT_SNAPSHOT_REF_PREFIX}b", old - 1, "sha_b")]
+
+    deleted, records = _prune_with_logs(listed, now, caplog)
+
+    assert len(deleted) == 2
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "2" in message
+    # the shas are the recovery handle until the next gc, the prefix is the escape hatch
+    assert "sha_a" in message and "sha_b" in message
+    assert GIT_SNAPSHOT_REF_PREFIX in message
+
+
+def test_single_prune_stays_at_info(caplog):
+    """One ref retiring on schedule is housekeeping and must not cry wolf."""
+    now = time.time()
+    listed = [(f"{GIT_SNAPSHOT_REF_PREFIX}only",
+               int(now - (GIT_SNAPSHOT_MAX_AGE_DAYS + 1) * 86400), "sha")]
+
+    deleted, records = _prune_with_logs(listed, now, caplog)
+
+    assert deleted == [f"{GIT_SNAPSHOT_REF_PREFIX}only"]
+    assert [r for r in records if r.levelno >= logging.WARNING] == []
+    assert any(r.levelno == logging.INFO and "sha" in r.getMessage() for r in records)
 
 
 def test_prune_never_raises_when_git_is_unavailable():

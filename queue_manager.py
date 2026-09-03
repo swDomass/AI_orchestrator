@@ -151,6 +151,14 @@ MODEL_TAG_RE = re.compile(
     r"(?i)(?<!\S)#(" + "|".join(re.escape(t) for t in _MODEL_ALIAS_TAGS) + r")(?![\w-])"
 )
 
+# The provider-name prefix each known model-alias tag is built from (claude_opus ->
+# "claude", or_glm -> "or", vibe_medium -> "vibe", ...). Derived from _MODEL_ALIAS_TAGS
+# rather than hand-copied, so queue_linter's "does this look like a model tag but isn't
+# a known one" check picks up a new provider's aliases automatically. MODEL_TAG_RE itself
+# cannot serve that purpose — it can only ever match aliases already known to it, so an
+# unknown one (the exact case that check exists for) never reaches it at all.
+_MODEL_ALIAS_PREFIXES = sorted({tag.split("_", 1)[0] for tag in _MODEL_ALIAS_TAGS})
+
 # Matches #effort:<level> — reasoning effort for the run (Claude only; see
 # config.CLAUDE_EFFORT_LEVELS). Deliberately LOOSE: it matches any word, so an
 # invalid level (#effort:ultra) still produces a match and can be reported as a
@@ -178,8 +186,22 @@ EFFORT_ATTEMPT_RE = re.compile(
     r"(?i)(?<!\]\()(?:^|(?<=[\s(]))#effort(?![\w-])(\s*[:=]\s*[^\s)]*)?"
 )
 
-# Matches #pass1:<provider> and #pass2:<provider> for cross-provider tool support
-PASS_PROVIDER_TAG_RE = re.compile(r"(?i)(?<!\S)#pass([12]):(claude|gemini|codex)(?=\s|$)")
+# Matches #pass1:<provider> and #pass2:<provider> for cross-provider tool support.
+# Value is a bare provider name, not a model alias — resolved downstream via
+# dispatcher.policy_allows_provider()/get_provider_by_name() (critical_review.py
+# _resolve_pass2_provider()), both of which accept any registered provider, not just
+# claude/gemini/codex. The alternation is therefore derived from the same
+# _PROVIDER_TAG_MAP as MODEL_TAG_RE instead of hand-copied: this regex used to list
+# claude/gemini/codex only and predated vibe/openrouter, so `#pass2:vibe` and
+# `#pass2:openrouter` matched nothing — extract_pass_providers() returned {} for pass 2
+# and _resolve_pass2_provider() silently fell back to the primary provider, indistinguishable
+# from the tag not being there at all. Provider names are full words with no shared
+# prefixes (unlike the model-alias tags), so no length-sort is needed here.
+PASS_PROVIDER_TAG_RE = re.compile(
+    r"(?i)(?<!\S)#pass([12]):("
+    + "|".join(re.escape(p) for p in sorted(set(_PROVIDER_TAG_MAP.values())))
+    + r")(?=\s|$)"
+)
 
 # Matches #second_opinion:<alias> — opt-in second-opinion provider for review-loop.
 # Value is a model alias (e.g. or_glm, or_minimax_free, claude_opus) or a bare
@@ -836,7 +858,9 @@ def extract_tool_providers(task: str) -> list[str] | None:
 def extract_pass_providers(task: str) -> dict[int, str]:
     """Extract #pass1:<provider> and #pass2:<provider> from task text.
 
-    Returns e.g. {1: 'claude', 2: 'gemini'} or {} if none found.
+    Any provider name in dispatcher._TAG_MAP is accepted (claude, gemini, codex,
+    vibe, openrouter) — see PASS_PROVIDER_TAG_RE. Returns e.g. {1: 'claude', 2:
+    'vibe'} or {} if none found.
     """
     result: dict[int, str] = {}
     for m in PASS_PROVIDER_TAG_RE.finditer(task):

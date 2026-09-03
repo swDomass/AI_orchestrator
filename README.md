@@ -178,17 +178,16 @@ Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
 
 - Invalid / missing `cwd:` (path doesn't exist or outside `ALLOWED_CWD_ROOTS`)
 - Unknown `#tool:<name>`
-- Unknown model alias (`#claude_*`, `#gemini_*`, `#codex_*`, `#or_*`)
+- Unknown model alias (`#claude_*`, `#gemini_*`, `#codex_*`, `#vibe_*`, `#or_*`)
 - Unknown `#effort:` level (`unknown_effort`) — the tag regex is deliberately loose so a typo is *reported* here instead of being indistinguishable from no tag at all; at runtime the task falls back to the session default
 - Cross-provider model leakage (`#claude_opus` + explicit `#gemini` = error)
 - Duplicate `#id:` values in the open queue
 - `#needs:` referencing IDs that will never resolve (warning)
 - `#openrouter` / `#or_*` without `OPENROUTER_API_KEY` configured (warning — task falls back to default chain)
+- `#vibe` / `#vibe_*` without the `vibe` CLI on PATH (warning, `vibe_missing_cli`) — worded differently from the OpenRouter case: a missing Vibe binary does not fall back to the default chain, it **parks** the task (`dispatcher._REVIEWER_ONLY`)
 - `#parallel` with 0-1 subtasks (warning) or shared CWD (info)
 - HTML comment inside the task body (`html_comment_in_body`) — truncates the task and deletes the trailing tags on rewrite, see [Retry Markers](#retry-markers)
 - HTML comment at the line end that is not a valid `retry`/`hang` marker (`html_comment_trailing`) — silently dropped on rewrite; a near-miss marker means the schedule never applies
-
-Not yet covered: `#vibe*` tags — the linter's unknown-alias check enumerates the `claude|gemini|codex|or` prefixes only, and there is no counterpart to the OpenRouter "missing key" warning for a `#vibe` tag without the CLI (which the dispatcher answers by parking the task). This is a *linter* gap only: since 2026-08-15 `extract_model_tag()` itself resolves `#vibe_medium`/`#vibe_small` correctly, so the model really is forced at runtime.
 
 Exit codes: **0** = clean, **1** = warnings only, **2** = errors. Wire into CI / pre-commit if you have a shared queue file.
 
@@ -242,7 +241,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Stale grace window | `#grace:<duration>` | `- [ ] Recap #at:19:00 #every:24h #freshonly #grace:4h` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
 | Post-task outcome check | `#verify:<script>` | `- [ ] Daily brief #verify:scripts\check_brief.ps1` |
-| Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` | `#pass1:claude #pass2:codex` |
+| Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` — provider is `claude`, `gemini`, `codex`, `vibe` or `openrouter` | `#pass1:claude #pass2:codex` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
 | Second opinion (review-loop) | `#second_opinion:<alias\|provider>` | `#second_opinion:codex`, `#second_opinion:vibe_small` |
 
@@ -256,12 +255,9 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 
 ### Known Limitations
 
-**`#pass1:` / `#pass2:` accept only `claude`, `gemini`, `codex`.** The
-cross-provider `critical-review` tags are matched by their own regex, which
-predates the opt-in providers — `#pass2:vibe` and `#pass2:openrouter` are ignored
-rather than rejected. Use `#second_opinion:` for those.
-
 **`select_provider()` is still fail-open for a bare `#vibe`/`#openrouter` tag when the policy is missing.** The fail-closed rule described above lives in `policy_allows_provider()` / `dispatcher._allows()`. The *forced-provider* path in `select_provider()` was not converted in the same pass, so a task carrying a bare `#vibe` or `#openrouter` tag can still reach that provider if `policy.yaml` is absent or unreadable. Deliberately left open — closing it means reworking roughly ten routing tests — but it is the one hole left in the pay-per-token ceiling, and it matters exactly in the scenario the ceiling was built for (a synced `policy.yaml` that failed to arrive before an unattended run).
+
+**An unregistered value in `#pass1:`/`#pass2:` is dropped without a word.** Since 2026-09-02 the regex accepts `vibe` and `openrouter` alongside `claude`/`gemini`/`codex`, but anything else — a typo, a provider that was never registered — fails twice over: `extract_pass_providers()` drops the pass silently, and `strip_metadata_tags()` does not recognise the tag either, so it survives into the prompt as literal text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. The queue linter has no check for it.
 
 **The safety hook cannot see a git write handed to a non-shell wrapper.** `find . -exec git push …`, `docker exec c git push …` and `xargs git push` are accepted residuals: `_CMD_START` treats `-` as a non-boundary character, and recognising these would need real argv parsing rather than a regex. Likewise, a **heredoc body line** that begins with a git write command matches, because `\n` is a genuine command separator and the hook cannot tell body text from a command — a deliberate false-positive trade in the safe direction. The hook also only covers Claude; the Codex path is fenced by its own sandbox, which depends on `experimental_windows_sandbox = true` in `~/.codex/config.toml`.
 

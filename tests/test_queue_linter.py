@@ -110,8 +110,22 @@ def test_unknown_or_alias_flagged():
     assert "unknown_model" in _codes(findings)
 
 
+def test_unknown_vibe_alias_flagged():
+    """Regression: the shape check used to enumerate claude|gemini|codex|or only,
+    so #vibe_* never even reached is_known_model_tag()."""
+    content = "## Queue\n- [ ] Task #vibe_giant\n"
+    findings = lint_queue(content)
+    assert "unknown_model" in _codes(findings)
+
+
 def test_known_model_alias_passes():
     content = "## Queue\n- [ ] Task #claude_opus\n"
+    findings = lint_queue(content)
+    assert "unknown_model" not in _codes(findings)
+
+
+def test_known_vibe_alias_passes():
+    content = "## Queue\n- [ ] Task #vibe_medium\n"
     findings = lint_queue(content)
     assert "unknown_model" not in _codes(findings)
 
@@ -154,6 +168,39 @@ def test_bare_openrouter_tag_treated_like_or_alias(monkeypatch):
     content = "## Queue\n- [ ] Task #openrouter\n"
     findings = lint_queue(content)
     assert "openrouter_missing_key" in _codes(findings)
+
+
+# ---------------------------------------------------------------------------
+# Vibe
+# ---------------------------------------------------------------------------
+
+def test_vibe_tag_without_cli_is_warning(monkeypatch):
+    monkeypatch.setattr(queue_linter.shutil, "which", lambda _name: None)
+    content = "## Queue\n- [ ] Task #vibe\n"
+    findings = lint_queue(content)
+    assert "vibe_missing_cli" in _codes(findings)
+    assert exit_code_for(findings) >= 1
+
+
+def test_vibe_model_tag_without_cli_is_warning(monkeypatch):
+    monkeypatch.setattr(queue_linter.shutil, "which", lambda _name: None)
+    content = "## Queue\n- [ ] Task #vibe_medium\n"
+    findings = lint_queue(content)
+    assert "vibe_missing_cli" in _codes(findings)
+
+
+def test_vibe_tag_with_cli_passes(monkeypatch):
+    monkeypatch.setattr(queue_linter.shutil, "which", lambda _name: "C:\\bin\\vibe.exe")
+    content = "## Queue\n- [ ] Task #vibe\n"
+    findings = lint_queue(content)
+    assert "vibe_missing_cli" not in _codes(findings)
+
+
+def test_task_without_vibe_tag_is_silent(monkeypatch):
+    monkeypatch.setattr(queue_linter.shutil, "which", lambda _name: None)
+    content = "## Queue\n- [ ] Plain task #codex\n"
+    findings = lint_queue(content)
+    assert "vibe_missing_cli" not in _codes(findings)
 
 
 # ---------------------------------------------------------------------------

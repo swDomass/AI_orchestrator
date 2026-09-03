@@ -98,6 +98,20 @@ class TestExtractPassProviders:
         result = extract_pass_providers(task)
         assert result == {1: "claude", 2: "claude"}
 
+    def test_pass2_vibe(self):
+        """Regression: the regex used to enumerate claude|gemini|codex only, so
+        #pass2:vibe matched nothing and was silently ignored rather than reaching
+        _resolve_pass2_provider() (which already handles arbitrary provider names
+        via policy_allows_provider()/get_provider_by_name())."""
+        task = "#pass1:claude #pass2:vibe"
+        result = extract_pass_providers(task)
+        assert result == {1: "claude", 2: "vibe"}
+
+    def test_pass2_openrouter(self):
+        task = "#pass1:claude #pass2:openrouter"
+        result = extract_pass_providers(task)
+        assert result == {1: "claude", 2: "openrouter"}
+
 
 class TestStripPassTags:
 

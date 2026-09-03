@@ -4,7 +4,9 @@ Queue linter — validates agent-queue.md without executing anything.
 Catches bad queue entries before they reach a provider:
   - Invalid / missing cwd
   - Unknown #tool:<name>
-  - Unknown model alias (#claude_*, #gemini_*, #codex_*, #or_*)
+  - Unknown model alias (#claude_*, #gemini_*, #codex_*, #vibe_*, #or_*) — the shape
+    check derives its provider prefixes from queue_manager._MODEL_ALIAS_PREFIXES
+    (itself generated from dispatcher._TAG_MAP), not a hand-copied list
   - Cross-provider model leakage (e.g. #claude_opus on a task tagged #gemini)
   - #effort: — unknown level, malformed form the strict regex cannot see
     (#effort: low / #effort=low / trailing punctuation), duplicate tags, and a level on
@@ -13,6 +15,8 @@ Catches bad queue entries before they reach a provider:
   - Duplicate #id: values in the open queue
   - #needs: references that will never resolve
   - #or_* tag without OPENROUTER_API_KEY configured
+  - #vibe / #vibe_* tag without the `vibe` CLI on PATH (the task is parked, not
+    handed to a fallback executor — see dispatcher._REVIEWER_ONLY)
   - #parallel with no/single subtask, or subtasks sharing CWD
   - HTML comments inside the task body (silently truncate the task text), or at the
     line end without being a valid retry/hang marker (silently dropped on rewrite)
@@ -26,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import shutil
 import sys
 
 from config import (
@@ -44,7 +49,6 @@ from queue_manager import (
     FRESHONLY_TAG_RE,
     GRACE_TAG_RE,
     HANG_COUNT_RE,
-    MODEL_TAG_RE,
     NEEDS_TAG_RE,
     PARALLEL_TAG_RE,
     PROVIDER_TAG_RE,
@@ -52,6 +56,7 @@ from queue_manager import (
     VERIFY_TAG_RE,
     _collect_completed_ids,
     _decode_queue_bytes,
+    _MODEL_ALIAS_PREFIXES,
     _parse_subtask_line,
     extract_cwd,
     extract_every_tag,
@@ -86,6 +91,22 @@ _TRAILING_COMMENT_RE = re.compile(r"\s*<!--(?:(?!-->).)*-->\s*$")
 
 # Detect any `#or_*` or bare `#openrouter` tag (case-insensitive).
 _OPENROUTER_TAG_RE = re.compile(r"(?i)(?<!\S)#(openrouter|or_[A-Za-z0-9_]+)(?=\s|$)")
+
+# Detect any `#vibe` or `#vibe_*` tag (case-insensitive).
+_VIBE_TAG_RE = re.compile(r"(?i)(?<!\S)#(vibe(?:_[A-Za-z0-9_]+)?)(?=\s|$)")
+
+# Shape of "looks like a model-alias tag but might not be one" — provider_word plus a
+# suffix, e.g. #claude_giga, #vibe_giant. Prefixes come from queue_manager's
+# _MODEL_ALIAS_PREFIXES (itself derived from dispatcher._TAG_MAP), not hand-copied —
+# that hand-copied list is exactly how this check missed #vibe_* for months: the
+# alternation enumerated claude|gemini|codex|or only, predating the vibe aliases.
+# `openrouter` is matched as a second, standalone alternative because its own model
+# aliases use the `or_` prefix, not the provider name itself.
+_UNKNOWN_MODEL_SHAPE_RE = re.compile(
+    r"(?i)(?<!\S)#((?:"
+    + "|".join(re.escape(p) for p in _MODEL_ALIAS_PREFIXES)
+    + r")_[A-Za-z0-9_]+|openrouter)(?=\s|$)"
+)
 
 # The permissive counterpart to queue_manager.EFFORT_TAG_RE lives in queue_manager as
 # EFFORT_ATTEMPT_RE — shared with strip_metadata_tags() and the parallel_runner
@@ -309,6 +330,7 @@ def _check_task(
     out.extend(_check_tool_tag(line_no, task_text, valid_tool_names))
     out.extend(_check_model_tag(line_no, task_text))
     out.extend(_check_openrouter(line_no, task_text))
+    out.extend(_check_vibe(line_no, task_text))
     out.extend(_check_duplicate_id(line_no, task_text, open_ids))
     out.extend(_check_needs(line_no, task_text, open_ids, completed_ids))
     out.extend(_check_parallel(line_no, task_text, subtasks))
@@ -556,12 +578,9 @@ def _check_model_tag(line_no: int, task_text: str) -> list[LintFinding]:
     """Model alias must (a) be known and (b) belong to the explicitly tagged provider."""
     out: list[LintFinding] = []
 
-    # Detect unknown alias *shape* (#claude_unknown, #or_xxx, ...) — anything
-    # that looks like a model tag but isn't in our alias tables.
-    for m in re.finditer(
-        r"(?i)(?<!\S)#((?:claude|gemini|codex|or)_[A-Za-z0-9_]+|openrouter)(?=\s|$)",
-        task_text,
-    ):
+    # Detect unknown alias *shape* (#claude_unknown, #or_xxx, #vibe_xxx, ...) —
+    # anything that looks like a model tag but isn't in our alias tables.
+    for m in _UNKNOWN_MODEL_SHAPE_RE.finditer(task_text):
         tag = m.group(1).lower()
         if tag == "openrouter":
             continue  # not a model tag — handled by _check_openrouter
@@ -616,6 +635,28 @@ def _check_openrouter(line_no: int, task_text: str) -> list[LintFinding]:
         "#openrouter / #or_* gesetzt, aber OPENROUTER_API_KEY nicht konfiguriert — "
         "Task fällt auf default-Chain zurück",
         code="openrouter_missing_key",
+    )]
+
+
+def _check_vibe(line_no: int, task_text: str) -> list[LintFinding]:
+    """Tasks tagged #vibe or #vibe_* require the `vibe` binary on PATH.
+
+    Unlike a missing OPENROUTER_API_KEY, this does NOT fall back to the default
+    chain: dispatcher._REVIEWER_ONLY parks the task instead, because degrading a
+    reviewer-only tag to a file-writing executor would be a wider blast radius
+    than the task asked for. Still a warning, not an error — the queue line
+    itself is well-formed and starts working the moment `vibe` is installed.
+    """
+    if not _VIBE_TAG_RE.search(task_text):
+        return []
+    if shutil.which("vibe"):
+        return []
+    return [LintFinding(
+        LEVEL_WARN, line_no, task_text,
+        "#vibe / #vibe_* gesetzt, aber die 'vibe'-CLI ist nicht im PATH — anders als "
+        "bei OpenRouter fällt der Task NICHT auf die default-Chain zurück (Vibe ist "
+        "reviewer-only), sondern wird geparkt",
+        code="vibe_missing_cli",
     )]
 
 

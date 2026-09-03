@@ -193,13 +193,31 @@ one is still within grace (daily cadence only, window capped at half the
 interval), and the realign is logged at INFO: the defect ran three times
 (2026-07-23, 07-27, 08-17) without leaving a single trace.
 
+A fifth and sixth were closed on 2026-09-02, both from the same root cause —
+**a hand-copied provider list drifting from `dispatcher._TAG_MAP`, the same
+pattern `MODEL_TAG_RE` already fixed on 2026-08-15**: `queue_linter.py`'s
+unknown-model-alias-shape regex now derives its provider prefixes from
+`queue_manager._MODEL_ALIAS_PREFIXES` (itself generated from `_TAG_MAP`)
+instead of a hand-copied `claude|gemini|codex|or` list, so `#vibe_*` is
+validated like every other provider's aliases; a `#vibe`/`#vibe_*` tag without
+the `vibe` CLI on PATH now gets a `vibe_missing_cli` warning, worded
+differently from the OpenRouter one because a missing Vibe binary *parks* the
+task (`dispatcher._REVIEWER_ONLY`) instead of falling back to the default
+chain. And `PASS_PROVIDER_TAG_RE` (`#pass1:`/`#pass2:`) now accepts `vibe` and
+`openrouter` the same way, sourced from the same `_TAG_MAP` — chosen over
+rejecting the two values outright because `_resolve_pass2_provider()` already
+routed an arbitrary provider name through `policy_allows_provider()` /
+`get_provider_by_name()` (see `test_pass2_tag_barred_by_policy_falls_back`);
+the regex simply never produced `vibe`/`openrouter` for that already-built
+path to receive. `select_provider()`'s own fail-open path (first row below) is
+a separate, still-open item — untouched by this pass.
+
 | Defect | Impact |
 |---|---|
 | `select_provider()` fail-open for a bare `#vibe`/`#openrouter` tag | The pay-per-token ceiling was made fail-closed in `policy_allows_provider()`/`dispatcher._allows()`, but not on the forced-provider path. With `policy.yaml` missing or unreadable, an explicitly tagged task still reaches the uncapped provider. Left open deliberately — the fix reworks ~10 routing tests. |
 | `stdin_incomplete` requeues without bound | `<!-- hang: N -->` is the only persistent per-task counter and only `hang` + `format_error` *increment* it. Every other error code requeues without raising it. Count unbounded, rate still throttled by the 5-min cooldown. Pre-existing. Narrowed 2026-08-15: those parks no longer *reset* the counter either, so a task alternating between real failures and parks does reach the cap. |
+| An unregistered value in `#pass1:`/`#pass2:` is still dropped silently | Narrowed 2026-09-02: `vibe` and `openrouter` are accepted now, but a typo or an unknown provider still fails twice over — `extract_pass_providers()` drops the pass, and `strip_metadata_tags()` leaves the tag in place, so it reaches the model as prompt text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. `queue_linter.py` has no counterpart check. |
 | Safety-hook residuals | `find . -exec git push`, `docker exec c git push`, `xargs git push` are not recognised (needs real argv parsing, not a regex). A heredoc body line starting with a git write command matches — a deliberate false positive in the safe direction. Hook covers Claude only; Codex relies on its own sandbox flag. |
-| `#pass1:`/`#pass2:` accept only `claude`, `gemini`, `codex` | Own regex, predates the opt-in providers. `#pass2:vibe`/`#pass2:openrouter` are ignored rather than rejected. Use `#second_opinion:`. |
-| `queue_linter.py` does not validate `#vibe*` tags | Its unknown-alias regex enumerates `claude\|gemini\|codex\|or` only, and there is no "CLI missing" warning to match the OpenRouter one. Linter-only since 2026-08-15 — runtime resolves the alias correctly. |
 | `tests/test_telegram_listener.py` order-dependent; `tests/test_usage_suggester.py` environment-dependent | Run with `-p no:randomly`. A red suite in a fresh worktree is more likely one of these two than a real regression. |
 
 ---
@@ -283,7 +301,8 @@ task*, regardless of outcome.
 Stays offline and instant: no LLM calls, no "will this task succeed?"
 prediction. Exit codes 0/1/2 make it CI-wireable. *Planned but not implemented*:
 tool/profile compatibility checks (e.g. `#tool:deep-security-audit` +
-`#agent:readonly`), plus the `#vibe*` gaps noted in the defect table above.
+`#agent:readonly`). The `#vibe*` gap (unknown-alias shape + missing-CLI
+warning) noted here before was closed 2026-09-02 — see the defect table above.
 
 ### 30. Replay JSONL
 Path/offset references only — no full prompt or output text in the record, which

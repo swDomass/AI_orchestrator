@@ -1,0 +1,72 @@
+# Tooling-Konfiguration only — bewusst KEINE [project]/[build-system]-Tabelle:
+# AI_orchestrator ist eine flache Skript-Sammlung (32 Root-Module, kein Package),
+# eine Packaging-Tabelle wuerde `pip install .` eine Bedeutung geben, die das
+# Repo nicht einloesen kann.
+#
+# Regelauswahl uebernommen von den Schwester-Repos eeg_analysis (pyproject.toml)
+# und pyrolyse-1d-model (ruff.toml) — Abweichungen sind unten je Zeile begruendet.
+# Baseline gemessen am 2026-09-02 mit ruff 0.16.1 / mypy 2.3.1
+# → docs/lint-baseline-2026-09-02.md
+#   pip install "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Vereinigung beider Repos, minus NPY (keine numpy-Abhaengigkeit im Repo).
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+    "RUF",  # ruff-specific
+    "PL",   # pylint
+]
+ignore = [
+    "E501",     # Zeilenlaenge — Sache des Formatters (Linie eeg_analysis)
+    "PLR0913",  # too-many-arguments      (Linie pyrolyse)
+    "PLR2004",  # magic-value-comparison  (Linie pyrolyse)
+    "PLR0915",  # too-many-statements     (Linie pyrolyse)
+    # Deutsche Umlaute und Zeichen wie '→' stehen bewusst in Kommentaren,
+    # Docstrings und Prompt-Strings (Linie pyrolyse, hier noch staerker zutreffend).
+    "RUF001",   # ambiguous-unicode-character-string
+    "RUF002",   # ambiguous-unicode-character-docstring
+    "RUF003",   # ambiguous-unicode-character-comment
+]
+# BEWUSST NICHT uebernommen aus pyrolyse/ruff.toml:
+#   N802/N803/N806/N815 — dort ausschliesslich fuer die SI-Suffix-Konvention
+#     (temperature_K, pressure_Pa) aus jenem CLAUDE.md §7.2 ignoriert. Dieses Repo
+#     hat keine solche Konvention; ein Copy-Paste wuerde echte Naming-Befunde
+#     stumm schalten.
+#   [lint.per-file-ignores] — waere hier tote Konfiguration: PLR2004 ist bereits
+#     global ignoriert, S (flake8-bandit) und T (flake8-print) sind nicht selektiert.
+# BEWUSST NICHT ignoriert, obwohl zahlenmaessig dominant:
+#   PLC0415 (import-outside-top-level) — trifft das absichtliche Lazy-Import-Muster
+#     dieses Repos (Zirkelimport-Vermeidung). Steht als Entscheidungsvorlage im
+#     Baseline-Bericht statt als stiller Ignore.
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+# Linie eeg_analysis (lenient), NICHT pyrolyses `strict = true`: strict misst auf
+# diesem Code 3851 Fehler gegen 131 lenient — eine Baseline, mit der niemand
+# arbeiten kann. strict ist im Bericht als Ziel benannt, nicht als Startpunkt.
+#
+# Flache Layout-Notwendigkeit, in keinem der beiden Schwester-Repos noetig
+# (beide haben ein src-/model-Package): scripts/, tests/ und hooks/ haben kein
+# __init__.py, waehrend die Root-Module top-level sind. Ohne diese zwei Flags
+# bricht mypy mit "Source file found twice under different module names" ab.
+explicit_package_bases = true
+namespace_packages = true

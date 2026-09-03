@@ -35,6 +35,9 @@ logs/
 /docs/*
 !/docs/architecture/
 !/docs/adr/
+# Lint-/Typecheck-Baselines sind aus README.md und CLAUDE.md verlinkt und
+# muessen deshalb mitgeliefert werden — sonst zeigen beide ins Leere.
+!/docs/lint-baseline-*.md
 /.review-loop
 /.dev-loop
 *_FUTURE_IDEAS.md

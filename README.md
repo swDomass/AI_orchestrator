@@ -63,7 +63,11 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 
 - Python `3.10+` — ⚠️ **this floor is currently unverified**: `import limits`
   fails with a `NameError` on 3.10–3.13 (only 3.14 works). See
-  [Linting & Typing](#linting--typing) before relying on it.
+  [Linting & Typing](#linting--typing) before relying on it. `pyproject.toml`'s
+  `requires-python = ">=3.12"` (2026-09-04, real key now, was a comment before)
+  states the **intended** floor — matching `ruff`/`mypy`'s `py312` target — not
+  yet the verified one; the fix for the `NameError` above lives on a separate,
+  not-yet-merged branch.
 - `cclimits` CLI (`npm install -g cclimits`)
 - Provider CLIs in `PATH`: `claude`, `codex`
 - Valid authentication in each CLI (OAuth / subscription login)

@@ -1,13 +1,36 @@
-# Tooling-Konfiguration only — bewusst KEINE [project]/[build-system]-Tabelle:
-# AI_orchestrator ist eine flache Skript-Sammlung (32 Root-Module, kein Package),
-# eine Packaging-Tabelle wuerde `pip install .` eine Bedeutung geben, die das
-# Repo nicht einloesen kann.
+# [project] carries only requires-python as a real, machine-readable key —
+# bewusst KEIN [build-system]: AI_orchestrator ist eine flache Skript-Sammlung
+# (32 Root-Module, kein Package), und `pip install .` scheitert bereits heute
+# (vor UND nach dieser Aenderung identisch) an genau dieser Struktur —
+# setuptools' Default-Backend verweigert Auto-Discovery bei mehreren
+# Top-Level-Verzeichnissen ("Multiple top-level packages discovered in a
+# flat-layout"), gemessen 2026-09-04 mit `pip install --dry-run --no-deps .`.
+# Ein [build-system] wuerde daran nichts aendern, ohne `packages`/`py_modules`
+# explizit zu setzen — das ist hier bewusst nicht gewollt. `name`/`version`
+# sind Pflichtfelder von PEP 621, sobald [project] existiert; sie tragen keine
+# eigene Bedeutung (kein Release, kein PyPI-Eintrag geplant).
+#
+# ACHTUNG requires-python: der Wert 3.12 ist die ZIEL-Untergrenze (passt zu
+# ruff target-version / mypy python_version unten), aber auf diesem Stand
+# NICHT empirisch erfuellt — `limits.py:85` annotiert `ProviderLimits` in
+# einer Modul-Annotation vor der Klassendefinition, `import limits` wirft dort
+# ein NameError auf 3.12/3.13 (gemessen 2026-09-04, `py -3.12 -c "import
+# limits"` / `py -3.13 -c ...`), nur PEP 649 auf 3.14 verdeckt es. Der Fix
+# existiert bereits auf einem separaten, hier bewusst nicht gemergten Branch
+# (Quote-Annotation). Bis der landet, ist dieser Key aspirational, nicht
+# aktuell wahr — siehe README.md Requirements + CLAUDE.md Linting & Typing
+# fuer denselben, dort schon laenger dokumentierten Vorbehalt.
 #
 # Regelauswahl uebernommen von den Schwester-Repos eeg_analysis (pyproject.toml)
 # und pyrolyse-1d-model (ruff.toml) — Abweichungen sind unten je Zeile begruendet.
 # Baseline gemessen am 2026-09-02 mit ruff 0.16.1 / mypy 2.3.1
 # → docs/lint-baseline-2026-09-02.md
 #   pip install "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
+
+[project]
+name = "ai-orchestrator"
+version = "0.1.0"
+requires-python = ">=3.12"
 
 [tool.ruff]
 line-length = 100

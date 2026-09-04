@@ -45,16 +45,24 @@ ruff check .            # 1351 findings as of 2026-09-02 (ruff 0.16.1)
 python -m mypy .        # 131 errors in 36 files (mypy 2.3.1, lenient config)
 ```
 
-**Linting & Typing** — `pyproject.toml` carries `[tool.ruff]` + `[tool.mypy]` and
-deliberately **no** `[project]`/`[build-system]` table (flat script collection, not an
-installable package); `pytest.ini` keeps precedence for pytest. Ruleset is borrowed
-from the sister repos `eeg_analysis` (layout + lenient mypy) and `pyrolyse-1d-model`
-(rule selection), minus `NPY` and minus the `N8xx` block that exists there only for an
-SI-suffix convention this repo does not have — deviations are commented inline.
-Baseline, defect triage and work order → [`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md).
+**Linting & Typing** — `pyproject.toml` carries `[project]` (2026-09-04, `requires-python`
+only — real key now, was a comment before) + `[tool.ruff]` + `[tool.mypy]`, deliberately
+**no** `[build-system]` table: AI_orchestrator is a flat script collection, not an
+installable package, and `pip install .` already fails today regardless (setuptools'
+auto-discovery refuses the flat multi-module layout — measured, unaffected by the
+`[project]` table either way); `pytest.ini` keeps precedence for pytest. Ruleset is
+borrowed from the sister repos `eeg_analysis` (layout + lenient mypy) and
+`pyrolyse-1d-model` (rule selection), minus `NPY` and minus the `N8xx` block that exists
+there only for an SI-suffix convention this repo does not have — deviations are
+commented inline. Baseline, defect triage and work order →
+[`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md).
 **Ungefixt und dort dokumentiert:** `limits.py:85` benutzt `ProviderLimits` in einer
 Modul-Annotation vor der Klassendefinition — auf Python ≤3.13 ein `NameError` beim
-Import, der die ganze Anwendung lahmlegt; nur PEP 649 auf 3.14 verdeckt ihn.
+Import, der die ganze Anwendung lahmlegt; nur PEP 649 auf 3.14 verdeckt ihn. **Deshalb
+ist `requires-python = ">=3.12"` aktuell aspirational, nicht empirisch erfüllt** — der
+Wert spiegelt das Ziel (passt zu `ruff`/`mypy`s `py312`) und den Fix, der bereits auf
+einem separaten, hier nicht gemergten Branch existiert; bis der landet, importiert
+`limits.py` unter 3.12/3.13 nicht (siehe README Requirements für denselben Vorbehalt).
 
 ## Architecture
 

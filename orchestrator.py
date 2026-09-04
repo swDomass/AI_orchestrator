@@ -2735,7 +2735,13 @@ def main() -> None:
     if args.check_limits:
         limits = get_limits()
         print("\nAktuelle Usage-Limits:")
-        for name in ("claude", "gemini", "codex"):
+        # opencode carries no cclimits windows (its AllLimits.remaining_pct is a
+        # live OpenRouter $-budget snapshot, not a window breakdown — see
+        # limits._opencode_budget_snapshot()) — `lim.windows` defaults to an
+        # empty dict for it (ProviderLimits.windows: field(default_factory=dict)),
+        # verified rather than assumed, so the loop below is a natural no-op for
+        # opencode, not a special case.
+        for name in ("claude", "gemini", "codex", "opencode"):
             lim = getattr(limits, name)
             status = f"{lim.remaining_pct:.1f}% remaining" if lim.available else f"❌ {lim.error}"
             reset = f", reset in {fmt_time(lim.resets_in_sec)}" if lim.resets_in_sec else ""

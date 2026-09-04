@@ -130,6 +130,20 @@ def test_known_vibe_alias_passes():
     assert "unknown_model" not in _codes(findings)
 
 
+def test_unknown_opencode_alias_flagged():
+    """#opencode_kaputt looks like a model tag but isn't a handpicked ZDR alias —
+    must be reported, not silently passed through to the provider."""
+    content = "## Queue\n- [ ] Task #opencode_kaputt\n"
+    findings = lint_queue(content)
+    assert "unknown_model" in _codes(findings)
+
+
+def test_known_opencode_alias_passes():
+    content = "## Queue\n- [ ] Task #opencode_deepseek\n"
+    findings = lint_queue(content)
+    assert "unknown_model" not in _codes(findings)
+
+
 def test_cross_provider_model_leakage_flagged():
     """#claude_opus + explicit #gemini = error."""
     content = "## Queue\n- [ ] Task #gemini #claude_opus\n"
@@ -201,6 +215,42 @@ def test_task_without_vibe_tag_is_silent(monkeypatch):
     content = "## Queue\n- [ ] Plain task #codex\n"
     findings = lint_queue(content)
     assert "vibe_missing_cli" not in _codes(findings)
+
+
+# ---------------------------------------------------------------------------
+# opencode — same non-fallback park behaviour as vibe (dispatcher._NO_FALLBACK_
+# PROVIDERS), but a different cause and different wording: is_available() checks
+# BOTH the resolved .exe AND both required agents in opencode.json, not just a
+# binary on PATH.
+# ---------------------------------------------------------------------------
+
+def test_opencode_tag_without_registration_is_warning(monkeypatch):
+    monkeypatch.setattr(queue_linter.OpencodeProvider, "is_available", staticmethod(lambda: False))
+    content = "## Queue\n- [ ] Task #opencode\n"
+    findings = lint_queue(content)
+    assert "opencode_missing_cli" in _codes(findings)
+    assert exit_code_for(findings) >= 1
+
+
+def test_opencode_model_tag_without_registration_is_warning(monkeypatch):
+    monkeypatch.setattr(queue_linter.OpencodeProvider, "is_available", staticmethod(lambda: False))
+    content = "## Queue\n- [ ] Task #opencode_deepseek\n"
+    findings = lint_queue(content)
+    assert "opencode_missing_cli" in _codes(findings)
+
+
+def test_opencode_tag_with_registration_passes(monkeypatch):
+    monkeypatch.setattr(queue_linter.OpencodeProvider, "is_available", staticmethod(lambda: True))
+    content = "## Queue\n- [ ] Task #opencode\n"
+    findings = lint_queue(content)
+    assert "opencode_missing_cli" not in _codes(findings)
+
+
+def test_task_without_opencode_tag_is_silent(monkeypatch):
+    monkeypatch.setattr(queue_linter.OpencodeProvider, "is_available", staticmethod(lambda: False))
+    content = "## Queue\n- [ ] Plain task #codex\n"
+    findings = lint_queue(content)
+    assert "opencode_missing_cli" not in _codes(findings)
 
 
 # ---------------------------------------------------------------------------

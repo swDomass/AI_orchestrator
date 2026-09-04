@@ -37,8 +37,14 @@ TRANSIENT_ERRORS = ("rate_limit", "unreachable", "timeout", "hang", "stdin_incom
 # "model_refusal" is a taxonomy category of its own — without it here, a Gemini
 # refusal loses its code and is booked as a generic tool error.
 # "http_<status>" is deliberately absent: it is not part of the stable taxonomy.
+# "policy_block" is opencode's: the executing provider refused on data-protection
+# grounds ("No endpoints found matching your data policy"). Without it here,
+# error_code_of() returns "" for it and the code evaporates in analytics and the
+# taxonomy — the resulting behaviour (not transient, so terminal) would still be
+# right, but by accident rather than because the code was recognised.
 _KNOWN_ERROR_CODES = TRANSIENT_ERRORS + (
     "session_missing", "auth_error", "network", "parse_error", "api_error", "model_refusal",
+    "policy_block",
 )
 
 

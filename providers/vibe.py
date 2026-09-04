@@ -5,8 +5,8 @@ registered ONLY when the `vibe` binary is present and is deliberately kept OUT o
 the dispatcher's fallback chain — it activates via an explicit `#vibe` /
 `#vibe_*` tag or as the value of `#second_opinion:`. Rationale (and the reason
 this provider never writes, see below): in this system Mistral is a *reviewer*,
-not an executor. `dispatcher._REVIEWER_ONLY` additionally prevents a tagged-but-
-unregistered Vibe from degrading into a file-writing executor.
+not an executor. `dispatcher._NO_FALLBACK_PROVIDERS` additionally prevents a
+tagged-but-unregistered Vibe from degrading into a file-writing executor.
 
 Tool reach was measured, not assumed (2026-07-23): with `--trust` + `--workdir X`,
 `read_file` reads files **inside** X, and refuses both an absolute path outside X

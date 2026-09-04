@@ -2,6 +2,10 @@
 Wrapper around `cclimits --json`.
 Parses usage limits for Claude, Gemini (all 3 tiers), and Codex.
 Auto-refreshes expired OAuth tokens before querying.
+
+opencode's limits are NOT from cclimits (opencode has no OAuth quota - it pays
+per token via an OpenRouter key). Its ProviderLimits comes from a live HTTP
+budget check instead; see _apply_opencode_budget_override() / openrouter_budget.py.
 """
 
 import json
@@ -12,10 +16,13 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+
 import config
+import openrouter_budget
 from config import (
-    CLAUDE_PLAN,
     CLAUDE_FIVE_HOUR_MIN_CAPACITY_PCT,
+    CLAUDE_PLAN,
     CLAUDE_SEVEN_DAY_MIN_CAPACITY_PCT,
     CODEX_PRIMARY_MIN_CAPACITY_PCT,
     CODEX_SECONDARY_MIN_CAPACITY_PCT,
@@ -131,11 +138,20 @@ class AllLimits:
     claude: ProviderLimits = field(default_factory=ProviderLimits)
     gemini: ProviderLimits = field(default_factory=ProviderLimits)
     codex: ProviderLimits = field(default_factory=ProviderLimits)
+    opencode: ProviderLimits = field(default_factory=ProviderLimits)
+
+    # NOTE for whoever adds a 5th field: the three methods below enumerate the
+    # provider fields BY HAND — that hand-enumeration is the drift source this
+    # class already got bitten by once (opencode's own addition needed all
+    # three, and the plan that introduced it only remembered two of them).
+    # tests/test_limits_opencode.py::test_all_limits_drift_guard iterates
+    # dataclasses.fields(AllLimits) and fails loudly if a new field is missing
+    # from any of the three — update all three together, or that test tells you.
 
     def earliest_reset_sec(self) -> int:
         """Live calculation from absolute epoch — accurate regardless of cache age."""
         epochs = [
-            p.reset_at_epoch for p in (self.claude, self.gemini, self.codex)
+            p.reset_at_epoch for p in (self.claude, self.gemini, self.codex, self.opencode)
             if p.reset_at_epoch > 0
         ]
         if not epochs:
@@ -143,15 +159,23 @@ class AllLimits:
         return max(0, int(min(epochs) - time.time()))
 
     def any_available(self) -> bool:
-        return any((self.claude.available, self.gemini.available, self.codex.available))
+        return any((
+            self.claude.available, self.gemini.available, self.codex.available,
+            self.opencode.available,
+        ))
 
     def has_transient_token_refresh(self) -> bool:
         """True when any provider is unavailable solely because its OAuth token is
         mid-refresh (an "expired" snapshot). The dispatcher uses this to force a
-        synchronous limits refresh before declaring a task unroutable at boot."""
+        synchronous limits refresh before declaring a task unroutable at boot.
+
+        opencode has no OAuth token (it's a bare API key), so this is always
+        False for it in practice — but it is still enumerated here, because this
+        function counts the same fields by hand as the other two above and is
+        exactly the same drift source if a field is skipped."""
         return any(
             is_transient_token_refresh(p)
-            for p in (self.claude, self.gemini, self.codex)
+            for p in (self.claude, self.gemini, self.codex, self.opencode)
         )
 
 
@@ -289,6 +313,123 @@ def _apply_gemini_http_override(result: AllLimits) -> AllLimits:
     return result
 
 
+def _opencode_reset_epoch(reset_cadence: "str | None") -> float:
+    """Absolute unix timestamp of the next OpenRouter budget reset, from a
+    cadence string ("daily"/"weekly"/"monthly").
+
+    ASSUMPTION, not a documented fact — flagged, not sold as measured: the API
+    (GET /api/v1/key) returns only the cadence, no reset timestamp, so this
+    assumes the reset lands at UTC midnight (weekly: next UTC Monday 00:00;
+    monthly: the 1st of next month, UTC 00:00). Only feeds
+    AllLimits.earliest_reset_sec() (a "how soon might capacity return" estimate
+    for the dispatcher's backoff/retry timing) — it never affects `available`
+    itself, so a wrong guess here delays a retry, it does not risk spend.
+    """
+    if reset_cadence not in ("daily", "weekly", "monthly"):
+        return 0.0
+    now = datetime.now(UTC)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if reset_cadence == "daily":
+        target = midnight + timedelta(days=1)
+    elif reset_cadence == "weekly":
+        days_ahead = 7 - now.weekday()  # Monday == 0; always lands on next Monday
+        target = midnight + timedelta(days=days_ahead)
+    elif now.month == 12:  # "monthly"
+        target = midnight.replace(year=now.year + 1, month=1, day=1)
+    else:  # "monthly"
+        target = midnight.replace(month=now.month + 1, day=1)
+    return target.timestamp()
+
+
+def _opencode_budget_snapshot() -> ProviderLimits:
+    """Live snapshot for opencode from OpenRouter's GET /api/v1/key (the only
+    capacity source opencode has — see openrouter_budget.fetch_budget()).
+
+    Deliberately fail-CLOSED, the opposite of Claude/Codex (which fail open on
+    a missing/unreadable policy or transport hiccup, see CLAUDE.md's
+    "_UNCAPPED_PROVIDERS" section): a Claude/Codex run that slips through on
+    stale/unknown capacity costs nothing extra (subscription quota, not
+    metered spend). An opencode run costs real OpenRouter dollars, so "we
+    don't know the remaining budget" must default to "assume none available",
+    not "assume plenty".
+
+    Registration is checked FIRST, and that is not an optimisation. The budget
+    lives on the OpenRouter key, so it answers "is there money" even on a
+    machine where opencode is not installed at all -- and `available=True` then
+    propagates into aggregates that mean something else entirely. Measured
+    2026-09-04 with claude/gemini/codex all False and a budget hit faked:
+    `any_available()` flips False -> True, which makes run_watch sleep 30 s
+    instead of up to SLEEP_POLL_INTERVAL*10 and re-run a real cclimits
+    subprocess every round; `_compute_next_poll_sec` goes 30 -> 300 s; and
+    `earliest_reset_sec()` takes a min() over opencode's ASSUMED UTC midnight,
+    so an unreachable provider can set the retry time and the
+    notify_providers_exhausted message. `available` has to mean "work can
+    actually run here", and without the binary it cannot.
+
+    The dispatcher import is deliberately lazy: dispatcher imports limits at
+    module level, so a top-level import here would be a cycle. Same pattern
+    limits.py already uses for quota_state/quota_calibration/notifier.
+    """
+    from dispatcher import get_provider_by_name  # lazy: see docstring
+
+    if get_provider_by_name("opencode") is None:
+        # Deliberately NOT a fetch: no binary means no run, so the key's balance
+        # is irrelevant -- and this is what keeps machines without opencode from
+        # paying an HTTPS round-trip on every single limits refresh.
+        return ProviderLimits(available=False, remaining_pct=0.0, error="not_registered")
+
+    limit, remaining, reset_cadence = openrouter_budget.fetch_budget()
+
+    if remaining is None:
+        # fetch_budget() collapses EVERY non-success outcome to (None, None,
+        # None) by design (see its docstring) — an outright failed query
+        # (network down, invalid key, malformed JSON) and a structurally
+        # valid response reporting no configured cap are NOT distinguishable
+        # from this triple alone. "budget_unavailable" covers both.
+        return ProviderLimits(available=False, remaining_pct=0.0, error="budget_unavailable")
+
+    if limit is None:
+        # Reachable only if fetch_budget() is ever extended to report
+        # limit_remaining without limit (it does not today - both collapse
+        # together, see above) - kept as an explicit, distinct branch/message
+        # because "the key has no spending cap" and "the query failed" are
+        # different operational situations even though today's fetch_budget()
+        # contract cannot yet tell them apart.
+        return ProviderLimits(available=False, remaining_pct=0.0, error="uncapped_key")
+
+    try:
+        remaining_pct = (remaining / limit) * 100.0
+    except ZeroDivisionError:
+        remaining_pct = 0.0
+
+    min_remaining_usd = config.OPENCODE_MIN_REMAINING_USD
+    available = remaining > min_remaining_usd
+
+    reset_at_epoch = _opencode_reset_epoch(reset_cadence)
+    resets_in_sec = max(0, int(reset_at_epoch - time.time())) if reset_at_epoch > 0 else 0
+
+    return ProviderLimits(
+        available=available,
+        remaining_pct=remaining_pct,
+        resets_in_sec=resets_in_sec,
+        reset_at_epoch=reset_at_epoch,
+        error="" if available else f"below OPENCODE_MIN_REMAINING_USD (${remaining:.2f} <= ${min_remaining_usd:.2f})",
+    )
+
+
+def _apply_opencode_budget_override(result: AllLimits) -> AllLimits:
+    """Fill AllLimits.opencode from a live OpenRouter budget check.
+
+    Same override pattern as _apply_gemini_http_override() above, but there is
+    no cclimits-derived opencode data to replace — opencode isn't polled by
+    cclimits at all (see the comments on _providers_with_429() and
+    _apply_429_fallback() below) — so this always runs, unconditionally,
+    unlike the Gemini override which only fires when a key is configured.
+    """
+    result.opencode = _opencode_budget_snapshot()
+    return result
+
+
 def _parse_codex(data: dict) -> ProviderLimits:
     return _parse_dual_window_provider(
         data,
@@ -305,7 +446,16 @@ def _is_provider_429(provider_data: dict) -> bool:
 
 
 def _providers_with_429(raw: dict) -> set[str]:
-    """Return set of provider names that have 429 errors in cclimits output."""
+    """Return set of provider names that have 429 errors in cclimits output.
+
+    opencode is deliberately NOT in the ("claude", "gemini", "codex") tuple
+    below — this whole function operates on cclimits' raw JSON, and opencode
+    was never a cclimits provider (it has no OAuth quota to poll; its capacity
+    comes from openrouter_budget.fetch_budget() instead, applied separately by
+    _apply_opencode_budget_override()). Omission is intentional, not an
+    oversight — a bare rate_limit/HTTP 429 from the opencode CLI itself is
+    handled by the provider's own error classification, same as Codex/Vibe.
+    """
     p429 = {
         name for name in ("claude", "gemini", "codex")
         if _is_provider_429(raw.get(name, {}))
@@ -620,8 +770,8 @@ def _write_live_quota_state() -> None:
             cached = _limits_cache
         if cached is None:
             return
-        from quota_state import write_quota_state
         from config import CC_QUOTA_STATE_FILE
+        from quota_state import write_quota_state
         write_quota_state(
             _apply_live_estimate(cached[0]), CC_QUOTA_STATE_FILE,
             claude_factors=_get_calibrated_windows("claude"),
@@ -747,7 +897,15 @@ def _is_reliable_429_base_snapshot(provider_limits: ProviderLimits) -> bool:
 
 
 def _apply_429_fallback(result: AllLimits, p429: set[str]) -> AllLimits:
-    """Replace 429-error providers with cached + estimated data."""
+    """Replace 429-error providers with cached + estimated data.
+
+    opencode is deliberately NOT among the ("claude", "gemini", "codex")
+    providers this function walks below — same reason as _providers_with_429()
+    above: this machinery reconstructs cclimits-shaped snapshots, and opencode
+    was never in cclimits' output to begin with. Its own budget-exhaustion
+    handling lives entirely in _apply_opencode_budget_override(), which runs
+    unconditionally after this function regardless of p429's contents.
+    """
     with _limits_cache_lock:
         cached_tuple = _limits_cache
 
@@ -936,10 +1094,10 @@ def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
             token_limit,
         )
         remaining_pct = max(0.0, (1.0 - tokens_used / token_limit) * 100)
-        now = _dt.datetime.now(_dt.timezone.utc)
+        now = _dt.datetime.now(_dt.UTC)
         end = active.end_time
         if end.tzinfo is None:
-            end = end.replace(tzinfo=_dt.timezone.utc)
+            end = end.replace(tzinfo=_dt.UTC)
         resets_in_sec = max(0, int((end - now).total_seconds()))
         window = WindowData(remaining_pct=remaining_pct, resets_in_sec=resets_in_sec)
         return ProviderLimits(
@@ -1101,11 +1259,11 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
             _CCLIMITS_TIMEOUT_SEC, use_cache=not force_fresh,
         )
         if raw is None:
-            return _apply_gemini_http_override(AllLimits(
+            return _apply_opencode_budget_override(_apply_gemini_http_override(AllLimits(
                 claude=ProviderLimits(error="cclimits timeout"),
                 gemini=ProviderLimits(error="cclimits timeout"),
                 codex=ProviderLimits(error="cclimits timeout"),
-            ))
+            )))
 
         # Auto-refresh expired tokens and re-query
         refresh_attempted = False
@@ -1116,11 +1274,18 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
         # Publish preliminary result before the slow token refresh so that
         # get_limits() callers don't time out waiting for _cache_ready.
         if needs_refresh and on_preliminary is not None:
-            preliminary = _apply_gemini_http_override(AllLimits(
+            # NOTE: this adds an opencode HTTP round-trip (<=10s, fail-closed)
+            # to the preliminary-publish path, which exists specifically to
+            # avoid making callers wait for the slow Claude token refresh.
+            # Kept anyway, at the same place as the Gemini override, per the
+            # explicit instruction this override follows — a stale/slow
+            # opencode budget reading here is corrected on the next poll,
+            # same as every other field in this preliminary snapshot.
+            preliminary = _apply_opencode_budget_override(_apply_gemini_http_override(AllLimits(
                 claude=_parse_claude(raw.get("claude", {"status": "missing"})),
                 gemini=_parse_gemini(raw.get("gemini", {"status": "missing"})),
                 codex=_parse_codex(raw.get("codex", {"status": "missing"})),
-            ))
+            )))
             on_preliminary(preliminary)
 
         now = time.monotonic()
@@ -1202,7 +1367,10 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
 
         # Gemini HTTP-API mode bypasses cclimits entirely (applied last so neither
         # the 429 fallback nor _clear_429_state can clobber the synthetic snapshot).
-        return _apply_gemini_http_override(result)
+        # opencode's live budget check is the same kind of bypass (see
+        # _apply_opencode_budget_override()'s docstring) and is applied last for
+        # the identical reason — nothing above this line touches AllLimits.opencode.
+        return _apply_opencode_budget_override(_apply_gemini_http_override(result))
 
 
 def _is_timeout_snapshot(result: AllLimits) -> bool:
@@ -1298,8 +1466,8 @@ def _bg_refresh_loop() -> None:
                     # multi-second JSONL load runs on a separate worker thread
                     # and does NOT delay the next _bg_wake.wait() cycle.
                     try:
-                        from quota_calibration import log_calibration_sample_async
                         from config import QUOTA_CALIBRATION_LOG_FILE
+                        from quota_calibration import log_calibration_sample_async
                         log_calibration_sample_async(
                             result, QUOTA_CALIBRATION_LOG_FILE,
                             queue_idle=_queue_idle.is_set(),
@@ -1312,8 +1480,8 @@ def _bg_refresh_loop() -> None:
                     # Tiny atomic JSON write (no JSONL load) — synchronous is
                     # fine; never raises.
                     try:
-                        from quota_state import write_quota_state
                         from config import CC_QUOTA_STATE_FILE
+                        from quota_state import write_quota_state
                         write_quota_state(
                             result, CC_QUOTA_STATE_FILE,
                             claude_factors=_get_calibrated_windows("claude"),
@@ -1380,6 +1548,14 @@ def get_limits(force_refresh: bool = False) -> AllLimits:
     with _limits_cache_lock:
         if _limits_cache is not None:
             return _apply_live_estimate(_limits_cache[0])
+        # Deliberately NOT wrapped in _apply_opencode_budget_override() here,
+        # unlike the three call sites inside _get_limits_fresh(): this branch
+        # runs under _limits_cache_lock, and adding a (fail-closed, but still
+        # up-to-10s) HTTP round-trip while holding that lock would stall every
+        # other get_limits() caller during the one corner case this fallback
+        # exists for (cclimits hung on the very first call). AllLimits.opencode
+        # keeps its safe ProviderLimits() default (available=False) here, which
+        # is the same fail-closed outcome the override would produce anyway.
         fallback = _apply_gemini_http_override(AllLimits(
             claude=ProviderLimits(error="cclimits unavailable"),
             gemini=ProviderLimits(error="cclimits unavailable"),

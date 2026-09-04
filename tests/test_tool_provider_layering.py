@@ -350,7 +350,7 @@ def test_policy_dead_end_covers_a_profile_that_cannot_intersect_the_policy(tmp_p
 
 
 def test_policy_dead_end_leaves_the_unregistered_reviewer_park_alone(monkeypatch):
-    """`#vibe` without the vibe binary is parked on purpose (_REVIEWER_ONLY).
+    """`#vibe` without the vibe binary is parked on purpose (_NO_FALLBACK_PROVIDERS).
 
     That is a registration state, not a policy verdict, so it must not be
     finalized as "policy allows nothing" — pinned so the new terminal path cannot

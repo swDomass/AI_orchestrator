@@ -59,6 +59,33 @@ def _isolate_gemini_api_key(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_openrouter_api_key(monkeypatch):
+    """Default OPENROUTER_API_KEY to empty so the suite is hermetic against a
+    real key in the developer's .env.
+
+    Added alongside limits.py's opencode budget override (2026-09-04):
+    limits._get_limits_fresh() now calls openrouter_budget.fetch_budget()
+    unconditionally on every refresh, which makes a real GET /api/v1/key HTTP
+    call whenever config.OPENROUTER_API_KEY is truthy. Dozens of existing
+    tests in tests/test_limits.py call limits._get_limits_fresh()/get_limits()
+    directly without mocking that call — without this fixture they would fire
+    real network requests using the developer's real key on every run (this
+    repo's .env has one configured, confirmed 2026-09-04). Same problem, same
+    fix shape as _isolate_gemini_api_key above; test_heartbeat_model_check.py
+    already carries a narrower, file-local version of this exact guard for the
+    same underlying reason (there: dispatcher._llm_check_for_newer_models
+    trying OpenRouter first when configured).
+
+    Tests that need a real-shaped key set it explicitly (see
+    tests/test_providers_openrouter.py's `provider` fixture, tests/
+    test_openrouter_budget.py's `_configured_key` fixture) — those run after
+    this one and simply override the value for their own test.
+    """
+    monkeypatch.setattr("config.OPENROUTER_API_KEY", "", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_active_runs_dir(tmp_path: Path, monkeypatch):
     """Redirect ActiveRunRegistry writes into pytest's tmp_path.
 

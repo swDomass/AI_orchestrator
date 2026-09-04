@@ -108,11 +108,16 @@ def test_model_tag_re_covers_every_dispatcher_alias():
     """MODEL_TAG_RE is derived from dispatcher._TAG_MAP so the two cannot drift apart
     again (regression for the gap where it hand-covered only 6 of 20 model aliases —
     gemini_flash_lite, codex_5/_5_4, vibe_medium/_small and all nine or_* aliases routed
-    to the right provider but silently ran on that provider's default model)."""
+    to the right provider but silently ran on that provider's default model).
+
+    20 -> 23 (2026-09-04): opencode's three handpicked ZDR aliases
+    (opencode_deepseek, opencode_deepseek_long, opencode_glm) joined _TAG_MAP —
+    raised deliberately, not relaxed, so the counter keeps catching a silently
+    shrunk _TAG_MAP."""
     from dispatcher import _TAG_MAP
 
     model_aliases = {tag[1:] for tag, provider in _TAG_MAP.items() if tag[1:] != provider}
-    assert len(model_aliases) == 20  # guards against a silently shrunk _TAG_MAP too
+    assert len(model_aliases) == 23  # guards against a silently shrunk _TAG_MAP too
 
     for alias in model_aliases:
         assert queue_manager.extract_model_tag(f"Run #{alias} now") == alias
@@ -123,6 +128,21 @@ def test_model_tag_re_disambiguates_prefix_aliases():
     not get truncated to (or swallowed by) the other."""
     assert queue_manager.extract_model_tag("Run #codex_5 now") == "codex_5"
     assert queue_manager.extract_model_tag("Run #codex_5_4 now") == "codex_5_4"
+
+
+def test_model_tag_re_disambiguates_opencode_bare_vs_alias():
+    """#opencode (bare provider tag) is a literal prefix of #opencode_deepseek (a
+    model alias) — PROVIDER_TAG_RE must not match inside the longer tag, and
+    MODEL_TAG_RE must not be shadowed by the bare provider tag. Regression, same
+    class of bug as codex_5/codex_5_4 above, for the newer #opencode_* aliases."""
+    assert queue_manager.extract_model_tag("Run #opencode now") is None
+    assert queue_manager.extract_model_tag("Run #opencode_deepseek now") == "opencode_deepseek"
+    assert queue_manager.extract_model_tag("Run #opencode_deepseek_long now") == "opencode_deepseek_long"
+    assert queue_manager.extract_model_tag("Run #opencode_glm now") == "opencode_glm"
+
+    # PROVIDER_TAG_RE (bare tags) must not match inside the longer alias tags.
+    assert queue_manager.PROVIDER_TAG_RE.search("#opencode_deepseek") is None
+    assert queue_manager.PROVIDER_TAG_RE.search("#opencode") is not None
 
 
 def test_extract_cwd_stops_before_non_metadata_hashtag(tmp_path, monkeypatch):

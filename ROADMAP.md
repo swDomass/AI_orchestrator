@@ -258,7 +258,7 @@ instead of a hand-copied `claude|gemini|codex|or` list, so `#vibe_*` is
 validated like every other provider's aliases; a `#vibe`/`#vibe_*` tag without
 the `vibe` CLI on PATH now gets a `vibe_missing_cli` warning, worded
 differently from the OpenRouter one because a missing Vibe binary *parks* the
-task (`dispatcher._REVIEWER_ONLY`) instead of falling back to the default
+task (`dispatcher._NO_FALLBACK_PROVIDERS`) instead of falling back to the default
 chain. And `PASS_PROVIDER_TAG_RE` (`#pass1:`/`#pass2:`) now accepts `vibe` and
 `openrouter` the same way, sourced from the same `_TAG_MAP` — chosen over
 rejecting the two values outright because `_resolve_pass2_provider()` already

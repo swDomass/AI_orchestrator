@@ -39,7 +39,21 @@ ALT_FINDING_RE = re.compile(
     re.IGNORECASE,
 )
 NO_FINDINGS_RE = re.compile(
-    r"^\s*(?:`|\*\*)?\s*No\s+P1(?:\s*(?:/|,|and|or)\s*P2)(?:\s*(?:/|,|and|or)\s*P3)\s+findings(?:\s+found)?\.?\s*(?:`|\*\*)?\s*$",
+    # Tolerant of the same shapes ALT_FINDING_RE already accepts around findings
+    # themselves: a leading bullet/numbered-list marker, and markdown emphasis
+    # (bold `**`, italic `*`/`_`, or code `` ` ``) wrapping the sentinel. The
+    # `/P3` clause is now optional (measured 2026-09-04: a reviewer wrote
+    # "No P1/P2 findings: ..." when it had only non-blocking P3 remarks to add
+    # in prose — P3 alone never blocks, so the sentinel should still count as
+    # clean). The tail accepts either the original strict end-of-line (nothing
+    # after "findings[.]") OR a colon introducing trailing prose, but NOT
+    # arbitrary unmarked trailing text — so a self-contradicting single line
+    # like "No P1/P2/P3 findings, actually P1: crash" still fails to match
+    # (no colon delimiter right after "findings").
+    r"^\s*(?:[-*•]|\d+[.)])?\s*(?:[*_`]{1,2})?\s*"
+    r"No\s+P1(?:\s*(?:/|,|and|or)\s*P2)(?:\s*(?:/|,|and|or)\s*P3)?"
+    r"\s+findings(?:\s+found)?"
+    r"(?:\.?\s*(?:[*_`]{1,2})?\s*$|\s*:\s*.*)",
     re.IGNORECASE,
 )
 

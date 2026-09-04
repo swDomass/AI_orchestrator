@@ -76,10 +76,24 @@ def _clear_state(cwd: str) -> None:
         pass
 
 
-# Resolution review output patterns
-_RESOLVED_RE = re.compile(r"^\s*RESOLVED\s*:", re.IGNORECASE | re.MULTILINE)
-_PARTIAL_RE = re.compile(r"^\s*PARTIAL\s*:", re.IGNORECASE | re.MULTILINE)
-_UNRESOLVED_RE = re.compile(r"^\s*UNRESOLVED\s*:", re.IGNORECASE | re.MULTILINE)
+# Resolution review output patterns.
+# `_VERDICT_PREFIX`/`_VERDICT_SUFFIX` tolerate a leading bullet/numbered-list
+# marker ("- RESOLVED:", "1. UNRESOLVED:") and markdown emphasis wrapping the
+# verdict word (bold `**`, italic `*`/`_`, code `` ` ``) — measured 2026-09-04:
+# a reviewer wrote `**UNRESOLVED: Nothing was implemented.**`, and the plain
+# `^\s*UNRESOLVED\s*:` anchor broke on the two leading asterisks alone, with a
+# prose preamble on earlier lines on top (already tolerated: `.search()` +
+# MULTILINE finds the verdict line regardless of what precedes it on other
+# lines — see test_parse_resolution_prose_preamble_on_earlier_lines).
+# `\b` after the keyword is load-bearing: without it, a line starting
+# "Partially, the fix..." would match `_PARTIAL_RE` (both sides of the "L" in
+# "PARTIAL"/"Partially" are word characters, so only a boundary check tells
+# them apart).
+_VERDICT_PREFIX = r"^\s*(?:[-*•]|\d+[.)])?\s*(?:[*_`]{1,2})?"
+_VERDICT_SUFFIX = r"\b(?:[*_`]{1,2})?\s*:"
+_RESOLVED_RE = re.compile(rf"{_VERDICT_PREFIX}RESOLVED{_VERDICT_SUFFIX}", re.IGNORECASE | re.MULTILINE)
+_PARTIAL_RE = re.compile(rf"{_VERDICT_PREFIX}PARTIAL{_VERDICT_SUFFIX}", re.IGNORECASE | re.MULTILINE)
+_UNRESOLVED_RE = re.compile(rf"{_VERDICT_PREFIX}UNRESOLVED{_VERDICT_SUFFIX}", re.IGNORECASE | re.MULTILINE)
 
 
 def _parse_resolution(text: str) -> str:

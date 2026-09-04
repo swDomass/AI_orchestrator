@@ -94,8 +94,72 @@ def test_collect_ids_done():
 
 
 def test_collect_ids_failed():
+    """`[-]` is CANCELLED in Obsidian — a human decision, so it releases the slot.
+
+    Deliberate and load-bearing: `/drop` (queue_healing.apply_drop) writes exactly
+    this line to unblock downstream tasks. Do not "fix" it along with the ❌ case
+    below; the two states mean different things.
+    """
     content = "- [-] Build schema #id:db-setup\n"
     assert "db-setup" in _collect_completed_ids(content)
+
+
+# ---------------------------------------------------------------------------
+# Terminal failure ([x] + ❌) must NOT satisfy a dependency
+#
+# Measured 2026-09-04 01:21: `#id:nightfloor` ended `exit_status: error`,
+# `error_code: format_error_blocked` — and its queue line still read
+# `- [x] … ✅ 2026-09-04 01:21 (claude+dev-loop)`, because every writer stamped ✅
+# unconditionally. `_collect_completed_ids` counted it, the dependent
+# `#needs:…,nightfloor,…` shutdown task was released, and the machine powered off
+# with the fix unwritten.
+# ---------------------------------------------------------------------------
+
+def test_collect_ids_skips_orchestrator_failure_stamp():
+    content = "- [x] Fix the floor #id:nightfloor ❌ 2026-09-04 01:21 (claude+dev-loop)\n"
+    assert "nightfloor" not in _collect_completed_ids(content)
+
+
+def test_collect_ids_still_counts_success_stamp():
+    content = "- [x] Fix the floor #id:nightfloor ✅ 2026-09-04 01:21 (claude+dev-loop)\n"
+    assert "nightfloor" in _collect_completed_ids(content)
+
+
+def test_collect_ids_unstamped_done_line_still_counts():
+    """Backward compatibility: weeks of `[x]` lines carry no stamp at all
+    (hand-ticked, or moved in from before the stamp existed). They keep counting."""
+    content = "- [x] Hand-ticked task #id:manual\n"
+    assert "manual" in _collect_completed_ids(content)
+
+
+def test_collect_ids_failure_verdict_cannot_be_faked_by_description():
+    """A ❌ inside the task TEXT is not a verdict — only the full stamp shape is.
+
+    Otherwise any task whose description mentions the emoji would stop satisfying
+    its dependents, silently and for a reason nobody could see.
+    """
+    content = "- [x] Replace ❌ with ✅ in the report #id:report ✅ 2026-09-04 01:21 (claude)\n"
+    assert "report" in _collect_completed_ids(content)
+
+
+def test_collect_ids_dropped_task_keeps_releasing_downstream():
+    """`/drop` writes `[-] … ❌ …` — cancelled by a human, still satisfies."""
+    content = "- [-] Give up on this #id:dropme ❌ 2026-09-04 01:21 (drop via queue-healing)\n"
+    assert "dropme" in _collect_completed_ids(content)
+
+
+def test_needs_stays_blocked_when_dep_failed(mock_queue_file):
+    """The night of 2026-09-04, end to end at the dependency layer."""
+    mock_queue_file.write_text(
+        "## Ergebnisse\n"
+        "- [x] Fix the floor #id:nightfloor ❌ 2026-09-04 01:21 (claude+dev-loop)\n"
+        "## Queue\n"
+        "- [ ] Shut the machine down #needs:nightfloor\n",
+        encoding="utf-8",
+    )
+    items = read_queue_items()
+    assert len(items) == 1
+    assert "nightfloor" in items[0].blocked_reason
 
 
 def test_collect_ids_ignores_open():
@@ -284,3 +348,127 @@ def test_run_once_blocked_stays_in_queue(monkeypatch):
     orchestrator.run_once()
 
     assert mark_done_calls == [], "mark_done must not be called for a blocked task"
+
+
+# ---------------------------------------------------------------------------
+# Structural proof of the "16 terminal paths" claim
+#
+# The first round asserted in prose that every terminal-failure finalization
+# passes failed=True. Prose is not evidence, and a path added later would slip
+# back to the silent ✅ without any test noticing. This reads orchestrator.py and
+# checks the property instead.
+# ---------------------------------------------------------------------------
+
+_FINALIZERS = {"_finalize_task_with_result_checked", "_mark_done_checked"}
+
+
+def _finalization_call_sites() -> list[tuple[int, str, str]]:
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "orchestrator.py").read_text(
+        encoding="utf-8"
+    )
+    sites = []
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in _FINALIZERS):
+            kwargs = {k.arg: ast.unparse(k.value) for k in node.keywords if k.arg}
+            sites.append((node.lineno, node.func.id, kwargs.get("failed", "<MISSING>")))
+    return sorted(sites)
+
+
+def test_every_finalization_states_its_verdict_explicitly():
+    """No call site may leave `failed=` to the default.
+
+    The default is False, so "forgot to think about it" and "this is a success"
+    are indistinguishable at the call site — which is precisely how the queue came
+    to stamp ✅ on a task that had been given up on.
+    """
+    missing = [(ln, fn) for ln, fn, val in _finalization_call_sites() if val == "<MISSING>"]
+    assert not missing, (
+        "finalization call sites without an explicit failed= argument: " + repr(missing)
+    )
+
+
+def test_sixteen_terminal_failure_paths_are_covered():
+    """Pins the count the commit message claims, and names them when it changes.
+
+    A tripwire on purpose: adding a terminal path is a decision about dependency
+    release, so it should require updating this number deliberately rather than
+    passing unnoticed.
+    """
+    sites = _finalization_call_sites()
+    failure_paths = [(ln, fn, val) for ln, fn, val in sites if val != "False"]
+    success_paths = [(ln, fn) for ln, fn, val in sites if val == "False"]
+
+    assert len(failure_paths) == 16, (
+        f"expected 16 failure-stamping finalizations, found {len(failure_paths)}: "
+        + repr(failure_paths)
+    )
+    # The two success paths are the tool and the single-shot completion; the
+    # #parallel one is conditional (`failed=not success_all`) and counts as a
+    # failure path because it can stamp ❌.
+    assert len(success_paths) == 2, repr(success_paths)
+    assert any("not success_all" in val for _ln, _fn, val in failure_paths)
+
+
+# ---------------------------------------------------------------------------
+# restamp_done_as_failed — the ✅→❌ flip behind the #verify: fix
+# ---------------------------------------------------------------------------
+
+def test_restamp_turns_a_written_success_into_a_failure(mock_queue_file):
+    mock_queue_file.write_text(
+        "## Queue\n"
+        "- [x] Write the brief #id:brief \u2705 2026-09-04 07:05 (claude)\n",
+        encoding="utf-8",
+    )
+    assert queue_manager.restamp_done_as_failed(
+        "Write the brief #id:brief", line_no=2
+    ) is True
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "- [x] Write the brief #id:brief \u274c 2026-09-04 07:05 (claude)" in content
+    assert _collect_completed_ids(content) == set()
+
+
+def test_restamp_is_a_noop_for_a_recurring_task(mock_queue_file):
+    """`#every:` lines are rescheduled as `- [ ]`, so there is no stamp to flip."""
+    mock_queue_file.write_text(
+        "## Queue\n"
+        "- [ ] Daily brief #id:brief #every:24h <!-- retry: 2026-09-05 07:00 -->\n",
+        encoding="utf-8",
+    )
+    before = mock_queue_file.read_text(encoding="utf-8")
+    assert queue_manager.restamp_done_as_failed("Daily brief #id:brief #every:24h") is False
+    assert mock_queue_file.read_text(encoding="utf-8") == before
+
+
+def test_restamp_leaves_a_different_task_alone(mock_queue_file):
+    mock_queue_file.write_text(
+        "## Queue\n"
+        "- [x] Task A #id:a \u2705 2026-09-04 07:05 (claude)\n"
+        "- [x] Task B #id:b \u2705 2026-09-04 07:06 (claude)\n",
+        encoding="utf-8",
+    )
+    assert queue_manager.restamp_done_as_failed("Task B #id:b", line_no=3) is True
+    content = mock_queue_file.read_text(encoding="utf-8")
+    assert "- [x] Task A #id:a \u2705" in content
+    assert "- [x] Task B #id:b \u274c" in content
+
+
+# ---------------------------------------------------------------------------
+# The known, deliberate false positive of the stamp SHAPE (Codex P2, rejected
+# as a blocker). Pinned so the direction of the error stays documented: it can
+# only WITHHOLD a dependency, never release one.
+# ---------------------------------------------------------------------------
+
+def test_hand_ticked_line_ending_in_a_stamp_shape_reads_as_failed():
+    content = "- [x] Dokumentiere das Format \u274c 2026-09-04 01:21 (provider) #id:doc\n"
+    # Not stamp-shaped at END of line (the #id: follows) → unaffected.
+    assert "doc" in _collect_completed_ids(content)
+
+    trailing = "- [x] Format-Beispiel #id:doc \u274c 2026-09-04 01:21 (provider)\n"
+    # Stamp-shaped at end of line → classified as failed. Known and accepted:
+    # the dependent stays BLOCKED (safe, visible, and queue_healing reports it
+    # after 24 h) instead of being released on a failure (the measured disaster).
+    assert "doc" not in _collect_completed_ids(trailing)

@@ -54,7 +54,64 @@ Extracted via `getattr(queue_task, "subtasks", None)` at loop start for test-moc
 
 ### Task dependencies (`#id:`/`#needs:`)
 
-`#id:name` tags a task with a unique ID. `#needs:name1,name2` blocks a task until all named deps appear as `[x]` or `[-]` in the file. `_collect_completed_ids()` scans the full file for done/failed tasks. Two-pass in `read_queue_items()` — short-circuit if no `#needs:` present. Blocked tasks keep `QueueTask.blocked_reason != ""` and are skipped by `run_once()` (no `mark_done` → stays in queue for next cycle). Queue header shows `(N ausführbar, M blockiert)` when any tasks are blocked.
+`#id:name` tags a task with a unique ID. `#needs:name1,name2` blocks a task until all named deps are **satisfied**: `[x] … ✅ …` (succeeded) or `[-]` (cancelled by a human — either ticked off in Obsidian or dropped via `/drop`, which exists to release the downstream slot). `_collect_completed_ids()` scans the full file for them. Two-pass in `read_queue_items()` — short-circuit if no `#needs:` present. Blocked tasks keep `QueueTask.blocked_reason != ""` and are skipped by `run_once()` (no `mark_done` → stays in queue for next cycle). Queue header shows `(N ausführbar, M blockiert)` when any tasks are blocked.
+
+### `#verify:` decides the final mark, not just the alarm
+
+The three success paths finalize the queue line BEFORE running the task's `#verify:` outcome check, deliberately: a re-run on the next poll would alarm twice. Once the queue can express a failure, that ordering leaves a hole — `#verify:` is the one signal that says "the run was formally clean and the work did not happen" (measured 2026-09-03, reel task `njtaxr`: `exit_status ok`, artefact missing), and a `✅` on such a line releases every `#needs:` dependent. That is the same failure mode the terminal-failure state was built to remove, arriving through a different door.
+
+`queue_manager.restamp_done_as_failed()` flips the already-written `✅` to `❌` when the check fails, and `orchestrator._restamp_after_failed_verify()` is paired with all three `_verify_task_result()` call sites (tool, `#parallel` with `success_all`, single-shot). This needs **no retry budget of its own** — the objection that kept the hole open in the first round. The line stays `[x]`, so nothing is requeued and the finalize-then-verify ordering is untouched; only the mark changes. A `#every:` task has no stamp to flip (it was rescheduled as `- [ ]`), which is the expected no-op.
+
+`tests/test_orchestrator_tool_tasks.py::test_every_verify_site_restamps_on_failure` asserts the pairing structurally (3 verify sites, 3 restamps), because fixing two of three would leave the third silently stamping `✅` on a failed check.
+
+**The "16 terminal paths" claim is now proven rather than asserted.** `test_every_finalization_states_its_verdict_explicitly` parses `orchestrator.py` and requires every call to `_finalize_task_with_result_checked` / `_mark_done_checked` to pass an explicit `failed=` argument — the default is `False`, so "forgot to decide" and "this is a success" were indistinguishable at the call site, which is exactly how a given-up task came to be stamped `✅`. `test_sixteen_terminal_failure_paths_are_covered` pins the partition (16 failure-stamping, 2 success), a deliberate tripwire: adding a terminal path is a decision about dependency release.
+
+### Clean-worktree gate (`BaseTool.requires_clean_worktree`)
+
+`#tool:dev-loop` does not start unless its `cwd:` is a git repository with a clean working tree. On a violation the task is never started: it is finalized terminally with `error_code="worktree_dirty"` (own taxonomy category `CAT_WORKTREE`) and the ❌ stamp, so it neither retries forever nor releases a `#needs:` dependent.
+
+Measured 2026-09-03/04: `nightstash` ran 22:02–22:45 and left the repo on its own branch `night/stash-pruning`. Over two hours later `nightfloor` started in the same repo, and its Quality reviewer refused the output format — "Task und Working Tree passen nicht zusammen … Branch: night/stash-pruning ← nicht night/version-floor" — which tipped the run into `format_error`; three attempts later the retry budget was gone. The runs did not overlap, so this is a missing reset between *sequential* tasks, not a race. Every task order carried "start with `git switch -c night/xyz master`, abort on an unclean tree", but that lived in the PROMPT: a fail-open guard nothing enforced.
+
+**Scope is a property of the tool, not of the queue line.** `BaseTool.requires_clean_worktree` is False by default and True on `DevLoopTool`. Three reasons for keying it there rather than to a new opt-in tag:
+
+* The queue is hand-written. A rule you must remember for every new task is weaker than one that is right on its own, and `#tool:dev-loop` is already written for its own reasons.
+* dev-loop is precisely the tool that *produces* the diff its own reviewers judge, so a foreign working tree is not noise but a corrupted object under review. `review-loop` *consumes* an existing diff and is deliberately NOT gated — a clean tree there would be the opposite of what the tool is for. "Every writing tool" would therefore be the wrong rule.
+* Legitimate tasks in permanently dirty repos keep working untouched: `nightlovelace` ran plain (no `#tool:` tag) in `haus`, explicitly ordered not to commit or write anything, and never reaches the gate.
+
+`#allow-dirty` is the opt-out for a repo that always carries uncommitted work, so the escape hatch needs no code change.
+
+**Two gaps in the enforcement were closed after an external review (2026-09-04); both were real.**
+
+*No `cwd:` is now a refusal, not a skip.* "No cwd" does not mean "no repo": `providers/process_runner._spawn()` passes `cwd=None` straight to `Popen` (`cwd=cwd`, line 183), which inherits the orchestrator's own working directory — so a `dev-loop` task without a `cwd:` tag runs against whatever repo the orchestrator was started in, with the precondition unverifiable rather than absent. A guard that cannot check must not pass. `#allow-dirty` still waives it. Nine existing tests drive `#tool:dev-loop` without a cwd to exercise other mechanisms (retry counter, policy routing); they now switch the gate off explicitly via `_no_worktree_gate()` rather than satisfying it by accident.
+
+*`#parallel` subtasks are gated where they actually run.* The parent stays exempt in `run_once()` — its own `#tool:` tag is not what executes — but `parallel_runner._run_single_subtask()` calls `_execute_tool_task()` directly, which made the subtasks the one route around the gate (the `#worktree` precheck only covers `#worktree` runs). The same `_worktree_gate_violation()` now runs per subtask before provider selection; a violation fails that subtask, and the parent is finalized `❌` through `failed=not success_all`. Under `#worktree` the subtask cwd has already been rewritten to the freshly created worktree, which is clean by construction.
+
+**Terminal, not parked** — nothing cleans the tree on its own, so parking would re-check the same dirty tree on every poll, unattended and silent. **No automatic reset or branch switch**: a reset can destroy work from another session, while refusing to start makes the same mistake just as visible and costs nothing.
+
+**Known limit, measured rather than assumed.** The gate catches a dirty tree, not a foreign branch. Of the three failed `nightfloor` attempts that night, the tree was actually dirty at exactly one (00:11 — proven by the `git stash create` snapshot the orchestrator takes before each task, which produces a commit only for a dirty tree; no snapshot exists for the 23:49 and 01:05 attempts). At the other two the tree was clean and only the branch was foreign. A branch check is not implementable generically: the orchestrator has no way to know which branch a task expects, since that appears only in the prompt text. The current branch is therefore named in the block message, so the human sees the state the repo was left in.
+
+The check itself reuses `parallel_runner._is_clean_git_repo()` — one implementation for both the worktree path and this gate.
+
+### Terminal failure state (`- [x] … ❌ …`)
+
+The queue had no way to say "this went wrong": `mark_done()` and `finalize_task_with_result()` both wrote `- [x] <task> ✅ <ts> (<provider>)` unconditionally, and no writer anywhere in the repo produced any other terminal shape. Measured 2026-09-04 01:21: `#id:nightfloor` ended `exit_status: "error"`, `error_code: "format_error_blocked"` (`logs/runs.jsonl`) and its line read `✅ 2026-09-04 01:21 (claude+dev-loop)`. `_collect_completed_ids()` matched `[x]` **or** `[-]`, so the failure counted as satisfied, the dependent `#needs:…,nightfloor,…` shutdown task was released, and the machine powered off with the fix unwritten.
+
+A terminal failure now stamps **❌ instead of ✅** on an otherwise unchanged `- [x]` line. Four constraints pick that shape, and each rules out an alternative:
+
+* **It must not be picked up again.** `OPEN_TASK_RE` only matches `- [ ]`, so the checkbox has to stay `[x]`. Leaving the line open would re-burn the full runtime every following night — the retry cap had just been reached.
+* **It must not satisfy `#needs:`.** `_collect_completed_ids()` skips a `[x]` line carrying the failure stamp. `[-]` deliberately keeps satisfying: in Obsidian that symbol means *cancelled*, and `queue_healing.apply_drop()` writes it precisely to unblock downstream tasks.
+* **It must not disturb Obsidian.** The queue file is a vault note rendered by the Tasks plugin. A vault-wide census (2026-09-03) found exactly four status symbols (`x`, `-`, ` `, `/`), and the plugin classifies an unregistered symbol as type **TODO** — a `- [!]` would have made every failed task reappear as *open* in every task query in the vault. So the verdict rides on the mark, not on the checkbox.
+* **A human must see it while skimming.** ❌ against ✅ in the same column is the whole point.
+
+`queue_manager.line_is_failed()` is the single reader of that shape. It anchors on the **complete stamp** (` ❌ YYYY-MM-DD HH:MM (provider)` at end of line), not on the bare emoji, so a task whose description merely contains ❌ cannot fake a verdict. `_DONE_TASK_TS_RE` accepts both marks, so failures are archived to `agent-queue-erledigt.md` on the same 48 h clock instead of piling up in the live queue. `#every:` tasks are unaffected — `_completion_replacement()` reschedules them instead of stamping, and a recurring line never becomes `[x]`, so it never satisfied a dependency anyway.
+
+**Two things about the stamp that an external review (2026-09-04) put a finger on.**
+
+*The shape is forgeable, and that is accepted.* `line_is_failed()` recognises a SHAPE — a hand-ticked `[x]` line whose description happens to end in `❌ YYYY-MM-DD HH:MM (text)` cannot be told from one the orchestrator wrote. Distinguishing them needs a second marker in the line, which this repo has already weighed and rejected once (it splits the queue's only persistent state across two markers every rewrite must keep in sync). It stays because the direction of the error is safe: a false positive can only **withhold** a dependency — blocked, visible, and reported by `queue_healing` after 24 h — never release one, and releasing one wrongly is the disaster this mechanism exists to prevent. Measured read-only against the live `agent-queue.md` on 2026-09-04: 15 finished lines, **all 15** carrying a real orchestrator `✅` stamp, **zero** hand-ticked lines and zero lines of the failure shape. The exposure is a shape nothing in the file has.
+
+*Stripping the stamp must be anchored, not greedy.* `re.sub(r"\s*❌\s+.*$", …)` cuts at the FIRST ❌, so `/retry` on `- [x] Replace ❌ with ✅ #id:a ❌ 2026-… (claude)` produced `- [ ] Replace` — instruction and `#id:` gone, the reopened task unrunnable. `queue_manager.strip_failure_stamp()` removes only the validated trailing stamp; `_promote_failed_line()` uses `rpartition()` for the same reason (the last ❌ is the stamp's, because the stamp is anchored at end of line).
+
+`queue_healing.py` is the only other component that reads task status. `_find_failed_ids()` recognises both failure shapes (so a failed dep still produces an `/unblock`/`/retry` proposal), `_find_completed_ids()` excludes the ❌ stamp (so a failure cannot silence the proposal), `apply_unblock()` promotes a failed line to a satisfying one — checkbox to `[x]` **and** ❌ to ✅, because doing only the first turned `apply_drop()`'s `- [-] … ❌ …` into `- [x] … ❌ …`, which reads as a failure: `/unblock` reported success and left the dependent blocked. `apply_retry_dep()` reopens a failed line as `- [ ]` (stamp stripped, description intact) while refusing to reopen a *successful* task.
 
 ### Schedule tags (`#at:`/`#every:`)
 

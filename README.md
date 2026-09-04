@@ -257,6 +257,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Timeout (hard backstop, not aggressive deadline; for tools an upper cap) | `#timeout:<n>[s\|m\|h]` | `#timeout:30s`, `#timeout:15m`, `#timeout:1h` |
 | Execution profile | `#agent:<name>` | `#agent:work` |
 | Parallel task | `#parallel` | Parent task with indented subtasks |
+| Waive the clean-worktree gate | `#allow-dirty` | `- [ ] Fix it #tool:dev-loop #allow-dirty cwd:D:\repo` |
 | Task ID | `#id:<name>` | `- [ ] Build backend #id:build` |
 | Task dependency | `#needs:<id1,id2>` | `- [ ] Test #needs:build` |
 | One-time schedule | `#at:<timestamp>` | `- [ ] Review #at:2026-05-17T22:00` |
@@ -331,10 +332,70 @@ ageing retires at most one at a time.
 - [ ] Deploy to staging #needs:build,tests cwd:D:\projects\app
 ```
 
-- A task with `#needs:` stays **blocked** until all named IDs appear as `[x]` (done) or `[-]` (failed).
+- A task with `#needs:` stays **blocked** until all named IDs appear as `[x] … ✅ …` (done) or `[-]` (cancelled).
 - Blocked tasks are **not removed** from the queue — they stay open and are re-checked each cycle.
 - The queue header shows `(N runnable, M blocked)` when blocked tasks are present.
-- `[-]` (failed) tasks also unblock dependents — the downstream task decides how to handle failure.
+- `[-]` (cancelled) tasks **do** unblock dependents. That is a human decision — either you ticked it off in Obsidian, or you sent `/drop` — and the downstream task decides how to handle it.
+- A task the orchestrator **gave up on** does not. It is written as `- [x] <task> ❌ <ts> (<provider>)`: checked off so it is never picked up again, stamped ❌ so it satisfies nothing. See [Terminal failures](#terminal-failures--x--) below.
+
+### Clean-worktree gate (`#tool:dev-loop`)
+
+A `#tool:dev-loop` task does not start unless its `cwd:` is a git repository with a
+clean working tree. On a violation the task is **not started at all** and is
+finalized as a terminal failure with `error_code="worktree_dirty"`.
+
+Why dev-loop specifically: it *produces* the diff that its own Quality and
+Resolution reviewers then judge. Uncommitted changes from an earlier task are not
+noise there, they corrupt the object under review. `#tool:review-loop` is
+deliberately **not** gated — it *consumes* an existing diff, so requiring a clean
+tree would be the opposite of what it is for.
+
+The scope is a property of the tool class (`BaseTool.requires_clean_worktree`), not
+of the queue line, so a hand-written task is right by default with no extra tag to
+remember. Plain tasks (no `#tool:`) in permanently dirty repos are unaffected.
+
+- **`#allow-dirty`** waives the check for a repo that legitimately always carries
+  uncommitted work.
+- A task **without `cwd:` is refused**, not skipped: `cwd=None` is passed straight
+  to `Popen`, which inherits the orchestrator's own working directory, so the task
+  would run against an unspecified repo. `#allow-dirty` waives this too.
+- `#parallel` **subtasks are gated individually** (`parallel_runner`), since they
+  are what actually runs; the parent itself is exempt.
+- There is **no** automatic branch switch or reset: a reset can destroy work from
+  another session, and refusing to start makes the same mistake just as visible.
+- Terminal rather than parked: nothing cleans the tree on its own, so a park would
+  re-check the same dirty tree every poll, forever and unattended.
+- **Not covered:** a *clean* tree left on a foreign branch. The orchestrator cannot
+  know which branch a task expects — that lives only in the prompt text.
+
+### Terminal failures (`- [x] … ❌ …`)
+
+When a task ends without doing what it was asked — retry cap for hang/format breaks
+reached, `tool_providers` policy denial, invalid `cwd:`, unknown tool, tool runtime
+budget exhausted, a `#parallel` run with a failed subtask — the queue line is stamped:
+
+```md
+- [x] Fix the version floor #id:nightfloor ❌ 2026-09-04 01:21 (claude+dev-loop)
+```
+
+- **Out of the queue.** `[x]` means the parser never picks it up again, so a task at
+  its retry cap cannot burn a full runtime every following night.
+- **Satisfies nothing.** `#needs:` is only released by ✅ or by `[-]`.
+- **Obsidian-safe.** The Tasks plugin knows four status symbols in this vault
+  (`x`, `-`, ` `, `/`) and treats an unregistered one as *TODO* — a fifth symbol
+  would make failed tasks reappear as open in every task query. The mark carries
+  the verdict instead of the checkbox.
+- **Visible.** ❌ against ✅ is the one thing you see when skimming the file.
+- Archived to `agent-queue-erledigt.md` on the same 48 h clock as a success, and
+  recorded in `logs/runs.jsonl` with its `error_code`.
+- Recurring (`#every:`) tasks are the exception: they are rescheduled rather than
+  stamped, exactly as before — a failure today does not cancel tomorrow's slot.
+- A failed **`#verify:` outcome check** flips an already-written ✅ to ❌. The three
+  success paths finalize before they verify (so a re-run cannot alarm twice), and
+  `#verify:` is the one signal for "the run was clean and the work did not happen"
+  — without the flip, that line would still release its `#needs:` dependents.
+- `/unblock <id>` (Telegram) promotes such a line to ✅, `/retry <id>` reopens it as
+  `- [ ]`.
 
 ### Schedules (`#at:` / `#every:`)
 

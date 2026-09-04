@@ -103,6 +103,7 @@ from queue_manager import (
     extract_hang_count,
     extract_verify_tag,
     finalize_task_with_result,
+    has_allow_dirty_tag,
     has_cwd_tag,
     has_verify_tag,
     mark_done,
@@ -110,6 +111,7 @@ from queue_manager import (
     read_queue,
     read_queue_items,
     realign_stale_freshonly,
+    restamp_done_as_failed,
     strip_metadata_tags,
 )
 from providers.process_runner import run_with_watchdog
@@ -212,6 +214,78 @@ def _is_git_repo(cwd: str) -> bool:
         return result.returncode == 0 and result.stdout.strip() == "true"
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _current_branch(cwd: str) -> str:
+    """Best-effort branch name for the error message ("detached" / "?" on failure)."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "?"
+
+
+def _worktree_gate_violation(task: str, tool_name: str | None, cwd: str | None) -> str | None:
+    """Return a message when a task must NOT start because its repo is not clean.
+
+    Scope is a property of the TOOL, not of the queue line: a tool sets
+    `requires_clean_worktree` when it produces the working-tree diff that its own
+    reviewers subsequently judge. Today that is `dev-loop` alone. Keying it to the
+    tool means a hand-written queue line is right by default — there is no extra tag
+    to remember — while `review-loop`, which CONSUMES an existing diff, is
+    deliberately not covered, and plain tasks in permanently dirty repos (`haus`,
+    where a task may be explicitly told not to write) keep running as before.
+
+    `#allow-dirty` waives it for the rare legitimate case, so the escape hatch does
+    not require a code change at 03:00.
+
+    No automatic reset or branch switch: a reset can destroy work that belongs to
+    somebody else's session, and refusing to start makes the same mistake just as
+    visible. What is NOT covered is a clean tree left on a foreign BRANCH — the
+    orchestrator has no way to know which branch a task expects, that lives only in
+    the prompt text.
+
+    A task with no `cwd:` is REFUSED, not waved through. "No cwd" does not mean "no
+    repo": `providers/process_runner._spawn()` passes `cwd=None` straight to
+    `Popen`, which inherits the orchestrator's own working directory — so such a
+    task runs dev-loop against whatever repo the orchestrator was started in, and
+    the precondition would be unverifiable rather than absent. A guard that cannot
+    check must not pass.
+    """
+    if not tool_name:
+        return None
+    tool = get_tool(tool_name)
+    if tool is None or not getattr(tool, "requires_clean_worktree", False):
+        return None
+    if has_allow_dirty_tag(task):
+        print(f"  [worktree] #allow-dirty → Sauberkeits-Check für {tool_name} übersprungen")
+        return None
+    if not cwd:
+        return (
+            f"'{tool_name}' verlangt einen sauberen Arbeitsbaum, der Task hat aber kein "
+            f"cwd:-Tag. Ohne cwd erbt der Provider das Arbeitsverzeichnis des "
+            f"Orchestrators (Popen mit cwd=None), der Task liefe also gegen ein "
+            f"unbestimmtes Repo. Task nicht gestartet — cwd: setzen, oder #allow-dirty, "
+            f"wenn das wirklich so gemeint ist."
+        )
+
+    from parallel_runner import _is_clean_git_repo
+    ok, reason = _is_clean_git_repo(Path(cwd))
+    if ok:
+        return None
+    return (
+        f"Arbeitsbaum-Check fehlgeschlagen für '{tool_name}': {reason} "
+        f"(cwd: {cwd}, Branch: {_current_branch(cwd)}). "
+        f"{tool_name} erzeugt den Diff, über den seine eigenen Reviewer urteilen — "
+        f"fremde Änderungen im Baum verfälschen den Prüfgegenstand. Task nicht gestartet. "
+        f"Aufräumen (committen/verwerfen) und Task wieder öffnen, oder #allow-dirty setzen, "
+        f"wenn dieses Repo dauerhaft ungebundene Änderungen trägt."
+    )
 
 
 def _snapshot_refs(cwd: str) -> list[tuple[str, int, str]]:
@@ -764,9 +838,17 @@ def _mark_done_checked(
     *,
     queue_line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    failed: bool = False,
 ) -> bool:
-    """Mark task done and return False if queue mutation failed."""
-    if mark_done(task, provider, line_no=queue_line_no, subtasks=subtasks):
+    """Mark task finished and return False if queue mutation failed.
+
+    `failed=True` stamps the queue line ❌ instead of ✅. Both take the task out of
+    the queue; only ✅ satisfies a `#needs:` dependency. Pass it wherever the task
+    did NOT do what it was asked — otherwise a downstream task is released on a
+    failure (measured 2026-09-04: a blocked dev-loop task released the shutdown
+    task, which powered the machine down with the fix unwritten).
+    """
+    if mark_done(task, provider, line_no=queue_line_no, subtasks=subtasks, failed=failed):
         return True
     msg = "Queue-Update fehlgeschlagen: Task konnte nicht als erledigt markiert werden"
     print(f"  ❌ {msg}")
@@ -1003,6 +1085,30 @@ def _verify_failed(task: str, provider_name: str, msg: str) -> VerifyOutcome:
     return VerifyOutcome(ok=False, note=f"\n\n[verify] {msg}")
 
 
+def _restamp_after_failed_verify(task: str, queue_line_no: int | None) -> None:
+    """Turn the ✅ this task was already stamped with into ❌.
+
+    All three verify sites finalize BEFORE they check — deliberately, so a re-run
+    on the next poll cannot alarm twice. Once the queue can express a failure that
+    ordering leaves a hole: `#verify:` is the one signal that says "the run was
+    formally clean and the work did not happen" (measured 2026-09-03, reel task
+    `njtaxr`: exit ok, artefact missing), and a ✅ on such a line releases every
+    `#needs:` dependent.
+
+    Flipping the mark afterwards needs no retry budget of its own: the line stays
+    `[x]`, so nothing is requeued and the original ordering is untouched. A
+    `#every:` task has no stamp to flip (it was rescheduled as `- [ ]`) — that is
+    the expected no-op, not an error.
+    """
+    if restamp_done_as_failed(task, line_no=queue_line_no):
+        print("  ❌ Ergebnis-Check fehlgeschlagen → Queue-Zeile als gescheitert markiert")
+        return
+    append_log(
+        "Hinweis: Ergebnis-Check fehlgeschlagen, aber kein ✅-Stempel zum Umsetzen "
+        "gefunden (wiederkehrender Task oder Zeile bereits verändert)"
+    )
+
+
 def _finalize_task_with_result_checked(
     task: str,
     result: str,
@@ -1010,9 +1116,16 @@ def _finalize_task_with_result_checked(
     *,
     queue_line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    failed: bool = False,
 ) -> bool:
-    """Atomically persist result + done status and return False on queue mutation failure."""
-    if finalize_task_with_result(task, result, provider, line_no=queue_line_no, subtasks=subtasks):
+    """Atomically persist result + finished status; False on queue mutation failure.
+
+    `failed=True` writes the ❌ stamp — same "gone from the queue" effect as ✅, but
+    it does not satisfy `#needs:` (see `queue_manager._collect_completed_ids`).
+    """
+    if finalize_task_with_result(
+        task, result, provider, line_no=queue_line_no, subtasks=subtasks, failed=failed,
+    ):
         return True
     msg = "Queue-Update fehlgeschlagen: Ergebnis+Status konnten nicht atomar persistiert werden"
     print(f"  ❌ {msg}")
@@ -1101,7 +1214,10 @@ def _execute_tool_task(
         if not skip_queue:
             append_log(f"Unbekanntes Tool: {tool_name}")
             notify_error(task, provider.name if provider else "unknown", msg)
-            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no, subtasks=subtasks)
+            finalized = _mark_done_checked(
+                task, "failed", queue_line_no=queue_line_no,
+                subtasks=subtasks, failed=True,
+            )
         else:
             finalized = False
         return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
@@ -1116,7 +1232,10 @@ def _execute_tool_task(
             if not skip_queue:
                 append_log(msg)
                 notify_error(task, provider.name, msg)
-                finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no, subtasks=subtasks)
+                finalized = _mark_done_checked(
+                task, "failed", queue_line_no=queue_line_no,
+                subtasks=subtasks, failed=True,
+            )
             else:
                 finalized = False
             return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
@@ -1176,6 +1295,7 @@ def _execute_tool_task(
                 provider_tool,
                 queue_line_no=queue_line_no,
                 subtasks=subtasks,
+                failed=False,   # ...unless #verify: says otherwise — see below
             ):
                 return ToolTaskExecutionOutcome(
                     success=False,
@@ -1200,6 +1320,8 @@ def _execute_tool_task(
                     task, provider_tool, tool_result.output,
                     change_summary=change_summary,
                 )
+            else:
+                _restamp_after_failed_verify(task, queue_line_no)
         return ToolTaskExecutionOutcome(
             success=True,
             finalized=not skip_queue,
@@ -1230,6 +1352,7 @@ def _execute_tool_task(
                 provider_tool,
                 queue_line_no=queue_line_no,
                 subtasks=subtasks,
+                failed=True,
             ):
                 return ToolTaskExecutionOutcome(
                     success=False,
@@ -1411,7 +1534,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if not dry_run:
                 append_log(msg)
                 notify_error(task, "profile", msg)
-                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                if not _mark_done_checked(
+                    task, "profile-denied", queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=True,
+                ):
                     _span.error("profile_denied")
                     _span.emit()
                     return False
@@ -1426,7 +1552,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if not dry_run:
                 append_log(msg)
                 notify_error(task, "profile", msg)
-                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                if not _mark_done_checked(
+                    task, "profile-denied", queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=True,
+                ):
                     _span.error("profile_denied")
                     _span.emit()
                     return False
@@ -1441,7 +1570,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 continue
             append_log(msg)
             notify_error(task, "queue", msg)
-            if not _mark_done_checked(task, "invalid-cwd", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+            if not _mark_done_checked(
+                task, "invalid-cwd", queue_line_no=queue_task.line_no,
+                subtasks=task_subtasks, failed=True,
+            ):
                 _span.error("cwd_invalid")
                 _span.emit()
                 return False
@@ -1523,7 +1655,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  ❌ {msg}")
                 append_log(msg)
                 notify_error(task, "policy", msg)
-                if not _mark_done_checked(task, "policy-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                if not _mark_done_checked(
+                    task, "policy-denied", queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=True,
+                ):
                     _span.error("policy_denied")
                     _span.emit()
                     return False
@@ -1579,6 +1714,46 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         except Exception as e:
             _log.warning("policy check failed: %s", e)
 
+        # --- Clean-worktree precondition (2026-09-04) ---
+        # The last gate before anything runs. A tool that produces the diff its own
+        # reviewers judge (dev-loop) must not start on top of another task's leftover
+        # working tree: measured 2026-09-04, `nightstash` finished at 22:45 and left
+        # the repo on its branch, and the next dev-loop task in the same repo had its
+        # Quality reviewer refuse the output format ("Task und Working Tree passen
+        # nicht zusammen"), which tipped the run into format_error and burned the whole
+        # retry budget. The task orders all said "abort on an unclean tree", but that
+        # lived in the PROMPT — a fail-open guard nothing enforced.
+        #
+        # Terminal, not parked: nothing cleans the tree on its own, so a park would
+        # re-check the same dirty tree forever, unattended and silent. The ❌ stamp
+        # keeps it from releasing `#needs:` dependents.
+        # `#parallel` parents are exempt HERE because the parent's own `#tool:` tag
+        # is not what runs — the subtasks are, each with its own cwd. They are not
+        # exempt from the gate itself: `parallel_runner._run_single_subtask()`
+        # applies the same check per subtask before selecting a provider, so a
+        # dev-loop subtask in a dirty repo fails as a subtask and the parent is
+        # finalized with `failed=not success_all`.
+        gate_msg = (
+            None if getattr(queue_task, "subtasks", None)
+            else _worktree_gate_violation(task, tool_name, cwd)
+        )
+        if gate_msg:
+            print(f"  🚫 {gate_msg}")
+            if dry_run:
+                continue
+            append_log(gate_msg)
+            notify_error(task, tool_name or "queue", gate_msg)
+            if not _finalize_task_with_result_checked(
+                task, gate_msg, tool_name or "queue",
+                queue_line_no=queue_task.line_no, subtasks=task_subtasks, failed=True,
+            ):
+                _span.error("queue_update_failed")
+                _span.emit()
+                return False
+            _span.error("worktree_dirty")
+            _span.emit()
+            continue
+
         # --- Feature 7: Parallel sub-agent spawning ---
         if getattr(queue_task, "subtasks", None):
             print(f"  [parallel] {len(task_subtasks)} Subtask(s)")
@@ -1602,7 +1777,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 status_str = "✅" if success_all else "⚠️"
                 print(f"  {status_str} Parallel abgeschlossen ({len(results)} Subtasks)")
                 if not _finalize_task_with_result_checked(
-                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no, subtasks=task_subtasks
+                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=not success_all,
                 ):
                     _span.error("queue_update_failed")
                     _span.emit()
@@ -1632,6 +1808,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(f"Parallel-Task erledigt: {task[:60]}")
                 if verify.ok:
                     notify_task_done(task, provider_tag, aggregated)
+                elif success_all:
+                    # Only reachable when every subtask succeeded — a partial run is
+                    # already stamped ❌ by `failed=not success_all` above.
+                    _restamp_after_failed_verify(task, queue_task.line_no)
                 if not success_all:
                     _span.error("parallel_subtask_failure")
                 elif not verify.ok:
@@ -1685,6 +1865,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _finalize_task_with_result_checked(
                             task, msg, violation[0],
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                            failed=True,
                         )
                         _span.error("provider_not_allowed", retry_count=tool_retry_count)
                         break
@@ -1704,6 +1885,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _finalize_task_with_result_checked(
                             task, msg, "policy",
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                            failed=True,
                         )
                         _span.error("no_provider_allowed", retry_count=tool_retry_count)
                         break
@@ -1814,6 +1996,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, outcome.output or msg, f"{provider.name}+{tool_name}",
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("tool_runtime_exceeded", retry_count=tool_retry_count)
                     break
@@ -1875,6 +2058,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _finalize_task_with_result_checked(
                             task, msg, f"{provider.name}+{tool_name}",
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                            failed=True,
                         )
                         _span.error(f"{outcome.error_code}_blocked", retry_count=tool_retry_count)
                         break
@@ -1981,6 +2165,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, msg, violation[0],
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("provider_not_allowed", retry_count=single_shot_retry_count)
                     break
@@ -1998,6 +2183,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, msg, "policy",
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("no_provider_allowed", retry_count=single_shot_retry_count)
                     break
@@ -2094,6 +2280,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     provider.name,
                     queue_line_no=queue_task.line_no,
                     subtasks=task_subtasks,
+                    failed=False,   # ...unless #verify: says otherwise — see below
                 ):
                     _span.error("queue_update_failed", retry_count=single_shot_retry_count)
                     _span.emit()
@@ -2125,6 +2312,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         cache_read_input_tokens=result.cache_read_input_tokens,
                     )
                 else:
+                    _restamp_after_failed_verify(task, queue_task.line_no)
                     _span.error("verify_failed", retry_count=single_shot_retry_count)
                 single_shot_success = True
                 break
@@ -2152,6 +2340,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, msg, provider.name,
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("hang_blocked", retry_count=single_shot_retry_count)
                     break

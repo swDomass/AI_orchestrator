@@ -10,6 +10,18 @@ from tools.base_tool import ToolResult
 
 
 
+def _no_worktree_gate(monkeypatch):
+    """Neutralise the clean-worktree precondition for tests about OTHER mechanisms.
+
+    These tests drive `#tool:dev-loop` without a `cwd:`, which the gate refuses
+    (a dev-loop without cwd would run against whatever repo the orchestrator was
+    started in). They are about the retry counter / policy routing, so the gate is
+    switched off explicitly rather than accidentally satisfied — see
+    tests/test_worktree_gate.py for its own coverage.
+    """
+    monkeypatch.setattr(orchestrator, "_worktree_gate_violation", lambda *a, **kw: None)
+
+
 def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
     provider = SimpleNamespace(name="codex")
     tool = Mock()
@@ -474,6 +486,7 @@ def test_run_once_format_error_blocks_task_after_max_retries(monkeypatch):
     mark_retry_mock = Mock(return_value=True)
     finalize_mock = Mock(return_value=True)
 
+    _no_worktree_gate(monkeypatch)
     monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
     monkeypatch.setattr(
         orchestrator, "read_queue_items",
@@ -513,6 +526,7 @@ def test_run_once_tool_task_stops_on_policy_barred_provider_tag(monkeypatch):
     finalize_mock = Mock(return_value=True)
     mark_retry_mock = Mock(return_value=True)
 
+    _no_worktree_gate(monkeypatch)
     monkeypatch.setattr(
         orchestrator, "read_queue_items",
         lambda: [SimpleNamespace(task_text="Task #tool:dev-loop #vibe", line_no=1,
@@ -945,6 +959,7 @@ def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monk
         "codex+test-loop",
         line_no=42,
         subtasks=None,
+        failed=False,
     )
 
 
@@ -1019,7 +1034,9 @@ def test_run_once_stops_when_atomic_queue_finalization_fails(monkeypatch):
     result = orchestrator.run_once()
 
     assert result is False
-    finalize_task.assert_called_once_with("Task A", "ok", "codex", line_no=7, subtasks=None)
+    finalize_task.assert_called_once_with(
+        "Task A", "ok", "codex", line_no=7, subtasks=None, failed=False,
+    )
 
 
 def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
@@ -1048,6 +1065,7 @@ def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
         "invalid-cwd",
         line_no=9,
         subtasks=None,
+        failed=True,
     )
     notify_error.assert_called_once()
     select_provider.assert_not_called()
@@ -1221,6 +1239,7 @@ def _dead_end_queue(monkeypatch, tool="dev-loop"):
         lambda: [SimpleNamespace(task_text=f"Task #tool:{tool}", line_no=1,
                                  raw_line=f"- [ ] Task #tool:{tool}")],
     )
+    _no_worktree_gate(monkeypatch)
     monkeypatch.setattr(orchestrator, "read_queue", lambda: [f"Task #tool:{tool}"])
     monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
     monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
@@ -1324,6 +1343,7 @@ def _blocked_message_for(monkeypatch, error_code, raw_line):
     finalize_mock = Mock(return_value=True)
     mark_retry_mock = Mock(return_value=True)
 
+    _no_worktree_gate(monkeypatch)
     monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
     monkeypatch.setattr(
         orchestrator, "read_queue_items",
@@ -1393,6 +1413,7 @@ def test_requeue_message_shows_the_joint_attempt_budget(monkeypatch):
     ))
     mark_retry_mock = Mock(return_value=True)
 
+    _no_worktree_gate(monkeypatch)
     monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", 2)
     monkeypatch.setattr(
         orchestrator, "read_queue_items",
@@ -1424,7 +1445,8 @@ def test_requeue_message_shows_the_joint_attempt_budget(monkeypatch):
 # The counter has to SURVIVE the parks that say nothing about the task
 # ---------------------------------------------------------------------------
 
-def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1):
+def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1,
+                    queue_content="## Queue\n- [ ] Task #tool:dev-loop\n"):
     """Drive run_once() over a REAL queue file, one outcome per call.
 
     Every neighbouring test mocks `mark_retry`, which makes the counter bug
@@ -1435,7 +1457,7 @@ def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1):
     import queue_manager
 
     q_file = tmp_path / "agent-queue.md"
-    q_file.write_text("## Queue\n- [ ] Task #tool:dev-loop\n", encoding="utf-8")
+    q_file.write_text(queue_content, encoding="utf-8")
     monkeypatch.setattr(queue_manager, "QUEUE_FILE", q_file)
 
     p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
@@ -1444,6 +1466,7 @@ def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1):
     def next_outcome(*_a, **_kw):
         return pending.pop(0)
 
+    _no_worktree_gate(monkeypatch)
     monkeypatch.setattr(orchestrator, "MAX_HANG_RETRIES", max_hang_retries)
     # Negative backoff → the retry marker lands in the past, so the next poll
     # picks the task up again instead of the test having to sleep.
@@ -1554,3 +1577,189 @@ def test_timeout_and_strict_mode_parks_preserve_the_counter_too(tmp_path, monkey
     orchestrator.run_once()
     content = q_file.read_text(encoding="utf-8")
     assert queue_manager.extract_hang_count(content) == 1, content
+
+
+# ---------------------------------------------------------------------------
+# A terminally failed task must not release its #needs: dependents
+# ---------------------------------------------------------------------------
+
+_DEP_QUEUE = (
+    "## Queue\n"
+    "- [ ] Task #id:nightfloor #tool:dev-loop\n"
+    "\n"
+    "- [ ] Shutdown #needs:nightfloor #tool:dev-loop\n"
+)
+
+
+def test_blocked_task_is_stamped_as_failed_not_as_done(tmp_path, monkeypatch):
+    """The queue has to be able to say "this went wrong".
+
+    Measured 2026-09-04 01:21: `#id:nightfloor` ended with exit_status "error" /
+    error_code "format_error_blocked" and its queue line still read
+    `- [x] … 2026-09-04 01:21 (claude+dev-loop)` — every writer stamped
+    unconditionally, so the file could not express a failure at all.
+    """
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        [_outcome("format_error"), _outcome("format_error")],
+        max_hang_retries=1,
+        queue_content=_DEP_QUEUE,
+    )
+
+    orchestrator.run_once()   # attempt 1 → requeue, dependent stays blocked
+    orchestrator.run_once()   # attempt 2 → over the cap → terminal
+
+    line = next(
+        ln for ln in q_file.read_text(encoding="utf-8").splitlines()
+        if "#id:nightfloor" in ln
+    )
+    assert line.startswith("- [x]"), "task must leave the queue: " + line
+    assert "\u274c" in line, "failure must be visible on the line: " + line
+    assert "\u2705" not in line, "a failed task must not carry the success mark: " + line
+
+
+def test_failed_task_does_not_release_its_needs_dependent(tmp_path, monkeypatch):
+    """The actual damage of that night, reproduced end to end.
+
+    `_collect_completed_ids()` matched `[x]` OR `[-]`, so the finalized-as-done
+    failure counted as satisfied: the dependent `#needs:nightfloor` shutdown task
+    was released and powered the machine off while the fix had never landed.
+    """
+    import queue_manager
+
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        # A third outcome that must never be consumed — if the dependent runs,
+        # the test says so instead of dying on an empty list.
+        [_outcome("format_error"), _outcome("format_error"), _outcome("format_error")],
+        max_hang_retries=1,
+        queue_content=_DEP_QUEUE,
+    )
+
+    orchestrator.run_once()
+    orchestrator.run_once()   # nightfloor is terminally failed from here on
+
+    items = queue_manager.read_queue_items()
+    dependent = next(t for t in items if "Shutdown" in t.task_text)
+    assert dependent.blocked_reason != "", (
+        "a failed dependency released its dependent: " + q_file.read_text(encoding="utf-8")
+    )
+    assert "nightfloor" in dependent.blocked_reason
+
+    # And run_once() must act on that: the dependent is skipped, not executed.
+    assert orchestrator.run_once() is None  # every remaining task blocked
+    assert "- [ ] Shutdown #needs:nightfloor" in q_file.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# A failed #verify: must not leave a ✅ behind (Codex P1)
+#
+# All three success paths finalize BEFORE they verify — deliberately, so a re-run
+# on the next poll cannot alarm twice. Measured 2026-09-03, reel task `njtaxr`:
+# the run reported ok while the artefact was missing. Once the queue can express a
+# failure, that ordering leaves the one "clean run, no work" signal writing ✅ —
+# and a ✅ releases every #needs: dependent.
+# ---------------------------------------------------------------------------
+
+_VERIFY_QUEUE = (
+    "## Queue\n"
+    "- [ ] Write the brief #id:brief #verify:check.ps1\n"
+    "\n"
+    "- [ ] Shut down #needs:brief\n"
+)
+
+
+def _verify_run(tmp_path, monkeypatch, *, verify_ok: bool, tool: bool):
+    import queue_manager
+
+    q_file = tmp_path / "agent-queue.md"
+    q_file.write_text(_VERIFY_QUEUE, encoding="utf-8")
+    monkeypatch.setattr(queue_manager, "QUEUE_FILE", q_file)
+
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    outcome = orchestrator.VerifyOutcome() if verify_ok else orchestrator.VerifyOutcome(
+        ok=False, note="\n\n[verify] artefact missing"
+    )
+
+    _no_worktree_gate(monkeypatch)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "dev-loop" if tool else None)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_verify_task_result", lambda *a, **kw: outcome)
+    monkeypatch.setattr(orchestrator, "_pin_verify_script", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "cleanup_done_tasks", lambda *a, **kw: 0)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    if tool:
+        monkeypatch.setattr(orchestrator, "_execute_tool_task", Mock(
+            return_value=orchestrator.ToolTaskExecutionOutcome(
+                success=True, finalized=True, verify_failed=not verify_ok,
+            ),
+        ))
+    else:
+        monkeypatch.setattr(orchestrator, "_run_with_retry", lambda *a, **kw: (
+            SimpleNamespace(
+                success=True, output="done", error=None, input_tokens=0, output_tokens=0,
+                cache_creation_input_tokens=0, cache_read_input_tokens=0, session_id=None,
+            ),
+            False,
+        ))
+    return q_file
+
+
+def test_failed_verify_restamps_the_line_and_blocks_the_dependent(tmp_path, monkeypatch):
+    import queue_manager
+
+    q_file = _verify_run(tmp_path, monkeypatch, verify_ok=False, tool=False)
+    orchestrator.run_once()
+
+    line = next(ln for ln in q_file.read_text(encoding="utf-8").splitlines()
+                if "#id:brief" in ln)
+    assert line.startswith("- [x]"), line       # still out of the queue, not requeued
+    assert "\u274c" in line and "\u2705" not in line, line
+
+    items = queue_manager.read_queue_items()
+    dependent = next(t for t in items if "Shut down" in t.task_text)
+    assert dependent.blocked_reason != "", q_file.read_text(encoding="utf-8")
+
+
+def test_passing_verify_still_stamps_success(tmp_path, monkeypatch):
+    """The restamp must not fire on the happy path."""
+    q_file = _verify_run(tmp_path, monkeypatch, verify_ok=True, tool=False)
+    orchestrator.run_once()
+
+    line = next(ln for ln in q_file.read_text(encoding="utf-8").splitlines()
+                if "#id:brief" in ln)
+    assert "\u2705" in line and "\u274c" not in line, line
+
+
+def test_every_verify_site_restamps_on_failure():
+    """Structural: all three verify call sites must be paired with a restamp.
+
+    The verify check exists at exactly three places (tool, #parallel, single-shot).
+    Fixing two of them would leave the third silently writing ✅ on a failed
+    outcome check — the defect this pairing removes.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "orchestrator.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(src)
+    calls = [
+        n.func.id for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    ]
+    assert calls.count("_verify_task_result") == 3, calls.count("_verify_task_result")
+    assert calls.count("_restamp_after_failed_verify") == 3, (
+        calls.count("_restamp_after_failed_verify")
+    )

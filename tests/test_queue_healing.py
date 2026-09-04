@@ -332,3 +332,75 @@ def test_apply_retry_dep_never_reopens_a_successful_task(monkeypatch):
     )
     ok, _ = apply_retry_dep(["task-a"])
     assert not ok
+
+
+# ---------------------------------------------------------------------------
+# /retry must not eat the task text (Codex P2)
+# ---------------------------------------------------------------------------
+
+def test_apply_retry_dep_keeps_a_description_containing_the_emoji(monkeypatch):
+    r"""The old `re.sub` cut at the FIRST ❌ and destroyed the task.
+
+    `- [x] Replace ❌ with ✅ #id:a ❌ 2026-… (claude)` collapsed to `- [ ] Replace`
+    — instruction and #id: gone, so the reopened task was unrunnable and could
+    never satisfy anything again.
+    """
+    written: dict[str, str] = {}
+    content = (
+        "## Queue\n"
+        "- [x] Replace \u274c with \u2705 in the report #id:task-a "
+        "\u274c 2026-09-04 01:21 (claude+dev-loop)\n"
+        "- [ ] B #id:task-b #needs:task-a\n"
+    )
+
+    def fake_apply(transform):
+        new = transform(content)
+        if new is None:
+            return False
+        written["out"] = new
+        return True
+
+    monkeypatch.setattr("queue_manager._apply_update", fake_apply)
+    ok, _ = apply_retry_dep(["task-a"])
+    assert ok
+    line = next(ln for ln in written["out"].splitlines() if "task-a" in ln)
+    assert line == "- [ ] Replace \u274c with \u2705 in the report #id:task-a", line
+
+
+def test_strip_failure_stamp_only_removes_the_trailing_stamp():
+    from queue_manager import strip_failure_stamp
+
+    assert strip_failure_stamp(
+        "- [x] A \u274c B #id:x \u274c 2026-09-04 01:21 (claude)"
+    ) == "- [x] A \u274c B #id:x"
+    # No stamp → untouched.
+    assert strip_failure_stamp("- [x] A \u274c B #id:x") == "- [x] A \u274c B #id:x"
+
+
+def test_unblock_actually_satisfies_the_dependency(monkeypatch):
+    """A promoted line must READ as satisfied, not merely look promoted.
+
+    Swapping only the checkbox turned `- [-] … ❌ …` (written by /drop) into
+    `- [x] … ❌ …`, which `_collect_completed_ids()` classifies as a FAILURE — so
+    `/unblock` reported success and changed nothing for the dependent.
+    """
+    import queue_manager
+
+    written: dict[str, str] = {}
+    content = (
+        "## Queue\n"
+        "- [-] A #id:task-a \u274c 2026-09-04 01:21 (drop via queue-healing)\n"
+        "- [ ] B #id:task-b #needs:task-a\n"
+    )
+
+    def fake_apply(transform):
+        new = transform(content)
+        if new is None:
+            return False
+        written["out"] = new
+        return True
+
+    monkeypatch.setattr("queue_manager._apply_update", fake_apply)
+    ok, _ = apply_unblock("task-b")
+    assert ok
+    assert "task-a" in queue_manager._collect_completed_ids(written["out"]), written["out"]

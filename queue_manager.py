@@ -1221,8 +1221,72 @@ _FAILED_STAMP_RE = re.compile(
 
 
 def line_is_failed(line_or_body: str) -> bool:
-    """True when a queue line carries the orchestrator's terminal-failure stamp."""
+    """True when a queue line carries the orchestrator's terminal-failure stamp.
+
+    ⚠️ Known, deliberate limit: this recognises a SHAPE, and a hand-ticked `[x]`
+    line whose description happens to end in `❌ YYYY-MM-DD HH:MM (text)` is
+    indistinguishable from one the orchestrator stamped. Telling them apart would
+    need a second marker in the line, which this repo has rejected before (it
+    splits the queue's only persistent state across two markers that every rewrite
+    has to keep in sync). The false positive is left standing because its direction
+    is safe: it can only withhold a dependency (blocked + visible + reported by
+    queue_healing after 24 h), never release one — and releasing one wrongly is the
+    defect this whole mechanism exists to prevent. Measured 2026-09-04 against the
+    live agent-queue.md and agent-queue-erledigt.md: zero lines of that shape.
+    """
     return bool(_FAILED_STAMP_RE.search(line_or_body.rstrip("\r\n")))
+
+
+def strip_failure_stamp(line: str) -> str:
+    """Remove ONLY the validated trailing failure stamp, never description text.
+
+    `re.sub(r"\\s*❌.*$", ...)` looks equivalent and is not: it cuts at the FIRST
+    ❌, so `- [x] Replace ❌ with ✅ #id:a ❌ 2026-09-04 01:21 (claude)` collapses to
+    `- [x] Replace` — instruction and #id: gone. Anchoring on the full stamp keeps
+    the cut at the end of the line where the orchestrator wrote it.
+    """
+    body = line.rstrip("\r\n")
+    return _FAILED_STAMP_RE.sub("", body).rstrip()
+
+
+def restamp_done_as_failed(task_text: str, *, line_no: int | None = None) -> bool:
+    """Turn an already-written `✅` stamp on a finalized task into `❌`.
+
+    The three success paths finalize the queue line BEFORE running the task's
+    `#verify:` outcome check, deliberately: re-running on the next poll would alarm
+    twice. That left the one measured "the run was clean and the work did not
+    happen" signal writing ✅ — and after the failure state exists, that ✅ releases
+    `#needs:` dependents. Flipping the mark afterwards needs no retry budget of its
+    own (the line stays `[x]`, so nothing is requeued) and keeps the original
+    ordering intact.
+
+    Returns False when there is nothing to flip — notably for `#every:` tasks,
+    which are rescheduled as `- [ ]` instead of stamped.
+    """
+    pattern = re.compile(
+        r"^- \[x\] " + re.escape(task_text)
+        + r"\s" + TASK_DONE_MARK + r" \d{4}-\d{2}-\d{2} \d{2}:\d{2} \([^)]+\)\s*$"
+    )
+    flipped = [False]
+
+    def update(content: str) -> str | None:
+        lines = content.splitlines(keepends=True)
+        matches = [i for i, ln in enumerate(lines) if pattern.match(ln.rstrip("\r\n"))]
+        if not matches:
+            return None
+        # Line numbers shift while a task runs, so prefer the recorded line and
+        # fall back to the nearest match — same rule as _replace_open_task_line.
+        preferred = (line_no - 1) if line_no is not None else matches[0]
+        idx = min(matches, key=lambda i: abs(i - preferred))
+        body = lines[idx].rstrip("\r\n")
+        newline = lines[idx][len(body):]
+        head, _, tail = body.rpartition(TASK_DONE_MARK)
+        lines[idx] = head + TASK_FAILED_MARK + tail + newline
+        flipped[0] = True
+        return "".join(lines)
+
+    _apply_update(update)
+    return flipped[0]
 
 
 def _collect_completed_ids(content: str) -> set[str]:

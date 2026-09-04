@@ -406,17 +406,21 @@ def heal_once(
 def _promote_failed_line(line: str) -> str:
     """Rewrite one failed task line into a satisfying completion.
 
-    `- [-] …` becomes `- [x] …`; a `- [x] … ❌ ts (p)` line keeps its checkbox and
-    only trades the ❌ stamp for ✅ — that stamp is what `_collect_completed_ids`
-    reads, so swapping it is exactly what "treat this dep as done" means.
+    Two things have to happen, and doing only the first was a defect: the checkbox
+    becomes `[x]`, AND a ❌ stamp is traded for ✅. `apply_drop()` writes
+    `- [-] … ❌ ts (drop via queue-healing)`, so promoting the checkbox alone
+    produced `- [x] … ❌ …` — which `_collect_completed_ids()` reads as a FAILURE.
+    `/unblock` would then have left the dependent blocked, i.e. done nothing at all.
+
+    `rpartition` is what keeps this safe on a description containing ❌: the last
+    occurrence is the stamp's, because the stamp is anchored at end of line.
     """
     from queue_manager import TASK_DONE_MARK, TASK_FAILED_MARK, line_is_failed
-    if line.startswith("- [-]"):
-        return line.replace("- [-]", "- [x]", 1)
-    if line_is_failed(line):
-        head, _, tail = line.rpartition(TASK_FAILED_MARK)
-        return head + TASK_DONE_MARK + tail
-    return line
+    promoted = line.replace("- [-]", "- [x]", 1) if line.startswith("- [-]") else line
+    if line_is_failed(promoted):
+        head, _, tail = promoted.rpartition(TASK_FAILED_MARK)
+        promoted = head + TASK_DONE_MARK + tail
+    return promoted
 
 
 def apply_unblock(task_id: str) -> tuple[bool, str]:
@@ -502,8 +506,13 @@ def apply_retry_dep(dep_ids: list[str]) -> tuple[bool, str]:
                 return line
             inner_id = extract_id_tag(m.group(1))
             if inner_id in targets:
-                # Strip trailing failure stamp like "❌ 2026-01-01 10:00 (...)"
-                stripped = re.sub(r"\s*❌\s+.*$", "", line).rstrip()
+                # Strip ONLY the validated trailing stamp. The former
+                # `re.sub(r"\s*❌\s+.*$", "", line)` cut at the FIRST ❌, so a task
+                # whose own text contains the emoji lost its instruction and its
+                # #id: — `- [x] Replace ❌ with ✅ #id:a ❌ 2026-… (claude)` became
+                # `- [ ] Replace`, and the reopened task was unrunnable.
+                from queue_manager import strip_failure_stamp
+                stripped = strip_failure_stamp(line)
                 marker = "- [-]" if stripped.startswith("- [-]") else "- [x]"
                 return stripped.replace(marker, "- [ ]", 1)
             return line

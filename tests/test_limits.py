@@ -102,17 +102,25 @@ def _reset_bg_state(monkeypatch):
 
 
 def test_get_limits_requeries_after_successful_refresh(monkeypatch):
-    """After a successful token refresh, _get_limits_fresh re-queries cclimits."""
+    """After a successful token refresh, _get_limits_fresh re-queries cclimits.
+
+    Claude is the example here (not gemini) because gemini was dropped from
+    _TOKEN_REFRESH_PROVIDERS — retired from routing, nobody authenticates the
+    CLI anymore, so the auto-refresh loop no longer touches it.
+    """
     expired = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "error", "error": "expired"},
+        "claude": {"status": "error", "error": "expired"},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     fresh = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "claude": {"status": "ok", "five_hour": {"remaining": "99%", "resets_in": "30m"}},
         "gemini": {
             "status": "ok",
-            "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}},
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
         },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
@@ -131,22 +139,28 @@ def test_get_limits_requeries_after_successful_refresh(monkeypatch):
     got = limits._get_limits_fresh()
 
     assert calls["n"] >= 2
-    assert got.gemini.available is True
-    assert got.gemini.remaining_pct == 99.0
+    assert got.claude.available is True
+    assert got.claude.remaining_pct == 99.0
 
 
 def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
-    """Re-query also happens if refresh command returns non-zero once."""
+    """Re-query also happens if refresh command returns non-zero once.
+
+    Claude is the example here (not gemini) — see comment on the test above.
+    """
     expired = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "error", "error": "expired"},
+        "claude": {"status": "error", "error": "expired"},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     fresh = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "claude": {"status": "ok", "five_hour": {"remaining": "99%", "resets_in": "30m"}},
         "gemini": {
             "status": "ok",
-            "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}},
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
         },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
@@ -165,14 +179,20 @@ def test_get_limits_requeries_even_when_refresh_returns_false(monkeypatch):
     got = limits._get_limits_fresh()
 
     assert calls["n"] >= 2
-    assert got.gemini.available is True
+    assert got.claude.available is True
 
 
 def test_refresh_failed_cooldown_skips_retry(monkeypatch):
-    """After a failed refresh, subsequent calls skip the refresh until cooldown expires."""
+    """After a failed refresh, subsequent calls skip the refresh until cooldown expires.
+
+    Claude is the example here (not gemini) — see comment on the first test above.
+    """
     expired = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "error", "error": "expired"},
+        "claude": {"status": "error", "error": "expired"},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     refresh_calls = {"n": 0}
@@ -189,7 +209,7 @@ def test_refresh_failed_cooldown_skips_retry(monkeypatch):
     # First call: refresh attempted and fails, cooldown set
     limits.get_limits(force_refresh=True)
     assert refresh_calls["n"] == 1
-    assert "gemini" in limits._refresh_failed_until
+    assert "claude" in limits._refresh_failed_until
 
     # Second call within cooldown: refresh must NOT be attempted again
     # (force_refresh bypasses the cache so _get_limits_fresh runs again)
@@ -198,11 +218,17 @@ def test_refresh_failed_cooldown_skips_retry(monkeypatch):
 
 
 def test_refresh_false_positive_sets_cooldown(monkeypatch):
-    """If _refresh_token returns True but cclimits still shows expired, set cooldown."""
-    # cclimits always reports gemini as expired (refresh was a false positive)
+    """If _refresh_token returns True but cclimits still shows expired, set cooldown.
+
+    Claude is the example here (not gemini) — see comment on the first test above.
+    """
+    # cclimits always reports claude as expired (refresh was a false positive)
     expired = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "error", "error": "expired"},
+        "claude": {"status": "error", "error": "expired"},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     refresh_calls = {"n": 0}
@@ -219,7 +245,7 @@ def test_refresh_false_positive_sets_cooldown(monkeypatch):
     # First call: refresh "succeeds" but token still expired → cooldown set
     limits.get_limits(force_refresh=True)
     assert refresh_calls["n"] == 1
-    assert "gemini" in limits._refresh_failed_until
+    assert "claude" in limits._refresh_failed_until
 
     # Second call within cooldown: refresh must NOT be attempted again
     # (force_refresh bypasses the cache so _get_limits_fresh runs again)
@@ -228,15 +254,24 @@ def test_refresh_false_positive_sets_cooldown(monkeypatch):
 
 
 def test_refresh_failed_cooldown_cleared_on_success(monkeypatch):
-    """A successful refresh clears the cooldown for that provider."""
+    """A successful refresh clears the cooldown for that provider.
+
+    Claude is the example here (not gemini) — see comment on the first test above.
+    """
     expired = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "error", "error": "expired"},
+        "claude": {"status": "error", "error": "expired"},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     fresh = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "ok", "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}}},
+        "claude": {"status": "ok", "five_hour": {"remaining": "99%", "resets_in": "30m"}},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     calls = {"cclimits": 0, "refresh": 0}
@@ -247,30 +282,36 @@ def test_refresh_failed_cooldown_cleared_on_success(monkeypatch):
 
     _reset_bg_state(monkeypatch)
     # Pre-seed a failed cooldown
-    monkeypatch.setattr(limits, "_refresh_failed_until", {"gemini": time.monotonic() - 1})
+    monkeypatch.setattr(limits, "_refresh_failed_until", {"claude": time.monotonic() - 1})
     monkeypatch.setattr(limits, "_run_cclimits", fake_cclimits)
     monkeypatch.setattr(limits, "_refresh_token", lambda p: True)  # success
     monkeypatch.setattr(limits.time, "sleep", lambda *_args, **_kwargs: None)
 
     got = limits.get_limits()
     # Cooldown was expired, so refresh ran and succeeded
-    assert "gemini" not in limits._refresh_failed_until
-    assert got.gemini.available is True
+    assert "claude" not in limits._refresh_failed_until
+    assert got.claude.available is True
 
 
 def test_post_refresh_requery_bypasses_disk_cache(monkeypatch):
     """After token refresh, re-queries must use use_cache=False to avoid reading
-    the stale 'expired' result that the first cclimits call wrote to disk."""
+    the stale 'expired' result that the first cclimits call wrote to disk.
+
+    Claude is the example here (not gemini) — see comment on the first test above.
+    """
     expired = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
-        "gemini": {"status": "error", "error": "expired"},
+        "claude": {"status": "error", "error": "expired"},
+        "gemini": {
+            "status": "ok",
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
+        },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
     fresh = {
-        "claude": {"status": "ok", "five_hour": {"remaining": "50%", "resets_in": "1h"}},
+        "claude": {"status": "ok", "five_hour": {"remaining": "99%", "resets_in": "30m"}},
         "gemini": {
             "status": "ok",
-            "models": {"gemini-2.5-pro": {"remaining": "99%", "resets_in": "30m"}},
+            "models": {"gemini-2.5-pro": {"remaining": "40%", "resets_in": "2h"}},
         },
         "codex": {"status": "ok", "primary_window": {"remaining": "40%", "resets_in": "2h"}},
     }
@@ -291,7 +332,7 @@ def test_post_refresh_requery_bypasses_disk_cache(monkeypatch):
     # First call should use cache; post-refresh re-queries must NOT use cache
     assert calls[0] is True, "initial cclimits call should use disk cache"
     assert any(c is False for c in calls[1:]), "post-refresh re-queries must bypass disk cache"
-    assert got.gemini.available is True
+    assert got.claude.available is True
 
 
 def test_force_fresh_bypasses_disk_cache(monkeypatch):

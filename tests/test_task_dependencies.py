@@ -94,8 +94,72 @@ def test_collect_ids_done():
 
 
 def test_collect_ids_failed():
+    """`[-]` is CANCELLED in Obsidian — a human decision, so it releases the slot.
+
+    Deliberate and load-bearing: `/drop` (queue_healing.apply_drop) writes exactly
+    this line to unblock downstream tasks. Do not "fix" it along with the ❌ case
+    below; the two states mean different things.
+    """
     content = "- [-] Build schema #id:db-setup\n"
     assert "db-setup" in _collect_completed_ids(content)
+
+
+# ---------------------------------------------------------------------------
+# Terminal failure ([x] + ❌) must NOT satisfy a dependency
+#
+# Measured 2026-09-04 01:21: `#id:nightfloor` ended `exit_status: error`,
+# `error_code: format_error_blocked` — and its queue line still read
+# `- [x] … ✅ 2026-09-04 01:21 (claude+dev-loop)`, because every writer stamped ✅
+# unconditionally. `_collect_completed_ids` counted it, the dependent
+# `#needs:…,nightfloor,…` shutdown task was released, and the machine powered off
+# with the fix unwritten.
+# ---------------------------------------------------------------------------
+
+def test_collect_ids_skips_orchestrator_failure_stamp():
+    content = "- [x] Fix the floor #id:nightfloor ❌ 2026-09-04 01:21 (claude+dev-loop)\n"
+    assert "nightfloor" not in _collect_completed_ids(content)
+
+
+def test_collect_ids_still_counts_success_stamp():
+    content = "- [x] Fix the floor #id:nightfloor ✅ 2026-09-04 01:21 (claude+dev-loop)\n"
+    assert "nightfloor" in _collect_completed_ids(content)
+
+
+def test_collect_ids_unstamped_done_line_still_counts():
+    """Backward compatibility: weeks of `[x]` lines carry no stamp at all
+    (hand-ticked, or moved in from before the stamp existed). They keep counting."""
+    content = "- [x] Hand-ticked task #id:manual\n"
+    assert "manual" in _collect_completed_ids(content)
+
+
+def test_collect_ids_failure_verdict_cannot_be_faked_by_description():
+    """A ❌ inside the task TEXT is not a verdict — only the full stamp shape is.
+
+    Otherwise any task whose description mentions the emoji would stop satisfying
+    its dependents, silently and for a reason nobody could see.
+    """
+    content = "- [x] Replace ❌ with ✅ in the report #id:report ✅ 2026-09-04 01:21 (claude)\n"
+    assert "report" in _collect_completed_ids(content)
+
+
+def test_collect_ids_dropped_task_keeps_releasing_downstream():
+    """`/drop` writes `[-] … ❌ …` — cancelled by a human, still satisfies."""
+    content = "- [-] Give up on this #id:dropme ❌ 2026-09-04 01:21 (drop via queue-healing)\n"
+    assert "dropme" in _collect_completed_ids(content)
+
+
+def test_needs_stays_blocked_when_dep_failed(mock_queue_file):
+    """The night of 2026-09-04, end to end at the dependency layer."""
+    mock_queue_file.write_text(
+        "## Ergebnisse\n"
+        "- [x] Fix the floor #id:nightfloor ❌ 2026-09-04 01:21 (claude+dev-loop)\n"
+        "## Queue\n"
+        "- [ ] Shut the machine down #needs:nightfloor\n",
+        encoding="utf-8",
+    )
+    items = read_queue_items()
+    assert len(items) == 1
+    assert "nightfloor" in items[0].blocked_reason
 
 
 def test_collect_ids_ignores_open():

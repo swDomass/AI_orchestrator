@@ -1190,12 +1190,51 @@ def collect_file_context(task: str, max_chars: int = 0) -> str:
 
 _DONE_OR_FAILED_RE = re.compile(r"^- \[[x\-]\] (.+)$", re.MULTILINE)
 
+# Completion stamps. The queue file is an Obsidian note rendered by the Tasks
+# plugin, and a vault-wide census on 2026-09-03 found exactly four status symbols
+# (`x`, `-`, ` `, `/`). A fifth one is not available: the Tasks plugin treats an
+# unregistered symbol as type TODO, so a failed task would reappear as OPEN in
+# every task query in the vault — the opposite of "out of the queue". A terminal
+# failure therefore keeps `- [x]` (checked off, never picked up again) and is told
+# apart from a success by its MARK: ✅ = done, ❌ = failed.
+TASK_DONE_MARK = "✅"    # ✅
+TASK_FAILED_MARK = "❌"  # ❌
+
+# The failure stamp as a whole — mark + timestamp + provider, anchored at end of
+# line. Anchoring on the full shape and not on the bare emoji is deliberate: a
+# task description may legitimately contain a ❌, and a description must never be
+# able to fake a verdict.
+_FAILED_STAMP_RE = re.compile(
+    r"\s" + TASK_FAILED_MARK + r" \d{4}-\d{2}-\d{2} \d{2}:\d{2} \([^)]+\)\s*$"
+)
+
+
+def line_is_failed(line_or_body: str) -> bool:
+    """True when a queue line carries the orchestrator's terminal-failure stamp."""
+    return bool(_FAILED_STAMP_RE.search(line_or_body.rstrip("\r\n")))
+
 
 def _collect_completed_ids(content: str) -> set[str]:
-    """Return all #id: values from done ([x]) or failed ([-]) tasks in the full file."""
+    """Return the #id: values that SATISFY a `#needs:` dependency.
+
+    Two states satisfy a dependency and one does not:
+
+    * ``- [x] … ✅ …`` — the task ran and succeeded.
+    * ``- [-] …`` — cancelled. In Obsidian that means "the user called it off",
+      and `/drop` (queue_healing.apply_drop) writes it deliberately to release the
+      downstream slot too. That stays as it is.
+    * ``- [x] … ❌ …`` — the ORCHESTRATOR gave up on the task. Nobody decided
+      anything here, so it must NOT release anything. This is the case measured on
+      2026-09-04: `#id:nightfloor` ended in `format_error_blocked`, was written to
+      the queue as done anyway, and the dependent shutdown task therefore ran and
+      powered the machine down while the fix had never landed.
+    """
     completed: set[str] = set()
     for m in _DONE_OR_FAILED_RE.finditer(content):
-        task_id = extract_id_tag(m.group(1))
+        body = m.group(1)
+        if m.group(0).startswith("- [x]") and line_is_failed(body):
+            continue
+        task_id = extract_id_tag(body)
         if task_id:
             completed.add(task_id)
     return completed
@@ -1477,13 +1516,29 @@ def _replace_open_task_line(
     return "".join(lines)
 
 
+def _completion_line(task_text: str, provider: str, *, failed: bool) -> str:
+    """Build the terminal `- [x] …` line for a task that will not run again.
+
+    `failed=False` stamps ✅ (the task did what it was asked), `failed=True`
+    stamps ❌ (the orchestrator gave up: policy denial, invalid cwd, unusable
+    tool output past the retry cap, …). Both leave the queue — see
+    `_collect_completed_ids` for why only the ✅ form satisfies `#needs:`.
+    """
+    mark = TASK_FAILED_MARK if failed else TASK_DONE_MARK
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"- [x] {task_text} {mark} {now} ({provider})"
+
+
 def _completion_replacement(task_text: str, done_replacement: str) -> str:
-    """Return the rewrite for a successfully completed task.
+    """Return the rewrite for a completed task (successful or terminally failed).
 
     Normal case: returns `done_replacement` (a `- [x] ...` line).
 
     `#every:<duration>` case: returns `- [ ] <task> <!-- retry: <next> -->`, so the
-    task stays in the queue and fires again on schedule.
+    task stays in the queue and fires again on schedule. This wins over a failure
+    verdict on purpose: a recurring task that failed today is due again at its next
+    slot, and a `#every:` line never becomes `[x]`, so it never satisfied a
+    `#needs:` dependency in the first place.
 
     Anchored (`#at:HH:MM #every:Nd`, N>=1 day): the next run is the next occurrence of
     the anchor time-of-day — NOT now+duration — so the daily slot never drifts. The
@@ -1516,18 +1571,21 @@ def mark_done(
     *,
     line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    failed: bool = False,
 ) -> bool:
-    """Mark a task as completed in the queue file.
+    """Mark a task as finished in the queue file.
+
+    `failed=True` writes the ❌ stamp instead of ✅: the task is out of the queue
+    (it will not be picked up again) but does NOT satisfy a `#needs:` dependency.
 
     For `#every:` tasks, the line is rewritten as an open task with a new retry
     annotation (= now + duration) instead of being marked `[x]`. This implements
     recurring schedules on top of the existing retry primitive — see
     `_completion_replacement`.
     """
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
     replacement = _completion_replacement(
         task_text,
-        f"- [x] {task_text} ✅ {now} ({provider})",
+        _completion_line(task_text, provider, failed=failed),
     )
 
     def update(content: str) -> str | None:
@@ -1634,17 +1692,20 @@ def finalize_task_with_result(
     *,
     line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    failed: bool = False,
 ) -> bool:
-    """Atomically mark a task done in one queue update.
+    """Atomically mark a task finished in one queue update.
     Result is stored in memory/task_results/, not in the queue file.
+
+    `failed=True` stamps the line ❌ instead of ✅ — same "out of the queue"
+    effect, but it does not satisfy `#needs:` (see `_collect_completed_ids`).
 
     For `#every:` tasks, the line is rewritten as an open task with a new retry
     annotation instead of `[x]` — see `_completion_replacement`.
     """
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
     done_replacement = _completion_replacement(
         task_text,
-        f"- [x] {task_text} ✅ {now} ({provider})",
+        _completion_line(task_text, provider, failed=failed),
     )
 
     def update(content: str) -> str | None:
@@ -1771,9 +1832,17 @@ _ERLEDIGT_FILE = QUEUE_FILE.with_name("agent-queue-erledigt.md")
 # Rate limiting: run at most once per calendar day
 _done_cleanup_last_run_date: date | None = None
 
-# Matches completed tasks with embedded timestamp: - [x] text ✅ YYYY-MM-DD HH:MM (provider)
+# Matches finished tasks with embedded timestamp:
+#   - [x] text ✅ YYYY-MM-DD HH:MM (provider)   → succeeded
+#   - [x] text ❌ YYYY-MM-DD HH:MM (provider)   → terminally failed
+#   - [-] text ❌ YYYY-MM-DD HH:MM (…)          → dropped via queue-healing
+# Failures are archived on the same 48 h clock as successes, so the live queue does
+# not silently accumulate dead lines. 48 h is longer than the gap between two
+# morning reviews, so a failure is still seen; the record itself survives in
+# agent-queue-erledigt.md and in logs/runs.jsonl.
 _DONE_TASK_TS_RE = re.compile(
-    r"^- \[[x\-]\] .+ ✅ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \([^)]+\)\s*$"
+    r"^- \[[x\-]\] .+ [" + TASK_DONE_MARK + TASK_FAILED_MARK
+    + r"] (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \([^)]+\)\s*$"
 )
 # Matches timestamp prefix in queue-events.log lines: "YYYY-MM-DD HH:MM |"
 _EVENTS_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \|")

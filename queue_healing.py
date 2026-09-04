@@ -7,8 +7,9 @@ Triggers
 
 * A task is blocked by ``#needs:`` for more than ``HEAL_BLOCK_THRESHOLD_HOURS``.
 * All other tasks have completed but this one + its dependencies are still open.
-* A ``#needs:`` target is already finalized as ``[-]`` (failed) — the dep can
-  never resolve on its own.
+* A ``#needs:`` target has already failed — either dropped as ``[-]`` or
+  finalized by the orchestrator as ``[x] … ❌ …`` — so the dep can never resolve
+  on its own.
 
 Actions (Telegram-asked)
 ------------------------
@@ -205,17 +206,33 @@ class HealCandidate:
 
 
 # These regexes are kept local — queue_manager.OPEN_TASK_RE filters retry tags
-# but we need to inspect failed ([-]) lines too.
+# but we need to inspect finished lines too.
+#
+# A task counts as FAILED in two shapes, and both have to be recognised here or
+# healing goes blind to exactly the tasks it exists for:
+#   * ``- [-] …``            — dropped by the user (`/drop`), or a legacy failure.
+#   * ``- [x] … ❌ ts (p)``  — the orchestrator gave up (see
+#     queue_manager._collect_completed_ids). Checked off so it is never picked up
+#     again, but it satisfies nothing.
 _FAILED_TASK_RE = re.compile(r"^- \[-\] (.+?)\s*$", re.MULTILINE)
 _DONE_TASK_RE = re.compile(r"^- \[x\] (.+?)\s*$", re.MULTILINE)
+_FINISHED_TASK_RE = re.compile(r"^- \[[x-]\] (.+?)\s*$", re.MULTILINE)
 _OPEN_TASK_RE = re.compile(r"^- \[ \] (.+?)(?:\s*<!--.*?-->)?\s*$", re.MULTILINE)
 
 
+def _is_failed_line(line: str) -> bool:
+    """True for both failure shapes: a `[-]` line, or a `[x]` line stamped ❌."""
+    from queue_manager import line_is_failed
+    return line.startswith("- [-]") or line_is_failed(line)
+
+
 def _find_failed_ids(queue_content: str) -> set[str]:
-    """Return the set of #id: values that appear on [-] (failed) task lines."""
+    """Return the set of #id: values on task lines that failed (either shape)."""
     from queue_manager import extract_id_tag
     ids: set[str] = set()
-    for m in _FAILED_TASK_RE.finditer(queue_content):
+    for m in _FINISHED_TASK_RE.finditer(queue_content):
+        if not _is_failed_line(m.group(0)):
+            continue
         tid = extract_id_tag(m.group(1))
         if tid:
             ids.add(tid)
@@ -223,9 +240,16 @@ def _find_failed_ids(queue_content: str) -> set[str]:
 
 
 def _find_completed_ids(queue_content: str) -> set[str]:
-    from queue_manager import extract_id_tag
+    """Return the #id: values that a dependency may treat as satisfied.
+
+    Mirrors queue_manager._collect_completed_ids: a `[x]` line stamped ❌ is a
+    failure, not a completion, and must not silence a healing proposal.
+    """
+    from queue_manager import extract_id_tag, line_is_failed
     ids: set[str] = set()
     for m in _DONE_TASK_RE.finditer(queue_content):
+        if line_is_failed(m.group(1)):
+            continue
         tid = extract_id_tag(m.group(1))
         if tid:
             ids.add(tid)
@@ -379,8 +403,24 @@ def heal_once(
 # Mutating actions — used by Telegram /unblock /drop /retry
 # ---------------------------------------------------------------------------
 
+def _promote_failed_line(line: str) -> str:
+    """Rewrite one failed task line into a satisfying completion.
+
+    `- [-] …` becomes `- [x] …`; a `- [x] … ❌ ts (p)` line keeps its checkbox and
+    only trades the ❌ stamp for ✅ — that stamp is what `_collect_completed_ids`
+    reads, so swapping it is exactly what "treat this dep as done" means.
+    """
+    from queue_manager import TASK_DONE_MARK, TASK_FAILED_MARK, line_is_failed
+    if line.startswith("- [-]"):
+        return line.replace("- [-]", "- [x]", 1)
+    if line_is_failed(line):
+        head, _, tail = line.rpartition(TASK_FAILED_MARK)
+        return head + TASK_DONE_MARK + tail
+    return line
+
+
 def apply_unblock(task_id: str) -> tuple[bool, str]:
-    """Mark each failed dep of the task as completed (-> [x]). Idempotent."""
+    """Mark each failed dep of the task as completed (-> [x] ✅). Idempotent."""
     from queue_manager import _apply_update, extract_id_tag, extract_needs_tags
 
     def transform(content: str) -> str | None:
@@ -399,15 +439,17 @@ def apply_unblock(task_id: str) -> tuple[bool, str]:
         for dep_id in target_needs:
             if dep_id not in failed_ids_in_content:
                 continue
-            # Promote any [-] task with this id to [x]
+            # Promote any failed task with this id (either shape) to a completion
             def _promote(m_inner: re.Match[str], dep=dep_id) -> str:
                 line = m_inner.group(0)
+                if not _is_failed_line(line):
+                    return line
                 inner_id = extract_id_tag(m_inner.group(1))
                 if inner_id == dep:
-                    return line.replace("- [-]", "- [x]", 1)
+                    return _promote_failed_line(line)
                 return line
 
-            new = _FAILED_TASK_RE.sub(_promote, new)
+            new = _FINISHED_TASK_RE.sub(_promote, new)
             changed = True
         return new if changed else None
 
@@ -454,14 +496,19 @@ def apply_retry_dep(dep_ids: list[str]) -> tuple[bool, str]:
         changed = False
         def _reset(m: re.Match[str]) -> str:
             line = m.group(0)
+            # Only failed lines are resettable — a successful `[x]` must never be
+            # reopened by a /retry that names it.
+            if not _is_failed_line(line):
+                return line
             inner_id = extract_id_tag(m.group(1))
             if inner_id in targets:
                 # Strip trailing failure stamp like "❌ 2026-01-01 10:00 (...)"
                 stripped = re.sub(r"\s*❌\s+.*$", "", line).rstrip()
-                return stripped.replace("- [-]", "- [ ]", 1)
+                marker = "- [-]" if stripped.startswith("- [-]") else "- [x]"
+                return stripped.replace(marker, "- [ ]", 1)
             return line
 
-        new = _FAILED_TASK_RE.sub(_reset, new)
+        new = _FINISHED_TASK_RE.sub(_reset, new)
         changed = new != content
         return new if changed else None
 

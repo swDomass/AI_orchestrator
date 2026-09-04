@@ -597,9 +597,17 @@ def _mark_done_checked(
     *,
     queue_line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    failed: bool = False,
 ) -> bool:
-    """Mark task done and return False if queue mutation failed."""
-    if mark_done(task, provider, line_no=queue_line_no, subtasks=subtasks):
+    """Mark task finished and return False if queue mutation failed.
+
+    `failed=True` stamps the queue line ❌ instead of ✅. Both take the task out of
+    the queue; only ✅ satisfies a `#needs:` dependency. Pass it wherever the task
+    did NOT do what it was asked — otherwise a downstream task is released on a
+    failure (measured 2026-09-04: a blocked dev-loop task released the shutdown
+    task, which powered the machine down with the fix unwritten).
+    """
+    if mark_done(task, provider, line_no=queue_line_no, subtasks=subtasks, failed=failed):
         return True
     msg = "Queue-Update fehlgeschlagen: Task konnte nicht als erledigt markiert werden"
     print(f"  ❌ {msg}")
@@ -843,9 +851,16 @@ def _finalize_task_with_result_checked(
     *,
     queue_line_no: int | None = None,
     subtasks: tuple[str, ...] | None = None,
+    failed: bool = False,
 ) -> bool:
-    """Atomically persist result + done status and return False on queue mutation failure."""
-    if finalize_task_with_result(task, result, provider, line_no=queue_line_no, subtasks=subtasks):
+    """Atomically persist result + finished status; False on queue mutation failure.
+
+    `failed=True` writes the ❌ stamp — same "gone from the queue" effect as ✅, but
+    it does not satisfy `#needs:` (see `queue_manager._collect_completed_ids`).
+    """
+    if finalize_task_with_result(
+        task, result, provider, line_no=queue_line_no, subtasks=subtasks, failed=failed,
+    ):
         return True
     msg = "Queue-Update fehlgeschlagen: Ergebnis+Status konnten nicht atomar persistiert werden"
     print(f"  ❌ {msg}")
@@ -934,7 +949,10 @@ def _execute_tool_task(
         if not skip_queue:
             append_log(f"Unbekanntes Tool: {tool_name}")
             notify_error(task, provider.name if provider else "unknown", msg)
-            finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no, subtasks=subtasks)
+            finalized = _mark_done_checked(
+                task, "failed", queue_line_no=queue_line_no,
+                subtasks=subtasks, failed=True,
+            )
         else:
             finalized = False
         return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
@@ -949,7 +967,10 @@ def _execute_tool_task(
             if not skip_queue:
                 append_log(msg)
                 notify_error(task, provider.name, msg)
-                finalized = _mark_done_checked(task, "failed", queue_line_no=queue_line_no, subtasks=subtasks)
+                finalized = _mark_done_checked(
+                task, "failed", queue_line_no=queue_line_no,
+                subtasks=subtasks, failed=True,
+            )
             else:
                 finalized = False
             return ToolTaskExecutionOutcome(success=False, finalized=finalized, error=msg)
@@ -1063,6 +1084,7 @@ def _execute_tool_task(
                 provider_tool,
                 queue_line_no=queue_line_no,
                 subtasks=subtasks,
+                failed=True,
             ):
                 return ToolTaskExecutionOutcome(
                     success=False,
@@ -1244,7 +1266,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if not dry_run:
                 append_log(msg)
                 notify_error(task, "profile", msg)
-                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                if not _mark_done_checked(
+                    task, "profile-denied", queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=True,
+                ):
                     _span.error("profile_denied")
                     _span.emit()
                     return False
@@ -1259,7 +1284,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if not dry_run:
                 append_log(msg)
                 notify_error(task, "profile", msg)
-                if not _mark_done_checked(task, "profile-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                if not _mark_done_checked(
+                    task, "profile-denied", queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=True,
+                ):
                     _span.error("profile_denied")
                     _span.emit()
                     return False
@@ -1274,7 +1302,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 continue
             append_log(msg)
             notify_error(task, "queue", msg)
-            if not _mark_done_checked(task, "invalid-cwd", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+            if not _mark_done_checked(
+                task, "invalid-cwd", queue_line_no=queue_task.line_no,
+                subtasks=task_subtasks, failed=True,
+            ):
                 _span.error("cwd_invalid")
                 _span.emit()
                 return False
@@ -1356,7 +1387,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  ❌ {msg}")
                 append_log(msg)
                 notify_error(task, "policy", msg)
-                if not _mark_done_checked(task, "policy-denied", queue_line_no=queue_task.line_no, subtasks=task_subtasks):
+                if not _mark_done_checked(
+                    task, "policy-denied", queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=True,
+                ):
                     _span.error("policy_denied")
                     _span.emit()
                     return False
@@ -1435,7 +1469,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 status_str = "✅" if success_all else "⚠️"
                 print(f"  {status_str} Parallel abgeschlossen ({len(results)} Subtasks)")
                 if not _finalize_task_with_result_checked(
-                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no, subtasks=task_subtasks
+                    task, aggregated, provider_tag, queue_line_no=queue_task.line_no,
+                    subtasks=task_subtasks, failed=not success_all,
                 ):
                     _span.error("queue_update_failed")
                     _span.emit()
@@ -1518,6 +1553,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _finalize_task_with_result_checked(
                             task, msg, violation[0],
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                            failed=True,
                         )
                         _span.error("provider_not_allowed", retry_count=tool_retry_count)
                         break
@@ -1537,6 +1573,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _finalize_task_with_result_checked(
                             task, msg, "policy",
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                            failed=True,
                         )
                         _span.error("no_provider_allowed", retry_count=tool_retry_count)
                         break
@@ -1647,6 +1684,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, outcome.output or msg, f"{provider.name}+{tool_name}",
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("tool_runtime_exceeded", retry_count=tool_retry_count)
                     break
@@ -1708,6 +1746,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _finalize_task_with_result_checked(
                             task, msg, f"{provider.name}+{tool_name}",
                             queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                            failed=True,
                         )
                         _span.error(f"{outcome.error_code}_blocked", retry_count=tool_retry_count)
                         break
@@ -1814,6 +1853,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, msg, violation[0],
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("provider_not_allowed", retry_count=single_shot_retry_count)
                     break
@@ -1831,6 +1871,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, msg, "policy",
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("no_provider_allowed", retry_count=single_shot_retry_count)
                     break
@@ -1985,6 +2026,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _finalize_task_with_result_checked(
                         task, msg, provider.name,
                         queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                        failed=True,
                     )
                     _span.error("hang_blocked", retry_count=single_shot_retry_count)
                     break

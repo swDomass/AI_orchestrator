@@ -945,6 +945,7 @@ def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monk
         "codex+test-loop",
         line_no=42,
         subtasks=None,
+        failed=False,
     )
 
 
@@ -1019,7 +1020,9 @@ def test_run_once_stops_when_atomic_queue_finalization_fails(monkeypatch):
     result = orchestrator.run_once()
 
     assert result is False
-    finalize_task.assert_called_once_with("Task A", "ok", "codex", line_no=7, subtasks=None)
+    finalize_task.assert_called_once_with(
+        "Task A", "ok", "codex", line_no=7, subtasks=None, failed=False,
+    )
 
 
 def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
@@ -1048,6 +1051,7 @@ def test_run_once_aborts_task_when_cwd_tag_is_invalid(monkeypatch):
         "invalid-cwd",
         line_no=9,
         subtasks=None,
+        failed=True,
     )
     notify_error.assert_called_once()
     select_provider.assert_not_called()
@@ -1424,7 +1428,8 @@ def test_requeue_message_shows_the_joint_attempt_budget(monkeypatch):
 # The counter has to SURVIVE the parks that say nothing about the task
 # ---------------------------------------------------------------------------
 
-def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1):
+def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1,
+                    queue_content="## Queue\n- [ ] Task #tool:dev-loop\n"):
     """Drive run_once() over a REAL queue file, one outcome per call.
 
     Every neighbouring test mocks `mark_retry`, which makes the counter bug
@@ -1435,7 +1440,7 @@ def _real_queue_run(tmp_path, monkeypatch, outcomes, *, max_hang_retries=1):
     import queue_manager
 
     q_file = tmp_path / "agent-queue.md"
-    q_file.write_text("## Queue\n- [ ] Task #tool:dev-loop\n", encoding="utf-8")
+    q_file.write_text(queue_content, encoding="utf-8")
     monkeypatch.setattr(queue_manager, "QUEUE_FILE", q_file)
 
     p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
@@ -1554,3 +1559,75 @@ def test_timeout_and_strict_mode_parks_preserve_the_counter_too(tmp_path, monkey
     orchestrator.run_once()
     content = q_file.read_text(encoding="utf-8")
     assert queue_manager.extract_hang_count(content) == 1, content
+
+
+# ---------------------------------------------------------------------------
+# A terminally failed task must not release its #needs: dependents
+# ---------------------------------------------------------------------------
+
+_DEP_QUEUE = (
+    "## Queue\n"
+    "- [ ] Task #id:nightfloor #tool:dev-loop\n"
+    "\n"
+    "- [ ] Shutdown #needs:nightfloor #tool:dev-loop\n"
+)
+
+
+def test_blocked_task_is_stamped_as_failed_not_as_done(tmp_path, monkeypatch):
+    """The queue has to be able to say "this went wrong".
+
+    Measured 2026-09-04 01:21: `#id:nightfloor` ended with exit_status "error" /
+    error_code "format_error_blocked" and its queue line still read
+    `- [x] … 2026-09-04 01:21 (claude+dev-loop)` — every writer stamped
+    unconditionally, so the file could not express a failure at all.
+    """
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        [_outcome("format_error"), _outcome("format_error")],
+        max_hang_retries=1,
+        queue_content=_DEP_QUEUE,
+    )
+
+    orchestrator.run_once()   # attempt 1 → requeue, dependent stays blocked
+    orchestrator.run_once()   # attempt 2 → over the cap → terminal
+
+    line = next(
+        ln for ln in q_file.read_text(encoding="utf-8").splitlines()
+        if "#id:nightfloor" in ln
+    )
+    assert line.startswith("- [x]"), "task must leave the queue: " + line
+    assert "\u274c" in line, "failure must be visible on the line: " + line
+    assert "\u2705" not in line, "a failed task must not carry the success mark: " + line
+
+
+def test_failed_task_does_not_release_its_needs_dependent(tmp_path, monkeypatch):
+    """The actual damage of that night, reproduced end to end.
+
+    `_collect_completed_ids()` matched `[x]` OR `[-]`, so the finalized-as-done
+    failure counted as satisfied: the dependent `#needs:nightfloor` shutdown task
+    was released and powered the machine off while the fix had never landed.
+    """
+    import queue_manager
+
+    q_file = _real_queue_run(
+        tmp_path, monkeypatch,
+        # A third outcome that must never be consumed — if the dependent runs,
+        # the test says so instead of dying on an empty list.
+        [_outcome("format_error"), _outcome("format_error"), _outcome("format_error")],
+        max_hang_retries=1,
+        queue_content=_DEP_QUEUE,
+    )
+
+    orchestrator.run_once()
+    orchestrator.run_once()   # nightfloor is terminally failed from here on
+
+    items = queue_manager.read_queue_items()
+    dependent = next(t for t in items if "Shutdown" in t.task_text)
+    assert dependent.blocked_reason != "", (
+        "a failed dependency released its dependent: " + q_file.read_text(encoding="utf-8")
+    )
+    assert "nightfloor" in dependent.blocked_reason
+
+    # And run_once() must act on that: the dependent is skipped, not executed.
+    assert orchestrator.run_once() is None  # every remaining task blocked
+    assert "- [ ] Shutdown #needs:nightfloor" in q_file.read_text(encoding="utf-8")

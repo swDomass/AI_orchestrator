@@ -309,10 +309,36 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 - [ ] Deploy to staging #needs:build,tests cwd:D:\projects\app
 ```
 
-- A task with `#needs:` stays **blocked** until all named IDs appear as `[x]` (done) or `[-]` (failed).
+- A task with `#needs:` stays **blocked** until all named IDs appear as `[x] … ✅ …` (done) or `[-]` (cancelled).
 - Blocked tasks are **not removed** from the queue — they stay open and are re-checked each cycle.
 - The queue header shows `(N runnable, M blocked)` when blocked tasks are present.
-- `[-]` (failed) tasks also unblock dependents — the downstream task decides how to handle failure.
+- `[-]` (cancelled) tasks **do** unblock dependents. That is a human decision — either you ticked it off in Obsidian, or you sent `/drop` — and the downstream task decides how to handle it.
+- A task the orchestrator **gave up on** does not. It is written as `- [x] <task> ❌ <ts> (<provider>)`: checked off so it is never picked up again, stamped ❌ so it satisfies nothing. See [Terminal failures](#terminal-failures--x--) below.
+
+### Terminal failures (`- [x] … ❌ …`)
+
+When a task ends without doing what it was asked — retry cap for hang/format breaks
+reached, `tool_providers` policy denial, invalid `cwd:`, unknown tool, tool runtime
+budget exhausted, a `#parallel` run with a failed subtask — the queue line is stamped:
+
+```md
+- [x] Fix the version floor #id:nightfloor ❌ 2026-09-04 01:21 (claude+dev-loop)
+```
+
+- **Out of the queue.** `[x]` means the parser never picks it up again, so a task at
+  its retry cap cannot burn a full runtime every following night.
+- **Satisfies nothing.** `#needs:` is only released by ✅ or by `[-]`.
+- **Obsidian-safe.** The Tasks plugin knows four status symbols in this vault
+  (`x`, `-`, ` `, `/`) and treats an unregistered one as *TODO* — a fifth symbol
+  would make failed tasks reappear as open in every task query. The mark carries
+  the verdict instead of the checkbox.
+- **Visible.** ❌ against ✅ is the one thing you see when skimming the file.
+- Archived to `agent-queue-erledigt.md` on the same 48 h clock as a success, and
+  recorded in `logs/runs.jsonl` with its `error_code`.
+- Recurring (`#every:`) tasks are the exception: they are rescheduled rather than
+  stamped, exactly as before — a failure today does not cancel tomorrow's slot.
+- `/unblock <id>` (Telegram) promotes such a line to ✅, `/retry <id>` reopens it as
+  `- [ ]`.
 
 ### Schedules (`#at:` / `#every:`)
 

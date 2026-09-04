@@ -54,7 +54,22 @@ Extracted via `getattr(queue_task, "subtasks", None)` at loop start for test-moc
 
 ### Task dependencies (`#id:`/`#needs:`)
 
-`#id:name` tags a task with a unique ID. `#needs:name1,name2` blocks a task until all named deps appear as `[x]` or `[-]` in the file. `_collect_completed_ids()` scans the full file for done/failed tasks. Two-pass in `read_queue_items()` — short-circuit if no `#needs:` present. Blocked tasks keep `QueueTask.blocked_reason != ""` and are skipped by `run_once()` (no `mark_done` → stays in queue for next cycle). Queue header shows `(N ausführbar, M blockiert)` when any tasks are blocked.
+`#id:name` tags a task with a unique ID. `#needs:name1,name2` blocks a task until all named deps are **satisfied**: `[x] … ✅ …` (succeeded) or `[-]` (cancelled by a human — either ticked off in Obsidian or dropped via `/drop`, which exists to release the downstream slot). `_collect_completed_ids()` scans the full file for them. Two-pass in `read_queue_items()` — short-circuit if no `#needs:` present. Blocked tasks keep `QueueTask.blocked_reason != ""` and are skipped by `run_once()` (no `mark_done` → stays in queue for next cycle). Queue header shows `(N ausführbar, M blockiert)` when any tasks are blocked.
+
+### Terminal failure state (`- [x] … ❌ …`)
+
+The queue had no way to say "this went wrong": `mark_done()` and `finalize_task_with_result()` both wrote `- [x] <task> ✅ <ts> (<provider>)` unconditionally, and no writer anywhere in the repo produced any other terminal shape. Measured 2026-09-04 01:21: `#id:nightfloor` ended `exit_status: "error"`, `error_code: "format_error_blocked"` (`logs/runs.jsonl`) and its line read `✅ 2026-09-04 01:21 (claude+dev-loop)`. `_collect_completed_ids()` matched `[x]` **or** `[-]`, so the failure counted as satisfied, the dependent `#needs:…,nightfloor,…` shutdown task was released, and the machine powered off with the fix unwritten.
+
+A terminal failure now stamps **❌ instead of ✅** on an otherwise unchanged `- [x]` line. Four constraints pick that shape, and each rules out an alternative:
+
+* **It must not be picked up again.** `OPEN_TASK_RE` only matches `- [ ]`, so the checkbox has to stay `[x]`. Leaving the line open would re-burn the full runtime every following night — the retry cap had just been reached.
+* **It must not satisfy `#needs:`.** `_collect_completed_ids()` skips a `[x]` line carrying the failure stamp. `[-]` deliberately keeps satisfying: in Obsidian that symbol means *cancelled*, and `queue_healing.apply_drop()` writes it precisely to unblock downstream tasks.
+* **It must not disturb Obsidian.** The queue file is a vault note rendered by the Tasks plugin. A vault-wide census (2026-09-03) found exactly four status symbols (`x`, `-`, ` `, `/`), and the plugin classifies an unregistered symbol as type **TODO** — a `- [!]` would have made every failed task reappear as *open* in every task query in the vault. So the verdict rides on the mark, not on the checkbox.
+* **A human must see it while skimming.** ❌ against ✅ in the same column is the whole point.
+
+`queue_manager.line_is_failed()` is the single reader of that shape. It anchors on the **complete stamp** (` ❌ YYYY-MM-DD HH:MM (provider)` at end of line), not on the bare emoji, so a task whose description merely contains ❌ cannot fake a verdict. `_DONE_TASK_TS_RE` accepts both marks, so failures are archived to `agent-queue-erledigt.md` on the same 48 h clock instead of piling up in the live queue. `#every:` tasks are unaffected — `_completion_replacement()` reschedules them instead of stamping, and a recurring line never becomes `[x]`, so it never satisfied a dependency anyway.
+
+`queue_healing.py` is the only other component that reads task status. `_find_failed_ids()` recognises both failure shapes (so a failed dep still produces an `/unblock`/`/retry` proposal), `_find_completed_ids()` excludes the ❌ stamp (so a failure cannot silence the proposal), `apply_unblock()` promotes ❌ → ✅ on the same line, and `apply_retry_dep()` reopens it as `- [ ]` while refusing to reopen a *successful* task.
 
 ### Schedule tags (`#at:`/`#every:`)
 

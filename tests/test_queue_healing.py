@@ -252,3 +252,83 @@ def test_was_recently_notified_respects_cooldown():
     assert qh._was_recently_notified("task-b", "unblock_or_retry") is True
     assert qh._was_recently_notified("task-b", "drop") is False
     assert qh._was_recently_notified("other", "unblock_or_retry") is False
+
+
+# ---------------------------------------------------------------------------
+# The orchestrator's terminal-failure shape: `- [x] … ❌ ts (provider)`
+#
+# Healing exists for exactly this situation — a dependency that can never resolve
+# on its own. It read `[-]` only, so the new shape would have been invisible to it
+# and, worse, `_find_completed_ids` would have counted the failure as a completion.
+# ---------------------------------------------------------------------------
+
+_FAILED_DONE_LINE = "- [x] A #id:task-a \u274c 2026-09-04 01:21 (claude+dev-loop)\n"
+
+
+def test_detect_sees_orchestrator_failure_as_a_failed_dep():
+    items = [
+        _FakeQueueItem("Run B #id:task-b #needs:task-a", blocked_reason="needs task-a"),
+    ]
+    content = "## Queue\n" + _FAILED_DONE_LINE + "- [ ] Run B #id:task-b #needs:task-a\n"
+    cands = detect_candidates(items, content)
+    assert len(cands) == 1
+    assert cands[0].failed_deps == ("task-a",)
+
+
+def test_find_completed_ids_excludes_the_failure_stamp():
+    assert qh._find_completed_ids(_FAILED_DONE_LINE) == set()
+    assert qh._find_completed_ids(
+        "- [x] A #id:task-a \u2705 2026-09-04 01:21 (claude)\n"
+    ) == {"task-a"}
+
+
+def test_apply_unblock_promotes_an_orchestrator_failure(monkeypatch):
+    written: dict[str, str] = {}
+    content = "## Queue\n" + _FAILED_DONE_LINE + "- [ ] B #id:task-b #needs:task-a\n"
+
+    def fake_apply(transform):
+        new = transform(content)
+        if new is None:
+            return False
+        written["out"] = new
+        return True
+
+    monkeypatch.setattr("queue_manager._apply_update", fake_apply)
+    ok, _ = apply_unblock("task-b")
+    assert ok
+    # Same checkbox, success stamp — that is what "treat the dep as done" means.
+    assert "- [x] A #id:task-a \u2705 2026-09-04 01:21 (claude+dev-loop)" in written["out"]
+    assert "\u274c" not in written["out"]
+
+
+def test_apply_retry_dep_reopens_an_orchestrator_failure(monkeypatch):
+    written: dict[str, str] = {}
+    content = "## Queue\n" + _FAILED_DONE_LINE + "- [ ] B #id:task-b #needs:task-a\n"
+
+    def fake_apply(transform):
+        new = transform(content)
+        if new is None:
+            return False
+        written["out"] = new
+        return True
+
+    monkeypatch.setattr("queue_manager._apply_update", fake_apply)
+    ok, _ = apply_retry_dep(["task-a"])
+    assert ok
+    assert "- [ ] A #id:task-a" in written["out"]
+    assert "\u274c" not in written["out"]
+
+
+def test_apply_retry_dep_never_reopens_a_successful_task(monkeypatch):
+    """/retry names an id, not a status — a succeeded task must stay done."""
+    content = (
+        "## Queue\n"
+        "- [x] A #id:task-a \u2705 2026-09-04 01:21 (claude)\n"
+        "- [ ] B #id:task-b #needs:task-a\n"
+    )
+    monkeypatch.setattr(
+        "queue_manager._apply_update",
+        lambda transform: transform(content) is not None,
+    )
+    ok, _ = apply_retry_dep(["task-a"])
+    assert not ok

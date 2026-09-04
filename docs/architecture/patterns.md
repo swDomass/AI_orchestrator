@@ -56,6 +56,26 @@ Extracted via `getattr(queue_task, "subtasks", None)` at loop start for test-moc
 
 `#id:name` tags a task with a unique ID. `#needs:name1,name2` blocks a task until all named deps are **satisfied**: `[x] … ✅ …` (succeeded) or `[-]` (cancelled by a human — either ticked off in Obsidian or dropped via `/drop`, which exists to release the downstream slot). `_collect_completed_ids()` scans the full file for them. Two-pass in `read_queue_items()` — short-circuit if no `#needs:` present. Blocked tasks keep `QueueTask.blocked_reason != ""` and are skipped by `run_once()` (no `mark_done` → stays in queue for next cycle). Queue header shows `(N ausführbar, M blockiert)` when any tasks are blocked.
 
+### Clean-worktree gate (`BaseTool.requires_clean_worktree`)
+
+`#tool:dev-loop` does not start unless its `cwd:` is a git repository with a clean working tree. On a violation the task is never started: it is finalized terminally with `error_code="worktree_dirty"` (own taxonomy category `CAT_WORKTREE`) and the ❌ stamp, so it neither retries forever nor releases a `#needs:` dependent.
+
+Measured 2026-09-03/04: `nightstash` ran 22:02–22:45 and left the repo on its own branch `night/stash-pruning`. Over two hours later `nightfloor` started in the same repo, and its Quality reviewer refused the output format — "Task und Working Tree passen nicht zusammen … Branch: night/stash-pruning ← nicht night/version-floor" — which tipped the run into `format_error`; three attempts later the retry budget was gone. The runs did not overlap, so this is a missing reset between *sequential* tasks, not a race. Every task order carried "start with `git switch -c night/xyz master`, abort on an unclean tree", but that lived in the PROMPT: a fail-open guard nothing enforced.
+
+**Scope is a property of the tool, not of the queue line.** `BaseTool.requires_clean_worktree` is False by default and True on `DevLoopTool`. Three reasons for keying it there rather than to a new opt-in tag:
+
+* The queue is hand-written. A rule you must remember for every new task is weaker than one that is right on its own, and `#tool:dev-loop` is already written for its own reasons.
+* dev-loop is precisely the tool that *produces* the diff its own reviewers judge, so a foreign working tree is not noise but a corrupted object under review. `review-loop` *consumes* an existing diff and is deliberately NOT gated — a clean tree there would be the opposite of what the tool is for. "Every writing tool" would therefore be the wrong rule.
+* Legitimate tasks in permanently dirty repos keep working untouched: `nightlovelace` ran plain (no `#tool:` tag) in `haus`, explicitly ordered not to commit or write anything, and never reaches the gate.
+
+`#allow-dirty` is the opt-out for a repo that always carries uncommitted work, so the escape hatch needs no code change. `#parallel` parents are exempt (their subtasks carry their own cwds, and the `#worktree` path already runs `_is_clean_git_repo` per CWD group). A task without `cwd:` is not checked and says so in the log.
+
+**Terminal, not parked** — nothing cleans the tree on its own, so parking would re-check the same dirty tree on every poll, unattended and silent. **No automatic reset or branch switch**: a reset can destroy work from another session, while refusing to start makes the same mistake just as visible and costs nothing.
+
+**Known limit, measured rather than assumed.** The gate catches a dirty tree, not a foreign branch. Of the three failed `nightfloor` attempts that night, the tree was actually dirty at exactly one (00:11 — proven by the `git stash create` snapshot the orchestrator takes before each task, which produces a commit only for a dirty tree; no snapshot exists for the 23:49 and 01:05 attempts). At the other two the tree was clean and only the branch was foreign. A branch check is not implementable generically: the orchestrator has no way to know which branch a task expects, since that appears only in the prompt text. The current branch is therefore named in the block message, so the human sees the state the repo was left in.
+
+The check itself reuses `parallel_runner._is_clean_git_repo()` — one implementation for both the worktree path and this gate.
+
 ### Terminal failure state (`- [x] … ❌ …`)
 
 The queue had no way to say "this went wrong": `mark_done()` and `finalize_task_with_result()` both wrote `- [x] <task> ✅ <ts> (<provider>)` unconditionally, and no writer anywhere in the repo produced any other terminal shape. Measured 2026-09-04 01:21: `#id:nightfloor` ended `exit_status: "error"`, `error_code: "format_error_blocked"` (`logs/runs.jsonl`) and its line read `✅ 2026-09-04 01:21 (claude+dev-loop)`. `_collect_completed_ids()` matched `[x]` **or** `[-]`, so the failure counted as satisfied, the dependent `#needs:…,nightfloor,…` shutdown task was released, and the machine powered off with the fix unwritten.

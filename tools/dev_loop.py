@@ -253,6 +253,12 @@ class DevLoopTool(BaseTool):
         "Research → Execute → Dual-Review Loop "
         "(Code Quality + Issue Resolution) bis beide Reviews grünes Licht geben"
     )
+    # Execute writes the diff, Quality + Resolution review exactly that diff.
+    # Foreign uncommitted changes make the reviewers judge someone else's work —
+    # measured 2026-09-04, where the Quality reviewer refused its output format
+    # over a working tree left behind by the previous task, which tipped the run
+    # into format_error and burned the whole retry budget.
+    requires_clean_worktree = True
 
     def _get_plan_approval_mode(self) -> str:
         """Check policy.yaml for plan approval mode: auto | approve | skip."""

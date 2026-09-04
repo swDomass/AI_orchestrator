@@ -72,13 +72,20 @@ CAT_STDIN = "stdin_incomplete"
 # and the WORK did not happen. Lumping it into tool_internal_error would hide exactly
 # the class of silent failure the check exists to surface.
 CAT_VERIFY = "verify_failed"
+# A precondition of the ENVIRONMENT was not met, so the task never started: a tool
+# that produces the diff its own reviewers judge (dev-loop) was pointed at a repo
+# with uncommitted changes. Its own category on purpose — it is not a bad `cwd:`
+# tag (that is cwd_invalid, a mistake in the queue line) but a repo left in the
+# wrong state, usually by the PREVIOUS task, and telling the two apart is the whole
+# point of looking at the statistic.
+CAT_WORKTREE = "worktree_dirty"
 CAT_UNKNOWN = "unknown"
 
 ALL_CATEGORIES: tuple[str, ...] = (
     CAT_RATE_LIMIT, CAT_TIMEOUT, CAT_HANG, CAT_RUNTIME, CAT_AUTH,
     CAT_UNREACHABLE, CAT_REFUSAL, CAT_TOOL_INTERNAL, CAT_CWD, CAT_POLICY,
     CAT_PROFILE, CAT_APPROVAL, CAT_CAPACITY, CAT_DEP, CAT_TEST, CAT_QUEUE,
-    CAT_PAUSED, CAT_STDIN, CAT_VERIFY, CAT_UNKNOWN,
+    CAT_PAUSED, CAT_STDIN, CAT_VERIFY, CAT_WORKTREE, CAT_UNKNOWN,
 )
 
 # error_code → category. The orchestrator emits these codes (see _RunSpan in
@@ -123,6 +130,10 @@ _ERROR_CODE_MAP: dict[str, str] = {
     "gh_unavailable":         CAT_UNREACHABLE,
     "cwd_invalid":            CAT_CWD,
     "invalid_cwd":            CAT_CWD,
+    # The cwd is fine, the repo in it is not: a tool with
+    # requires_clean_worktree (dev-loop) was blocked before starting because the
+    # working tree carried uncommitted changes.
+    "worktree_dirty":         CAT_WORKTREE,
     "policy_denied":          CAT_POLICY,
     # A #provider tag the tool_providers policy bars — terminal, and deliberately
     # NOT rerouted to another provider.

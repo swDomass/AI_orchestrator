@@ -575,6 +575,17 @@ class BaseTool(ABC):
     description: str = ""
     read_only: bool = False
 
+    # The tool PRODUCES the working-tree diff that its own reviewers then judge,
+    # so it must start from a clean tree — leftover changes from an earlier task
+    # are not noise, they corrupt the object under review. The orchestrator refuses
+    # to start such a task in a dirty repo (error_code "worktree_dirty"); a task
+    # line can waive it with `#allow-dirty`.
+    #
+    # Deliberately False for review-loop and friends: review-loop CONSUMES an
+    # existing diff, so demanding a clean tree there would be the opposite of what
+    # the tool is for.
+    requires_clean_worktree: bool = False
+
     def _runtime_deadline(self) -> float:
         """Monotonic wall-clock deadline for the whole tool run.
 

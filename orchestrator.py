@@ -98,6 +98,7 @@ from queue_manager import (
     extract_hang_count,
     extract_verify_tag,
     finalize_task_with_result,
+    has_allow_dirty_tag,
     has_cwd_tag,
     has_verify_tag,
     mark_done,
@@ -207,6 +208,74 @@ def _is_git_repo(cwd: str) -> bool:
         return result.returncode == 0 and result.stdout.strip() == "true"
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _current_branch(cwd: str) -> str:
+    """Best-effort branch name for the error message ("detached" / "?" on failure)."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "?"
+
+
+def _worktree_gate_violation(task: str, tool_name: str | None, cwd: str | None) -> str | None:
+    """Return a message when a task must NOT start because its repo is not clean.
+
+    Scope is a property of the TOOL, not of the queue line: a tool sets
+    `requires_clean_worktree` when it produces the working-tree diff that its own
+    reviewers subsequently judge. Today that is `dev-loop` alone. Keying it to the
+    tool means a hand-written queue line is right by default — there is no extra tag
+    to remember — while `review-loop`, which CONSUMES an existing diff, is
+    deliberately not covered, and plain tasks in permanently dirty repos (`haus`,
+    where a task may be explicitly told not to write) keep running as before.
+
+    `#allow-dirty` waives it for the rare legitimate case, so the escape hatch does
+    not require a code change at 03:00.
+
+    No automatic reset or branch switch: a reset can destroy work that belongs to
+    somebody else's session, and refusing to start makes the same mistake just as
+    visible. What is NOT covered is a clean tree left on a foreign BRANCH — the
+    orchestrator has no way to know which branch a task expects, that lives only in
+    the prompt text.
+
+    A task with no `cwd:` is not checked (there is no repo to check); that is logged
+    rather than silently skipped.
+    """
+    if not tool_name:
+        return None
+    tool = get_tool(tool_name)
+    if tool is None or not getattr(tool, "requires_clean_worktree", False):
+        return None
+    if has_allow_dirty_tag(task):
+        print(f"  [worktree] #allow-dirty → Sauberkeits-Check für {tool_name} übersprungen")
+        return None
+    if not cwd:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Tool %s verlangt einen sauberen Arbeitsbaum, aber der Task hat kein cwd: — "
+            "Check übersprungen", tool_name,
+        )
+        print(f"  [worktree] {tool_name} ohne cwd: — Sauberkeits-Check nicht möglich")
+        return None
+
+    from parallel_runner import _is_clean_git_repo
+    ok, reason = _is_clean_git_repo(Path(cwd))
+    if ok:
+        return None
+    return (
+        f"Arbeitsbaum-Check fehlgeschlagen für '{tool_name}': {reason} "
+        f"(cwd: {cwd}, Branch: {_current_branch(cwd)}). "
+        f"{tool_name} erzeugt den Diff, über den seine eigenen Reviewer urteilen — "
+        f"fremde Änderungen im Baum verfälschen den Prüfgegenstand. Task nicht gestartet. "
+        f"Aufräumen (committen/verwerfen) und Task wieder öffnen, oder #allow-dirty setzen, "
+        f"wenn dieses Repo dauerhaft ungebundene Änderungen trägt."
+    )
 
 
 def _git_snapshot(cwd: str, is_git: bool | None = None) -> str | None:
@@ -1445,6 +1514,45 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             pass
         except Exception as e:
             _log.warning("policy check failed: %s", e)
+
+        # --- Clean-worktree precondition (2026-09-04) ---
+        # The last gate before anything runs. A tool that produces the diff its own
+        # reviewers judge (dev-loop) must not start on top of another task's leftover
+        # working tree: measured 2026-09-04, `nightstash` finished at 22:45 and left
+        # the repo on its branch, and the next dev-loop task in the same repo had its
+        # Quality reviewer refuse the output format ("Task und Working Tree passen
+        # nicht zusammen"), which tipped the run into format_error and burned the whole
+        # retry budget. The task orders all said "abort on an unclean tree", but that
+        # lived in the PROMPT — a fail-open guard nothing enforced.
+        #
+        # Terminal, not parked: nothing cleans the tree on its own, so a park would
+        # re-check the same dirty tree forever, unattended and silent. The ❌ stamp
+        # keeps it from releasing `#needs:` dependents.
+        # `#parallel` parents are exempt: the parent's own `#tool:` tag is not what
+        # runs (the subtasks are), each subtask carries its own cwd, and the
+        # `#worktree` path already runs `_is_clean_git_repo` per CWD group in
+        # parallel_runner. Gating here would turn a per-group precheck into a
+        # whole-task block for repos this task may never touch.
+        gate_msg = (
+            None if getattr(queue_task, "subtasks", None)
+            else _worktree_gate_violation(task, tool_name, cwd)
+        )
+        if gate_msg:
+            print(f"  🚫 {gate_msg}")
+            if dry_run:
+                continue
+            append_log(gate_msg)
+            notify_error(task, tool_name or "queue", gate_msg)
+            if not _finalize_task_with_result_checked(
+                task, gate_msg, tool_name or "queue",
+                queue_line_no=queue_task.line_no, subtasks=task_subtasks, failed=True,
+            ):
+                _span.error("queue_update_failed")
+                _span.emit()
+                return False
+            _span.error("worktree_dirty")
+            _span.emit()
+            continue
 
         # --- Feature 7: Parallel sub-agent spawning ---
         if getattr(queue_task, "subtasks", None):

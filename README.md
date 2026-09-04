@@ -253,6 +253,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Timeout (hard backstop, not aggressive deadline; for tools an upper cap) | `#timeout:<n>[s\|m\|h]` | `#timeout:30s`, `#timeout:15m`, `#timeout:1h` |
 | Execution profile | `#agent:<name>` | `#agent:work` |
 | Parallel task | `#parallel` | Parent task with indented subtasks |
+| Waive the clean-worktree gate | `#allow-dirty` | `- [ ] Fix it #tool:dev-loop #allow-dirty cwd:D:\repo` |
 | Task ID | `#id:<name>` | `- [ ] Build backend #id:build` |
 | Task dependency | `#needs:<id1,id2>` | `- [ ] Test #needs:build` |
 | One-time schedule | `#at:<timestamp>` | `- [ ] Review #at:2026-05-17T22:00` |
@@ -314,6 +315,33 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 - The queue header shows `(N runnable, M blocked)` when blocked tasks are present.
 - `[-]` (cancelled) tasks **do** unblock dependents. That is a human decision — either you ticked it off in Obsidian, or you sent `/drop` — and the downstream task decides how to handle it.
 - A task the orchestrator **gave up on** does not. It is written as `- [x] <task> ❌ <ts> (<provider>)`: checked off so it is never picked up again, stamped ❌ so it satisfies nothing. See [Terminal failures](#terminal-failures--x--) below.
+
+### Clean-worktree gate (`#tool:dev-loop`)
+
+A `#tool:dev-loop` task does not start unless its `cwd:` is a git repository with a
+clean working tree. On a violation the task is **not started at all** and is
+finalized as a terminal failure with `error_code="worktree_dirty"`.
+
+Why dev-loop specifically: it *produces* the diff that its own Quality and
+Resolution reviewers then judge. Uncommitted changes from an earlier task are not
+noise there, they corrupt the object under review. `#tool:review-loop` is
+deliberately **not** gated — it *consumes* an existing diff, so requiring a clean
+tree would be the opposite of what it is for.
+
+The scope is a property of the tool class (`BaseTool.requires_clean_worktree`), not
+of the queue line, so a hand-written task is right by default with no extra tag to
+remember. Plain tasks (no `#tool:`) in permanently dirty repos are unaffected.
+
+- **`#allow-dirty`** waives the check for a repo that legitimately always carries
+  uncommitted work.
+- A task without `cwd:` is not checked (there is no repo to check) — logged, not
+  silently skipped.
+- There is **no** automatic branch switch or reset: a reset can destroy work from
+  another session, and refusing to start makes the same mistake just as visible.
+- Terminal rather than parked: nothing cleans the tree on its own, so a park would
+  re-check the same dirty tree every poll, forever and unattended.
+- **Not covered:** a *clean* tree left on a foreign branch. The orchestrator cannot
+  know which branch a task expects — that lives only in the prompt text.
 
 ### Terminal failures (`- [x] … ❌ …`)
 

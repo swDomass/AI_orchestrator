@@ -280,6 +280,24 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 
 ### Known Limitations
 
+**A git snapshot restores tracked files only, and old ones are pruned.** Before every
+non-read-only task in a git repo the orchestrator writes a rollback point to
+`refs/orchestrator-backup/<timestamp>` (never to `refs/stash` — that list stays
+yours). Restore with `git stash apply refs/orchestrator-backup/<timestamp>`; the ref
+name is printed and logged on creation, because `git stash list` does not show it.
+Two limits: `git stash create` does **not** capture untracked files, so a snapshot
+rolls back modifications to tracked files only; and each new snapshot prunes the
+namespace by `age >= 14 d AND (age > 30 d OR outside the newest 50)`. The 14-day
+window is a veto over both caps — night tasks do not commit, so a young snapshot is
+the only undo for work still waiting in the working tree — which means the count cap
+can be starved in a high-churn repo. Nothing outside `refs/orchestrator-backup/` is
+ever touched, so moving a ref elsewhere keeps it forever. Age is the commit date, not
+the date the ref appeared: a ref moved into the namespace by hand keeps the *old*
+commit's age and can therefore be pruned on the very first run. Every deletion is
+logged with ref name and sha (recoverable with `git stash apply <sha>` until `git gc`);
+deleting more than one ref in a single pass is logged at `WARNING`, because routine
+ageing retires at most one at a time.
+
 **`select_provider()` is still fail-open for a bare `#vibe`/`#openrouter` tag when the policy is missing.** The fail-closed rule described above lives in `policy_allows_provider()` / `dispatcher._allows()`. The *forced-provider* path in `select_provider()` was not converted in the same pass, so a task carrying a bare `#vibe` or `#openrouter` tag can still reach that provider if `policy.yaml` is absent or unreadable. Deliberately left open — closing it means reworking roughly ten routing tests — but it is the one hole left in the pay-per-token ceiling, and it matters exactly in the scenario the ceiling was built for (a synced `policy.yaml` that failed to arrive before an unattended run).
 
 **An unregistered value in `#pass1:`/`#pass2:` is dropped without a word.** Since 2026-09-02 the regex accepts `vibe` and `openrouter` alongside `claude`/`gemini`/`codex`, but anything else — a typo, a provider that was never registered — fails twice over: `extract_pass_providers()` drops the pass silently, and `strip_metadata_tags()` does not recognise the tag either, so it survives into the prompt as literal text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. The queue linter has no check for it.
@@ -760,6 +778,9 @@ The calibrated factors are plan- and workload-specific (env-overridable, not uni
 - Protection against changes outside `cwd` (unless explicitly requested)
 - `cwd:` validation against `ALLOWED_CWD_ROOTS` (when set)
 - File-change snapshot + change summary after each task
+- Non-destructive git rollback point before each task, written to
+  `refs/orchestrator-backup/<timestamp>` (not to your `git stash` list) and capped
+  by age/count. Restore: `git stash apply refs/orchestrator-backup/<timestamp>`
 
 ## Prompt Budget (Token Allocation)
 

@@ -123,6 +123,7 @@ plan (2026-05-18).
 | 48 | External second opinion in `review-loop` (`#second_opinion:`), Gemini retired as reviewer | DONE |
 | 49 | Mistral Vibe provider — second non-Claude voice, reviewer-only | DONE |
 | 50 | Unattended `#tool:` reactivation — git-state freeze, provider ceiling, uniform error classification, effective safety hook | **Built, not yet proven** — see below |
+| 51 | Snapshots into an own ref namespace (`refs/orchestrator-backup/`) + retention cap | DONE |
 
 ### #50 — Unattended `#tool:` reactivation (2026-08-15)
 
@@ -154,6 +155,61 @@ four findings, all fixed, one (git aliases) refuted at the system level and
 deliberately not built. **Codex could not run**: usage limit exhausted, free again
 2026-08-20. So this diff has seen *one* external voice, not the usual two. It is
 not "externally reviewed" in the sense the rest of this repo means it.
+
+### #51 — Snapshot namespace + retention (2026-09-03)
+
+`_git_snapshot()` ran before every non-read-only task in a git repo and wrote
+its `git stash create` commit to `refs/stash` via `git stash store`. Two defects
+in one line: it wrote into **the user's own workspace** (a `git stash pop` after
+a nightly run pops an orchestrator snapshot, not your work), and **nothing ever
+removed the entries** — a repo-wide search for `stash drop`/`clear`/`pop` outside
+`tests/` returned nothing. Measured 2026-09-03: 11 entries had piled up and were
+hand-archived to `refs/orchestrator-backup/<timestamp>`.
+
+The snapshot now goes to `refs/orchestrator-backup/<timestamp>` via
+`git update-ref`; `refs/stash` is never written. Creation uses an empty
+`oldvalue` (create-only), so two snapshots in the same second in one repo cannot
+overwrite each other — the second retries with a `_2` suffix.
+
+**Why not "delete on task success".** The night tasks deliberately do not commit;
+the changes sit in the working tree until the morning review. The snapshot is
+therefore the *only* undo for them, and deleting it on success would destroy the
+one artefact the feature exists to produce. Retention has to outlive a review
+cycle, which makes the policy a **veto** structure rather than an LRU:
+
+| Constant | Value | Reasoning |
+|---|---|---|
+| `GIT_SNAPSHOT_PROTECT_DAYS` | 14 | Veto over both caps. Covers a missed weekend plus a week away. Matches `ORCH_SESSION_RETENTION_DAYS`. |
+| `GIT_SNAPSHOT_MAX_AGE_DAYS` | 30 | Age cap; the repo's existing retention convention (`MEMORY_DAILY_LOG_RETENTION_DAYS`, `QUEUE_EVENTS_LOG_RETENTION_DAYS`, `replay.py`). |
+| `GIT_SNAPSHOT_MAX_COUNT` | 50 | Count cap, newest-first. Far above the measured 11-in-6-months rate; bounds a high-frequency repo rather than pruning routinely. |
+
+Deletion rule: `age >= 14 d AND (age > 30 d OR outside the newest 50)`. In a
+high-churn repo the veto can starve the count cap — deliberate; the undo
+guarantee outranks tidiness, and the comment at `_prune_snapshot_refs` says so.
+Pruning is scoped to `refs/orchestrator-backup/` (prefix re-checked per ref
+before each delete) and to the repo the task runs in, and never raises.
+
+The ref name and the restore command go to **both** stdout and the file log:
+`git stash list` no longer shows the snapshot, so the ref name is the only way
+to find it — and `run_orchestrator.ps1` starts `--watch` without stdout
+redirection, where a `print` alone would be lost in exactly the unattended run
+that needs it.
+
+⚠️ **First run in this repo will prune the 11 hand-archived March refs.** They
+are ~180 days old, so the age cap takes them on the next snapshot here. Each
+deletion is logged with ref name *and* sha (recoverable via `git stash apply
+<sha>` until `git gc` runs). To keep any of them, move them out of
+`refs/orchestrator-backup/` first.
+
+Ageing runs on `committerdate`, i.e. on the age of the *content*, not on when a
+ref entered the namespace — the ref *names* carry the same March timestamps, so
+name-based ageing would not help either. That is the general case behind the 11
+refs: anything imported into the namespace from an older mechanism reads as
+ancient on its first prune. Because a *routine* prune retires at most one ref
+(snapshots accrue one per dirty run and cross the cap one at a time), deleting
+**more than one ref in a single pass** is logged at `WARNING` — with all names
+and shas, and the hint to move keepers out of the namespace — instead of
+disappearing into the `INFO` housekeeping stream of an unattended 03:00 run.
 
 ---
 

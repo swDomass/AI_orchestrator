@@ -320,6 +320,32 @@ TRACK_FILE_CHANGES = True
 # Safety: auto-stash in git repos before task execution
 GIT_AUTO_STASH = True
 
+# Safety: snapshots live in their OWN ref namespace, never in refs/stash.
+# refs/stash is the user's workspace -- writing there means a user `git stash pop`
+# after a nightly run pops an orchestrator snapshot instead of their own work.
+GIT_SNAPSHOT_REF_PREFIX = "refs/orchestrator-backup/"
+# Bounded retries when two snapshots collide on the same second in one repo.
+GIT_SNAPSHOT_REF_MAX_ATTEMPTS = 4
+
+# --- Snapshot retention -----------------------------------------------------
+# The binding constraint: night tasks deliberately do NOT commit, so this snapshot
+# is the ONLY undo for the changes waiting in the working tree for the morning
+# review. Deleting on task success would therefore destroy the one artefact the
+# feature exists to provide. Retention must outlive at least one review cycle,
+# which makes the policy a VETO structure rather than a plain LRU.
+#
+# Veto over BOTH caps below: nothing younger than this is ever pruned, no matter
+# how many snapshots exist. 14 days covers a missed weekend plus a week away.
+# Matches ORCH_SESSION_RETENTION_DAYS, the repo's other "user still needs it" window.
+GIT_SNAPSHOT_PROTECT_DAYS = 14
+# Age cap. 30 days is this repo's existing retention convention
+# (MEMORY_DAILY_LOG_RETENTION_DAYS, QUEUE_EVENTS_LOG_RETENTION_DAYS, replay.py rotation).
+GIT_SNAPSHOT_MAX_AGE_DAYS = 30
+# Count cap, newest-first. Far above the measured rate (11 snapshots in ~6 months),
+# so it only ever bites in a high-frequency repo -- it bounds growth, it is not the
+# routine pruner. The protect window can starve it; see _prune_snapshot_refs.
+GIT_SNAPSHOT_MAX_COUNT = 50
+
 # System prompts per provider (prepended to each task)
 _BASE_PROMPT = "Antworte auf Deutsch, praegnant und strukturiert."
 SYSTEM_PROMPTS: dict[str, str] = {

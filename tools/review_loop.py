@@ -123,8 +123,25 @@ Output format (strict):
 # VOLATILE suffix (iteration-specific findings + lessons hint). Anthropic
 # prompt cache matches the longest identical prefix → keeping the stable
 # part in front maximises cross-iteration cache hits.
+#
+# The original task text lives in the STABLE half, not VOLATILE, even though
+# it varies between *runs*: within a single run it is invariant across every
+# iteration (iteration 1 and iteration 5 fix the same task), so placing it
+# here extends the cacheable prefix — same reasoning as `system_prompt`
+# already being prepended in front of it. Putting it in VOLATILE instead would
+# buy nothing: VOLATILE's first line is `Iteration: {iteration}`, which
+# differs every call, so the cache match already breaks there regardless of
+# what follows it. Cross-run cache breaks either way (different task, like
+# `system_prompt` already varying with memory_context/provider) — not a new
+# cost, just an existing one this split never promised to solve.
+# The scope-guard bullet below ("Fix ONLY issues ... related to the original
+# task") used to have no task text anywhere in the prompt to check itself
+# against — with CLAUDE_SESSION_ENABLED off by default, the fixer has no other
+# channel to it — so the guard pointed at nothing.
 _FIX_PROMPT_STABLE = """
 You are fixing issues found by a code review.
+
+ORIGINAL TASK: {task}
 
 Task:
 - Fix ALL issues listed below. Only blocking findings (P1, P2) are listed —
@@ -148,8 +165,18 @@ Review findings (must all be addressed):
 # cannot navigate the codebase itself. The git diff is pre-loaded and injected.
 # The model is told what the primary reviewer already found so it can focus on
 # what was missed, not duplicate work.
+#
+# Also carries the original task: without it, this voice sees only "here's a
+# diff, here's what reviewer A found" — an independent perspective that can
+# only ever extend reviewer A's frame, never notice that the diff drifted past
+# the task in the first place (the one class of bug duplicating the primary
+# reviewer's blind spot cannot catch). No system_prompt prefix here (unlike
+# the fix prompt) — not requested and this call is a single stateless
+# review, not part of the cached review→fix cycle.
 _SECOND_OPINION_PROMPT = """\
 You are providing a SECOND OPINION on a code review.
+
+ORIGINAL TASK: {task}
 
 A primary reviewer has already reviewed the uncommitted changes below and
 listed their findings. Your job: identify ADDITIONAL P1/P2/P3 issues the
@@ -579,6 +606,7 @@ class ReviewLoopTool(BaseTool):
                             f"{':' + so_model_id if so_model_id else ''}) ==="
                         )
                         so_prompt = _SECOND_OPINION_PROMPT.format(
+                            task=task,
                             diff=diff_text,
                             primary_findings=(
                                 "\n".join(findings) if findings else "(none)"
@@ -815,7 +843,7 @@ class ReviewLoopTool(BaseTool):
             # Stable prefix (cached) + volatile suffix (iteration-specific).
             fix_prompt = (
                 f"{system_prompt}\n\n"
-                + _FIX_PROMPT_STABLE
+                + _FIX_PROMPT_STABLE.format(task=task)
                 + _FIX_PROMPT_VOLATILE.format(
                     iteration=iteration,
                     drift_warning=drift_warning,

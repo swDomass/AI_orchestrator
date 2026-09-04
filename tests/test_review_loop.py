@@ -401,6 +401,39 @@ def test_second_opinion_adds_findings_to_fix_prompt(monkeypatch, tmp_path):
     assert so_provider._forced_model is None
 
 
+def test_second_opinion_prompt_includes_original_task_text(monkeypatch, tmp_path):
+    """The second opinion otherwise sees only the diff + the primary reviewer's
+    findings — it needs the task text to judge scope drift on its own instead
+    of just extending the primary reviewer's frame. Asserts against the
+    generated prompt string, not the `_SECOND_OPINION_PROMPT` template.
+    """
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+    monkeypatch.setattr(
+        "tools.review_loop._load_git_diff", lambda _cwd, _max: "fake diff"
+    )
+
+    primary = _ScriptedProvider(outputs=[
+        "No P1/P2/P3 findings.",  # review iter 1
+        "VERIFIED",               # verification
+    ])
+    so_provider = _ScriptedProvider(outputs=["No P1/P2/P3 findings."], name="openrouter")
+    tool = ReviewLoopTool()
+
+    result = tool.run(
+        "Migrate the billing module to async I/O", primary, cwd=str(tmp_path),
+        second_opinion=(so_provider, "or_glm"),
+    )
+
+    assert result.success is True
+    assert len(so_provider.prompts) == 1
+    assert "Migrate the billing module to async I/O" in so_provider.prompts[0]
+
+
 def test_second_opinion_p3_only_does_not_reopen_the_loop(monkeypatch, tmp_path):
     """Interaction of the two features: a second opinion that finds ONLY P3 sets
     `no_findings = False`, but must not restart the fix loop — the success gate is
@@ -690,6 +723,41 @@ def test_scope_guard_present_in_stable_fix_prompt():
     """Scope-guard bullet must be in the stable (cached) prefix, not volatile."""
     assert "off-topic" in _FIX_PROMPT_STABLE.lower()
     assert "do not refactor unrelated" in _FIX_PROMPT_STABLE.lower()
+
+
+def test_fix_prompt_includes_original_task_text(monkeypatch, tmp_path):
+    """The fix prompt's scope-guard ("Fix ONLY issues ... related to the original
+    task") has nothing to check itself against unless the task text is actually
+    in the prompt. Asserts against the generated prompt string, not the
+    `_FIX_PROMPT_STABLE` template — pinning the template (as
+    test_scope_guard_present_in_stable_fix_prompt does) would not have caught a
+    missing `.format(task=...)` call at the call site.
+    """
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _sec: None)
+    monkeypatch.setattr(
+        "tools.review_loop.is_cached_provider_available", lambda _name: True
+    )
+
+    provider = _ScriptedProvider(
+        outputs=[
+            "- [P2] real problem",       # review iter 1
+            "Fixed the P2",              # fix iter 1
+            "No P1/P2/P3 findings.",     # review iter 2 — clean
+            "VERIFIED",                  # verification
+            "Pattern: x\nTool-Hint: y",  # summarizer (iterations > 1)
+        ]
+    )
+    tool = ReviewLoopTool()
+
+    result = tool.run(
+        "Migrate the billing module to async I/O", provider, cwd=str(tmp_path)
+    )
+
+    assert result.success is True
+    fix_prompt = provider.prompts[1]
+    assert "Migrate the billing module to async I/O" in fix_prompt
 
 
 def test_drift_check_failure_does_not_abort_loop(monkeypatch, tmp_path):

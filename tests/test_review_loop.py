@@ -26,6 +26,60 @@ def test_no_findings_sentinel_accepts_found_suffix_and_or_separator():
     assert _is_no_findings_output("No P1, P2 or P3 findings found.") is True
 
 
+# ── Tolerance fixes (measured 2026-09-03/04, nightfloor dev-loop failures) ─────
+
+def test_no_findings_sentinel_accepts_missing_p3_suffix_with_colon_tail():
+    # Real reviewer output: only non-blocking P3 remarks remained, worded in
+    # prose rather than as `- [P3] ...` bullets, so it wrote "No P1/P2
+    # findings: ..." instead of the exact "No P1/P2/P3 findings." sentinel.
+    # P3 alone never blocks, so this must still count as clean.
+    from tools.review_loop import _is_clean_output, _parse_findings
+
+    text = (
+        "No P1/P2 findings: the two remaining items are stylistic.\n"
+        "1. Consider renaming `foo` for clarity, but this is optional.\n"
+        "2. The docstring could mention the return type, though it is not required."
+    )
+    assert _is_no_findings_output(text) is True
+    # The prose P3 items aren't bulleted, so they don't parse as findings —
+    # which is fine, since P3 never blocks either way.
+    findings = _parse_findings(text)
+    assert _is_clean_output(text, findings) is True
+
+
+def test_no_findings_sentinel_accepts_leading_bullet_and_italic_wrap():
+    assert _is_no_findings_output("- No P1/P2/P3 findings.") is True
+    assert _is_no_findings_output("*No P1/P2/P3 findings*") is True
+
+
+def test_no_findings_sentinel_still_rejects_self_contradicting_single_line():
+    # Guardrail for the colon-tail relaxation above: a line that opens with
+    # the sentinel but is immediately followed by an unmarked continuation
+    # (no colon) must still fail — this is what keeps a genuinely malformed
+    # line out, rather than the relaxation swallowing everything after
+    # "findings".
+    assert _is_no_findings_output("No P1/P2/P3 findings and everything is great") is False
+
+
+def test_no_findings_sentinel_rejects_deliberate_format_refusal():
+    # The THIRD nightfloor failure that same night was a correct rejection,
+    # not a parser defect (see the matching dev_loop test for the resolution
+    # side): the reviewer refused to review at all and explicitly reported no
+    # findings in the required format. This text must stay non-clean.
+    from tools.review_loop import _is_clean_output, _parse_findings
+
+    text = (
+        "Task und Working Tree passen nicht zusammen: der Auftrag bezieht sich "
+        "auf night/version-floor, der aktuelle Branch ist aber night/stash-pruning. "
+        "Ich habe nichts veraendert und keine Findings im geforderten Format "
+        "ausgegeben."
+    )
+    assert _is_no_findings_output(text) is False
+    findings = _parse_findings(text)
+    assert findings == []
+    assert _is_clean_output(text, findings) is False
+
+
 class _ScriptedProvider:
     name = "codex"
 

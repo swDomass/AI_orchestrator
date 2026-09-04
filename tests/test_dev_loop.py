@@ -63,6 +63,57 @@ def test_parse_resolution_earliest_match_wins():
     assert _parse_resolution("UNRESOLVED: nothing changed\nRESOLVED: nope") == "UNRESOLVED"
 
 
+# ── Tolerance fixes (measured 2026-09-03/04, nightfloor dev-loop failures) ─────
+
+def test_parse_resolution_accepts_markdown_bold_wrap():
+    # Real reviewer output that broke the plain "^\s*UNRESOLVED\s*:" anchor:
+    # the leading "**" isn't whitespace, so the keyword no longer sat right
+    # after line start.
+    assert _parse_resolution("**UNRESOLVED: Nothing was implemented.**") == "UNRESOLVED"
+
+def test_parse_resolution_accepts_markdown_italic_and_backtick_wrap():
+    assert _parse_resolution("*RESOLVED*: done") == "RESOLVED"
+    assert _parse_resolution("`PARTIAL`: half done") == "PARTIAL"
+
+def test_parse_resolution_accepts_leading_bullet_marker():
+    assert _parse_resolution("- RESOLVED: everything works") == "RESOLVED"
+    assert _parse_resolution("1. UNRESOLVED: nothing changed") == "UNRESOLVED"
+
+def test_parse_resolution_tolerates_prose_preamble_on_earlier_lines():
+    # The keyword line itself still has to start clean (after optional
+    # bullet/markdown wrap) — but explanatory paragraphs before it, on their
+    # own lines, must not stop the verdict from being found.
+    text = (
+        "I reviewed the diff carefully and re-read the changed files.\n\n"
+        "Overall, the implementation partially addresses the task but misses "
+        "edge cases.\n\n"
+        "**UNRESOLVED: Nothing was implemented.**"
+    )
+    assert _parse_resolution(text) == "UNRESOLVED"
+
+def test_parse_resolution_word_boundary_prevents_partially_false_positive():
+    # "Partially" must not be read as the verdict keyword "PARTIAL" — the
+    # `\b` after the keyword is what tells them apart (without it, this
+    # returned "PARTIAL" instead of "UNKNOWN").
+    assert _parse_resolution("Partially, the fix looks reasonable.") == "UNKNOWN"
+
+def test_parse_resolution_still_unknown_for_deliberate_format_refusal():
+    # The THIRD nightfloor failure that same night was a correct rejection,
+    # not a parser defect: the reviewer refused to review at all because the
+    # working tree didn't match the task, and explicitly said it produced no
+    # findings in the required format. Tolerating markdown/bullets/preambles
+    # must not turn this into a false RESOLVED/PARTIAL/UNRESOLVED — there is
+    # no verdict keyword anywhere in it, and none of the new tolerance must
+    # invent one.
+    text = (
+        "Task und Working Tree passen nicht zusammen: der Auftrag bezieht sich "
+        "auf night/version-floor, der aktuelle Branch ist aber night/stash-pruning. "
+        "Ich habe nichts veraendert und keine Findings im geforderten Format "
+        "ausgegeben."
+    )
+    assert _parse_resolution(text) == "UNKNOWN"
+
+
 # ── Happy path ───────────────────────────────────────────────────────────────
 
 def test_dev_loop_succeeds_in_one_iteration(monkeypatch, tmp_path):

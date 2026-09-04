@@ -62,10 +62,12 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 ## Requirements
 
 - Python `3.12+` — matches `ruff`/`mypy` `target-version`/`python_version` in
-  `pyproject.toml`, and is empirically verified: `import limits` succeeds on
-  3.12, 3.13, and 3.14 (fixed 2026-09-04, was a `NameError` on 3.10–3.13 before
-  a forward-reference annotation got quoted). 3.10/3.11 are not available on
-  the machine that verified this and are therefore not claimed as supported.
+  `pyproject.toml` and is now a real machine-readable key there
+  (`requires-python = ">=3.12"`, 2026-09-04, was a comment before). The floor is
+  empirically verified: `import limits` succeeds on 3.12, 3.13, and 3.14 (fixed
+  2026-09-04, was a `NameError` on 3.10–3.13 before a forward-reference
+  annotation got quoted). 3.10/3.11 are not available on the machine that
+  verified this and are therefore not claimed as supported.
 - `cclimits` CLI (`npm install -g cclimits`)
 - Provider CLIs in `PATH`: `claude`, `codex`
 - Valid authentication in each CLI (OAuth / subscription login)

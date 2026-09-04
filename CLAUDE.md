@@ -45,19 +45,23 @@ ruff check .            # 1351 findings as of 2026-09-02 (ruff 0.16.1)
 python -m mypy .        # 131 errors in 36 files (mypy 2.3.1, lenient config)
 ```
 
-**Linting & Typing** — `pyproject.toml` carries `[tool.ruff]` + `[tool.mypy]` and
-deliberately **no** `[project]`/`[build-system]` table (flat script collection, not an
-installable package); `pytest.ini` keeps precedence for pytest. Ruleset is borrowed
-from the sister repos `eeg_analysis` (layout + lenient mypy) and `pyrolyse-1d-model`
-(rule selection), minus `NPY` and minus the `N8xx` block that exists there only for an
-SI-suffix convention this repo does not have — deviations are commented inline.
-Baseline, defect triage and work order → [`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md).
+**Linting & Typing** — `pyproject.toml` carries `[project]` (2026-09-04, `requires-python`
+only — real key now, was a comment before) + `[tool.ruff]` + `[tool.mypy]`, deliberately
+**no** `[build-system]` table: AI_orchestrator is a flat script collection, not an
+installable package, and `pip install .` already fails today regardless (setuptools'
+auto-discovery refuses the flat multi-module layout — measured, unaffected by the
+`[project]` table either way); `pytest.ini` keeps precedence for pytest. Ruleset is
+borrowed from the sister repos `eeg_analysis` (layout + lenient mypy) and
+`pyrolyse-1d-model` (rule selection), minus `NPY` and minus the `N8xx` block that exists
+there only for an SI-suffix convention this repo does not have — deviations are
+commented inline. Baseline, defect triage and work order →
+[`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md).
 **Fixed 2026-09-04:** `limits.py:85` used to annotate `ProviderLimits` in a module-level
 annotation before the class definition — a `NameError` on Python ≤3.13 that took down
 the whole app on import, masked only by PEP 649 on 3.14. The annotation is now quoted
 (same style as three other forward references already in the file); import verified
-clean on 3.12/3.13/3.14. Verified floor is `3.12+` (matches `pyproject.toml`'s
-`target-version`/`python_version`, documented in `README.md` Requirements).
+clean on 3.12/3.13/3.14. The `requires-python = ">=3.12"` key above is therefore
+empirically met, not aspirational (documented in `README.md` Requirements).
 
 ## Architecture
 

@@ -82,7 +82,7 @@ _paused     = threading.Event()  # set while orchestrator is paused → bg threa
 # itself is rate-limited and real capacity data is unavailable.
 _429_estimate_lock = threading.Lock()
 # Maps provider name -> (ProviderLimits snapshot, time.monotonic() when taken)
-_429_snapshots: dict[str, tuple[ProviderLimits, float]] = {}
+_429_snapshots: "dict[str, tuple[ProviderLimits, float]]" = {}
 # Maps provider name -> window name -> estimated percentage consumed.
 _429_estimated_usage: dict[str, dict[str, float]] = {}
 _429_notified: set[str] = set()

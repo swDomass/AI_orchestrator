@@ -56,6 +56,16 @@ Extracted via `getattr(queue_task, "subtasks", None)` at loop start for test-moc
 
 `#id:name` tags a task with a unique ID. `#needs:name1,name2` blocks a task until all named deps are **satisfied**: `[x] … ✅ …` (succeeded) or `[-]` (cancelled by a human — either ticked off in Obsidian or dropped via `/drop`, which exists to release the downstream slot). `_collect_completed_ids()` scans the full file for them. Two-pass in `read_queue_items()` — short-circuit if no `#needs:` present. Blocked tasks keep `QueueTask.blocked_reason != ""` and are skipped by `run_once()` (no `mark_done` → stays in queue for next cycle). Queue header shows `(N ausführbar, M blockiert)` when any tasks are blocked.
 
+### `#verify:` decides the final mark, not just the alarm
+
+The three success paths finalize the queue line BEFORE running the task's `#verify:` outcome check, deliberately: a re-run on the next poll would alarm twice. Once the queue can express a failure, that ordering leaves a hole — `#verify:` is the one signal that says "the run was formally clean and the work did not happen" (measured 2026-09-03, reel task `njtaxr`: `exit_status ok`, artefact missing), and a `✅` on such a line releases every `#needs:` dependent. That is the same failure mode the terminal-failure state was built to remove, arriving through a different door.
+
+`queue_manager.restamp_done_as_failed()` flips the already-written `✅` to `❌` when the check fails, and `orchestrator._restamp_after_failed_verify()` is paired with all three `_verify_task_result()` call sites (tool, `#parallel` with `success_all`, single-shot). This needs **no retry budget of its own** — the objection that kept the hole open in the first round. The line stays `[x]`, so nothing is requeued and the finalize-then-verify ordering is untouched; only the mark changes. A `#every:` task has no stamp to flip (it was rescheduled as `- [ ]`), which is the expected no-op.
+
+`tests/test_orchestrator_tool_tasks.py::test_every_verify_site_restamps_on_failure` asserts the pairing structurally (3 verify sites, 3 restamps), because fixing two of three would leave the third silently stamping `✅` on a failed check.
+
+**The "16 terminal paths" claim is now proven rather than asserted.** `test_every_finalization_states_its_verdict_explicitly` parses `orchestrator.py` and requires every call to `_finalize_task_with_result_checked` / `_mark_done_checked` to pass an explicit `failed=` argument — the default is `False`, so "forgot to decide" and "this is a success" were indistinguishable at the call site, which is exactly how a given-up task came to be stamped `✅`. `test_sixteen_terminal_failure_paths_are_covered` pins the partition (16 failure-stamping, 2 success), a deliberate tripwire: adding a terminal path is a decision about dependency release.
+
 ### Clean-worktree gate (`BaseTool.requires_clean_worktree`)
 
 `#tool:dev-loop` does not start unless its `cwd:` is a git repository with a clean working tree. On a violation the task is never started: it is finalized terminally with `error_code="worktree_dirty"` (own taxonomy category `CAT_WORKTREE`) and the ❌ stamp, so it neither retries forever nor releases a `#needs:` dependent.
@@ -68,7 +78,13 @@ Measured 2026-09-03/04: `nightstash` ran 22:02–22:45 and left the repo on its 
 * dev-loop is precisely the tool that *produces* the diff its own reviewers judge, so a foreign working tree is not noise but a corrupted object under review. `review-loop` *consumes* an existing diff and is deliberately NOT gated — a clean tree there would be the opposite of what the tool is for. "Every writing tool" would therefore be the wrong rule.
 * Legitimate tasks in permanently dirty repos keep working untouched: `nightlovelace` ran plain (no `#tool:` tag) in `haus`, explicitly ordered not to commit or write anything, and never reaches the gate.
 
-`#allow-dirty` is the opt-out for a repo that always carries uncommitted work, so the escape hatch needs no code change. `#parallel` parents are exempt (their subtasks carry their own cwds, and the `#worktree` path already runs `_is_clean_git_repo` per CWD group). A task without `cwd:` is not checked and says so in the log.
+`#allow-dirty` is the opt-out for a repo that always carries uncommitted work, so the escape hatch needs no code change.
+
+**Two gaps in the enforcement were closed after an external review (2026-09-04); both were real.**
+
+*No `cwd:` is now a refusal, not a skip.* "No cwd" does not mean "no repo": `providers/process_runner._spawn()` passes `cwd=None` straight to `Popen` (`cwd=cwd`, line 183), which inherits the orchestrator's own working directory — so a `dev-loop` task without a `cwd:` tag runs against whatever repo the orchestrator was started in, with the precondition unverifiable rather than absent. A guard that cannot check must not pass. `#allow-dirty` still waives it. Nine existing tests drive `#tool:dev-loop` without a cwd to exercise other mechanisms (retry counter, policy routing); they now switch the gate off explicitly via `_no_worktree_gate()` rather than satisfying it by accident.
+
+*`#parallel` subtasks are gated where they actually run.* The parent stays exempt in `run_once()` — its own `#tool:` tag is not what executes — but `parallel_runner._run_single_subtask()` calls `_execute_tool_task()` directly, which made the subtasks the one route around the gate (the `#worktree` precheck only covers `#worktree` runs). The same `_worktree_gate_violation()` now runs per subtask before provider selection; a violation fails that subtask, and the parent is finalized `❌` through `failed=not success_all`. Under `#worktree` the subtask cwd has already been rewritten to the freshly created worktree, which is clean by construction.
 
 **Terminal, not parked** — nothing cleans the tree on its own, so parking would re-check the same dirty tree on every poll, unattended and silent. **No automatic reset or branch switch**: a reset can destroy work from another session, while refusing to start makes the same mistake just as visible and costs nothing.
 

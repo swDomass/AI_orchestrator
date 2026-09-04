@@ -106,6 +106,7 @@ from queue_manager import (
     read_queue,
     read_queue_items,
     realign_stale_freshonly,
+    restamp_done_as_failed,
     strip_metadata_tags,
 )
 from providers.process_runner import run_with_watchdog
@@ -244,8 +245,12 @@ def _worktree_gate_violation(task: str, tool_name: str | None, cwd: str | None) 
     orchestrator has no way to know which branch a task expects, that lives only in
     the prompt text.
 
-    A task with no `cwd:` is not checked (there is no repo to check); that is logged
-    rather than silently skipped.
+    A task with no `cwd:` is REFUSED, not waved through. "No cwd" does not mean "no
+    repo": `providers/process_runner._spawn()` passes `cwd=None` straight to
+    `Popen`, which inherits the orchestrator's own working directory — so such a
+    task runs dev-loop against whatever repo the orchestrator was started in, and
+    the precondition would be unverifiable rather than absent. A guard that cannot
+    check must not pass.
     """
     if not tool_name:
         return None
@@ -256,13 +261,13 @@ def _worktree_gate_violation(task: str, tool_name: str | None, cwd: str | None) 
         print(f"  [worktree] #allow-dirty → Sauberkeits-Check für {tool_name} übersprungen")
         return None
     if not cwd:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "Tool %s verlangt einen sauberen Arbeitsbaum, aber der Task hat kein cwd: — "
-            "Check übersprungen", tool_name,
+        return (
+            f"'{tool_name}' verlangt einen sauberen Arbeitsbaum, der Task hat aber kein "
+            f"cwd:-Tag. Ohne cwd erbt der Provider das Arbeitsverzeichnis des "
+            f"Orchestrators (Popen mit cwd=None), der Task liefe also gegen ein "
+            f"unbestimmtes Repo. Task nicht gestartet — cwd: setzen, oder #allow-dirty, "
+            f"wenn das wirklich so gemeint ist."
         )
-        print(f"  [worktree] {tool_name} ohne cwd: — Sauberkeits-Check nicht möglich")
-        return None
 
     from parallel_runner import _is_clean_git_repo
     ok, reason = _is_clean_git_repo(Path(cwd))
@@ -913,6 +918,30 @@ def _verify_failed(task: str, provider_name: str, msg: str) -> VerifyOutcome:
     return VerifyOutcome(ok=False, note=f"\n\n[verify] {msg}")
 
 
+def _restamp_after_failed_verify(task: str, queue_line_no: int | None) -> None:
+    """Turn the ✅ this task was already stamped with into ❌.
+
+    All three verify sites finalize BEFORE they check — deliberately, so a re-run
+    on the next poll cannot alarm twice. Once the queue can express a failure that
+    ordering leaves a hole: `#verify:` is the one signal that says "the run was
+    formally clean and the work did not happen" (measured 2026-09-03, reel task
+    `njtaxr`: exit ok, artefact missing), and a ✅ on such a line releases every
+    `#needs:` dependent.
+
+    Flipping the mark afterwards needs no retry budget of its own: the line stays
+    `[x]`, so nothing is requeued and the original ordering is untouched. A
+    `#every:` task has no stamp to flip (it was rescheduled as `- [ ]`) — that is
+    the expected no-op, not an error.
+    """
+    if restamp_done_as_failed(task, line_no=queue_line_no):
+        print("  ❌ Ergebnis-Check fehlgeschlagen → Queue-Zeile als gescheitert markiert")
+        return
+    append_log(
+        "Hinweis: Ergebnis-Check fehlgeschlagen, aber kein ✅-Stempel zum Umsetzen "
+        "gefunden (wiederkehrender Task oder Zeile bereits verändert)"
+    )
+
+
 def _finalize_task_with_result_checked(
     task: str,
     result: str,
@@ -1099,6 +1128,7 @@ def _execute_tool_task(
                 provider_tool,
                 queue_line_no=queue_line_no,
                 subtasks=subtasks,
+                failed=False,   # ...unless #verify: says otherwise — see below
             ):
                 return ToolTaskExecutionOutcome(
                     success=False,
@@ -1123,6 +1153,8 @@ def _execute_tool_task(
                     task, provider_tool, tool_result.output,
                     change_summary=change_summary,
                 )
+            else:
+                _restamp_after_failed_verify(task, queue_line_no)
         return ToolTaskExecutionOutcome(
             success=True,
             finalized=not skip_queue,
@@ -1528,11 +1560,12 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Terminal, not parked: nothing cleans the tree on its own, so a park would
         # re-check the same dirty tree forever, unattended and silent. The ❌ stamp
         # keeps it from releasing `#needs:` dependents.
-        # `#parallel` parents are exempt: the parent's own `#tool:` tag is not what
-        # runs (the subtasks are), each subtask carries its own cwd, and the
-        # `#worktree` path already runs `_is_clean_git_repo` per CWD group in
-        # parallel_runner. Gating here would turn a per-group precheck into a
-        # whole-task block for repos this task may never touch.
+        # `#parallel` parents are exempt HERE because the parent's own `#tool:` tag
+        # is not what runs — the subtasks are, each with its own cwd. They are not
+        # exempt from the gate itself: `parallel_runner._run_single_subtask()`
+        # applies the same check per subtask before selecting a provider, so a
+        # dev-loop subtask in a dirty repo fails as a subtask and the parent is
+        # finalized with `failed=not success_all`.
         gate_msg = (
             None if getattr(queue_task, "subtasks", None)
             else _worktree_gate_violation(task, tool_name, cwd)
@@ -1608,6 +1641,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(f"Parallel-Task erledigt: {task[:60]}")
                 if verify.ok:
                     notify_task_done(task, provider_tag, aggregated)
+                elif success_all:
+                    # Only reachable when every subtask succeeded — a partial run is
+                    # already stamped ❌ by `failed=not success_all` above.
+                    _restamp_after_failed_verify(task, queue_task.line_no)
                 if not success_all:
                     _span.error("parallel_subtask_failure")
                 elif not verify.ok:
@@ -2076,6 +2113,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     provider.name,
                     queue_line_no=queue_task.line_no,
                     subtasks=task_subtasks,
+                    failed=False,   # ...unless #verify: says otherwise — see below
                 ):
                     _span.error("queue_update_failed", retry_count=single_shot_retry_count)
                     _span.emit()
@@ -2107,6 +2145,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         cache_read_input_tokens=result.cache_read_input_tokens,
                     )
                 else:
+                    _restamp_after_failed_verify(task, queue_task.line_no)
                     _span.error("verify_failed", retry_count=single_shot_retry_count)
                 single_shot_success = True
                 break

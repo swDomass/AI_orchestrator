@@ -118,6 +118,25 @@ def _run_single_subtask(
 
     clean_text = strip_metadata_tags(subtask.text)
 
+    # Same clean-worktree precondition as the single-task path. run_once() exempts
+    # the `#parallel` PARENT (its tool tag is not what runs), so without this the
+    # subtasks — which are what actually calls _execute_tool_task — would be the
+    # one route around the gate. Checked before provider selection, so a violation
+    # costs no token; the subtask fails, and the parent is finalized ❌ through
+    # `failed=not success_all`. Under `#worktree` the cwd has already been rewritten
+    # to the freshly created worktree, which is clean by construction.
+    from orchestrator import _worktree_gate_violation
+    gate_msg = _worktree_gate_violation(subtask.text, subtask.tool_name, subtask.cwd)
+    if gate_msg:
+        logger.warning("parallel: subtask %d blocked — %s", idx, gate_msg)
+        return SubTaskResult(
+            text=subtask.text,
+            provider_name="none",
+            success=False,
+            output="",
+            error=f"worktree_dirty: {gate_msg}",
+        )
+
     # Force provider if tag present
     exclude: set[str] = set()
     provider = select_provider(

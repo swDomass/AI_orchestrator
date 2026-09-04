@@ -135,10 +135,35 @@ def test_allow_dirty_waives_the_gate(monkeypatch, dirty_repo):
     ) is None
 
 
-def test_gate_skipped_without_cwd(monkeypatch):
-    """No cwd → no repo to check. Logged, not silently swallowed."""
+def test_gate_blocks_when_there_is_no_cwd(monkeypatch):
+    """"No cwd" is not "no repo" — it is an UNVERIFIABLE repo, so it is refused.
+
+    providers/process_runner._spawn() hands cwd=None straight to Popen, which
+    inherits the orchestrator's own working directory: a dev-loop task without a
+    cwd: tag runs against whatever repo the orchestrator was started in. A guard
+    that cannot check must not pass.
+    """
     monkeypatch.setattr(orchestrator, "get_tool", lambda _n: _FakeTool("dev-loop", True))
-    assert orchestrator._worktree_gate_violation("Task #tool:dev-loop", "dev-loop", None) is None
+    msg = orchestrator._worktree_gate_violation("Task #tool:dev-loop", "dev-loop", None)
+    assert msg is not None and "cwd" in msg
+
+
+def test_no_cwd_block_is_still_waivable(monkeypatch):
+    monkeypatch.setattr(orchestrator, "get_tool", lambda _n: _FakeTool("dev-loop", True))
+    assert orchestrator._worktree_gate_violation(
+        "Task #tool:dev-loop #allow-dirty", "dev-loop", None
+    ) is None
+
+
+def test_spawn_inherits_the_orchestrator_cwd_when_none_is_given():
+    """The evidence behind the rule above, pinned so it cannot rot silently."""
+    import inspect
+
+    from providers import process_runner
+
+    src = inspect.getsource(process_runner._spawn)
+    # cwd is passed through to Popen untouched; Popen with cwd=None inherits.
+    assert "cwd=cwd" in src
 
 
 def test_allow_dirty_tag_is_stripped_from_the_prompt():
@@ -248,3 +273,81 @@ def test_run_once_honours_allow_dirty(tmp_path, monkeypatch, dirty_repo):
     orchestrator.run_once()
 
     exec_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Parallel subtasks are the one route around run_once() — they must be gated too
+#
+# run_once() exempts the #parallel PARENT because the parent's own #tool: tag is
+# not what runs. parallel_runner._run_single_subtask() calls _execute_tool_task()
+# directly (parallel_runner.py, "Tool-based subtask" branch), so without a check
+# there a dev-loop subtask in a dirty repo would start unchecked.
+# ---------------------------------------------------------------------------
+
+def test_parallel_subtask_with_dev_loop_is_blocked_on_a_dirty_repo(monkeypatch, dirty_repo):
+    import parallel_runner
+    from limits import AllLimits
+
+    select_mock = Mock(side_effect=AssertionError("provider must not be selected"))
+    exec_mock = Mock(side_effect=AssertionError("subtask must not execute"))
+    monkeypatch.setattr("dispatcher.select_provider", select_mock)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+
+    subtask = parallel_runner.SubTask(
+        text="Fix it #tool:dev-loop", provider_forced=None, cwd=str(dirty_repo), tool_name="dev-loop",
+        timeout=60,
+    )
+    result = parallel_runner._run_single_subtask(
+        subtask, 0, AllLimits(), "", None,
+    )
+
+    assert result.success is False
+    assert result.error.startswith("worktree_dirty")
+
+
+def test_parallel_subtask_with_dev_loop_runs_on_a_clean_repo(monkeypatch, clean_repo):
+    """The gate must not make every parallel dev-loop subtask fail."""
+    import parallel_runner
+    from limits import AllLimits
+
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+    exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+        success=True, finalized=False, output="done",
+    ))
+    monkeypatch.setattr("dispatcher.select_provider", lambda *a, **kw: provider)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr("config.model_id_for_provider", lambda *a, **kw: None)
+
+    subtask = parallel_runner.SubTask(
+        text="Fix it #tool:dev-loop", provider_forced=None, cwd=str(clean_repo), tool_name="dev-loop",
+        timeout=60,
+    )
+    result = parallel_runner._run_single_subtask(subtask, 0, AllLimits(), "", None)
+
+    assert result.success is True
+    exec_mock.assert_called_once()
+
+
+def test_parallel_plain_subtask_in_a_dirty_repo_is_untouched(monkeypatch, dirty_repo):
+    """No tool tag → no gate, exactly like the single-task path."""
+    import parallel_runner
+    from limits import AllLimits
+
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+    monkeypatch.setattr("dispatcher.select_provider", lambda *a, **kw: provider)
+    monkeypatch.setattr("config.model_id_for_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *a, **kw: "prompt")
+    monkeypatch.setattr(orchestrator, "_run_with_retry", lambda *a, **kw: (
+        SimpleNamespace(
+            success=True, output="done", error=None, input_tokens=0, output_tokens=0,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0, session_id=None,
+        ),
+        False,
+    ))
+
+    subtask = parallel_runner.SubTask(
+        text="Read the dashboards", provider_forced=None, cwd=str(dirty_repo), tool_name=None, timeout=60,
+    )
+    result = parallel_runner._run_single_subtask(subtask, 0, AllLimits(), "", None)
+
+    assert result.success is True

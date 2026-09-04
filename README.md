@@ -334,8 +334,11 @@ remember. Plain tasks (no `#tool:`) in permanently dirty repos are unaffected.
 
 - **`#allow-dirty`** waives the check for a repo that legitimately always carries
   uncommitted work.
-- A task without `cwd:` is not checked (there is no repo to check) — logged, not
-  silently skipped.
+- A task **without `cwd:` is refused**, not skipped: `cwd=None` is passed straight
+  to `Popen`, which inherits the orchestrator's own working directory, so the task
+  would run against an unspecified repo. `#allow-dirty` waives this too.
+- `#parallel` **subtasks are gated individually** (`parallel_runner`), since they
+  are what actually runs; the parent itself is exempt.
 - There is **no** automatic branch switch or reset: a reset can destroy work from
   another session, and refusing to start makes the same mistake just as visible.
 - Terminal rather than parked: nothing cleans the tree on its own, so a park would
@@ -365,6 +368,10 @@ budget exhausted, a `#parallel` run with a failed subtask — the queue line is 
   recorded in `logs/runs.jsonl` with its `error_code`.
 - Recurring (`#every:`) tasks are the exception: they are rescheduled rather than
   stamped, exactly as before — a failure today does not cancel tomorrow's slot.
+- A failed **`#verify:` outcome check** flips an already-written ✅ to ❌. The three
+  success paths finalize before they verify (so a re-run cannot alarm twice), and
+  `#verify:` is the one signal for "the run was clean and the work did not happen"
+  — without the flip, that line would still release its `#needs:` dependents.
 - `/unblock <id>` (Telegram) promotes such a line to ✅, `/retry <id>` reopens it as
   `- [ ]`.
 

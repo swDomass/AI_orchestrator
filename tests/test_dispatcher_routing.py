@@ -12,6 +12,7 @@ from dispatcher import (
     resolve_forced_provider,
     force_refresh_can_unblock,
     _providers,
+    _selection_order,
 )
 
 
@@ -362,3 +363,19 @@ def test_limits_ok_returns_true_for_vibe():
     from dispatcher import _limits_ok
     limits_ = _make_limits(claude_avail=False, gemini_avail=False, codex_avail=False)
     assert _limits_ok("vibe", limits_) is True
+
+
+def test_profile_provider_order_fails_closed_on_uncapped_provider(with_vibe):
+    """A profile naming vibe/openrouter must clear the same fail-closed gate as the
+    global/task-level policy layers — the profile branch of _selection_order() used
+    to only check registration (`p in _providers`), never _allows(), so a profile
+    `providers: [claude, vibe]` reached vibe whenever no tool_providers policy was
+    configured (allowed=None), which is the normal state of an installation without
+    a configured ceiling, not a corruption case. _isolate_policy_engine (conftest)
+    points at an empty vault, so `allowed` here is None exactly like that scenario.
+    """
+    profile = SimpleNamespace(providers=["claude", "vibe"],
+                              tool_providers={}, allowed_skills=[], denied_skills=[])
+    order, allowed = _selection_order("Do it", profile, None, False, None)
+    assert allowed is None
+    assert order == ["claude"]

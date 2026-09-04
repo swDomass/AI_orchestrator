@@ -124,10 +124,13 @@ def _routed_providers(task_text: str) -> set[str]:
     """Every provider this task explicitly routes to — bare ``#<provider>`` tag or any
     model alias.
 
-    Derived from ``_MODEL_ALIASES_BY_PROVIDER`` instead of ``PROVIDER_TAG_RE``, which only
-    knows claude|gemini|codex and therefore misses ``#vibe``, ``#openrouter``, ``#or_*``,
-    ``#codex_5`` and ``#gemini_flash_lite``. Completeness matters here: the caller uses the
-    result to decide whether a Claude-only tag is a silent no-op.
+    Derived from ``_MODEL_ALIASES_BY_PROVIDER`` instead of ``PROVIDER_TAG_RE``, which
+    (since it derives its bare provider names from ``dispatcher._TAG_MAP.values()``)
+    now matches ``#vibe`` and ``#openrouter`` too, but still only the bare provider
+    names — it therefore still misses every *model-alias* tag (``#or_*``, ``#codex_5``,
+    ``#gemini_flash_lite``, ...), which route to a provider without naming it. Completeness
+    matters here: the caller uses the result to decide whether a Claude-only tag is a
+    silent no-op.
     """
     found: set[str] = set()
     for provider, aliases in _MODEL_ALIASES_BY_PROVIDER.items():
@@ -606,8 +609,9 @@ def _check_model_tag(line_no: int, task_text: str) -> list[LintFinding]:
                 code="model_provider_mismatch",
             ))
 
-    # Pass-provider regex restricts to claude|gemini|codex — nothing to check
-    # for unknown providers there. But we DO want to flag a model alias whose
+    # PASS_PROVIDER_TAG_RE only ever matches a registered provider name (it is
+    # generated from dispatcher._TAG_MAP since b947b76), so there is no unknown
+    # provider to check for there. But we DO want to flag a model alias whose
     # owning provider isn't covered by any #pass1:/#pass2: tag when both are set.
     pass_providers = extract_pass_providers(task_text)
     if model_tag and pass_providers and not explicit_providers:

@@ -17,15 +17,38 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# dispatcher._TAG_MAP is the same maßgebliche tag table queue_manager.py derives
+# PROVIDER_TAG_RE / MODEL_TAG_RE / PASS_PROVIDER_TAG_RE from (see the comment there).
+# Imported at module level, not deferred: dispatcher's own module-level imports
+# (config, limits, providers.*) never reach back into profiles, and no PRODUCTION
+# module imports profiles at module level either — measured, no cycle to defer
+# here. (Tests do — tests/test_profiles.py and tests/test_provider_list_derivation.py
+# both `import profiles` at module level; that's fine, tests aren't part of the
+# import graph a cycle would break.)
+from dispatcher import _TAG_MAP as _PROVIDER_TAG_MAP
+
 logger = logging.getLogger(__name__)
 
 _profile_cache: dict[str, tuple[float, "ProfileConfig | None"]] = {}
+
+# Every provider name dispatcher._TAG_MAP knows how to route, i.e. every value a
+# `providers:` entry may legitimately name. Derived instead of hand-copied so a
+# profile naming vibe/openrouter (or any future provider) is no longer silently
+# indistinguishable from a typo — see _build_profile_config() below.
+_KNOWN_PROVIDERS = frozenset(_PROVIDER_TAG_MAP.values())
+
+# The provider order used when a profile omits `providers:` entirely, or names only
+# unknown ones. Deliberately NOT derived from _KNOWN_PROVIDERS: that set includes
+# vibe/openrouter, and defaulting every profile to pay-per-token providers it never
+# asked for would be the opposite of what this default is for. "Known" and "default"
+# are two different questions — one constant each.
+_DEFAULT_PROVIDERS = ["claude", "gemini", "codex"]
 
 
 @dataclass
 class ProfileConfig:
     name: str
-    providers: list[str] = field(default_factory=lambda: ["claude", "gemini", "codex"])
+    providers: list[str] = field(default_factory=lambda: list(_DEFAULT_PROVIDERS))
     allowed_roots: list[str] = field(default_factory=list)
     allowed_skills: list[str] = field(default_factory=list)   # empty = allow all
     denied_skills: list[str] = field(default_factory=list)
@@ -110,10 +133,41 @@ def _build_profile_config(name: str, data: dict) -> ProfileConfig:
             return [v]
         return list(v) if v else []
 
-    providers = _list("providers") or ["claude", "gemini", "codex"]
-    # Validate provider names
-    known = {"claude", "gemini", "codex"}
-    providers = [p for p in providers if p in known] or ["claude", "gemini", "codex"]
+    providers = _list("providers") or list(_DEFAULT_PROVIDERS)
+    # Validate provider names against dispatcher._TAG_MAP (see _KNOWN_PROVIDERS above).
+    # Discarded names are logged, not dropped silently — a profile whose YAML says
+    # `providers: [vibe]` but that actually loads the untagged default list is
+    # running the opposite of what it declares, and used to do so with no trace.
+    #
+    # The warning is built from what the YAML actually said, NOT from `providers`
+    # above: that name already carries the substituted default when the key is
+    # absent, so warning off it would blame the user's file for a name this code
+    # put there. That is the exact dishonest-message shape this repo has had to
+    # correct before — say only what the file says.
+    discarded = [p for p in _list("providers") if p not in _KNOWN_PROVIDERS]
+    if discarded:
+        logger.warning(
+            "profiles: '%s' names unknown provider(s) %s (known: %s) — dropped",
+            name, discarded, sorted(_KNOWN_PROVIDERS),
+        )
+    # The fallback default is filtered through the same _KNOWN_PROVIDERS check as
+    # the YAML-supplied list above, not appended raw — otherwise two of the three
+    # ways a profile ends up on the default list (omitted `providers:`, or every
+    # named entry discarded) could disagree the moment _DEFAULT_PROVIDERS and
+    # _KNOWN_PROVIDERS diverge (e.g. gemini retired from _TAG_MAP but left in
+    # _DEFAULT_PROVIDERS): one path would silently keep a provider dispatcher can
+    # no longer route to, the other would already have dropped it. The drift
+    # guard test asserts the two stay in sync, so today this filter is a no-op —
+    # it exists so a future divergence fails predictably instead of two ways.
+    #
+    # The THIRD path is ProfileConfig.providers' own default_factory, and it is
+    # deliberately left unfiltered: it produces a ProfileConfig without ever
+    # passing through here (get_default_profile()), and the drift guard covers it
+    # for the same reason it covers this filter. Filtering there too would buy
+    # nothing today and put the same invariant in a third place.
+    providers = [p for p in providers if p in _KNOWN_PROVIDERS] or [
+        p for p in _DEFAULT_PROVIDERS if p in _KNOWN_PROVIDERS
+    ]
 
     return ProfileConfig(
         name=data.get("name", name),

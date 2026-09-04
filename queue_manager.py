@@ -74,8 +74,30 @@ TOOL_TAG_RE = re.compile(r"#tool:[\w-]+")
 # Matches #tool_providers:p1,p2 metadata tag
 TOOL_PROVIDERS_TAG_RE = re.compile(r"(?i)#tool_providers:([\w,]+)")
 
-# Matches provider selection tags
-PROVIDER_TAG_RE = re.compile(r"#(?:claude|gemini|codex)\b", re.IGNORECASE)
+# Matches provider selection tags. Derived from dispatcher._TAG_MAP instead of
+# hand-copied (same reason as MODEL_TAG_RE / PASS_PROVIDER_TAG_RE below), so this
+# cannot drift from the tag table again — the hand-copied version only ever listed
+# claude/gemini/codex and never covered #vibe/#openrouter, so a blank one of those
+# stayed as literal tag text in the prompt instead of being stripped as metadata.
+# Sorted longest-first so no provider name can shadow a longer one that starts with
+# it (none currently share a prefix, but the sort makes that an invariant, not luck).
+# The name is the tie-breaker, so equal-length names (claude/gemini/codex are all 6)
+# give the same pattern on every run instead of inheriting the set's iteration order.
+#
+# Same two boundaries as MODEL_TAG_RE below, not `\b`: `\b` only ever tested the
+# RIGHT edge, and even there it was doing less than it looked like. `(?![\w-])`
+# protects that edge just as well against "_" (a word character, so "#claude" still
+# does not eat "#claude_opus" before MODEL_TAG_RE gets to see it) and additionally
+# against "-" (`\b` let "#vibe-medium" match as bare "#vibe", stripping "-medium" as
+# if it were prose). The LEFT edge is new: `(?<!\S)` (no non-whitespace immediately
+# before the "#") keeps the regex from firing inside a word at all — `\b` had none,
+# so "C#vibe" stripped to "C" and "ABC#codex-42" to "ABC-42", cutting text the
+# dispatcher never read as a tag in the first place (has_explicit_provider_tag()
+# uses dispatcher._TAG_RE_BY_PROVIDER, which already requires this left boundary).
+_PROVIDER_NAMES = sorted(set(_PROVIDER_TAG_MAP.values()), key=lambda s: (-len(s), s))
+PROVIDER_TAG_RE = re.compile(
+    r"(?i)(?<!\S)#(?:" + "|".join(re.escape(p) for p in _PROVIDER_NAMES) + r")(?![\w-])"
+)
 
 # Matches retry comment (legacy HH:MM or absolute local timestamp)
 RETRY_TAG_RE = re.compile(r"<!-- retry: ([^>]+?) -->")

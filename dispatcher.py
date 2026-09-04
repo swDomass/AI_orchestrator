@@ -325,9 +325,16 @@ def _selection_order(
     if forced and allowed and forced.name not in allowed:
         return [], allowed
 
-    # Profile provider order overrides _PRIORITY
+    # Profile provider order overrides _PRIORITY. Unlike _PRIORITY (which never
+    # contains openrouter/vibe), a profile's `providers:` list legitimately can —
+    # so it must clear _allows() here too, not just the `if allowed:` filter
+    # below. That filter alone is fail-OPEN when allowed is None (see _allows()),
+    # which is correct for _PRIORITY's capped members but was silently routing
+    # an uncapped profile provider around the fail-closed gate: `known =
+    # {claude, gemini, codex}` used to make this structurally impossible before
+    # profiles.py started deriving providers from dispatcher._TAG_MAP.
     if profile and getattr(profile, "providers", None):
-        base_order = [p for p in profile.providers if p in _providers]
+        base_order = [p for p in profile.providers if p in _providers and _allows(p, allowed)]
     else:
         base_order = _PRIORITY[:]
 
@@ -375,6 +382,73 @@ def policy_dead_end(
     if order:
         return None
     return _effective_allowed(allowed)
+
+
+def profile_dead_end_reason(
+    task: str,
+    *,
+    tool_name: str | None = None,
+    profile=None,  # ProfileConfig | None
+) -> tuple[list[str], list[str], list[str]] | None:
+    """Why the *profile* left nothing routable — or None when the honest answer is
+    "the policy did", which the caller already words correctly.
+
+    Returns ``(unregistered, uncapped_barred, policy_barred)``. Three buckets,
+    because ``_allows()`` says False for two unrelated reasons and a message that
+    merges them states a cause it cannot know:
+
+    * ``unregistered`` — named in ``providers:`` but not registered in this
+      process at all (CLI missing, API key unset). No edit to policy.yaml changes
+      this, so a message pointing there sends the reader to the wrong file.
+    * ``uncapped_barred`` — registered, but in ``_UNCAPPED_PROVIDERS`` with **no**
+      allow-list resolved. That is the fail-CLOSED default from ``_allows()``, and
+      it says nothing about policy.yaml's contents: ``get_allowed_providers()``
+      returns None whenever no ``tool_providers:`` section exists, the normal
+      state of an install that never configured one. The fix is an explicit
+      authorisation, not a correction.
+    * ``policy_barred`` — registered, and an allow-list exists that does not name
+      it. This one genuinely IS the policy, and it is the case the caller's
+      pre-existing message already describes accurately, including printing the
+      list. Reported here only so a mixed profile can be described completely.
+
+    Returns None unless at least one of the first two buckets is non-empty:
+    when every entry fell to an explicit allow-list, there is nothing the profile
+    wording adds and the caller keeps its own — which also keeps that message's
+    contract of naming what the policy *does* allow.
+
+    The gate is ``not any(registered and allowed)``. A single entry that is both
+    means the empty order came from somewhere else, so the profile is not to blame.
+    Capacity and cooldown are deliberately not consulted: ``_selection_order()``
+    does not apply them either (see its docstring) — they are the temporary
+    reasons, and this function only explains permanent ones.
+
+    This replaced a narrower predicate that asked only "is NONE of them
+    registered?". It covered the missing-CLI case and reported everything else as
+    a tool_providers policy problem — naming an allow-list ``_effective_allowed()``
+    had synthesised, and calling providers unregistered that were registered all
+    along.
+    """
+    if not profile or not getattr(profile, "providers", None):
+        return None
+    allowed = _allowed_by_policy(task, profile, tool_name)
+    if any(p in _providers and _allows(p, allowed) for p in profile.providers):
+        return None
+    unregistered = [p for p in profile.providers if p not in _providers]
+    registered_barred = [
+        p for p in profile.providers if p in _providers and not _allows(p, allowed)
+    ]
+    if allowed:
+        uncapped_barred: list[str] = []
+        policy_barred = registered_barred
+    else:
+        # No allow-list resolved -> _allows() only ever says False for the
+        # uncapped set (it fails OPEN for the capped providers), so everything
+        # in registered_barred got there via the fail-closed default.
+        uncapped_barred = registered_barred
+        policy_barred = []
+    if not unregistered and not uncapped_barred:
+        return None
+    return unregistered, uncapped_barred, policy_barred
 
 
 def _limits_ok(name: str, limits: AllLimits) -> bool:

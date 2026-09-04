@@ -82,10 +82,20 @@ _paused     = threading.Event()  # set while orchestrator is paused → bg threa
 # itself is rate-limited and real capacity data is unavailable.
 _429_estimate_lock = threading.Lock()
 # Maps provider name -> (ProviderLimits snapshot, time.monotonic() when taken)
-_429_snapshots: dict[str, tuple[ProviderLimits, float]] = {}
+_429_snapshots: "dict[str, tuple[ProviderLimits, float]]" = {}
 # Maps provider name -> window name -> estimated percentage consumed.
 _429_estimated_usage: dict[str, dict[str, float]] = {}
 _429_notified: set[str] = set()
+
+# Providers whose OAuth token _refresh_token() can actually refresh via CLI.
+# Gemini is deliberately excluded: retired from routing since 2026-08-15
+# (dispatcher._PRIORITY), nobody authenticates the gemini CLI anymore, so the
+# background loop's refresh attempts only produced dead log noise. Codex is
+# excluded too: _refresh_token() has no branch for it and would silently
+# return False, fabricating a bogus failed-refresh cooldown. Single source
+# for the 4 loop sites below — keeps them from drifting from each other or
+# from _refresh_token()'s own if/elif set.
+_TOKEN_REFRESH_PROVIDERS = ("claude",)
 
 # Cooldown after failed token refresh — avoids hammering the CLI every 90 s
 # when re-auth requires manual intervention (e.g. browser login).
@@ -1100,7 +1110,7 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
         # Auto-refresh expired tokens and re-query
         refresh_attempted = False
         needs_refresh = any(
-            _needs_token_refresh(raw, p) for p in ("claude", "gemini")
+            _needs_token_refresh(raw, p) for p in _TOKEN_REFRESH_PROVIDERS
         )
 
         # Publish preliminary result before the slow token refresh so that
@@ -1114,7 +1124,7 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
             on_preliminary(preliminary)
 
         now = time.monotonic()
-        for provider in ("claude", "gemini"):
+        for provider in _TOKEN_REFRESH_PROVIDERS:
             if _needs_token_refresh(raw, provider):
                 cooldown_until = _refresh_failed_until.get(provider, 0.0)
                 if now < cooldown_until:
@@ -1142,7 +1152,7 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
                 )
                 if fresh is not None:
                     raw = fresh
-                    if not any(_needs_token_refresh(raw, p) for p in ("claude", "gemini")):
+                    if not any(_needs_token_refresh(raw, p) for p in _TOKEN_REFRESH_PROVIDERS):
                         break
                 time.sleep(2)
 
@@ -1150,7 +1160,7 @@ def _get_limits_fresh(on_preliminary=None, force_fresh=False) -> AllLimits:
             # success but cclimits still shows the token as expired, treat it as a
             # failed refresh and activate the backoff cooldown.
             post_now = time.monotonic()
-            for provider in ("claude", "gemini"):
+            for provider in _TOKEN_REFRESH_PROVIDERS:
                 if _needs_token_refresh(raw, provider) and provider not in _refresh_failed_until:
                     _refresh_failed_until[provider] = post_now + _REFRESH_FAILED_BACKOFF_SEC
                     logger.warning(

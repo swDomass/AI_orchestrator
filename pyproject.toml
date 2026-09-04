@@ -8,6 +8,13 @@
 # Baseline gemessen am 2026-09-02 mit ruff 0.16.1 / mypy 2.3.1
 # → docs/lint-baseline-2026-09-02.md
 #   pip install "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
+#
+# Verifizierter Python-Floor: 3.12+ (siehe README Requirements). Kein
+# `[project]`-Key dafuer — eine Packaging-Tabelle nur fuer `requires-python`
+# widerspraeche der Nicht-Package-Entscheidung oben; der Floor steht deshalb
+# hier als Kommentar UND im README. Empirisch mit `py -3.12`/`py -3.13`/
+# `py -3.14` verifiziert (limits.py:85, 2026-09-04); 3.10/3.11 sind auf dieser
+# Maschine nicht testbar und bleiben deshalb explizit unterstuetzt-nicht.
 
 [tool.ruff]
 line-length = 100

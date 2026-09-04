@@ -52,9 +52,12 @@ from the sister repos `eeg_analysis` (layout + lenient mypy) and `pyrolyse-1d-mo
 (rule selection), minus `NPY` and minus the `N8xx` block that exists there only for an
 SI-suffix convention this repo does not have — deviations are commented inline.
 Baseline, defect triage and work order → [`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md).
-**Ungefixt und dort dokumentiert:** `limits.py:85` benutzt `ProviderLimits` in einer
-Modul-Annotation vor der Klassendefinition — auf Python ≤3.13 ein `NameError` beim
-Import, der die ganze Anwendung lahmlegt; nur PEP 649 auf 3.14 verdeckt ihn.
+**Fixed 2026-09-04:** `limits.py:85` used to annotate `ProviderLimits` in a module-level
+annotation before the class definition — a `NameError` on Python ≤3.13 that took down
+the whole app on import, masked only by PEP 649 on 3.14. The annotation is now quoted
+(same style as three other forward references already in the file); import verified
+clean on 3.12/3.13/3.14. Verified floor is `3.12+` (matches `pyproject.toml`'s
+`target-version`/`python_version`, documented in `README.md` Requirements).
 
 ## Architecture
 

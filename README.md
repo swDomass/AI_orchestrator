@@ -61,9 +61,11 @@ Architecture details → [`docs/architecture/components.md`](docs/architecture/c
 
 ## Requirements
 
-- Python `3.10+` — ⚠️ **this floor is currently unverified**: `import limits`
-  fails with a `NameError` on 3.10–3.13 (only 3.14 works). See
-  [Linting & Typing](#linting--typing) before relying on it.
+- Python `3.12+` — matches `ruff`/`mypy` `target-version`/`python_version` in
+  `pyproject.toml`, and is empirically verified: `import limits` succeeds on
+  3.12, 3.13, and 3.14 (fixed 2026-09-04, was a `NameError` on 3.10–3.13 before
+  a forward-reference annotation got quoted). 3.10/3.11 are not available on
+  the machine that verified this and are therefore not claimed as supported.
 - `cclimits` CLI (`npm install -g cclimits`)
 - Provider CLIs in `PATH`: `claude`, `codex`
 - Valid authentication in each CLI (OAuth / subscription login)
@@ -98,10 +100,10 @@ python -m mypy .
 
 The first full measurement — 1351 ruff findings, 131 mypy errors, which of them
 are real defects, and a proposed work order — is recorded in
-[`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md). Note
-that it documents an **import failure on Python 3.10–3.13** that contradicts the
-`3.10+` claim under [Requirements](#requirements); read it before relying on
-that version floor.
+[`docs/lint-baseline-2026-09-02.md`](docs/lint-baseline-2026-09-02.md). Its
+headline defect, an import failure on Python 3.10–3.13, was fixed 2026-09-04
+(see the doc's status note); the `3.12+` floor under
+[Requirements](#requirements) reflects that fix.
 
 ## Configuration
 

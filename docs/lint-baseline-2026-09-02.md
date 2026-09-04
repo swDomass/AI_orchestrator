@@ -12,11 +12,18 @@ reine HEAD-Baseline.
 
 ## Kernbefund vorweg
 
-> **Das Repo laesst sich auf Python 3.10–3.13 nicht importieren.** `limits.py:85`
-> benutzt `ProviderLimits` in einer Modul-Annotation 19 Zeilen bevor die Klasse
+> **Status 2026-09-04: behoben.** `limits.py:85` quotet die Annotation jetzt
+> (`"dict[str, tuple[ProviderLimits, float]]"`), Import auf 3.12/3.13/3.14
+> empirisch verifiziert. `README.md` und `pyproject.toml` nennen `3.12+` als
+> verifizierten Floor. Der Rest dieses Abschnitts und [D1](#d1--limitspy85--f821-undefined-name)
+> bleiben als historischer Befund stehen — dieser Bericht ist eine
+> Bestandsaufnahme vom 2026-09-02, keine lebende Doku.
+
+> **Das Repo liess sich auf Python 3.10–3.13 nicht importieren.** `limits.py:85`
+> benutzte `ProviderLimits` in einer Modul-Annotation 19 Zeilen bevor die Klasse
 > definiert wird. Auf Python 3.14 faellt das dank PEP 649 (verzoegerte
-> Annotations-Auswertung) nicht auf — auf jeder aelteren Version ist es ein
-> `NameError` beim Import. `README.md:64` nennt als Anforderung `Python 3.10+`.
+> Annotations-Auswertung) nicht auf — auf jeder aelteren Version war es ein
+> `NameError` beim Import. `README.md:64` nannte als Anforderung `Python 3.10+`.
 > Details und Beleg unter [D1](#d1--limitspy85--f821-undefined-name).
 
 Der Rest des Berichts ist Routine: 1351 ruff-Befunde und 131 mypy-Fehler, davon
@@ -228,12 +235,12 @@ unterstuetzt nennt (`Python 3.10+`), ausser 3.14.
 halbes Jahr unbemerkt. Die Testsuite kann das bauartbedingt nicht sehen: sie
 laeuft nur auf dem Interpreter, der installiert ist.
 
-**Fix** (nicht ausgefuehrt — Auftrag schliesst Produktivcode aus): Annotation
-quoten (`tuple["ProviderLimits", float]`), oder `from __future__ import
-annotations` setzen, oder die Zuweisung unter die Klassendefinition schieben.
-Die erste Variante ist die kleinste. Danach gehoert die untere Versionsgrenze
-verifiziert statt behauptet — entweder CI auf 3.10/3.12, oder `README.md`
-ehrlich auf `3.14+` ziehen.
+**Fix (umgesetzt 2026-09-04):** die Annotation quoten
+(`"dict[str, tuple[ProviderLimits, float]]"`) — die kleinste der drei
+Varianten, und konsistent mit dem bereits im File etablierten Stil (`Z. 69/74/110`
+quoten dieselbe Art Forward-Reference bereits). Untere Versionsgrenze verifiziert
+statt behauptet: `README.md` und `pyproject.toml` nennen jetzt `3.12+`,
+empirisch mit `py -3.12`/`py -3.13`/`py -3.14` gegen den echten Import geprueft.
 
 ### D2 — `B023` `telegram_listener.py:942/944/945`
 
@@ -473,7 +480,7 @@ Nichts davon wurde in diesem Task ausgefuehrt.
 
 | # | Paket | Umfang | Risiko |
 |---|---|---|---|
-| **1** | **[D1](#d1--limitspy85--f821-undefined-name) fixen** — eine Zeile quoten, danach Versionsgrenze klaeren (CI auf 3.12 **oder** README auf 3.14+ korrigieren) | 1 Zeile + 1 Entscheidung | keins, hoher Gewinn |
+| **1** | ~~**[D1](#d1--limitspy85--f821-undefined-name) fixen**~~ — **behoben 2026-09-04**, siehe Status-Update oben | 1 Zeile + 1 Entscheidung | keins, hoher Gewinn |
 | 2 | Entscheidung [E1](#e1--plc0415-524) `PLC0415` — vor allem anderen, weil sie 39 % der Baseline bewegt | 1 Konfigzeile | keins |
 | 3 | `F401` + `F541` + `RUF059` autofixen (`ruff check --fix --select F401,F541,RUF059`), Diff durchsehen. **Die 5 `unused-ignore` gehoeren ausdruecklich NICHT dazu** — mypy-Diagnose, von ruff gar nicht erreichbar, und laut [E7](#e7--unused-ignore-5--artefakte-der-lenient-konfiguration) stehen zu lassen | 154 Stellen (134 davon safe-autofixbar, die 20 `RUF059` brauchen `--unsafe-fixes`) | sehr gering |
 | 4 | `I001` + `UP045` + `UP037` + `UP017` autofixen — reine Modernisierung | ~230 Stellen | gering |
@@ -494,7 +501,9 @@ optional und sollte nicht als Hygiene-Pflicht missverstanden werden.
 1. **`requirements-dev.txt` anlegen?** Ohne Pin sind die Zahlen dieses Berichts
    beim naechsten ruff-Release nicht reproduzierbar. Haette den Diff aber ueber
    „Konfiguration + Bericht" hinaus erweitert — deshalb hier nur gefragt.
-2. **Untere Python-Grenze:** `README.md` sagt 3.10+, real laeuft nur 3.14.
-   Reparieren (D1 + CI-Matrix) oder Anspruch zuruecknehmen?
+2. ~~**Untere Python-Grenze:** `README.md` sagt 3.10+, real laeuft nur 3.14.
+   Reparieren (D1 + CI-Matrix) oder Anspruch zuruecknehmen?~~ — **beantwortet
+   2026-09-04:** repariert, `README.md`/`pyproject.toml` auf `3.12+` gezogen.
+   Eine CI-Matrix bleibt offen (kein `.github/workflows` im Repo).
 3. **Pre-commit-Hook / CI-Gate** fuer ruff — sinnvoll erst, wenn die Baseline
    auf ein Niveau gebracht ist, das ein Gate ueberhaupt halten kann.

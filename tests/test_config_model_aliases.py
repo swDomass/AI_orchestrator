@@ -4,6 +4,7 @@ from config import (
     CLAUDE_MODEL_ALIASES,
     CODEX_MODEL_ALIASES,
     GEMINI_MODEL_ALIASES,
+    OPENCODE_MODEL_ALIASES,
     OPENROUTER_MODEL_ALIASES,
     is_known_model_tag,
     model_id_for_provider,
@@ -131,3 +132,52 @@ def test_openrouter_alias_count():
     # Sanity: drift-detection — if the dict shrinks/grows unexpectedly the
     # tag map in dispatcher.py probably needs updating too.
     assert len(OPENROUTER_MODEL_ALIASES) == 9
+
+
+# ---------------------------------------------------------------------------
+# opencode aliases (tag-activated third external voice, Stufe 2, pay-per-token
+# but capped via its own OpenRouter key — see limits.py)
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_tags_resolve_for_opencode():
+    assert model_id_for_provider("opencode_deepseek", "opencode") == OPENCODE_MODEL_ALIASES["opencode_deepseek"]
+    assert model_id_for_provider("opencode_deepseek_long", "opencode") == OPENCODE_MODEL_ALIASES["opencode_deepseek_long"]
+    assert model_id_for_provider("opencode_glm", "opencode") == OPENCODE_MODEL_ALIASES["opencode_glm"]
+
+
+def test_opencode_aliases_are_zdr_review_variants():
+    # Handpicked ZDR aliases only — zdr-auto-* (managed by oc_sync_zdr_aliases.py,
+    # order changes over time) are deliberately not valid tag targets.
+    assert OPENCODE_MODEL_ALIASES["opencode_deepseek"] == "openrouter/zdr-review"
+    assert OPENCODE_MODEL_ALIASES["opencode_deepseek_long"] == "openrouter/zdr-review-long"
+    assert OPENCODE_MODEL_ALIASES["opencode_glm"] == "openrouter/zdr-review-alt"
+
+
+def test_opencode_tags_do_not_leak_to_other_providers():
+    assert model_id_for_provider("opencode_deepseek", "claude") is None
+    assert model_id_for_provider("claude_opus", "opencode") is None
+
+
+def test_opencode_aliases_blocked_on_other_providers():
+    assert model_id_for_provider("opencode_deepseek", "openrouter") is None
+    assert model_id_for_provider("opencode_glm", "codex") is None
+
+
+def test_native_aliases_blocked_on_opencode():
+    assert model_id_for_provider("or_glm", "opencode") is None
+    assert model_id_for_provider("vibe_medium", "opencode") is None
+
+
+def test_is_known_model_tag_recognises_opencode():
+    assert is_known_model_tag("opencode_deepseek") is True
+    assert is_known_model_tag("opencode_deepseek_long") is True
+    assert is_known_model_tag("opencode_glm") is True
+    assert is_known_model_tag("opencode_kaputt") is False
+
+
+def test_opencode_alias_count():
+    # Sanity: drift-detection — if the dict shrinks/grows unexpectedly the
+    # tag map in dispatcher.py probably needs updating too (same pattern as
+    # test_openrouter_alias_count above).
+    assert len(OPENCODE_MODEL_ALIASES) == 3

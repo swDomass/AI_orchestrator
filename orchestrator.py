@@ -68,6 +68,7 @@ from dispatcher import (
     force_refresh_can_unblock,
     forced_provider_policy_violation,
     policy_dead_end,
+    profile_dead_end_reason,
 )
 from limits import get_limits, set_queue_idle, set_paused, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
@@ -1176,7 +1177,9 @@ def _policy_violation_message(name: str, allowed: list[str], tool_name: str | No
     )
 
 
-def _policy_dead_end_message(allowed: list[str], tool_name: str | None) -> str:
+def _policy_dead_end_message(
+    allowed: list[str], tool_name: str | None, task: str, profile=None
+) -> str:
     """Message for "the policy leaves no routable provider" — no #provider tag involved.
 
     Terminal for the same reason as _policy_violation_message, but it has to say
@@ -1184,9 +1187,81 @@ def _policy_dead_end_message(allowed: list[str], tool_name: str | None) -> str:
     fallback chain simply do not intersect. Reported instead of parked, because
     the park path promises a quota reset that cannot lift a policy restriction —
     the task would sit in the queue forever, re-announcing a wait that never ends.
+
+    ``profile`` only sharpens the wording; ``task`` is mandatory and must be the
+    same task string ``policy_dead_end()`` just saw. It carries the
+    ``#tool_providers:`` tag layer (``dispatcher._allowed_by_policy``), so passing
+    a placeholder silently drops one policy layer and can flip a cause from
+    "excluded by an allow-list" to "barred as uncapped" — measured, which is why
+    the parameter has no default any more.
+
+    When the profile's own ``providers:`` list is the reason, pointing at
+    tool_providers-Policy/policy.yaml sends whoever reads this at 03:00 to the
+    wrong file. ``dispatcher.profile_dead_end_reason()`` therefore splits that
+    case into **three** causes, each with a different remedy:
+
+    * **unregistered** — no CLI/API key here. Nothing in policy.yaml fixes it.
+    * **uncapped_barred** — registered, but pay-per-token with no allow-list
+      resolved, i.e. the fail-closed default. Emphatically NOT a statement about
+      policy.yaml's contents: the allow-list this function receives has already
+      been through ``_effective_allowed()``, so a synthesised list is
+      indistinguishable from a configured one by the time it arrives here. That
+      is why the classification happens dispatcher-side, on the raw ``allowed``.
+    * **policy_barred** — an allow-list exists and omits it. This is the ONLY
+      cause that may print ``listed``, and printing it is safe precisely there:
+      a non-empty ``policy_barred`` implies a truthy raw ``allowed``, hence
+      ``dead_end == list(allowed)`` — a real, configured list, never a synthesised
+      one. It is rendered only ALONGSIDE one of the first two (the reason function
+      returns None when it stands alone, leaving that case to the generic message
+      below, which already names the allow-list correctly).
+
+    Do not drop the third branch as redundant: it is the only place this message
+    names an allow-list as the *cause* (policy.yaml is mentioned as a *remedy* in
+    the uncapped branch and in the generic message below as well), and a mixed
+    profile genuinely has both halves.
     """
     scope = f"Tool '{tool_name}'" if tool_name else "diesen Task"
     listed = ", ".join(allowed) if allowed else "keiner"
+    reason = profile_dead_end_reason(task, tool_name=tool_name, profile=profile)
+    if reason is not None:
+        unregistered, uncapped_barred, policy_barred = reason
+        causes = []
+        if unregistered:
+            causes.append(
+                f"{unregistered} ist in diesem Prozess nicht registriert (CLI bzw. API-Key fehlt)"
+            )
+        if uncapped_barred:
+            # Every barred name, not just the first: the advice is only actionable
+            # if following it actually unblocks the run, and a profile naming
+            # [vibe, openrouter] needs both freed.
+            causes.append(
+                f"{uncapped_barred} wird ohne ausdrückliche Freigabe nicht geroutet "
+                f"(pay-per-token, kein Kostendeckel) — "
+                f"`#tool_providers:{','.join(uncapped_barred)}` in der Queue-Zeile oder "
+                f"ein `tool_providers:`-Eintrag in der policy.yaml gibt sie frei"
+            )
+        if policy_barred:
+            causes.append(
+                f"{policy_barred} steht nicht in der tool_providers-Allow-Liste [{listed}]"
+            )
+        # Where to look depends on which causes fired. Both `policy_barred` (not in
+        # the allow-list) and `uncapped_barred` (needs an authorisation) are fixed in
+        # policy.yaml or the queue line, so naming only the profile would point at a
+        # file that cannot resolve them — the same wrong-finger error this whole
+        # branch exists to remove, one level smaller. "Profil prüfen" alone is left
+        # for the single case where neither file helps: the provider is not
+        # installed here at all.
+        where = (
+            "policy.yaml oder Profil prüfen"
+            if (policy_barred or uncapped_barred)
+            else "Profil prüfen"
+        )
+        return (
+            f"Kein Provider für {scope} routebar: Profil "
+            f"'{getattr(profile, 'name', '?')}' nennt {list(profile.providers)} — "
+            + " und ".join(causes)
+            + f". Kein Quota-Reset ändert das. Task abgebrochen ({where})."
+        )
     return (
         f"Kein Provider für {scope} zugelassen: die tool_providers-Policy erlaubt "
         f"[{listed}], davon ist keiner in der Fallback-Kette registriert und "
@@ -1878,7 +1953,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         task, tool_name=tool_name, strict=provider_is_forced, profile=profile,
                     )
                     if dead_end is not None:
-                        msg = _policy_dead_end_message(dead_end, tool_name)
+                        msg = _policy_dead_end_message(dead_end, tool_name, task, profile)
                         print(f"  🚫 {msg}")
                         append_log(msg)
                         notify_error(task, "policy", msg)
@@ -2176,7 +2251,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     task, tool_name=tool_name, strict=provider_is_forced, profile=profile,
                 )
                 if dead_end is not None:
-                    msg = _policy_dead_end_message(dead_end, tool_name)
+                    msg = _policy_dead_end_message(dead_end, tool_name, task, profile)
                     print(f"  🚫 {msg}")
                     append_log(msg)
                     notify_error(task, "policy", msg)
@@ -2660,7 +2735,13 @@ def main() -> None:
     if args.check_limits:
         limits = get_limits()
         print("\nAktuelle Usage-Limits:")
-        for name in ("claude", "gemini", "codex"):
+        # opencode carries no cclimits windows (its AllLimits.remaining_pct is a
+        # live OpenRouter $-budget snapshot, not a window breakdown — see
+        # limits._opencode_budget_snapshot()) — `lim.windows` defaults to an
+        # empty dict for it (ProviderLimits.windows: field(default_factory=dict)),
+        # verified rather than assumed, so the loop below is a natural no-op for
+        # opencode, not a special case.
+        for name in ("claude", "gemini", "codex", "opencode"):
             lim = getattr(limits, name)
             status = f"{lim.remaining_pct:.1f}% remaining" if lim.available else f"❌ {lim.error}"
             reset = f", reset in {fmt_time(lim.resets_in_sec)}" if lim.resets_in_sec else ""

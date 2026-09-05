@@ -352,6 +352,10 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "claude": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
     "gemini": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
     "codex": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
+    # opencode has neither a PreToolUse hook (that only fires for Claude) nor a
+    # sandbox (unlike Codex's --sandbox workspace-write) — the agent's own tool
+    # permission gates (opencode.json) plus this prompt are the only guardrails.
+    "opencode": f"{_BASE_PROMPT}\n\n{SAFETY_RULES}",
 }
 
 # --- OpenRouter (HTTP provider, pay-per-token) ---
@@ -396,6 +400,46 @@ VIBE_MAX_TURNS = _parse_int_env("VIBE_MAX_TURNS", 12)
 # read_only runs disable every tool, so a single assistant turn is all that can
 # happen — anything higher would just widen the blast radius of a hang.
 VIBE_READONLY_MAX_TURNS = _parse_int_env("VIBE_READONLY_MAX_TURNS", 1)
+
+# --- opencode CLI (Stufe 2: tag-activated third external voice) ---
+# Registered only when opencode.exe resolves past the npm shim AND both
+# required agents (extern-review/extern-dev) exist in opencode.json — see
+# providers/opencode.py. Never part of the fallback chain (Stufe 3, not
+# built): activation needs an explicit #opencode / #opencode_<alias> tag.
+# Byte-only liveness like Vibe/Codex (no NDJSON tool-aware signal) — 300s
+# instead of the CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC default of 1200s because
+# measured normal runs finish in 8-21s with the longest observed silence at
+# 46-58s, so 300s already sits at ~5x the worst observed gap.
+OPENCODE_IDLE_TIMEOUT_SEC = _parse_int_env("OPENCODE_IDLE_TIMEOUT_SEC", 300)
+# Prompt travels via a `-f` temp file, not stdin (see providers/opencode.py).
+# A file outside --dir cannot be reread by either agent once attached
+# (external_directory: deny is the LAST matching permission rule, measured
+# 2026-09-04 — even the seemingly-allowed %TEMP%/opencode/* path fails the
+# same way), so above this cap the run fails loudly with error=
+# "prompt_too_large" instead of the agent silently judging a truncated
+# fraction of the material. Measured largest real prompts: 16.8/29.3/32.0 KB —
+# the cap does not fire in normal operation.
+OPENCODE_MAX_PROMPT_BYTES = _parse_int_env("OPENCODE_MAX_PROMPT_BYTES", 50_000)
+# Profile passed to the optional model picker (oc_pick_model.py --profile).
+# "zdr" restricts picks to opencode.json aliases carrying
+# data_collection:"deny" AND zdr:true — the only aliases safe for customer code.
+OPENCODE_PICKER_PROFILE = os.getenv("OPENCODE_PICKER_PROFILE", "zdr")
+# Absolute path to oc_pick_model.py. Empty by default and NOT a last resort:
+# the picker lives in ~/.claude/scripts and is simply absent on a fresh
+# machine, where OPENCODE_DEFAULT_MODEL below is the normal resolution path.
+OPENCODE_MODEL_PICKER = os.getenv("OPENCODE_MODEL_PICKER", "")
+OPENCODE_DEFAULT_MODEL = os.getenv("OPENCODE_DEFAULT_MODEL", "openrouter/zdr-review")
+# opencode's own config file — read-only from here, never written to. Machine-
+# local agent/model setup stays with the user; see doctor's WARN-only check.
+OPENCODE_CONFIG_PATH = Path(
+    os.getenv("OPENCODE_CONFIG_PATH", str(Path.home() / ".config" / "opencode" / "opencode.json"))
+)
+# Minimum OpenRouter $ remaining before AllLimits.opencode reports available=False
+# (limits._opencode_budget_snapshot(), fail-closed — see its docstring). The
+# threshold is sized off the most expensive curated review measured so far
+# (~$0.195, ZDR auto-2/Kimi K3), so it leaves exactly one full run of headroom
+# rather than an arbitrary buffer.
+OPENCODE_MIN_REMAINING_USD = _parse_positive_float_env("OPENCODE_MIN_REMAINING_USD", 0.25)
 
 # --- Telegram Notifications ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -673,10 +717,14 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
 # from any benchmark here. Treat it as a default worth trying, not as an invariant, and
 # re-check it when model generations change (quarterly sweep).
 #
-# Selected per task via the `#effort:<level>` queue tag. Claude-exclusive: Codex,
-# Mistral and OpenRouter have no equivalent flag. They ignore the tag *by
-# construction*, because only providers/claude.py reads `_forced_effort` — there is
-# deliberately no `supports_effort` capability check.
+# Selected per task via the `#effort:<level>` queue tag. Codex, Gemini, Mistral and
+# OpenRouter have no equivalent flag and ignore the tag *by construction*, because
+# they never read `_forced_effort` — there is deliberately no `supports_effort`
+# capability check. NOT Claude-exclusive since 2026-09-04: providers/opencode.py
+# reads the same property and passes the level straight through to opencode's
+# `--variant` flag, raw and unmapped (opencode tolerates unknown values; `--variant
+# xhigh` was measured at exit 0). Corrected 2026-09-05 — this comment still claimed
+# exclusivity months after opencode joined.
 #
 # Ordered tuple, not a set: this is an ordinal scale, and lint/help messages must show
 # it in ascending order. A sorted frozenset would print "high, low, max, medium, xhigh"
@@ -733,12 +781,24 @@ OPENROUTER_MODEL_ALIASES: dict[str, str] = {
     "or_deepseek": "deepseek/deepseek-v4-pro",     # $0.44 / $0.87, 1M ctx
     "or_minimax":  "minimax/minimax-m2.7",         # $0.28 / $1.20, 196k ctx
 }
+# opencode aliases: ONLY handpicked entries. The zdr-auto-* aliases in
+# opencode.json are managed by oc_sync_zdr_aliases.py and their ORDER changes
+# (it re-ranks by benchmark score) — a tag pointing at one of those would
+# silently pick a different model over time, so they are not valid tag targets.
+# All three verified 2026-09-04 against opencode.json: present, and each
+# carries data_collection:"deny" + zdr:true.
+OPENCODE_MODEL_ALIASES: dict[str, str] = {
+    "opencode_deepseek":      "openrouter/zdr-review",       # deepseek-v4-pro
+    "opencode_deepseek_long": "openrouter/zdr-review-long",  # deepseek-v4-flash, 1M ctx
+    "opencode_glm":           "openrouter/zdr-review-alt",   # glm-5.2
+}
 _MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
     "claude":     CLAUDE_MODEL_ALIASES,
     "gemini":     GEMINI_MODEL_ALIASES,
     "codex":      CODEX_MODEL_ALIASES,
     "openrouter": OPENROUTER_MODEL_ALIASES,
     "vibe":       VIBE_MODEL_ALIASES,
+    "opencode":   OPENCODE_MODEL_ALIASES,
 }
 
 

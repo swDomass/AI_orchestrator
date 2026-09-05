@@ -105,6 +105,170 @@ def check_vibe_cli() -> CheckResult:
     )
 
 
+def check_opencode_cli() -> CheckResult:
+    """opencode is optional (Stufe 2, tag-activated) — every finding here is a
+    WARN, never a FAIL, same posture as check_vibe_cli(). Six independent
+    checks, because the point of this one is opencode's real ZDR/budget
+    contract, not just "is the binary there":
+
+    1. ``opencode.exe`` resolvable — not just the ``.CMD``/``.ps1`` npm shim
+       (see providers/opencode.py's module docstring for why the shim alone
+       cannot be spawned safely).
+    2. Both agents this repo depends on (extern-review/extern-dev) configured
+       in opencode.json.
+    3. Every ``config.OPENCODE_MODEL_ALIASES`` entry exists in opencode.json's
+       ``provider.<name>.models`` map AND carries
+       ``options.provider.data_collection == "deny"`` and
+       ``options.provider.zdr == true`` — measured against the real
+       opencode.json 2026-09-04, that nested path is where the ZDR
+       restriction actually lives (on the alias, not the raw model id), so a
+       tag resolving straight to a bare model id would ship without it.
+    3b. ``config.OPENCODE_DEFAULT_MODEL`` (what a ``#opencode`` task without an
+       alias tag actually uses) passes the same contract check as the tag
+       aliases above — a target opencode cannot resolve does not error, it
+       hangs at init (measured 2026-09-04: no exit, no output, watchdog
+       idle-kill instead of a diagnosable failure). Skipped when it is
+       byte-identical to an already-checked alias target, so a broken shared
+       id is reported once, not twice.
+    4. Top-level ``small_model`` is set and points at an ``openrouter/``
+       alias — unset, opencode picks its own small-model path, which
+       measured 2026-09-04 went straight to Google/opencode Zen: past both
+       the $5 cap and ZDR.
+    5. The OpenRouter key behind opencode has a spending cap at all
+       (``openrouter_budget.fetch_budget()``) — without one,
+       ``AllLimits.opencode`` is permanently ``available=False`` and opencode
+       never routes (see ``limits._opencode_budget_snapshot()``'s
+       ``"uncapped_key"`` branch).
+
+    opencode.json is READ ONLY here — same as providers/opencode.py's own
+    ``_load_opencode_config()`` — never written to (machine-local setup stays
+    with the user).
+    """
+    import config
+    import openrouter_budget
+    from providers.opencode import _load_opencode_config, _resolve_exe
+
+    findings: list[str] = []
+
+    if _resolve_exe() is None:
+        shim = shutil.which("opencode")
+        if shim:
+            expected = Path(shim).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+            findings.append(f"nur npm-Shim gefunden ({shim}), erwartete Datei fehlt: {expected}")
+        else:
+            findings.append("opencode nicht im PATH gefunden")
+
+    cfg = _load_opencode_config()  # never raises, {} on any read/parse failure
+
+    agents = cfg.get("agent")
+    agents = agents if isinstance(agents, dict) else {}
+    missing_agents = [a for a in ("extern-review", "extern-dev") if a not in agents]
+    if missing_agents:
+        findings.append(f"opencode.json: Agent(en) fehlen: {', '.join(missing_agents)}")
+
+    providers_cfg = cfg.get("provider")
+    providers_cfg = providers_cfg if isinstance(providers_cfg, dict) else {}
+
+    def _zdr_contract_violation(full_id: str) -> str | None:
+        """None when *full_id* resolves to an alias carrying the full ZDR contract.
+
+        The restriction lives on the ALIAS, never on the model: under
+        `provider.openrouter` there is no provider-wide `options` block, so a raw
+        model id goes out with no data-protection option at all (A/B measured
+        2026-08-21 — same model, two throwaway aliases, only the option differing:
+        without it "pong" and exit 0, with it "No endpoints found matching your
+        data policy" and exit 1). Existence alone is therefore not enough; both
+        halves have to be there.
+        """
+        provider_name, sep, model_key = full_id.partition("/")
+        provider_entry = providers_cfg.get(provider_name) if sep else None
+        provider_entry = provider_entry if isinstance(provider_entry, dict) else {}
+        models = provider_entry.get("models")
+        entry = models.get(model_key) if isinstance(models, dict) else None
+        if not isinstance(entry, dict):
+            return "fehlt in opencode.json"
+        options = entry.get("options")
+        provider_opts = options.get("provider") if isinstance(options, dict) else None
+        provider_opts = provider_opts if isinstance(provider_opts, dict) else {}
+        if not (provider_opts.get("data_collection") == "deny" and provider_opts.get("zdr") is True):
+            return "ohne data_collection:deny + zdr:true"
+        return None
+
+    alias_problems = [
+        f"{alias} ({full_id}) {problem}"
+        for alias, full_id in config.OPENCODE_MODEL_ALIASES.items()
+        if (problem := _zdr_contract_violation(full_id))
+    ]
+    if alias_problems:
+        findings.append("ZDR-Alias-Vertrag verletzt: " + "; ".join(alias_problems))
+
+    # config.OPENCODE_DEFAULT_MODEL is what every #opencode task WITHOUT an
+    # alias tag actually resolves to — unlike the three checks above, an
+    # unresolvable target here does not surface as an error at all: measured
+    # 2026-09-04, three otherwise-identical runs in the same empty directory —
+    # a nonexistent `--model` produced no exit and no output (last log line
+    # `message=init`, observation aborted after 120s/150s), while the same run
+    # with `openrouter/zdr-review` printed OK and exited in 8s. In the
+    # orchestrator that non-error is a silent hang: OPENCODE_IDLE_TIMEOUT_SEC
+    # elapses, the watchdog kills it, error="hang", requeue with backoff to
+    # MAX_HANG_RETRIES, then blocked — a dead task with no diagnostic pointing
+    # at the cause. Skip when the default is byte-identical to an already-
+    # checked alias target (today: default == OPENCODE_MODEL_ALIASES["opencode_
+    # deepseek"] == "openrouter/zdr-review") — _zdr_contract_violation() is a
+    # pure function of (full_id, providers_cfg), so re-running it here would
+    # either duplicate a finding already in alias_problems or duplicate a
+    # silent pass, never add information.
+    default_model = config.OPENCODE_DEFAULT_MODEL
+    if default_model not in config.OPENCODE_MODEL_ALIASES.values():
+        if (default_problem := _zdr_contract_violation(default_model)):
+            findings.append(
+                f"Standardmodell OPENCODE_DEFAULT_MODEL ({default_model}) {default_problem} "
+                "— jeder #opencode-Task ohne Alias-Tag nutzt genau dieses Modell; ein nicht "
+                "aufloesbares Modell haengt (kein Fehler, Idle-Timeout + Hang-Retry bis "
+                "MAX_HANG_RETRIES, dann blockiert), statt sauber zu scheitern"
+            )
+
+    # The small model is THE documented bypass: opencode picks it itself when
+    # `small_model` is unset, and 9 measured runs went straight to Google resp.
+    # opencode Zen — past the $5 cap AND past ZDR. So the prefix is only half the
+    # check: `openrouter/whatever` routes through the capped key but says nothing
+    # about data protection, and this is the one path where that matters most
+    # (customer code, unattended). Run the target through the SAME contract check
+    # as the tag aliases above rather than trusting the prefix.
+    small_model = cfg.get("small_model")
+    if not isinstance(small_model, str) or not small_model.startswith("openrouter/"):
+        findings.append(
+            "small_model nicht gesetzt oder zeigt nicht auf einen openrouter/-Alias — "
+            "der Klein-Modell-Pfad kann Deckel und ZDR umgehen (gemessen: 4x Google, "
+            "5x opencode Zen direkt)"
+        )
+    elif (problem := _zdr_contract_violation(small_model)):
+        findings.append(
+            f"small_model ({small_model}) {problem} — der Klein-Modell-Pfad laeuft "
+            f"damit zwar ueber den gedeckelten Key, aber ohne Datenschutz-Zusage"
+        )
+
+    # Kein Hänger: fetch_budget() kapselt ihren eigenen Timeout, hier trotzdem
+    # kurz gehalten, damit ein hängender Netzcall --doctor nicht blockiert.
+    _limit, remaining, _reset = openrouter_budget.fetch_budget(timeout=5.0)
+    if remaining is None:
+        findings.append(
+            "OpenRouter-Key hinter opencode traegt keinen abfragbaren Deckel (oder "
+            "die Abfrage schlug fehl) — AllLimits.opencode bleibt dauerhaft "
+            "available=False, opencode routet nie"
+        )
+
+    if not findings:
+        return CheckResult(
+            PASS, "opencode CLI",
+            "exe + Agenten + ZDR-Aliase + small_model + Budget-Deckel OK",
+        )
+    return CheckResult(
+        WARN, "opencode CLI", "; ".join(findings),
+        fix_hint="opencode ist optional — Details im CLAUDE.md-Abschnitt zu opencode",
+    )
+
+
 def check_node() -> CheckResult:
     return _check_cli("Node.js", "node", "https://nodejs.org")
 
@@ -633,6 +797,7 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_gemini_cli(),
         check_codex_cli(),
         check_vibe_cli(),
+        check_opencode_cli(),
         check_node(),
         check_git(),
         check_cclimits(),

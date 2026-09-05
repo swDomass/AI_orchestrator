@@ -326,9 +326,12 @@ def test_linter_flags_malformed_tag_hiding_behind_a_valid_one():
     "#vibe", "#openrouter", "#or_glm", "#codex_5", "#gemini_flash_lite", "#codex",
 ])
 def test_linter_warns_for_every_non_claude_routing_form(routing_tag):
-    """The routing check must be complete. PROVIDER_TAG_RE alone knows only
-    claude|gemini|codex and silently missed #vibe, #openrouter, #or_* and the
-    version-shaped model aliases."""
+    """The routing check must be complete: bare provider tags AND version-shaped
+    model aliases. Uses queue_linter._routed_providers(), not PROVIDER_TAG_RE
+    directly — that regex (even after being derived from dispatcher._TAG_MAP,
+    which added #vibe/#openrouter to it) only ever matches bare provider names,
+    never #or_*/#codex_5/#gemini_flash_lite-style aliases; see the docstring on
+    _routed_providers() for why it derives from _MODEL_ALIASES_BY_PROVIDER instead."""
     assert (LEVEL_WARN, "effort_non_claude") in _lint_codes(f"Task {routing_tag} #effort:low")
 
 

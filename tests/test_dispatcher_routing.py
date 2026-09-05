@@ -12,12 +12,21 @@ from dispatcher import (
     resolve_forced_provider,
     force_refresh_can_unblock,
     _providers,
+    _selection_order,
 )
 
 
 def _make_limits(claude_avail=True, gemini_avail=True, codex_avail=True,
-                 claude_pct=50.0, gemini_pct=50.0, codex_pct=50.0):
-    """Build a mock AllLimits object."""
+                 claude_pct=50.0, gemini_pct=50.0, codex_pct=50.0,
+                 opencode_avail=True, opencode_pct=50.0):
+    """Build a mock AllLimits object.
+
+    opencode defaults to available=True — unlike openrouter/vibe it is NOT in
+    _UNCAPPED_PROVIDERS, so _limits_ok("opencode", ...) reaches the real
+    getattr(limits, "opencode").available branch instead of short-circuiting to
+    True. Without this field any test that routes an #opencode tag through a
+    registered-and-available provider would AttributeError here.
+    """
     return SimpleNamespace(
         claude=SimpleNamespace(available=claude_avail, remaining_pct=claude_pct, error=None,
                                windows={}),
@@ -25,6 +34,8 @@ def _make_limits(claude_avail=True, gemini_avail=True, codex_avail=True,
                                windows={}),
         codex=SimpleNamespace(available=codex_avail, remaining_pct=codex_pct, error=None,
                               windows={}),
+        opencode=SimpleNamespace(available=opencode_avail, remaining_pct=opencode_pct, error=None,
+                                 windows={}),
     )
 
 
@@ -362,3 +373,194 @@ def test_limits_ok_returns_true_for_vibe():
     from dispatcher import _limits_ok
     limits_ = _make_limits(claude_avail=False, gemini_avail=False, codex_avail=False)
     assert _limits_ok("vibe", limits_) is True
+
+
+def test_profile_provider_order_fails_closed_on_uncapped_provider(with_vibe):
+    """A profile naming vibe/openrouter must clear the same fail-closed gate as the
+    global/task-level policy layers — the profile branch of _selection_order() used
+    to only check registration (`p in _providers`), never _allows(), so a profile
+    `providers: [claude, vibe]` reached vibe whenever no tool_providers policy was
+    configured (allowed=None), which is the normal state of an installation without
+    a configured ceiling, not a corruption case. _isolate_policy_engine (conftest)
+    points at an empty vault, so `allowed` here is None exactly like that scenario.
+    """
+    profile = SimpleNamespace(providers=["claude", "vibe"],
+                              tool_providers={}, allowed_skills=[], denied_skills=[])
+    order, allowed = _selection_order("Do it", profile, None, False, None)
+    assert allowed is None
+    assert order == ["claude"]
+
+
+# ---------------------------------------------------------------------------
+# opencode routing — capped-but-opt-in: registered conditionally like Vibe,
+# but NOT in _UNCAPPED_PROVIDERS (its cap is pollable, see limits.py) and NOT
+# reviewer-only (it writes) — still in _NO_FALLBACK_PROVIDERS because the tag
+# itself is the ask (avoid Claude quota, or the only ZDR path for customer
+# code), not because of blast radius.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def with_opencode():
+    """Register opencode in dispatcher._providers regardless of local CLI/config
+    presence."""
+    import dispatcher
+    from providers.opencode import OpencodeProvider
+
+    had_it = "opencode" in dispatcher._providers
+    if not had_it:
+        dispatcher._providers["opencode"] = OpencodeProvider()
+    yield dispatcher._providers["opencode"]
+    if not had_it:
+        dispatcher._providers.pop("opencode", None)
+
+
+@pytest.fixture
+def without_opencode():
+    import dispatcher
+
+    saved = dispatcher._providers.pop("opencode", None)
+    yield
+    if saved is not None:
+        dispatcher._providers["opencode"] = saved
+
+
+def test_opencode_not_in_default_fallback_chain(with_opencode):
+    """Untagged tasks must never route to opencode, even when it's registered —
+    Stufe 3 (_PRIORITY membership) is explicitly not built."""
+    limits_ = _make_limits()
+    provider = select_provider("Fix a bug", limits_)
+    assert provider is not None
+    assert provider.name != "opencode"
+
+
+def test_opencode_not_selected_when_all_others_unavailable(with_opencode):
+    """opencode must NOT step in as a last resort when claude/codex are blocked —
+    only an explicit tag can reach it."""
+    limits_ = _make_limits(claude_avail=False, gemini_avail=False, codex_avail=False)
+    assert select_provider("Fix a bug", limits_) is None
+
+
+def test_opencode_tags_select_opencode_when_registered(with_opencode):
+    limits_ = _make_limits()
+    for tag in ("#opencode", "#opencode_deepseek", "#opencode_deepseek_long", "#opencode_glm"):
+        provider = select_provider(f"Second opinion {tag}", limits_)
+        assert provider is not None, f"No provider returned for {tag}"
+        assert provider.name == "opencode", f"{tag} did not route to opencode"
+
+
+def test_opencode_tag_does_not_degrade_into_another_provider(without_opencode):
+    """Explicitly asking for opencode must never be silently answered by
+    Claude/Codex — the tag itself is the ask (avoid Claude quota, or the only
+    ZDR path). Without the CLI/config the task is parked, not escalated."""
+    limits_ = _make_limits()
+    assert select_provider("Second opinion #opencode", limits_) is None
+    assert select_provider("Second opinion #opencode_deepseek", limits_) is None
+
+
+def test_unregistered_opencode_does_not_park_untagged_tasks(without_opencode):
+    """The guard is scoped to tasks that actually tag opencode."""
+    limits_ = _make_limits()
+    provider = select_provider("Fix a bug", limits_)
+    assert provider is not None
+    assert provider.name == "claude"
+
+
+def test_explicit_executor_tag_still_wins_alongside_opencode(without_opencode):
+    """#claude next to an inert #opencode is an explicit choice, not an escalation."""
+    limits_ = _make_limits()
+    provider = select_provider("Review this #claude #opencode", limits_)
+    assert provider is not None
+    assert provider.name == "claude"
+
+
+def test_has_explicit_provider_tag_detects_opencode_tags():
+    assert has_explicit_provider_tag("Review #opencode") is True
+    assert has_explicit_provider_tag("Review #opencode_deepseek") is True
+    assert has_explicit_provider_tag("Review #opencode_deepseek_long") is True
+    assert has_explicit_provider_tag("Review #opencode_glm") is True
+
+
+def test_opencode_bare_tag_not_confused_with_model_alias(with_opencode):
+    r"""#opencode is a literal prefix of #opencode_deepseek — each must resolve to
+    itself. Regression for the boundary MODEL_TAG_RE/_TAG_RE_BY_PROVIDER rely on
+    ((?![\w-]) on the right, (?<!\S) on the left) — same class of bug as
+    codex_5 vs codex_5_4."""
+    from dispatcher import resolve_forced_provider
+
+    bare = resolve_forced_provider("Task #opencode")
+    aliased = resolve_forced_provider("Task #opencode_deepseek")
+    assert bare is not None and bare.name == "opencode"
+    assert aliased is not None and aliased.name == "opencode"
+
+    limits_ = _make_limits()
+    from config import model_id_for_provider
+    # The bare tag must NOT force a model — only the aliased tag should.
+    assert model_id_for_provider("opencode", "opencode") is None
+    assert model_id_for_provider("opencode_deepseek", "opencode") is not None
+
+
+def test_limits_ok_checks_opencode_capacity_unlike_openrouter_and_vibe():
+    """opencode is NOT in _UNCAPPED_PROVIDERS — its own AllLimits.opencode.available
+    must actually be consulted, unlike the unconditional True for openrouter/vibe."""
+    from dispatcher import _limits_ok
+    available = _make_limits(opencode_avail=True)
+    unavailable = _make_limits(opencode_avail=False)
+    assert _limits_ok("opencode", available) is True
+    assert _limits_ok("opencode", unavailable) is False
+
+
+def test_opencode_not_in_priority():
+    """Stufe 3 (_PRIORITY membership) is explicitly not built — the hang cause
+    against opencode is unmeasured, and _PRIORITY is exactly where an unattended
+    run would hit it without a tag asking for it."""
+    from dispatcher import _PRIORITY
+    assert "opencode" not in _PRIORITY
+
+
+def test_opencode_not_in_uncapped_providers():
+    """opencode IS pay-per-token but its cap is pollable (own OpenRouter key,
+    live-polled $/day limit via openrouter_budget.fetch_budget()) — unlike
+    openrouter/vibe it does not need the unconditional _limits_ok() True nor the
+    fail-closed _allows() default, so it must stay out of this set."""
+    from dispatcher import _UNCAPPED_PROVIDERS
+    assert "opencode" not in _UNCAPPED_PROVIDERS
+    assert _UNCAPPED_PROVIDERS == frozenset({"openrouter", "vibe"})
+
+
+def test_opencode_in_no_fallback_providers():
+    from dispatcher import _NO_FALLBACK_PROVIDERS
+    assert "opencode" in _NO_FALLBACK_PROVIDERS
+    assert "vibe" in _NO_FALLBACK_PROVIDERS
+
+
+def test_park_log_names_the_specific_no_fallback_provider(without_vibe, without_opencode, capsys):
+    """The park log line must name which provider is missing — 'vibe fehlt' and
+    'opencode fehlt' need to be distinguishable in an unattended 03:00 log."""
+    limits_ = _make_limits()
+
+    select_provider("Second opinion #vibe", limits_)
+    vibe_out = capsys.readouterr().out
+    assert "vibe" in vibe_out
+    assert "opencode" not in vibe_out
+
+    select_provider("Second opinion #opencode", limits_)
+    opencode_out = capsys.readouterr().out
+    assert "opencode" in opencode_out
+
+
+def test_park_log_also_reaches_the_logger_not_only_stdout(without_opencode, caplog):
+    """capsys alone pins the WRONG channel for the promise this line makes.
+
+    The line exists to be readable "in an unattended run", and run_orchestrator.ps1
+    starts --watch with no stdout redirection — so a print-only version is exactly
+    absent where it was needed, and the morning shows the generic "alle Provider
+    voll" message instead. Same trap CLAUDE.md documents for
+    queue_manager.collect_file_context.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="dispatcher"):
+        select_provider("Second opinion #opencode", _make_limits())
+
+    assert any("opencode" in r.message for r in caplog.records)

@@ -17,6 +17,7 @@ protection). The provider stays registered so tagged/legacy paths still resolve,
 but nothing routes there by default.
 """
 
+import logging
 import re
 from typing import Callable
 
@@ -27,9 +28,12 @@ from providers import (
     ClaudeProvider,
     CodexProvider,
     GeminiProvider,
+    OpencodeProvider,
     OpenRouterProvider,
     VibeProvider,
 )
+
+logger = logging.getLogger(__name__)
 
 # Tag in task text to force a specific provider.
 # Model-specific tags also select their owning provider.
@@ -61,6 +65,10 @@ _TAG_MAP = {
     "#or_qwen":           "openrouter",
     "#or_deepseek":       "openrouter",
     "#or_minimax":        "openrouter",
+    "#opencode":               "opencode",
+    "#opencode_deepseek":      "opencode",
+    "#opencode_deepseek_long": "opencode",
+    "#opencode_glm":           "opencode",
 }
 
 _TAG_RE_BY_PROVIDER = {
@@ -70,8 +78,9 @@ _TAG_RE_BY_PROVIDER = {
 
 # Singleton provider instances (carry cooldown state across calls).
 # OpenRouter and Vibe are registered conditionally: without an API key resp.
-# without the `vibe` binary on PATH, tagged tasks fall through to the default
-# chain (Claude/Gemini/Codex) automatically.
+# without the `vibe` binary on PATH, an OpenRouter-tagged task falls through to
+# the default chain (_PRIORITY = claude, codex — gemini left it on 2026-08-15)
+# automatically. Vibe and opencode do NOT: see _NO_FALLBACK_PROVIDERS below.
 _providers: dict[str, BaseProvider] = {
     "claude": ClaudeProvider(),
     "gemini": GeminiProvider(),
@@ -81,22 +90,42 @@ if config.OPENROUTER_API_KEY:
     _providers["openrouter"] = OpenRouterProvider()
 if VibeProvider.is_available():
     _providers["vibe"] = VibeProvider()
+if OpencodeProvider.is_available():
+    _providers["opencode"] = OpencodeProvider()
 
-# Priority order — OpenRouter and Vibe are intentionally absent so they NEVER
-# enter the default fallback chain. Activation requires an explicit
-# #openrouter/#or_* resp. #vibe/#vibe_* tag (or #second_opinion:vibe).
+# Priority order — OpenRouter, Vibe and opencode are intentionally absent so
+# they NEVER enter the default fallback chain. Activation requires an explicit
+# #openrouter/#or_*, #vibe/#vibe_* (or #second_opinion:vibe) resp.
+# #opencode/#opencode_* tag. opencode's omission here is Stufe 3 of its plan
+# and deliberately NOT built yet — the cause of a hang observed against it is
+# still unclear, and _PRIORITY membership is exactly where an unattended run
+# would hit that unmeasured failure mode without a tag asking for it.
 # Gemini removed 2026-08-15: an exhausted Claude used to hand untagged tasks
 # straight to it (fallback slot 2) although it cannot execute them
 # (IneligibleTierError) — plus data protection.
 _PRIORITY = ["claude", "codex"]
 
-# Providers whose whole point is that they do NOT write. Falling back from one of
-# these to the default chain would silently swap a non-writing reviewer for a
-# file-writing executor — a wider blast radius than the task asked for. For
-# OpenRouter the same fallback is harmless (executor → executor); here it is not.
-# So: an explicit tag for a reviewer-only provider that isn't registered yields
-# no provider at all, and the task is parked instead of quietly escalated.
-_REVIEWER_ONLY = {"vibe"}
+# Providers where falling back to the default chain on an unregistered tag would
+# be worse than parking the task — for two DIFFERENT reasons, not one:
+#
+# * vibe — blast radius. Vibe's whole point is that it does NOT write. Falling
+#   back would silently swap a non-writing reviewer for a file-writing executor.
+#   For OpenRouter the same fallback is harmless (executor → executor); here it
+#   is not.
+# * opencode — tag intent. opencode DOES write, so blast radius is not the
+#   argument. But tagging #opencode is itself the ask: often specifically to
+#   avoid spending Claude quota, and for customer code it is the only provider
+#   routed through a ZDR-guaranteed model (the handpicked openrouter/zdr-review*
+#   aliases). A silent fallback to Claude/Codex would spend the quota the tag
+#   was trying to avoid, or — worse, for customer code — quietly drop the ZDR
+#   guarantee the task was relying on.
+#
+# So: an explicit tag for one of these providers that isn't registered yields no
+# provider at all, and the task is parked instead of quietly escalated. Renamed
+# from `_REVIEWER_ONLY` (2026-09-04, opencode's addition) because "reviewer-only"
+# stopped describing the set the moment a writing provider joined it — the
+# mechanism is "no fallback", not "no writing".
+_NO_FALLBACK_PROVIDERS = {"vibe", "opencode"}
 
 # Providers billed per token with NO cost ceiling anywhere in this codebase:
 # _limits_ok() below returns True for them unconditionally (there is no cclimits
@@ -104,6 +133,29 @@ _REVIEWER_ONLY = {"vibe"}
 # (claude, codex) are capped by their own quota and cost nothing extra when they
 # run — so "spent money while nobody was watching" is a risk that exists for
 # exactly this set.
+#
+# opencode is deliberately NOT in this set, unlike OpenRouter/Vibe. It IS
+# pay-per-token, but the cap sits at the provider: a dedicated OpenRouter key
+# with `limit: 5`, `limit_reset: "daily"` (measured 2026-09-04), polled live via
+# openrouter_budget.fetch_budget() and applied fail-closed in
+# limits._apply_opencode_budget_override(). _limits_ok() below therefore does
+# NOT special-case opencode — the regular `getattr(limits, name).available`
+# path already carries its capacity, and _allows() stays fail-OPEN for it like
+# any other capped provider (a lost policy.yaml must not additionally bar an
+# already-capped provider).
+#
+# ⚠️ That last sentence is true of select_provider() ONLY. The tool routes —
+# get_provider_for_tool() / policy_provider_lookup(), e.g. a `#pass2:opencode`
+# resolved inside critical_review — consult the policy and nothing else; no
+# caller on that path reads AllLimits at all, for ANY provider. So with a
+# missing or unreadable policy.yaml (the OneDrive-sync case this file already
+# documents) a tool-tagged opencode run starts even at $0.00 remaining.
+# Deliberately left as-is: what bounds the money is the key's own daily cap, not
+# this check — which is the entire point of putting the ceiling at the provider
+# ("a bug in a counter we do not have cannot cost anything"). Adding a capacity
+# gate to the tool routes would be a change for every provider, not for opencode,
+# and belongs in its own task. Recorded here so the paragraph above is not read
+# as a guarantee it does not give.
 #
 # Single source of truth for that property: _limits_ok() reads it, and
 # _allows() below fails CLOSED for these when no policy could be loaded. Adding a
@@ -325,9 +377,16 @@ def _selection_order(
     if forced and allowed and forced.name not in allowed:
         return [], allowed
 
-    # Profile provider order overrides _PRIORITY
+    # Profile provider order overrides _PRIORITY. Unlike _PRIORITY (which never
+    # contains openrouter/vibe), a profile's `providers:` list legitimately can —
+    # so it must clear _allows() here too, not just the `if allowed:` filter
+    # below. That filter alone is fail-OPEN when allowed is None (see _allows()),
+    # which is correct for _PRIORITY's capped members but was silently routing
+    # an uncapped profile provider around the fail-closed gate: `known =
+    # {claude, gemini, codex}` used to make this structurally impossible before
+    # profiles.py started deriving providers from dispatcher._TAG_MAP.
     if profile and getattr(profile, "providers", None):
-        base_order = [p for p in profile.providers if p in _providers]
+        base_order = [p for p in profile.providers if p in _providers and _allows(p, allowed)]
     else:
         base_order = _PRIORITY[:]
 
@@ -367,14 +426,81 @@ def policy_dead_end(
     naming only providers that are not in the fallback chain, or a profile whose
     provider list and the policy do not intersect).
     """
-    # A task tagging an unregistered reviewer-only provider is parked on purpose
-    # (see _REVIEWER_ONLY) — not a policy dead end, so leave that path alone.
-    if resolve_forced_provider(task, force_name) is None and _tags_unregistered_reviewer_only(task):
+    # A task tagging an unregistered no-fallback provider is parked on purpose
+    # (see _NO_FALLBACK_PROVIDERS) — not a policy dead end, so leave that path alone.
+    if resolve_forced_provider(task, force_name) is None and _tags_unregistered_no_fallback_provider(task):
         return None
     order, allowed = _selection_order(task, profile, force_name, strict, tool_name)
     if order:
         return None
     return _effective_allowed(allowed)
+
+
+def profile_dead_end_reason(
+    task: str,
+    *,
+    tool_name: str | None = None,
+    profile=None,  # ProfileConfig | None
+) -> tuple[list[str], list[str], list[str]] | None:
+    """Why the *profile* left nothing routable — or None when the honest answer is
+    "the policy did", which the caller already words correctly.
+
+    Returns ``(unregistered, uncapped_barred, policy_barred)``. Three buckets,
+    because ``_allows()`` says False for two unrelated reasons and a message that
+    merges them states a cause it cannot know:
+
+    * ``unregistered`` — named in ``providers:`` but not registered in this
+      process at all (CLI missing, API key unset). No edit to policy.yaml changes
+      this, so a message pointing there sends the reader to the wrong file.
+    * ``uncapped_barred`` — registered, but in ``_UNCAPPED_PROVIDERS`` with **no**
+      allow-list resolved. That is the fail-CLOSED default from ``_allows()``, and
+      it says nothing about policy.yaml's contents: ``get_allowed_providers()``
+      returns None whenever no ``tool_providers:`` section exists, the normal
+      state of an install that never configured one. The fix is an explicit
+      authorisation, not a correction.
+    * ``policy_barred`` — registered, and an allow-list exists that does not name
+      it. This one genuinely IS the policy, and it is the case the caller's
+      pre-existing message already describes accurately, including printing the
+      list. Reported here only so a mixed profile can be described completely.
+
+    Returns None unless at least one of the first two buckets is non-empty:
+    when every entry fell to an explicit allow-list, there is nothing the profile
+    wording adds and the caller keeps its own — which also keeps that message's
+    contract of naming what the policy *does* allow.
+
+    The gate is ``not any(registered and allowed)``. A single entry that is both
+    means the empty order came from somewhere else, so the profile is not to blame.
+    Capacity and cooldown are deliberately not consulted: ``_selection_order()``
+    does not apply them either (see its docstring) — they are the temporary
+    reasons, and this function only explains permanent ones.
+
+    This replaced a narrower predicate that asked only "is NONE of them
+    registered?". It covered the missing-CLI case and reported everything else as
+    a tool_providers policy problem — naming an allow-list ``_effective_allowed()``
+    had synthesised, and calling providers unregistered that were registered all
+    along.
+    """
+    if not profile or not getattr(profile, "providers", None):
+        return None
+    allowed = _allowed_by_policy(task, profile, tool_name)
+    if any(p in _providers and _allows(p, allowed) for p in profile.providers):
+        return None
+    unregistered = [p for p in profile.providers if p not in _providers]
+    registered_barred = [
+        p for p in profile.providers if p in _providers and not _allows(p, allowed)
+    ]
+    if allowed:
+        uncapped_barred: list[str] = []
+        policy_barred = registered_barred
+    else:
+        # No allow-list resolved -> _allows() only ever says False for the
+        # uncapped set (it fails OPEN for the capped providers), so everything
+        # in registered_barred got there via the fail-closed default.
+        uncapped_barred = registered_barred
+        policy_barred = []
+    if not unregistered and not uncapped_barred:
+        return None
+    return unregistered, uncapped_barred, policy_barred
 
 
 def _limits_ok(name: str, limits: AllLimits) -> bool:
@@ -390,6 +516,12 @@ def _limits_ok(name: str, limits: AllLimits) -> bool:
     # it as available; rate-limit recovery is cooldown-driven, exactly like OpenRouter.
     if name == "gemini" and config.GEMINI_API_KEY:
         return True
+    # opencode falls through to here on purpose — no special case. It IS
+    # pay-per-token, but unlike OpenRouter/Vibe its cap is pollable (the
+    # OpenRouter key behind it has a real $/day limit), so
+    # limits.AllLimits.opencode.available already carries a real, fail-closed
+    # capacity signal (see limits._apply_opencode_budget_override()) — the
+    # same getattr() path every capped provider uses.
     return getattr(limits, name).available
 
 
@@ -415,20 +547,23 @@ def resolve_forced_provider(task: str, force_name: str | None = None) -> BasePro
     return None
 
 
-def _tags_unregistered_reviewer_only(task: str) -> bool:
-    """True when the task tags a reviewer-only provider that is not registered.
+def _tags_unregistered_no_fallback_provider(task: str) -> str | None:
+    """Return the name of a _NO_FALLBACK_PROVIDERS member the task tags but that
+    isn't registered, or None.
 
-    That is the one case where falling through to the default chain would hand a
-    deliberately non-writing review job to a file-writing executor. Everything
-    else (unknown tag, unregistered OpenRouter) keeps the existing fall-through.
+    Returning the name (not just a bool) lets the caller name the specific
+    provider in its park log line — "vibe fehlt" and "opencode fehlt" need to be
+    distinguishable in a 03:00 log, not collapse into one generic message.
+    Everything else (unknown tag, unregistered OpenRouter) keeps the existing
+    fall-through to the default chain.
     """
     task_lower = task.lower()
     for tag, provider_name in _TAG_MAP.items():
-        if provider_name not in _REVIEWER_ONLY or provider_name in _providers:
+        if provider_name not in _NO_FALLBACK_PROVIDERS or provider_name in _providers:
             continue
         if _TAG_RE_BY_PROVIDER[tag].search(task_lower):
-            return True
-    return False
+            return provider_name
+    return None
 
 
 def select_provider(
@@ -453,8 +588,28 @@ def select_provider(
     # without an API key), so the task falls through to the default chain.
     forced = resolve_forced_provider(task, force_name)
 
-    # Reviewer-only providers do not degrade into executors — see _REVIEWER_ONLY.
-    if forced is None and _tags_unregistered_reviewer_only(task):
+    # _NO_FALLBACK_PROVIDERS members do not degrade into another provider — see
+    # its docstring for the two different reasons (vibe: blast radius, opencode:
+    # tag intent). Name the provider in the log line so "vibe fehlt" and
+    # "opencode fehlt" read as different problems in an unattended run.
+    no_fallback_provider = _tags_unregistered_no_fallback_provider(task)
+    if forced is None and no_fallback_provider:
+        msg = (
+            f"[{no_fallback_provider}] Tag gesetzt, aber Provider nicht registriert — "
+            f"kein Fallback auf einen anderen Provider (siehe _NO_FALLBACK_PROVIDERS), "
+            f"Task wird geparkt."
+        )
+        # BOTH channels on purpose. The sentence above promises this line is
+        # readable "in an unattended run", and a bare print does not keep that
+        # promise: run_orchestrator.ps1 starts --watch with no stdout
+        # redirection, so print goes to a console nobody is looking at at 03:00
+        # (same trap CLAUDE.md documents for queue_manager.collect_file_context).
+        # What the morning actually shows without the log line is the generic
+        # "alle Provider voll/unreachable" message plus notify_providers_exhausted
+        # — pointing at a capacity problem that never existed, while Claude and
+        # Codex were free the whole time. print stays for the interactive case.
+        print(f"  {msg}")
+        logger.warning(msg)
         return None
 
     # Tool Policy Layering: task tag → profile → policy.yaml (see _allowed_by_policy),

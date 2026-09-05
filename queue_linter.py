@@ -16,7 +16,10 @@ Catches bad queue entries before they reach a provider:
   - #needs: references that will never resolve
   - #or_* tag without OPENROUTER_API_KEY configured
   - #vibe / #vibe_* tag without the `vibe` CLI on PATH (the task is parked, not
-    handed to a fallback executor — see dispatcher._REVIEWER_ONLY)
+    handed to a fallback executor — see dispatcher._NO_FALLBACK_PROVIDERS)
+  - #opencode / #opencode_* tag without a registered opencode (exe unresolved or
+    opencode.json missing extern-review/extern-dev) — parked, same non-fallback
+    reasoning as #vibe above but a different cause (see dispatcher._NO_FALLBACK_PROVIDERS)
   - #parallel with no/single subtask, or subtasks sharing CWD
   - HTML comments inside the task body (silently truncate the task text), or at the
     line end without being a valid retry/hang marker (silently dropped on rewrite)
@@ -40,6 +43,7 @@ from config import (
     _MODEL_ALIASES_BY_PROVIDER,
     is_known_model_tag,
 )
+from providers.opencode import OpencodeProvider
 from queue_manager import (
     AT_TAG_RE,
     CWD_RE,
@@ -95,6 +99,9 @@ _OPENROUTER_TAG_RE = re.compile(r"(?i)(?<!\S)#(openrouter|or_[A-Za-z0-9_]+)(?=\s
 # Detect any `#vibe` or `#vibe_*` tag (case-insensitive).
 _VIBE_TAG_RE = re.compile(r"(?i)(?<!\S)#(vibe(?:_[A-Za-z0-9_]+)?)(?=\s|$)")
 
+# Detect any `#opencode` or `#opencode_*` tag (case-insensitive).
+_OPENCODE_TAG_RE = re.compile(r"(?i)(?<!\S)#(opencode(?:_[A-Za-z0-9_]+)?)(?=\s|$)")
+
 # Shape of "looks like a model-alias tag but might not be one" — provider_word plus a
 # suffix, e.g. #claude_giga, #vibe_giant. Prefixes come from queue_manager's
 # _MODEL_ALIAS_PREFIXES (itself derived from dispatcher._TAG_MAP), not hand-copied —
@@ -124,10 +131,13 @@ def _routed_providers(task_text: str) -> set[str]:
     """Every provider this task explicitly routes to — bare ``#<provider>`` tag or any
     model alias.
 
-    Derived from ``_MODEL_ALIASES_BY_PROVIDER`` instead of ``PROVIDER_TAG_RE``, which only
-    knows claude|gemini|codex and therefore misses ``#vibe``, ``#openrouter``, ``#or_*``,
-    ``#codex_5`` and ``#gemini_flash_lite``. Completeness matters here: the caller uses the
-    result to decide whether a Claude-only tag is a silent no-op.
+    Derived from ``_MODEL_ALIASES_BY_PROVIDER`` instead of ``PROVIDER_TAG_RE``, which
+    (since it derives its bare provider names from ``dispatcher._TAG_MAP.values()``)
+    now matches ``#vibe`` and ``#openrouter`` too, but still only the bare provider
+    names — it therefore still misses every *model-alias* tag (``#or_*``, ``#codex_5``,
+    ``#gemini_flash_lite``, ...), which route to a provider without naming it. Completeness
+    matters here: the caller uses the result to decide whether a Claude-only tag is a
+    silent no-op.
     """
     found: set[str] = set()
     for provider, aliases in _MODEL_ALIASES_BY_PROVIDER.items():
@@ -331,6 +341,7 @@ def _check_task(
     out.extend(_check_model_tag(line_no, task_text))
     out.extend(_check_openrouter(line_no, task_text))
     out.extend(_check_vibe(line_no, task_text))
+    out.extend(_check_opencode(line_no, task_text))
     out.extend(_check_duplicate_id(line_no, task_text, open_ids))
     out.extend(_check_needs(line_no, task_text, open_ids, completed_ids))
     out.extend(_check_parallel(line_no, task_text, subtasks))
@@ -606,8 +617,9 @@ def _check_model_tag(line_no: int, task_text: str) -> list[LintFinding]:
                 code="model_provider_mismatch",
             ))
 
-    # Pass-provider regex restricts to claude|gemini|codex — nothing to check
-    # for unknown providers there. But we DO want to flag a model alias whose
+    # PASS_PROVIDER_TAG_RE only ever matches a registered provider name (it is
+    # generated from dispatcher._TAG_MAP since b947b76), so there is no unknown
+    # provider to check for there. But we DO want to flag a model alias whose
     # owning provider isn't covered by any #pass1:/#pass2: tag when both are set.
     pass_providers = extract_pass_providers(task_text)
     if model_tag and pass_providers and not explicit_providers:
@@ -642,10 +654,11 @@ def _check_vibe(line_no: int, task_text: str) -> list[LintFinding]:
     """Tasks tagged #vibe or #vibe_* require the `vibe` binary on PATH.
 
     Unlike a missing OPENROUTER_API_KEY, this does NOT fall back to the default
-    chain: dispatcher._REVIEWER_ONLY parks the task instead, because degrading a
-    reviewer-only tag to a file-writing executor would be a wider blast radius
-    than the task asked for. Still a warning, not an error — the queue line
-    itself is well-formed and starts working the moment `vibe` is installed.
+    chain: dispatcher._NO_FALLBACK_PROVIDERS parks the task instead, because
+    degrading a reviewer-only tag to a file-writing executor would be a wider
+    blast radius than the task asked for. Still a warning, not an error — the
+    queue line itself is well-formed and starts working the moment `vibe` is
+    installed.
     """
     if not _VIBE_TAG_RE.search(task_text):
         return []
@@ -657,6 +670,34 @@ def _check_vibe(line_no: int, task_text: str) -> list[LintFinding]:
         "bei OpenRouter fällt der Task NICHT auf die default-Chain zurück (Vibe ist "
         "reviewer-only), sondern wird geparkt",
         code="vibe_missing_cli",
+    )]
+
+
+def _check_opencode(line_no: int, task_text: str) -> list[LintFinding]:
+    """Tasks tagged #opencode or #opencode_* require a registered opencode —
+    ``opencode.exe`` resolvable past the npm shim AND both agents this repo
+    depends on (extern-review/extern-dev) present in opencode.json (the exact
+    contract ``providers.opencode.OpencodeProvider.is_available()`` checks).
+
+    Different wording than #vibe's message on purpose, same non-fallback
+    reasoning (dispatcher._NO_FALLBACK_PROVIDERS parks rather than falls back to
+    the default chain) but a different cause: vibe is reviewer-only (blast
+    radius), opencode is unregistered/misconfigured (the tag's whole point —
+    no Claude quota spent, or for customer code the only ZDR path — would be
+    lost by a silent fallback). Still a warning: the queue line is well-formed
+    and starts working the moment opencode is set up.
+    """
+    if not _OPENCODE_TAG_RE.search(task_text):
+        return []
+    if OpencodeProvider.is_available():
+        return []
+    return [LintFinding(
+        LEVEL_WARN, line_no, task_text,
+        "#opencode / #opencode_* gesetzt, aber opencode ist nicht registriert "
+        "(opencode.exe nicht auflösbar oder opencode.json ohne extern-review/"
+        "extern-dev) — wie bei Vibe fällt der Task NICHT auf die default-Chain "
+        "zurück, sondern wird geparkt",
+        code="opencode_missing_cli",
     )]
 
 

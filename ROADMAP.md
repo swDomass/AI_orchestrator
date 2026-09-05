@@ -122,8 +122,9 @@ plan (2026-05-18).
 | 47 | OpenRouter provider — opt-in, pay-per-token, never in the fallback chain | DONE |
 | 48 | External second opinion in `review-loop` (`#second_opinion:`), Gemini retired as reviewer | DONE |
 | 49 | Mistral Vibe provider — second non-Claude voice, reviewer-only | DONE |
-| 50 | Unattended `#tool:` reactivation — git-state freeze, provider ceiling, uniform error classification, effective safety hook | **Built, not yet proven** — see below |
+| 50 | Unattended `#tool:` reactivation — provider ceiling, uniform error classification, effective safety hook | DONE — **proven 2026-09-02**, see below |
 | 51 | Snapshots into an own ref namespace (`refs/orchestrator-backup/`) + retention cap | DONE |
+| 52 | opencode provider — third opt-in voice, tag-activated, capped by its own OpenRouter key | DONE (Stufe 1+2, 2026-09-04). Stufe 3 — joining `_PRIORITY` — deliberately **not** built: the cause of an observed hang is still unexplained. |
 
 ### #50 — Unattended `#tool:` reactivation (2026-08-15)
 
@@ -131,10 +132,17 @@ The orchestrator had run as a briefing runner only since 2026-04-03: not a singl
 `#tool:` task in that window. This wave rebuilt the guarantees an unattended tool
 run needs, as four separate changes:
 
-1. **Git state is frozen.** Unattended runs leave work in the working tree; the
-   user commits and pushes. Enforced by `config.SAFETY_DENY_PATTERNS` (hook, Claude
-   path) and by `approve:` entries in `policy.yaml`. *Not* by the prompt layer —
-   `SAFETY_RULES` mentions push only.
+1. **Git state is frozen — and this half was rolled back two days later.** The
+   original intent was that unattended runs leave work in the working tree and the
+   user commits and pushes; `88a48ef` (2026-08-17) denied both `git commit` and
+   `git push` in `config.SAFETY_DENY_PATTERNS`. `40c836f`, the same day, **dropped
+   the commit half**: the hook is registered for every Bash call and never tested
+   for "unattended", so it hit interactive sessions exactly as hard, with no way to
+   override it from inside one — and a commit is local and revertible while a push
+   is not. Today only `git push` is hard-denied; the only remaining lever against
+   commits in a night run is `approve:` in `policy.yaml`. The prompt layer never
+   restricted either (`SAFETY_RULES` mentions push only), so hook and prompt now
+   agree.
 2. **Provider ceiling.** `openrouter` and `vibe` are barred for tool tasks on the
    chain, on an explicit tag, and on tool-internal lookups; Gemini left the chain
    entirely.
@@ -145,10 +153,21 @@ run needs, as four separate changes:
    recognises as neither "block" nor "deny", so every block since it was written
    was a no-op.
 
-**Why this is not DONE:** the queue contains **no `#tool:` task**, so none of it has
-executed unattended even once. The path is repaired and tested, not demonstrated.
-The honest status is "ready for a first supervised `#tool:` run", and that run is
-the acceptance criterion.
+**Why this was not DONE at first:** the queue contained **no `#tool:` task**, so none
+of it had executed unattended even once. The path was repaired and tested, not
+demonstrated, and the acceptance criterion was a first supervised run.
+
+**Met on 2026-09-02 (recorded here 2026-09-05).** Counted in the vault queue: seven
+completed `#tool:` lines — four in `agent-queue.md`, three in `agent-queue-erledigt.md`
+— run unattended, among them the ruff/mypy introduction in this repo, the
+`limits.py` version-floor fix and two cross-repo config/retry jobs. The machinery
+held, and it also produced the first honest failures of the reactivated path, both
+already fixed or tracked: `#id:nightfloor` burned three `format_error` retries into
+`format_error_blocked` (two were parser strictness — fixed in `f9b29e0` — and the
+third a *correct* refusal to emit a verdict for a working tree that did not match
+the task), and `njtaxr` reported `ok` after 79 s having only started a renderer in
+the background. The second is why `#verify:` became mandatory for night tasks whose
+artefact lives outside git, and why a failed check now flips the mark to `❌`.
 
 **Review coverage is partial.** The change set was reviewed by Mistral (`vibe`) —
 four findings, all fixed, one (git aliases) refuted at the system level and
@@ -270,11 +289,14 @@ a separate, still-open item — untouched by this pass.
 
 | Defect | Impact |
 |---|---|
-| `select_provider()` fail-open for a bare `#vibe`/`#openrouter` tag | The pay-per-token ceiling was made fail-closed in `policy_allows_provider()`/`dispatcher._allows()`, but not on the forced-provider path. With `policy.yaml` missing or unreadable, an explicitly tagged task still reaches the uncapped provider. Left open deliberately — the fix reworks ~10 routing tests. |
+| `select_provider()` fail-open for a bare `#vibe`/`#openrouter` tag | The pay-per-token ceiling was made fail-closed in `policy_allows_provider()`/`dispatcher._allows()`, but not on the forced-provider path. With `policy.yaml` missing or unreadable, an explicitly tagged task still reaches the uncapped provider. **Halved on 2026-09-04** (`6702e13`): the *profile* branch now clears `_allows()` per candidate (`dispatcher.py:387-388`, own test); only the *tag/forced* branch remains, where `_allows()` is never consulted at all. Left open deliberately — the rest of the fix reworks ~10 routing tests. |
 | `stdin_incomplete` requeues without bound | `<!-- hang: N -->` is the only persistent per-task counter and only `hang` + `format_error` *increment* it. Every other error code requeues without raising it. Count unbounded, rate still throttled by the 5-min cooldown. Pre-existing. Narrowed 2026-08-15: those parks no longer *reset* the counter either, so a task alternating between real failures and parks does reach the cap. |
 | An unregistered value in `#pass1:`/`#pass2:` is still dropped silently | Narrowed 2026-09-02: `vibe` and `openrouter` are accepted now, but a typo or an unknown provider still fails twice over — `extract_pass_providers()` drops the pass, and `strip_metadata_tags()` leaves the tag in place, so it reaches the model as prompt text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. `queue_linter.py` has no counterpart check. |
 | Safety-hook residuals | `find . -exec git push`, `docker exec c git push`, `xargs git push` are not recognised (needs real argv parsing, not a regex). A heredoc body line starting with a git write command matches — a deliberate false positive in the safe direction. Hook covers Claude only; Codex relies on its own sandbox flag. |
 | `tests/test_telegram_listener.py` order-dependent; `tests/test_usage_suggester.py` environment-dependent | Run with `-p no:randomly`. A red suite in a fresh worktree is more likely one of these two than a real regression. |
+| `--lint-queue` is blind to a policy-barred provider tag | Added 2026-09-04. The linter checks CLI *registration* for `#vibe`/`#opencode`, never whether `policy.yaml` permits the provider. Measured: with `tool_providers.default: [claude, codex]` every `#opencode` line ended terminally with `provider_not_allowed` while the linter reported "no problems found". Needs the linter to load the policy, which it does not do today. |
+| `AllLimits.opencode` missing from four display paths | Added 2026-09-04. `heartbeat.py:213`/`:316` and `telegram_listener.py:562`/`:579` still hand-count `("claude", "gemini", "codex")`. Observability only — every gate (`_limits_ok`, `earliest_reset_sec`, `any_available`, `has_transient_token_refresh`) and `--check-limits` do carry opencode. |
+| `.dev-loop/` keyed by `cwd`, not by task | Added 2026-09-04. Two dev-loop tasks in one repo overwrite each other's `round-00N.md`, `summary.md` and `state.json`; the iteration counter restarts per run. `_task_hash()` exists but lives inside `state.json` rather than in the path. Costs traceability, not correctness. |
 
 ---
 
@@ -391,7 +413,9 @@ value expires.
 ### 34. Failure taxonomy
 Deterministic mapping from `error_code` first, keyword heuristics only as a
 fallback. The category list has grown past the original sketch — `taxonomy.py`
-is authoritative (19 categories today).
+is authoritative (21 categories as of 2026-09-05; `verify_failed` and
+`worktree_dirty` joined on 2026-09-04). Count it, do not quote this number:
+`len(taxonomy.ALL_CATEGORIES)`.
 
 ### 35. Preflight hooks
 Deterministic context collected *before* the LLM call is cheaper than having the

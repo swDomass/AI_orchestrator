@@ -78,8 +78,9 @@ _TAG_RE_BY_PROVIDER = {
 
 # Singleton provider instances (carry cooldown state across calls).
 # OpenRouter and Vibe are registered conditionally: without an API key resp.
-# without the `vibe` binary on PATH, tagged tasks fall through to the default
-# chain (Claude/Gemini/Codex) automatically.
+# without the `vibe` binary on PATH, an OpenRouter-tagged task falls through to
+# the default chain (_PRIORITY = claude, codex — gemini left it on 2026-08-15)
+# automatically. Vibe and opencode do NOT: see _NO_FALLBACK_PROVIDERS below.
 _providers: dict[str, BaseProvider] = {
     "claude": ClaudeProvider(),
     "gemini": GeminiProvider(),

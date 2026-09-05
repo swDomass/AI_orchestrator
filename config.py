@@ -717,10 +717,14 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
 # from any benchmark here. Treat it as a default worth trying, not as an invariant, and
 # re-check it when model generations change (quarterly sweep).
 #
-# Selected per task via the `#effort:<level>` queue tag. Claude-exclusive: Codex,
-# Mistral and OpenRouter have no equivalent flag. They ignore the tag *by
-# construction*, because only providers/claude.py reads `_forced_effort` — there is
-# deliberately no `supports_effort` capability check.
+# Selected per task via the `#effort:<level>` queue tag. Codex, Gemini, Mistral and
+# OpenRouter have no equivalent flag and ignore the tag *by construction*, because
+# they never read `_forced_effort` — there is deliberately no `supports_effort`
+# capability check. NOT Claude-exclusive since 2026-09-04: providers/opencode.py
+# reads the same property and passes the level straight through to opencode's
+# `--variant` flag, raw and unmapped (opencode tolerates unknown values; `--variant
+# xhigh` was measured at exit 0). Corrected 2026-09-05 — this comment still claimed
+# exclusivity months after opencode joined.
 #
 # Ordered tuple, not a set: this is an ordinal scale, and lint/help messages must show
 # it in ascending order. A sorted frozenset would print "high, low, max, medium, xhigh"

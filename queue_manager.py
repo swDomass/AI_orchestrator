@@ -829,7 +829,8 @@ def extract_model_tag(task: str) -> str | None:
 
     Supported tags: every model-specific alias in dispatcher._TAG_MAP (all of
     claude_{haiku,sonnet,opus}, gemini_{pro,flash,flash_lite}, codex_{5,5_4,mini},
-    vibe_{medium,small}, and the nine or_* OpenRouter aliases) — see MODEL_TAG_RE.
+    vibe_{medium,small}, opencode_{glm,deepseek,deepseek_long}, and the nine or_*
+    OpenRouter aliases — 23 in total) — see MODEL_TAG_RE.
     Returns the lowercased alias key (e.g. 'gemini_flash') or None.
     Resolution to a full model ID happens via config.model_id_for_provider(),
     which enforces that a tag only applies to its owning provider.
@@ -891,8 +892,8 @@ def extract_pass_providers(task: str) -> dict[int, str]:
     """Extract #pass1:<provider> and #pass2:<provider> from task text.
 
     Any provider name in dispatcher._TAG_MAP is accepted (claude, gemini, codex,
-    vibe, openrouter) — see PASS_PROVIDER_TAG_RE. Returns e.g. {1: 'claude', 2:
-    'vibe'} or {} if none found.
+    vibe, openrouter, opencode) — see PASS_PROVIDER_TAG_RE. Returns e.g.
+    {1: 'claude', 2: 'vibe'} or {} if none found.
     """
     result: dict[int, str] = {}
     for m in PASS_PROVIDER_TAG_RE.finditer(task):

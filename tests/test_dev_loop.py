@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from providers.base import RunResult
-from tools.dev_loop import DevLoopTool, _parse_resolution
+from tools.dev_loop import DevLoopTool, _parse_resolution, _run_dir, _task_hash
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ def test_dev_loop_writes_research_and_plan_file(monkeypatch, tmp_path):
     ])
     DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
 
-    rp_file = tmp_path / ".dev-loop" / "research-and-plan.md"
+    rp_file = _run_dir(str(tmp_path), _task_hash("Fix bug")) / "research-and-plan.md"
     assert rp_file.exists()
     content = rp_file.read_text(encoding="utf-8")
     assert "Found it." in content
@@ -159,7 +159,7 @@ def test_dev_loop_writes_round_file(monkeypatch, tmp_path):
     ])
     DevLoopTool().run("Add feature", provider, cwd=str(tmp_path))
 
-    round_file = tmp_path / ".dev-loop" / "round-001.md"
+    round_file = _run_dir(str(tmp_path), _task_hash("Add feature")) / "round-001.md"
     assert round_file.exists()
     content = round_file.read_text(encoding="utf-8")
     assert "Execution output." in content
@@ -176,7 +176,7 @@ def test_dev_loop_writes_summary_on_success(monkeypatch, tmp_path):
     ])
     DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
 
-    summary = tmp_path / ".dev-loop" / "summary.md"
+    summary = _run_dir(str(tmp_path), _task_hash("Fix bug")) / "summary.md"
     assert summary.exists()
     assert "DONE" in summary.read_text(encoding="utf-8")
 
@@ -200,7 +200,7 @@ def test_dev_loop_retries_on_quality_failure(monkeypatch, tmp_path):
     assert result.success is True
     assert result.iterations == 2
     # round-002.md should exist
-    assert (tmp_path / ".dev-loop" / "round-002.md").exists()
+    assert (_run_dir(str(tmp_path), _task_hash("Fix bug")) / "round-002.md").exists()
 
 
 def test_dev_loop_retries_on_resolution_partial(monkeypatch, tmp_path):
@@ -416,10 +416,18 @@ def test_dev_loop_fails_on_execution_error(monkeypatch, tmp_path):
 
 
 def test_dev_loop_classifies_transient_execution_error(monkeypatch, tmp_path):
-    """A provider error in "code: detail" form keeps its code and stays retryable."""
+    """A provider error in "code: detail" form keeps its code and stays retryable.
+
+    Uses `timeout:` rather than `rate_limit:` since 2026-09-10: a capacity error is
+    now deliberately re-routed to `capacity_exhausted` so the task is PARKED instead
+    of rotated to the next provider (which would restart the loop at iteration 1
+    with a fresh deadline). That redirect is covered by
+    tests/test_dev_loop_landing_and_resume.py; this test keeps its original job of
+    pinning that the "code: detail" form is parsed at all.
+    """
     _patch(monkeypatch)
 
-    class _RateLimited:
+    class _TimedOut:
         name = "claude"
         supports_sessions = False
         _calls = 0
@@ -430,12 +438,12 @@ def test_dev_loop_classifies_transient_execution_error(monkeypatch, tmp_path):
                     success=True,
                     output="## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
                 )
-            return RunResult(success=False, error="rate_limit: 429 from upstream")
+            return RunResult(success=False, error="timeout: watchdog hard limit")
 
-    result = DevLoopTool().run("Fix bug", _RateLimited(), cwd=str(tmp_path))
+    result = DevLoopTool().run("Fix bug", _TimedOut(), cwd=str(tmp_path))
 
     assert result.success is False
-    assert result.error_code == "rate_limit"
+    assert result.error_code == "timeout"
     assert result.retryable is True
 
 

@@ -44,6 +44,7 @@ from config import (
     MIN_CAPACITY_PERCENT,
     VAULT_PATH,
 )
+from limits import all_provider_names, display_provider_names
 from queue_manager import _write_bytes_atomic
 
 logger = logging.getLogger(__name__)
@@ -206,11 +207,28 @@ def _check_disk_space() -> Optional[str]:
 
 
 def _append_capacity_log(limits) -> None:
-    """Append one line per provider/window to the persistent capacity log in the vault."""
+    """Append one line per provider/window to the persistent capacity log in the vault.
+
+    This is a **data recorder**, not a display: ``logs/capacity-log.md`` is the
+    input of ``analytics._parse_capacity_log()``, which feeds both the
+    dashboard's current-limits panel and its historical LimitSnapshot series.
+    It therefore enumerates ``all_provider_names()`` (every AllLimits field) and
+    NOT ``display_provider_names()`` — a policy filter belongs on the three
+    human-facing sites, where hiding a barred provider is the point, but here it
+    would silently end a provider's history. Concrete case: a policy with
+    ``default: [claude]`` but ``dev-loop: [claude, codex]`` — codex keeps
+    executing dev-loop tasks while the ``default:`` lookup drops it, so no codex
+    row would ever be appended again and the dashboard would report no codex
+    capacity at all. Recording is cheap; a hole in the series is not
+    reconstructible.
+    """
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lines: list[str] = []
-        for name in ("claude", "gemini", "codex"):
+        # Derived from AllLimits' fields — NOT a hand-written tuple. The literal
+        # ("claude", "gemini", "codex") that stood here never once logged
+        # opencode, which has been an AllLimits field since 2026-09-04.
+        for name in all_provider_names():
             lim = getattr(limits, name, None)
             if lim is None:
                 continue
@@ -313,8 +331,14 @@ def _check_limits(get_limits_fn: Callable) -> Optional[str]:
     try:
         limits = get_limits_fn()
         parts: list[str] = []
-        for name in ("claude", "gemini", "codex"):
-            lim = getattr(limits, name)
+        # Human-facing heartbeat text, so the policy-filtered list: a provider
+        # policy.yaml bars from every route has no business in a status message.
+        # Deliberately NOT the same list as _append_capacity_log() — see the
+        # docstring there for why the recorder must stay unfiltered.
+        for name in display_provider_names():
+            lim = getattr(limits, name, None)
+            if lim is None:
+                continue
             if lim.available:
                 parts.append(f"{name}: {lim.remaining_pct:.0f}% remaining")
             else:

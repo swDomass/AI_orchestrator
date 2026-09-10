@@ -20,6 +20,12 @@ Catches bad queue entries before they reach a provider:
   - #opencode / #opencode_* tag without a registered opencode (exe unresolved or
     opencode.json missing extern-review/extern-dev) — parked, same non-fallback
     reasoning as #vibe above but a different cause (see dispatcher._NO_FALLBACK_PROVIDERS)
+  - a #provider tag the tool_providers policy BARS (terminal ❌ at runtime, not a
+    fallback — orchestrator.py calls forced_provider_policy_violation()), plus the
+    two silently-degrading variants #pass2: and #second_opinion:. Registration
+    and policy are different questions: the checks above only ask whether a CLI exists
+  - policy.yaml missing (warning) or present-but-unparseable (error) — PolicyEngine
+    reports both as "no restriction configured", so the linter reads the file itself
   - #parallel with no/single subtask, or subtasks sharing CWD
   - HTML comments inside the task body (silently truncate the task text), or at the
     line end without being a valid retry/hang marker (silently dropped on rewrite)
@@ -68,6 +74,8 @@ from queue_manager import (
     extract_needs_tags,
     extract_model_tag,
     extract_pass_providers,
+    extract_profile_tag,
+    extract_second_opinion_alias,
     extract_verify_tag,
     has_cwd_tag,
     _is_whole_day_interval,
@@ -218,6 +226,12 @@ def lint_queue(content: str | None = None) -> list[LintFinding]:
             valid_tool_names=valid_tool_names,
         ))
 
+    # File-level: one finding about policy.yaml itself. line_no is None, which
+    # LintFinding.format() renders without a line and the sort below puts first.
+    policy_finding = _policy_status()
+    if policy_finding is not None:
+        findings.append(policy_finding)
+
     findings.sort(key=lambda f: (f.line_no or 0, f.level != LEVEL_ERROR))
     return findings
 
@@ -342,6 +356,7 @@ def _check_task(
     out.extend(_check_openrouter(line_no, task_text))
     out.extend(_check_vibe(line_no, task_text))
     out.extend(_check_opencode(line_no, task_text))
+    out.extend(_check_policy_providers(line_no, task_text))
     out.extend(_check_duplicate_id(line_no, task_text, open_ids))
     out.extend(_check_needs(line_no, task_text, open_ids, completed_ids))
     out.extend(_check_parallel(line_no, task_text, subtasks))
@@ -699,6 +714,290 @@ def _check_opencode(line_no: int, task_text: str) -> list[LintFinding]:
         "zurück, sondern wird geparkt",
         code="opencode_missing_cli",
     )]
+
+
+def _policy_status() -> LintFinding | None:
+    """One file-level finding about policy.yaml itself, or None when it is usable.
+
+    The linter reads and parses the file directly instead of asking PolicyEngine,
+    because the engine cannot tell the states apart: a missing file
+    (``_reload_if_changed`` returns early), an unparseable one
+    (``_load_rules_locked`` logs and returns) and a deliberately empty one all
+    surface as ``get_allowed_providers() -> None`` = "no restriction configured".
+
+    Three outcomes, deliberately different levels:
+
+    * **missing** -> WARN. A legitimate state on a fresh install, and
+      ``--lint-queue`` must not exit 2 for it. Still reported, because with no
+      policy the uncapped providers are barred by ``dispatcher._allows()``'s
+      fail-closed half, so every ``#vibe``/``#openrouter`` task dies terminally.
+    * **empty document** -> WARN, own code. A 0-byte or ``null`` policy.yaml is
+      most likely a truncated OneDrive sync, but "deliberately empty" is a
+      readable intent too - and an ERROR on an intended state would be noise in
+      the one report that has to be trustworthy.
+    * **present but not usable** (parse error, non-mapping root, ``tool_providers``
+      that is not a mapping) -> ERROR. That is corruption, and the OneDrive-sync
+      collision is exactly the case that must not pass quietly.
+    """
+    try:
+        from policy import get_engine
+        # The RUNNING engine's file, not config.VAULT_PATH — see
+        # PolicyEngine.config_path for why the two must not be asked separately.
+        path = get_engine().config_path
+    except Exception as exc:  # noqa: BLE001 - a config import must not kill the lint run
+        return LintFinding(
+            LEVEL_WARN, None, "policy.yaml",
+            f"Policy-Pfad nicht aufloesbar ({exc}) - Provider-Policy wird nicht geprueft",
+            code="policy_check_failed",
+        )
+
+    if not path.exists():
+        # Deliberately does NOT claim vibe/openrouter are barred. Measured with
+        # no policy.yaml: _selection_order("... #vibe", ...) -> (['vibe',
+        # 'claude', 'codex'], None) and forced_provider_policy_violation(...) ->
+        # None, while policy_allows_provider('vibe', None) -> False. _allows()'s
+        # fail-CLOSED half only reaches the TOOL-INTERNAL lookups; the
+        # forced-tag branch (dispatcher._selection_order) never consults it -
+        # the gap CLAUDE.md and README document. An operator reading this at
+        # 03:00 must not be told an uncapped, pay-per-token provider is fenced
+        # off when it will in fact run.
+        return LintFinding(
+            LEVEL_WARN, None, str(path),
+            f"policy.yaml nicht gefunden ({path}) - die Provider-Policy kann hier "
+            "nicht geprueft werden. Achtung: ein direktes #vibe/#openrouter-Tag "
+            "laeuft dann trotzdem (die Fail-Closed-Regel greift nur bei "
+            "Second-Opinion/Pass-2, nicht beim erzwungenen Provider-Tag)",
+            code="policy_missing",
+        )
+
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - yaml/OSError raise a wide family
+        return LintFinding(
+            LEVEL_ERROR, None, str(path),
+            f"policy.yaml nicht lesbar/parsebar ({exc}) - PolicyEngine meldet das als "
+            "'keine Einschraenkung', jede Provider-Sperre ist damit still weg",
+            code="policy_unreadable",
+        )
+
+    if data is None:
+        return LintFinding(
+            LEVEL_WARN, None, str(path),
+            "policy.yaml ist leer - entweder Absicht oder ein abgeschnittener Sync; "
+            "in beiden Faellen greift keine tool_providers-Regel",
+            code="policy_empty",
+        )
+
+    if not isinstance(data, dict):
+        return LintFinding(
+            LEVEL_ERROR, None, str(path),
+            f"policy.yaml enthaelt kein Mapping (got {type(data).__name__}) - "
+            "PolicyEngine verwirft das still, jede Provider-Sperre ist damit weg",
+            code="policy_unreadable",
+        )
+
+    providers_raw = data.get("tool_providers")
+    if providers_raw is not None and not isinstance(providers_raw, dict):
+        return LintFinding(
+            LEVEL_ERROR, None, str(path),
+            f"policy.yaml: tool_providers ist kein Mapping (got "
+            f"{type(providers_raw).__name__}) - wird still ignoriert, der "
+            "Provider-Deckel greift dann nirgends",
+            code="policy_unreadable",
+        )
+
+    return None
+
+
+def _resolved_profile(task_text: str):
+    """The ProfileConfig a ``#agent:`` tag names, or None.
+
+    Needed because a profile's own ``tool_providers`` overrides the global list
+    (``dispatcher._allowed_by_policy`` layer 2) - without passing it, the check
+    below would report a false ``provider_not_allowed`` for every task whose
+    profile legitimately widens the allow-list. Mirrors orchestrator.run_once().
+    """
+    name = extract_profile_tag(task_text)
+    if not name:
+        return None
+    try:
+        from config import VAULT_PATH
+        from profiles import load_profile
+        return load_profile(name, VAULT_PATH)
+    except Exception:  # noqa: BLE001 - an unloadable profile is not this check's verdict
+        return None
+
+
+def _second_opinion_provider(alias: str) -> str | None:
+    """Provider that owns a ``#second_opinion:<alias>`` value, or None if unknown.
+
+    Delegates to ``review_loop.second_opinion_target()`` — the mapping the tool
+    itself uses — instead of the module-local ``_owning_provider_for_alias()``.
+    That one spans all six providers, while the second-opinion phase only
+    consults four alias maps, and the difference was a live false positive:
+    ``#second_opinion:opencode_glm`` resolved to ``opencode`` here and to None
+    there, so the linter blamed the policy for a phase that is skipped under
+    EVERY policy (measured: ``_resolve_second_opinion('opencode_glm')`` -> None,
+    same for ``gemini_flash``). Widening ``review-loop:`` in policy.yaml would
+    have silenced the warning without ever enabling the second opinion — the
+    exact error ``#pass1:`` is deliberately excluded for.
+    """
+    try:
+        from tools.review_loop import second_opinion_target
+    except Exception:  # noqa: BLE001 - a broken tool import must not blind the linter
+        return None
+    target = second_opinion_target(alias)
+    return target[0] if target else None
+
+
+_SECOND_OPINION_CONSUMER_TOOL_FALLBACK = "review-loop"
+
+
+def _second_opinion_consumer_tool() -> str:
+    """Name of the one tool that reads a ``#second_opinion:`` tag.
+
+    Same reasoning as ``_pass2_consumer_tool()``: ``orchestrator.py:1339`` hands
+    ``second_opinion_alias`` to every tool, but grep confirms only
+    ``ReviewLoopTool`` consumes it. On any other tool the tag is inert
+    regardless of policy, so a policy finding there would be blaming the policy
+    for a non-effect.
+    """
+    try:
+        from tools.review_loop import ReviewLoopTool
+    except Exception:  # noqa: BLE001 - a broken tool import must not blind the linter
+        return _SECOND_OPINION_CONSUMER_TOOL_FALLBACK
+    return ReviewLoopTool.name
+
+
+_PASS2_CONSUMER_TOOL_FALLBACK = "critical-review"
+
+
+def _pass2_consumer_tool() -> str:
+    """Name of the one tool that reads a ``#pass2:`` tag.
+
+    Taken from ``critical_review`` rather than restated, so a rename there cannot
+    leave the linter warning about a tag nothing reads any more. Verified by grep:
+    ``pass_providers.get(2)`` / ``[2]`` appears only in ``tools/critical_review.py``,
+    and ``pass_providers[1]`` appears nowhere at all.
+    """
+    try:
+        from tools.critical_review import _TOOL_NAME
+    except Exception:  # noqa: BLE001 - a broken tool import must not blind the linter
+        return _PASS2_CONSUMER_TOOL_FALLBACK
+    return _TOOL_NAME
+
+
+def _check_policy_providers(line_no: int, task_text: str) -> list[LintFinding]:
+    """Flag providers the ``tool_providers`` policy bars.
+
+    The gap this closes: every other provider check in this module asks whether a
+    provider is REGISTERED (binary on PATH, API key set). None of them asked
+    whether policy.yaml allows it - so a bare ``#opencode`` task under a
+    ``default: [claude, codex]`` policy linted clean and then ended terminal with
+    ``provider_not_allowed`` at 03:00, with nothing warning beforehand.
+
+    Three tag families, two severities, because runtime treats them differently:
+
+    * ``#<provider>`` / model alias -> **ERROR**. ``select_provider()`` returns
+      None, ``forced_provider_policy_violation()`` fires, the task is finalised
+      as failed. No fallback and no point retrying - a retry cannot change a policy.
+    * ``#pass2:`` on a ``#tool:critical-review`` task -> **WARN**.
+      ``critical_review._resolve_pass2_provider()`` degrades to the primary
+      provider; the task still runs, just without the cross-provider diversity
+      that was asked for. ``#pass1:`` is deliberately NOT reported: no code reads
+      ``pass_providers[1]``, so pass 1 runs on the primary under every policy -
+      a policy finding there would be blaming the policy for a non-effect.
+    * ``#second_opinion:`` on a ``#tool:review-loop`` task, with an alias
+      review_loop actually resolves -> **WARN**.
+      ``review_loop._resolve_second_opinion()`` returns None and the phase is
+      skipped - the documented inert case. Both qualifiers are load-bearing and
+      mirror the ``#pass2:`` ones: on any other tool the tag is never read, and
+      an alias outside review_loop's four maps (``opencode_glm``,
+      ``gemini_flash``) skips the phase under EVERY policy - reporting either
+      would tell an operator that widening tool_providers fixes something it
+      cannot fix.
+
+    The verdict comes from ``dispatcher.forced_provider_policy_violation()``
+    itself rather than a reimplementation, so linter and runtime cannot disagree
+    about what the policy says. That inherits the known open gap in
+    ``_selection_order()``'s forced branch (CLAUDE.md) - which is correct for a
+    linter whose job is predicting runtime, not describing the intent.
+    """
+    try:
+        from dispatcher import forced_provider_policy_violation, policy_allows_provider
+    except Exception as exc:  # noqa: BLE001 - provider construction can fail on a half-set-up box
+        return [LintFinding(
+            LEVEL_WARN, line_no, task_text,
+            f"Provider-Policy nicht pruefbar ({exc})",
+            code="policy_check_failed",
+        )]
+
+    out: list[LintFinding] = []
+    try:
+        from tools.registry import extract_tool_tag
+        tool_name = extract_tool_tag(task_text)
+    except Exception:  # noqa: BLE001
+        tool_name = None
+    profile = _resolved_profile(task_text)
+    scope = f"Tool '{tool_name}'" if tool_name else "diesen Task"
+
+    try:
+        violation = forced_provider_policy_violation(
+            task_text, tool_name=tool_name, profile=profile,
+        )
+        if violation:
+            name, allowed = violation
+            out.append(LintFinding(
+                LEVEL_ERROR, line_no, task_text,
+                f"Provider '{name}' ist fuer {scope} per tool_providers-Policy nicht "
+                f"zugelassen (erlaubt: {', '.join(allowed)}) - der Task endet zur "
+                f"Laufzeit terminal mit provider_not_allowed, ohne Fallback",
+                code="provider_not_allowed",
+            ))
+
+        # Pass 2 only, and only on the tool that reads it. `pass_providers[1]`
+        # is consumed nowhere in the repo: pass 1 always runs on the primary
+        # provider, under every policy, so a policy warning on `#pass1:` would
+        # blame the policy for a non-effect and imply that widening
+        # tool_providers would change something. The same holds for a `#pass2:`
+        # on any other tool - orchestrator.py hands `pass_providers` to every
+        # tool, but only critical_review._resolve_pass2_provider() looks at it.
+        pass2_provider = extract_pass_providers(task_text).get(2)
+        if (
+            pass2_provider
+            and tool_name == _pass2_consumer_tool()
+            and not policy_allows_provider(pass2_provider, tool_name)
+        ):
+            out.append(LintFinding(
+                LEVEL_WARN, line_no, task_text,
+                f"#pass2:{pass2_provider} ist fuer {scope} per tool_providers-Policy "
+                f"gesperrt - Pass 2 faellt still auf den Primary-Provider zurueck",
+                code="pass_provider_not_allowed",
+            ))
+
+        # Same two guards as #pass2: above. The alias must be one review_loop
+        # actually resolves (an unknown one skips the phase under every policy),
+        # and the task must be running the one tool that reads the tag.
+        alias = extract_second_opinion_alias(task_text)
+        if alias and tool_name == _second_opinion_consumer_tool():
+            owner = _second_opinion_provider(alias)
+            if owner and not policy_allows_provider(owner, tool_name):
+                out.append(LintFinding(
+                    LEVEL_WARN, line_no, task_text,
+                    f"#second_opinion:{alias} loest auf '{owner}' auf, das fuer {scope} "
+                    f"per tool_providers-Policy gesperrt ist - die Zweitmeinung "
+                    f"entfaellt kommentarlos",
+                    code="second_opinion_not_allowed",
+                ))
+    except Exception as exc:  # noqa: BLE001 - never a silent skip
+        out.append(LintFinding(
+            LEVEL_WARN, line_no, task_text,
+            f"Provider-Policy nicht pruefbar ({exc})",
+            code="policy_check_failed",
+        ))
+
+    return out
 
 
 def _check_duplicate_id(

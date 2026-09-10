@@ -359,7 +359,28 @@ def test_run_once_blocked_stays_in_queue(monkeypatch):
 # checks the property instead.
 # ---------------------------------------------------------------------------
 
-_FINALIZERS = {"_finalize_task_with_result_checked", "_mark_done_checked"}
+# The two `_checked` wrappers AND the two raw queue_manager functions they wrap.
+# The raw names were added 2026-09-10: `_charge_process_crash` calls
+# `finalize_task_with_result` directly and on purpose (the wrappers call
+# notify_error, i.e. a Telegram round trip inside a dying process), so with only
+# the wrapper names here the one genuinely new terminal path in months slipped
+# past BOTH guards below — including the tripwire whose whole job is to notice
+# exactly that. No false positives: every call site passes `failed=` explicitly.
+_FINALIZERS = {
+    "_finalize_task_with_result_checked",
+    "_mark_done_checked",
+    "finalize_task_with_result",
+    "mark_done",
+}
+
+
+# The two wrappers delegate to the raw functions with `failed=failed`. Those two
+# calls are plumbing, not decisions about dependency release, and they are excluded
+# BY LOCATION rather than by argument text: a `val != "failed"` filter (the first
+# attempt, 2026-09-10) would also hide any future real call site that happens to
+# compute a local named `failed` — a completely ordinary name — and it would hide it
+# from BOTH guards at once, since `failed=` is explicitly present there.
+_WRAPPER_FUNCS = {"_mark_done_checked", "_finalize_task_with_result_checked"}
 
 
 def _finalization_call_sites() -> list[tuple[int, str, str]]:
@@ -369,10 +390,20 @@ def _finalization_call_sites() -> list[tuple[int, str, str]]:
     src = (Path(__file__).resolve().parent.parent / "orchestrator.py").read_text(
         encoding="utf-8"
     )
+    tree = ast.parse(src)
+
+    inside_wrappers: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in _WRAPPER_FUNCS:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    inside_wrappers.add(inner.lineno)
+
     sites = []
-    for node in ast.walk(ast.parse(src)):
+    for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id in _FINALIZERS):
+                and node.func.id in _FINALIZERS
+                and node.lineno not in inside_wrappers):
             kwargs = {k.arg: ast.unparse(k.value) for k in node.keywords if k.arg}
             sites.append((node.lineno, node.func.id, kwargs.get("failed", "<MISSING>")))
     return sorted(sites)
@@ -391,7 +422,7 @@ def test_every_finalization_states_its_verdict_explicitly():
     )
 
 
-def test_sixteen_terminal_failure_paths_are_covered():
+def test_seventeen_terminal_failure_paths_are_covered():
     """Pins the count the commit message claims, and names them when it changes.
 
     A tripwire on purpose: adding a terminal path is a decision about dependency
@@ -402,8 +433,8 @@ def test_sixteen_terminal_failure_paths_are_covered():
     failure_paths = [(ln, fn, val) for ln, fn, val in sites if val != "False"]
     success_paths = [(ln, fn) for ln, fn, val in sites if val == "False"]
 
-    assert len(failure_paths) == 16, (
-        f"expected 16 failure-stamping finalizations, found {len(failure_paths)}: "
+    assert len(failure_paths) == 17, (
+        f"expected 17 failure-stamping finalizations, found {len(failure_paths)}: "
         + repr(failure_paths)
     )
     # The two success paths are the tool and the single-shot completion; the

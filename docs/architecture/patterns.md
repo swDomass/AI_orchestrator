@@ -176,7 +176,9 @@ Design: `Popen` + TWO simultaneous reader threads (stdout + stderr — a single 
 
 **Tool-aware liveness for Claude (load-bearing, verified claude 2.1.158):** byte-silence is NOT a hang signal for Claude — a single blocking tool call holds stdout silent for the whole tool duration (verified: 12 s tool → 18.1 s inter-line gap, scales with tool duration). A naive byte watchdog would kill a productive pytest/build/install phase. **Critical schema detail:** there is NO top-level `{"type":"tool_use"}` event; matching on `evt["type"]` would be dead code (it would only ever see `assistant`/`user`/`result`, never flip `_tool_active` on). The real sequence is `system/init → rate_limit_event → assistant[content: thinking] → assistant[content: tool_use] → (stdout silence) → user[content: tool_result] → assistant[content: text] → result`. So Claude runs with `liveness_lines=True` and `_Liveness.on_event(evt, now)` inspects `message.content[]` (`_content_blocks`) and tracks a **set of open `tool_use` ids** (not a single boolean — Claude emits parallel `tool_use` blocks in one message and spawns `Task` subagents, so the first `tool_result` must not resume the timer while a sibling tool still runs): an `assistant` event adds each `tool_use` id, a `user` event discards each `tool_result`'s `tool_use_id`, the top-level `result` clears all; the idle timer is paused (`idle_for()==0`) while the set is non-empty. **Known limitation:** a tool that itself hangs forever (no `tool_result` ever arrives) keeps the set non-empty → only `hard_timeout` catches it, not the idle watchdog. Gemini/Codex have no structured tool signal → byte-only liveness with a conservative `CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC` (1200 s) that exceeds the longest expected single tool phase; `hard_timeout` is the backstop if one buffers end-only. `#timeout:`/`timeout_minutes` now set the HARD backstop (90 min default), not an aggressive deadline.
 
-idle-kill surfaces as `error="hang"` (vs `error="timeout"` for the hard backstop). The orchestrator tool loop requeues a hang with a short fixed backoff (`HANG_RETRY_BACKOFF_SEC`, NOT quota-reset-timed) via `mark_retry(hang_count=N)`, and after `MAX_HANG_RETRIES` (default 2) BLOCKS the task (finalizes + notifies) instead of looping forever. The hang counter persists in a `<!-- hang: N -->` queue-line comment (`queue_manager.extract_hang_count`, read from `QueueTask.raw_line`). `error_code="format_error"` shares that counter — it is the queue's only per-task counter — so it counts **fruitless attempts, not hangs**: two format errors followed by a first genuine hang block at 3. That cap is intended (three dead attempts on one task is what it is for), but it means the message must not claim an ordinal it does not have, hence `… — 3. erfolgloser Versuch (Hang/Format-Fehler zusammen gezählt)`. A second marker was weighed and rejected: it would split the queue's only persistent state across two markers every rewrite has to keep in sync, and would raise the unattended budget from 3 dead attempts to 5.
+idle-kill surfaces as `error="hang"` (vs `error="timeout"` for the hard backstop). The orchestrator tool loop requeues a hang with a short fixed backoff (`HANG_RETRY_BACKOFF_SEC`, NOT quota-reset-timed) via `mark_retry(hang_count=N)`, and after `MAX_HANG_RETRIES` (default 2) BLOCKS the task (finalizes + notifies) instead of looping forever. The hang counter persists in a `<!-- hang: N -->` queue-line comment (`queue_manager.extract_hang_count`, read from `QueueTask.raw_line`). `error_code="format_error"` shares that counter — it is the queue's only per-task counter — so it counts **fruitless attempts, not hangs**: two format errors followed by a first genuine hang block at 3. That cap is intended (three dead attempts on one task is what it is for), but it means the message must not claim an ordinal it does not have, hence `… — 3. erfolgloser Versuch (Hang/Format-Fehler/Absturz zusammen gezählt)`. A second marker was weighed and rejected: it would split the queue's only persistent state across two markers every rewrite has to keep in sync, and would raise the unattended budget from 3 dead attempts to 3+N (it read "to 5" while only two failure classes shared the counter — see the third sharer below).
+
+**Since 2026-09-10 there is a THIRD sharer: an attributable process crash** (`orchestrator._charge_process_crash`, see CLAUDE.md "Prozess-Abstürze sind sichtbar und gedeckelt"). It is the same kind of thing — a dead attempt at the task — so it takes the same counter and the same cap for the same reason. What that change exposed: the honesty clause of 2026-08-15 had only ever been applied to the TOOL path. The single-shot hang branch still said `Hang (claude) zum 2. Mal`, which was harmless while only tool-path hangs and format errors could mix, and wrong the moment a crash could raise the count on any task. All three branches now read the wording from ONE constant, `orchestrator.JOINT_ATTEMPT_NOTE`, and `tests/test_orchestrator_crash_breaker.py::test_all_three_counter_messages_name_the_shared_count` locks the two retired spellings out and fails if the number of readers shrinks. Stated exactly, because this sentence overclaimed once: it does **not** catch a fourth branch that hard-codes its own wording — that would need an AST rule (every f-string interpolating a hang count also references `JOINT_ATTEMPT_NOTE`), which is not built. It is a regression lock on the known-bad spellings, not a proof.
 
 **`mark_retry()` is the single writer of that marker, and "no count" means preserve.** Every park rebuilds the queue line from scratch, so the counter only survives if the rebuild carries it. It did not until 2026-08-15: `mark_retry()` emitted the marker only when handed a `hang_count`, and `_mark_retry_checked()` — the helper behind the capacity, timeout, strict-mode, approval and parallel-error parks — never passed one, so each of those silently reset the count to 0 and a task alternating between format errors and capacity parks requeued forever. The distinction is drawn by what the park says about the *task*: `hang` and `format_error` pass `previous + 1` because they are unsuccessful attempts at it; everything else passes `None` and the existing value is carried through unchanged, because capacity, a cooldown or a quota reset says nothing about the task. `hang_count=0` clears explicitly (nothing uses it); success clears implicitly, since `finalize_task_with_result()` rewrites the line without the marker — including the `#every:` requeue, where a fresh start is the intent. Keeping the rule inside `mark_retry()` rather than at each caller is deliberate: the alternative is a cross-cutting obligation on the queue's only persistent state, and that is exactly the invariant that was already broken. `_replace_open_task_line()` therefore accepts a *builder* as well as a finished string, so the old count is read from the same line that gets overwritten — line numbers shift while a task runs, and reading it in the caller would read it off whatever moved into the remembered slot.
 
@@ -189,6 +191,90 @@ idle-kill surfaces as `error="hang"` (vs `error="timeout"` for the hard backstop
 ### Tool total-runtime deadline
 
 `BaseTool._runtime_deadline()` resolves `ToolContract.max_runtime_sec` (policy.yaml; fallback `TOOL_DEFAULT_MAX_RUNTIME_SEC=3600`) to a monotonic deadline checked at each iteration start of ALL three iterative loop tools (review-loop, dev-loop, test-loop) → bail with `error_code="tool_runtime_exceeded"` (partial output). This caps the SUM of all phases/iterations independently of the per-call hard backstop: without it, 20 iterations × multiple long phases (2 provider-calls each in test-loop) with a high `#timeout:` could bind dozens of hours of wall-clock. `BaseTool._phase_cap(task_timeout, phase_default)` enforces that a high task `#timeout:` is an upper deckel only — `min(task_timeout, phase_default)` never raises a phase above its `TOOL_*_TIMEOUT_SEC` constant (test-loop uses `_phase_cap(timeout, TOOL_FIX_TIMEOUT_SEC)`, not the old `timeout or TOOL_FIX_TIMEOUT_SEC`). **The orchestrator must treat `tool_runtime_exceeded` as terminal** (`orchestrator.py` tool-loop): it finalizes the task with the partial result rather than falling back to the next provider or `mark_retry`'ing — either path would restart the loop from iteration 1 with a FRESH `_runtime_deadline()` (3× the budget across the 3-provider chain, unbounded across re-polls), so the wall-clock bound only holds per single invocation otherwise.
+
+#### Landing round instead of a hard cut (2026-09-10)
+
+The deadline above is still the bound, but reaching it no longer means being cut off
+mid-flight. `dev-loop` reserves the last `TOOL_LANDING_RESERVE_SEC` (2400 s) of the
+budget: crossing `deadline - reserve` sets `final_round`, which (a) appends
+`_FINAL_ROUND_NOTE` to the execution prompt — stabilise, start nothing new, list what
+stays open — and (b) stops the loop after that round's reviews regardless of verdict.
+**A landing round whose reviews pass returns `success=True`** and takes the ordinary
+✅ path; only an unresolved one keeps `tool_runtime_exceeded`. The orchestrator side
+is deliberately untouched, so the terminal contract stated above holds word for word —
+what changed is only *when* `dev-loop` emits the code.
+
+The reserve is **enforced, not scheduled**: in the landing round every phase timeout is
+clamped to the remaining wall-clock **at the moment that phase starts**
+(`_landing_cap()` → `min(phase, max(MIN_PHASE, remaining))`). Without the clamp the
+reserve would be advisory — one execution phase may ask for `TOOL_DEV_EXEC_TIMEOUT_SEC`
+(7200 s) and overrun the whole budget on its own. Per phase rather than once per round,
+because the first version computed the remaining budget once and spread that value over
+all three sequential phases: with a 600 s budget the granted timeouts came out as
+[599, 599, 599] — up to 3× what was actually left. That defect survived the first test
+pass because a mocked provider returns instantly, so with a still clock all three phases
+legitimately see the full remainder; the gate now drives a fake clock and pins
+[600, 60, 60].
+
+**The clamp applies to every round, not only the landing round.** Restricting it to the
+landing round left a far larger hole than it closed: an ordinary iteration starting one
+second above the reserve was still granted 7200 + 3600 + 1800 s — up to ~10200 s past the
+deadline — while the documentation claimed a 120 s cap. Found by the external pass.
+
+**The floor is the one deliberate way past the budget, and it is bounded.** Every call is
+granted at most `max(TOOL_LANDING_MIN_PHASE_SEC, remaining)`, so the overrun is the number
+of calls that hit the floor times the floor: `2 ×` in the usual case (execution eats the
+rest, the two reviews take the floor), at most `6 ×` if each phase additionally needs a
+session-missing retry — 120 s to 360 s. The alternative, handing a provider a zero or
+negative timeout, spends a full prompt on a call that cannot finish. Below
+`3 × TOOL_LANDING_MIN_PHASE_SEC` no round is started at all, for the same reason. The
+auto-lesson call is skipped in a landing round for the same accounting reason. The clamp
+is as hard as `process_runner`'s tree-kill and no harder.
+
+**Only a capacity park may be resumed.** `state.json` records `park_reason`, and
+`_resume_checkpoint` returns None for anything else. Without that key every progress
+checkpoint licensed a continuation, so a hang, a format error, a process crash or a
+hand-reopened task would also have resumed mid-loop with the reduced budget and the
+dirty-tree waiver — the general retry mechanism the Auftrag ruled out, arrived at by
+accident. A park also caps the recorded budget so the next run keeps at least one
+minimal landing round: a park that recorded a fully spent budget promised a continuation
+it could not deliver and had the next run stamp the task terminally without a single
+provider call.
+
+Reserve size is derived, not guessed: the longest complete dev-loop iteration ever
+traced is 1829 s (2026-09-09; the others 1142 / 1153 / 1128 / 974 s). A landing round
+IS one complete iteration, so it must carry the worst case, not the 1142 s median.
+
+#### Capacity park with resume (2026-09-10)
+
+A quota exhaustion inside any phase is converted to `capacity_exhausted` rather than
+passed through as `rate_limit`. The distinction is load-bearing: `rate_limit` makes the
+orchestrator set a cooldown and **rotate to the next provider**, which restarts the loop
+at iteration 1 with a fresh deadline and no review context. `capacity_exhausted` parks
+the task until the quota reset with no fallback and no failure stamp.
+
+Before parking, the run checkpoints into its existing `state.json` (`state_version: 2`;
+version-1 files remain readable and count as research cache only). Restored on resume:
+`next_iteration`, `previous_quality_findings`, `previous_resolution_output`,
+`deferred_p3`, both loop-detector sets, the token counts, and `elapsed_budget_sec`.
+That last one is what keeps the deadline honest — `_runtime_deadline(consumed)`
+subtracts it, so the budget bounds the **task** and not one process; without it every
+park would hand out another full budget, exactly the failure the terminal rule above
+exists to prevent. `all_outputs` is deliberately not persisted (unbounded text; the
+durable copy is `round-NNN.md`), so a resumed run's final output points at earlier
+rounds instead of quoting them.
+
+**The worktree gate had to learn about this or the park would be a trap.** After a park
+the tree is dirty *with the run's own work*, and `orchestrator.py:2202` refuses that
+**terminally** rather than parking again — a parked task would end up worse off than an
+unparked one. `BaseTool.resume_permits_dirty()` (default `False`; only `DevLoopTool`
+overrides) answers it with a subset check against the dirty path set recorded at park
+time: fewer paths means somebody committed and it is still our tree; **any** path that
+was clean then restores the normal refusal. A boolean "I parked here" flag would not do,
+because `.dev-loop/` is gitignored in this repo but need not be in every target repo —
+there the tool's own artefacts make the tree dirty. `_dirty_paths()` therefore excludes
+the run directory; otherwise the checkpoint's own `state.json`, written just after the
+path set was recorded, would look like foreign work and every resume would be refused.
 
 ### HTTP 429 resilience
 

@@ -1734,9 +1734,16 @@ def mark_retry(
     and this function is the only place that writes it. Because every park rebuilds
     the line from scratch, "not passing the counter" used to mean "erase it":
 
-    * ``hang_count=<int>`` SETS the counter. Only the two paths that judge the task
-      itself pass one — hang and format_error, each with previous+1. Those are the
-      unsuccessful attempts the cap in MAX_HANG_RETRIES exists to bound.
+    * ``hang_count=<int>`` SETS the counter. Only the three paths that judge the
+      task itself pass one — hang, format_error and (since 2026-09-10) an
+      attributable process crash, ``orchestrator._charge_process_crash`` — each
+      with previous+1. Those are the unsuccessful attempts the cap in
+      MAX_HANG_RETRIES exists to bound. The crash path deliberately shares this
+      counter instead of adding a second marker: a separate one would split the
+      queue's only persistent state across two parsers that every rewrite has to
+      keep in sync, and would raise the unattended budget from 3 dead attempts to
+      3+N. Because the count is shared, the messages of all three name it as the
+      joint count it is.
     * ``hang_count=None`` PRESERVES whatever the line already carries. This is every
       other park — capacity, provider cooldown, timeout, strict-mode, approval
       denied/timeout/skipped, parallel error. None of them say anything about the

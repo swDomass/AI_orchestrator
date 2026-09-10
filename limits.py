@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 
 import config
@@ -147,6 +147,12 @@ class AllLimits:
     # tests/test_limits_opencode.py::test_all_limits_drift_guard iterates
     # dataclasses.fields(AllLimits) and fails loudly if a new field is missing
     # from any of the three — update all three together, or that test tells you.
+    #
+    # The STATUS-DISPLAY sites (heartbeat capacity log + heartbeat text,
+    # Telegram /status + /limits) used to be a fifth and sixth hand-written
+    # copy of the same list and are NOT any more: they call
+    # display_provider_names() below, which derives from these fields. Nothing
+    # to update there for a new field.
 
     def earliest_reset_sec(self) -> int:
         """Live calculation from absolute epoch — accurate regardless of cache age."""
@@ -177,6 +183,65 @@ class AllLimits:
             is_transient_token_refresh(p)
             for p in (self.claude, self.gemini, self.codex, self.opencode)
         )
+
+
+def all_provider_names() -> tuple[str, ...]:
+    """Every provider AllLimits carries a snapshot for, in declaration order.
+
+    Derived from ``dataclasses.fields(AllLimits)`` rather than written out, so
+    it can never miss a provider the way the four status-display sites missed
+    opencode from 2026-09-04 until 2026-09-09 (`grep -c opencode heartbeat.py
+    telegram_listener.py` returned 0 and 0 the whole time). Same drift pattern
+    MODEL_TAG_RE and PROVIDER_TAG_RE were each fixed for once already.
+
+    This answers "which providers EXIST" only. Whether one is reachable is a
+    policy question — see display_provider_names().
+    """
+    return tuple(f.name for f in fields(AllLimits))
+
+
+def display_provider_names() -> tuple[str, ...]:
+    """The providers a human-facing status message should enumerate.
+
+    ``all_provider_names()`` filtered by the tool policy, so a provider that
+    policy.yaml bars from every route disappears from the display without a
+    second hand-written list deciding it. That is what finally drops gemini:
+    its 2026-08-15 retirement took it out of policy.yaml's ``tool_providers``,
+    and this reads that decision instead of restating it. Measured 2026-09-09
+    against the live vault: ``('claude', 'codex', 'opencode')``.
+
+    **For displays only.** The three consumers are the heartbeat text and
+    Telegram's /status and /limits — messages a human reads, where a barred
+    provider is noise. ``heartbeat._append_capacity_log()`` deliberately uses
+    ``all_provider_names()`` instead: it records the data analytics later parses,
+    and filtering there would end a provider's history rather than tidy a
+    message.
+
+    Two deliberate properties, both chosen for the unattended 03:00 case:
+
+    * **Fail-open.** Any failure resolving the policy (import error, broken
+      engine) returns the full field list. A lost policy.yaml re-adds gemini to
+      /status — noise, not blindness, and the right direction: the alternative
+      would blank the status display exactly when something is already wrong.
+    * **Never empty.** A pathological policy that bars everything still yields
+      the full list rather than a status message with no providers in it.
+
+    Known limitation: this asks the ``default:`` entry (``tool_name=None``). A
+    provider allowed only for one specific tool and absent from ``default:``
+    would be hidden here. No such provider exists today (measured), but a
+    per-tool-only allow-list would make this a false negative.
+    """
+    names = all_provider_names()
+    try:
+        # Lazy: dispatcher imports limits at module level, so a top-level import
+        # here would be a cycle. Same pattern as _opencode_budget_snapshot().
+        from dispatcher import policy_allows_provider
+
+        allowed = tuple(n for n in names if policy_allows_provider(n, None))
+    except Exception as exc:  # noqa: BLE001 — status display must never raise
+        logger.debug("display_provider_names: policy lookup failed (%s) — showing all", exc)
+        return names
+    return allowed or names
 
 
 def is_transient_token_refresh(pl: ProviderLimits) -> bool:

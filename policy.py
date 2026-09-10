@@ -198,6 +198,29 @@ def reason_matches_preapproval(reason: str, category: str) -> bool:
     return cat_norm in _preapproval_tokens(reason_norm)
 
 
+def policy_file_path(vault_path: "Path | None" = None) -> Path:
+    """Absolute path of policy.yaml under *vault_path* (config.POLICY_FILE by default).
+
+    The layout itself lives in ``config.POLICY_FILE_RELATIVE`` and is NOT
+    restated here — ``config.POLICY_FILE`` already spelled it out for
+    ``doctor.py``, so a second literal would be the very duplication this
+    function exists to remove. This adds only the parametrised case: an engine
+    built against an explicit vault (every test does that).
+
+    Why the parametrised case is needed at all: queue_linter has to stat and
+    parse the file ITSELF — PolicyEngine reports a missing file, an unreadable
+    one and a deliberately empty one all as "no restriction configured"
+    (_reload_if_changed returns early, _load_rules_locked logs and returns), so
+    the linter cannot tell corruption from a fresh install through the engine.
+    Sharing the path is what keeps the two from checking different files.
+    """
+    if vault_path is None:
+        from config import POLICY_FILE
+        return Path(POLICY_FILE)
+    from config import POLICY_FILE_RELATIVE
+    return Path(vault_path) / POLICY_FILE_RELATIVE
+
+
 class PolicyEngine:
     """Load policy.yaml, classify tasks, manage approval flow."""
 
@@ -225,9 +248,21 @@ class PolicyEngine:
     # Rule loading
     # ------------------------------------------------------------------
 
+    @property
+    def config_path(self) -> Path:
+        """The policy.yaml THIS engine reads.
+
+        Public because queue_linter has to inspect the same file the running
+        engine loads. Asking config.VAULT_PATH instead would let the two check
+        different files whenever an engine is built with an explicit vault (the
+        test suite does exactly that), and a linter that reports on a file the
+        runtime never reads is worse than no check at all.
+        """
+        return policy_file_path(self._vault_path)
+
     def _reload_if_changed(self) -> None:
         """Reload policy.yaml if the file has changed since last load."""
-        path = self._vault_path / "99_System" / "AI" / "policy.yaml"
+        path = self.config_path
         if not path.exists():
             return
 

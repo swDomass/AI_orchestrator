@@ -225,6 +225,36 @@ subtle bugs the primary reviewer might overlook.
 _SECOND_OPINION_BARE_PROVIDERS = {"openrouter", "claude", "codex", "vibe"}
 
 
+def second_opinion_target(alias: str | None) -> tuple[str, str | None] | None:
+    """Map a ``#second_opinion:<alias>`` value to (provider_name, model_id|None).
+
+    The alias half of _resolve_second_opinion(), split out because it answers a
+    question the full resolver structurally cannot: "is this alias known at
+    all". _resolve_second_opinion() returns None for an unknown alias, for an
+    unregistered provider AND for a policy-barred one, so a caller that needs to
+    tell those apart — queue_linter, which must not report a policy problem for
+    an alias no policy could ever enable — has to ask this narrower question.
+
+    Public (no underscore) for exactly that cross-module use. Deliberately does
+    NOT span every provider: the four alias maps below are the ones this tool
+    consults, so `opencode_glm` and `gemini_flash` resolve to None here just as
+    they do at runtime, where the phase is skipped under *every* policy.
+    """
+    if not alias:
+        return None
+    if alias in OPENROUTER_MODEL_ALIASES:
+        return "openrouter", alias
+    if alias in CLAUDE_MODEL_ALIASES:
+        return "claude", alias
+    if alias in CODEX_MODEL_ALIASES:
+        return "codex", alias
+    if alias in VIBE_MODEL_ALIASES:
+        return "vibe", alias
+    if alias in _SECOND_OPINION_BARE_PROVIDERS:
+        return alias, None
+    return None
+
+
 def _resolve_second_opinion(
     alias: str | None,
     tool_name: str = "review-loop",
@@ -239,21 +269,10 @@ def _resolve_second_opinion(
 
     The caller logs a warning and skips the second-opinion phase on None.
     """
-    if not alias:
+    target = second_opinion_target(alias)
+    if target is None:
         return None
-
-    if alias in OPENROUTER_MODEL_ALIASES:
-        provider_name, model_id = "openrouter", alias
-    elif alias in CLAUDE_MODEL_ALIASES:
-        provider_name, model_id = "claude", alias
-    elif alias in CODEX_MODEL_ALIASES:
-        provider_name, model_id = "codex", alias
-    elif alias in VIBE_MODEL_ALIASES:
-        provider_name, model_id = "vibe", alias
-    elif alias in _SECOND_OPINION_BARE_PROVIDERS:
-        provider_name, model_id = alias, None
-    else:
-        return None
+    provider_name, model_id = target
 
     # Policy-aware lookup: a second opinion is still a provider run and must obey
     # tool_providers, otherwise `#second_opinion:vibe` reaches a pay-per-token

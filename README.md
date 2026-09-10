@@ -21,7 +21,7 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **2447 tests / ~90–125 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls. Run them with `-p no:randomly`: `tests/test_telegram_listener.py` is order-dependent, so a random seed can turn the suite red without a code change (known, unfixed — see [Known Limitations](#known-limitations)).
+- **2533 tests / ~90–125 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls. Run them with `-p no:randomly`: `tests/test_telegram_listener.py` is order-dependent, so a random seed can turn the suite red without a code change (known, unfixed — see [Known Limitations](#known-limitations)).
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, `git push`, …) even under `--dangerously-skip-permissions`. A second, softer layer (`SAFETY_RULES`) rides in the system prompt — but know its exact reach before relying on it, because it is narrower *and* wider than "the non-Claude providers", and a `SOUL.md` switches it off entirely. `config.SYSTEM_PROMPTS` has entries for **claude, codex, gemini and opencode** — so Claude gets the rules as well, while **`vibe` and `openrouter` get an empty string** (`get_system_prompt()` does a `.get(name, "")`). And the moment a `SOUL.md` exists, `get_system_prompt()` returns that file's `base` section plus an optional per-provider override and never consults `SYSTEM_PROMPTS` at all — so the `SAFETY_RULES` constant then reaches **no** provider, and whatever safety text ships is whatever your `SOUL.md` happens to carry. If you use a `SOUL.md`, repeat the rules in its `base` section, and re-check that copy whenever `SAFETY_RULES` changes: nothing keeps the two in sync, and the hook (`SAFETY_DENY_PATTERNS`) is unaffected either way. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
@@ -220,6 +220,9 @@ Runs a pure-validation pass over `agent-queue.md`. No LLM calls. Catches:
 - `#parallel` with 0-1 subtasks (warning) or shared CWD (info)
 - HTML comment inside the task body (`html_comment_in_body`) — truncates the task and deletes the trailing tags on rewrite, see [Retry Markers](#retry-markers)
 - HTML comment at the line end that is not a valid `retry`/`hang` marker (`html_comment_trailing`) — silently dropped on rewrite; a near-miss marker means the schedule never applies
+- A provider tag the `tool_providers:` policy **bars** (`provider_not_allowed`, error) — the runtime verdict comes from `dispatcher.forced_provider_policy_violation()` itself, so linter and orchestrator cannot disagree, and the task's `#agent:` profile and `#tool_providers:` tag are resolved first (both legitimately widen the allow-list). This is a *different question* from the registration checks above: `#vibe`/`#opencode` can be installed and still barred
+- The two silently-degrading variants, both warnings: `#pass2:` on a `#tool:critical-review` task naming a barred provider (`pass_provider_not_allowed` — the pass falls back to the primary) and `#second_opinion:` on a `#tool:review-loop` task resolving to one (`second_opinion_not_allowed` — the phase is skipped without a word). `#pass1:` is deliberately **not** reported: nothing in the repo reads `pass_providers[1]`, so pass 1 runs on the primary provider under every policy — a policy warning there would blame the policy for a non-effect and suggest that widening `tool_providers` would change something. Same reason for `#pass2:` on any other tool: `orchestrator.py` hands the tag to every tool, only `critical-review` reads it — and, for the same reason, for `#second_opinion:` on any tool other than `review-loop`, and for an alias `review-loop` does not resolve at all. That last one is not hypothetical: `#second_opinion:opencode_glm` is a valid opencode alias, but the second-opinion phase only consults the OpenRouter/Claude/Codex/Vibe alias maps, so it is skipped under *every* policy. The linter therefore asks `review_loop.second_opinion_target()` — the tool's own mapping — instead of the repo-wide alias table
+- `policy.yaml` missing (`policy_missing`, warning) or present-but-unusable (`policy_unreadable`, error: parse failure, non-mapping root, non-mapping `tool_providers:`); an empty file is `policy_empty` (warning). `PolicyEngine` reports all of these as "no restriction configured", so the linter reads the file itself — and reads the *running engine's* file (`PolicyEngine.config_path`), never `config.VAULT_PATH` separately. The `policy_missing` text deliberately does **not** claim the uncapped providers are then fenced off: measured with no `policy.yaml`, `policy_allows_provider('vibe', None)` is `False` but `_selection_order("… #vibe", …)` still yields `['vibe', 'claude', 'codex']` — the fail-closed rule reaches the tool-internal lookups (second opinion, pass 2) and not the forced-tag branch, so a bare `#vibe`/`#openrouter` tag runs. The warning says that, because a report claiming a pay-per-token provider is blocked while it is about to start is worse than no report
 
 Exit codes: **0** = clean, **1** = warnings only, **2** = errors. Wire into CI / pre-commit if you have a shared queue file.
 
@@ -317,11 +320,15 @@ ageing retires at most one at a time.
 
 **`tests/test_telegram_listener.py` is order-dependent** and `tests/test_usage_suggester.py` depends on environment/live state absent in a fresh worktree. Run the suite with `-p no:randomly`; a red run in a fresh worktree is more likely these two than a real regression.
 
-**`--lint-queue` is blind to a provider tag the policy bars.** For `#vibe`/`#opencode` the linter checks only whether the CLI is *registered*; whether `policy.yaml` allows that provider at all is checked by nobody offline. This hid a total outage: with `tool_providers.default: [claude, codex]`, **every** `#opencode` line ended terminally as `- [x] … ❌ …` with `provider_not_allowed`, while `--lint-queue` reported "no problems found" (measured 2026-09-04). Applies to every tag-activated provider, not just opencode. Closing it means teaching the linter to load the policy, which it does not know today.
+**`--lint-queue`'s policy check predicts the runtime — including where the runtime is wrong.** The linter reads `policy.yaml` since 2026-09-09 (before that it only asked whether a `#vibe`/`#opencode` CLI was *registered*, which hid a total outage: with `tool_providers.default: [claude, codex]` **every** `#opencode` line ended terminally as `- [x] … ❌ …` with `provider_not_allowed` while the linter reported "no problems found", measured 2026-09-04). It calls the runtime's own `forced_provider_policy_violation()` rather than reimplementing the layering, so linter and orchestrator cannot disagree — which necessarily means it also inherits the remaining hole in the ceiling (`_selection_order()`'s forced branch, above): a bare `#vibe`/`#openrouter` tag under a missing policy is reported as fine, because that is what will actually happen. Two things it still does not see: `policy_dead_end()` (a task with **no** provider tag that the policy leaves unroutable — a separate check, not built) and a provider tag on a `#parallel` **subtask**, which `parallel_runner` does route on its own (`select_provider(force_name=subtask.provider_forced, …)`). The subtask blind spot is the pre-existing one that model tags already have; widening it is a change of its own.
 
-**`AllLimits.opencode` is invisible in four display paths.** `heartbeat.py:213` (capacity log), `heartbeat.py:316` (health-check summary), `telegram_listener.py:562` (`/status`) and `:579` (`/limits`) still enumerate providers by hand as `("claude", "gemini", "codex")`. No *gate* depends on this — `_limits_ok()`, `earliest_reset_sec()`, `any_available()` and `has_transient_token_refresh()` all carry opencode, and `--check-limits` prints the fourth row — so the consequence is purely observability: the $5/day budget shrinks unseen in the heartbeat and in the Telegram commands.
+**The status display shows what the policy allows, which is not the same as what exists.** Since 2026-09-09 the heartbeat health-check summary, `/status` and `/limits` derive their provider list from `limits.display_provider_names()` — `dataclasses.fields(AllLimits)` filtered through `dispatcher.policy_allows_provider(name, None)`. (They used to hand-enumerate `("claude", "gemini", "codex")`, wrong in both directions: opencode became an `AllLimits` field on 2026-09-04 and was never shown, while gemini left every active path on 2026-08-15 and was shown on every poll. Gemini now disappears because its *retirement* says so — it left policy.yaml's `tool_providers` — not because a second list repeats the decision.)
 
-**`.dev-loop/` is keyed by `cwd` alone, not by the task.** `DEV_LOOP_DIR` is a constant (`tools/dev_loop.py:40`) and the path is `{cwd}/.dev-loop` (`:302`), so two dev-loop tasks pointed at the same repo overwrite each other's `round-00N.md` (`:676`), `summary.md` (`:710`) and `state.json` — the iteration counter restarts at 1 per run. A `_task_hash()` exists (`:44-45`) but is only stored *inside* `state.json`, never used in the path. The damage is traceability, not content: the original text of a reviewer failure was afterwards not reconstructable.
+**The capacity log is deliberately not filtered.** `heartbeat._append_capacity_log()` uses the unfiltered `limits.all_provider_names()` instead, because `logs/capacity-log.md` is not a message but the input of `analytics._parse_capacity_log()`, which feeds the dashboard's current-limits panel and its historical series. Filtering a recorder does not tidy anything — it ends a provider's history, including for a provider that is still running: with `default: [claude]` and `dev-loop: [claude, codex]`, Codex keeps executing dev-loop tasks while the `default:` lookup drops it, so no Codex row is ever appended again and the dashboard reports no Codex capacity at all.
+
+Three consequences worth knowing. The display filter asks the **`default:` entry**, so a provider allowed only for one specific tool and absent from `default:` is hidden from the *messages* even though tasks route to it (no such provider exists today; the log still records it). The filter is **fail-open and never empty**: a lost or unreadable policy.yaml re-adds gemini to every status message, and a policy barring everything still prints all four — noise in the safe direction, chosen over blanking the status display at 03:00. And the list is *not* universal: `limits.py`'s own cclimits enumerations (in `_providers_with_429()` and `_apply_429_fallback()` — named rather than line-numbered, because the two pointers written here on 2026-09-09 were already off by six lines when they were committed) and `quota_state.py:51` stay hand-written on purpose (opencode has no cclimits quota to probe), while `orchestrator.py:2744` (`--check-limits`) still hand-counts all four — complete today, and left alone deliberately; see ROADMAP.
+
+**`.dev-loop/` grows one subdirectory per distinct task text, and nothing prunes it.** Output is keyed by task since 2026-09-09 — `{cwd}/.dev-loop/<task-hash>/`, so two dev-loop tasks pointed at the same repo no longer overwrite each other's `research-and-plan.md`, `round-00N.md`, `summary.md` or `state.json` (they did until then: the path used the cwd alone and `_task_hash()` only ever reached the *inside* of `state.json`). The parent `.dev-loop/` deliberately keeps its name, because `ToolTracer` derives `{cwd}/.dev-loop/traces/` from the *tool name* and `analytics` globs `**/.*/traces/*.jsonl` — a renamed parent would move every trace file and change tool attribution. Two consequences: **pre-2026-09-09 artefacts are not migrated, moved or deleted** (they stay directly under `.dev-loop/`, and a run interrupted by the upgrade still resumes — `_load_state()` falls back to the shared `.dev-loop/state.json` after validating its task hash), and **neither location is ever cleaned up**. Editing a task's text creates a new subdirectory rather than continuing the old one. Deleting run artefacts automatically was rejected as destructive housekeeping; do it by hand.
 
 **`#freshonly` recovery is limited to a daily cadence.** A `#every:Nd` task (N > 1) that missed its slot is never recovered onto the current day, because a multi-day cadence is measured from `now` rather than from a fixed calendar phase — there is no well-defined "slot for today" to recover. It moves to the next occurrence instead. Likewise, a `#grace:` wider than half the interval does not extend the recovery window: the late run would otherwise land closer to the next slot than to its own. Neither is flagged by `--lint-queue`.
 
@@ -443,7 +450,7 @@ Both schedule tags reuse the existing retry primitive — no separate scheduler.
 
 | Tool | Description |
 |---|---|
-| `dev-loop` | Research → Execute → Dual-Review loop (Code Quality + Issue Resolution). Both reviews must pass. Same **P1 + P2** semantics as `review-loop`: only blocking findings reach the executor, P3 is collected across all iterations and appended once as a closing offer. Output in `{cwd}/.dev-loop/`. |
+| `dev-loop` | Research → Execute → Dual-Review loop (Code Quality + Issue Resolution). Both reviews must pass. Same **P1 + P2** semantics as `review-loop`: only blocking findings reach the executor, P3 is collected across all iterations and appended once as a closing offer. Output in `{cwd}/.dev-loop/<task-hash>/`. |
 | `review-loop` | Iterative Review → Fix → Re-Review loop. Fixes all **P1 + P2**; **P3 is non-blocking** and is reported once at the end as an offer instead of being fixed (cosmetics on working code widen the diff, and since each round re-reads the fresh diff, a P3 fix can surface new P3). A reviewer output that lists findings *and* the "no findings" sentinel counts as having findings — the sentinel alone used to pass the success gate with an unfixed blocker. Max 20 iterations with infinite-loop detection. Optional drift-check (`policy.yaml` `tool_phases.review-loop.drift_check_mode`, default `auto`) injiziert eine Refocus-Warning in den nächsten Fix-Prompt, wenn der Reviewer in unrelated Refactoring abgedriftet ist. |
 | `test-loop` | Iterative test / fix loop until tests pass or max iterations. |
 | `research-qa` | Read-only pre-implementation research: Discovery → Analysis → Question catalogue. Output in `{cwd}/.research-qa/`. No code changes. |
@@ -466,7 +473,7 @@ Phase 1 — Research + Plan  (merged into ONE subprocess call)
   Reads relevant code, understands the problem/feature,
   AND produces the implementation plan in the same response.
   Web search only if local sources are insufficient.
-  → Saved to {cwd}/.dev-loop/research-and-plan.md
+  → Saved to {cwd}/.dev-loop/<task-hash>/research-and-plan.md
   → State persisted under phase=research_and_plan_done for capacity-resume.
 
 Phase 2 — Execution
@@ -484,8 +491,8 @@ Phase 3b — Issue Resolution Review  (RESOLVED/PARTIAL/UNRESOLVED, read-only)
   Ignores code quality entirely. Re-reads `git diff` fresh.
 
 → Both reviews must pass → loop ends, no auto-push.
-→ Per-iteration output in {cwd}/.dev-loop/round-NNN.md
-→ Final summary: {cwd}/.dev-loop/summary.md
+→ Per-iteration output in {cwd}/.dev-loop/<task-hash>/round-NNN.md
+→ Final summary: {cwd}/.dev-loop/<task-hash>/summary.md
 ```
 
 **Phase B opt-in**: When `CLAUDE_SESSION_ENABLED=true`, all phases share a Claude session (`--session-id` / `--resume`) for cross-call prompt-cache hits. Iteration cap of 5 per session triggers a rollover to a fresh UUID; explicit findings re-injection in the exec prompt makes the rollover seamless.
@@ -514,6 +521,42 @@ CLI provider calls run through a liveness/hang watchdog (`providers/process_runn
 | `MAX_HANG_RETRIES` | 2 | Idle-kills (`error="hang"`) are requeued with a short backoff up to this many times, then the task is BLOCKED (not quota-reset-retried forever) |
 | `HANG_RETRY_BACKOFF_SEC` | 300 (5 min) | Backoff before requeueing a hung task |
 | `TOOL_DEFAULT_MAX_RUNTIME_SEC` | 3600 (60 min) | Fallback total-runtime deadline for an iterative tool when its ToolContract omits `max_runtime_sec` |
+| `TOOL_LANDING_RESERVE_SEC` | 2400 (40 min) | Wall-clock held back from the budget so a run can LAND instead of being cut off. Crossing `deadline - this` marks the current iteration as the last, tells the executor to stabilise, and still runs the reviews. Derived from the longest complete dev-loop iteration ever traced (1829 s), plus 31 % headroom |
+| `TOOL_LANDING_MIN_PHASE_SEC` | 60 | Floor for a phase timeout once clamped to the remaining wall-clock. Below `3 ×` this, the landing round is not started at all |
+
+**A tool that runs out of budget lands; it is not cut off.** Until 2026-09-10 the
+total-runtime deadline was checked between iterations and returned
+`tool_runtime_exceeded` on the spot, which `orchestrator.py` finalises terminally —
+so a run one review away from done was stamped failed. Now the last
+`TOOL_LANDING_RESERVE_SEC` of the budget are a landing round: no new full iteration
+is started, the execution prompt is told to stabilise rather than begin anything,
+and the reviews still run. **A landing round whose reviews pass is a success** and
+gets the normal ✅; only an unresolved one keeps the old terminal outcome. The
+reserve is enforced rather than merely scheduled — **every** phase of **every** round is
+clamped to the wall-clock left at the moment that phase starts, because a single
+execution phase may otherwise ask for `TOOL_DEV_EXEC_TIMEOUT_SEC` (7200 s) and overrun
+the whole budget. `TOOL_LANDING_MIN_PHASE_SEC` is the one deliberate way past the
+deadline (handing a provider a zero timeout spends a full prompt on a call that cannot
+finish), and the overrun is bounded by the number of calls that hit that floor:
+`2 ×` it in the usual case, at most `6 ×` if every phase also needs a session-missing
+retry — 120 s to 360 s against a 3 h budget.
+
+**A quota exhaustion mid-run parks the task and the next run continues it.**
+`providers/claude.py` now reads `session limit` as a rate limit (the CLI says
+"You've hit your session limit · resets 1:30am"; the four older keywords missed it,
+so the raw prose escaped classification and a finished two-hour dev-loop was
+finalised as failed on 2026-09-09). Inside `dev-loop` a capacity error in any phase
+is turned into `capacity_exhausted`, which parks the task until the quota reset
+instead of rotating it to the next provider — a rotation would restart the loop at
+iteration 1 with a fresh deadline and no review context. Before parking, the run
+writes an iteration checkpoint into its existing `state.json` (`state_version: 2`;
+version-1 files stay readable as research caches), and the resumed run picks up at
+that iteration with the previous review findings, the deferred P3 list, the loop
+detectors, the token counts — and with the consumed wall-clock subtracted, so the
+budget bounds the **task**, not one process. The worktree gate lets such a
+continuation start in a dirty repo via `tool.resume_permits_dirty()`, which proves
+ownership by comparing today's dirty path set against the one recorded at park time;
+any path that was clean then restores the normal refusal.
 
 **The `<!-- hang: N -->` counter survives parks, and only real failures raise it.** `mark_retry()` is the single writer of that marker and it rebuilds the whole queue line, so "the caller passed no count" has to mean *keep what is there* — until 2026-08-15 it meant *erase it*, and every capacity, timeout, strict-mode or approval park silently reset the count to 0. A task alternating between format errors and capacity parks therefore never reached `MAX_HANG_RETRIES` and requeued forever, unseen. The rule now: `hang` and `format_error` pass `previous + 1` because they are unsuccessful attempts **at the task**; every other park passes nothing and the counter is carried forward unchanged, because capacity or a quota reset says nothing about the task. A successful run clears it (the line is rewritten by `finalize_task_with_result()`).
 
@@ -945,14 +988,14 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (2447 tests, ~90-125 s) — fixed order, see below
+# Run all tests (2533 tests, ~90-125 s) — fixed order, see below
 python -m pytest tests/ -q -p no:randomly
 
 # Run a single test file
 python -m pytest tests/test_parallel_runner.py -v
 ```
 
-`-p no:randomly` is not cosmetic: `tests/test_telegram_listener.py` leaks state under some orderings, so `pytest-randomly` can colour the suite red without a code change. Last measured green run: **2447 passed / 0 failed in 123 s** (2026-09-05; the same suite took 99 s at 2098 tests on 2026-08-15 and ~90 s at 2447 on an idle machine, so treat 90-125 s as the band).
+`-p no:randomly` is not cosmetic: `tests/test_telegram_listener.py` leaks state under some orderings, so `pytest-randomly` can colour the suite red without a code change. Last measured green run: **2533 passed / 0 failed in 93 s** (2026-09-09; the same suite took 123 s at 2447 tests on 2026-09-05 and 99 s at 2098 on 2026-08-15, so treat 90-125 s as the band — the spread is machine load, not test count).
 
 ## Contributing
 

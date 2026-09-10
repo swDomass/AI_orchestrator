@@ -180,7 +180,16 @@ class ClaudeProvider(BaseProvider):
             # when it is an error result.
             scan_parts = [stderr]
             for line in stdout.splitlines():
-                if "rate_limit_event" in line or '"type":"error"' in line:
+                # Both spacings: the CLI currently emits compact JSON, but anything
+                # produced by a plain json.dumps writes `"type": "error"` with a
+                # space, and the substring test silently missed those — measured by
+                # an external review, which fed such an event and got the raw JSON
+                # back instead of `rate_limit`. Still a substring test rather than a
+                # per-line json.loads: this runs over every line of a possibly huge
+                # NDJSON stream, and the two spellings are what real emitters produce.
+                if ("rate_limit_event" in line
+                        or '"type":"error"' in line
+                        or '"type": "error"' in line):
                     scan_parts.append(line)
             if result_event is not None:
                 subtype = result_event.get("subtype")
@@ -195,7 +204,20 @@ class ClaudeProvider(BaseProvider):
             # exact phrase. Tools should fall back to a fresh session + state inject.
             if "no conversation found with session id" in combined:
                 return RunResult(success=False, error="session_missing", **tokens)
-            if any(kw in combined for kw in ("rate limit", "usage limit", "quota", "overloaded")):
+            # "session limit" was added 2026-09-10 after it cost a finished two-hour
+            # dev-loop. The CLI says "You've hit your session limit · resets 1:30am
+            # (Europe/Vienna)" — none of the four older keywords match it, so the raw
+            # prose escaped as RunResult.error, error_code_of() returned "",
+            # is_transient() returned False, and orchestrator.py:1733 stamped the
+            # queue line terminally failed. Measured over logs/ plus all four
+            # runs-archive months: exactly two limit phrasings occur, "rate limit: {"
+            # (already covered) and this one, 5x each. Deliberately NOT a bare
+            # "limit" — that would match ordinary prose. This tuple is safe to widen
+            # only because `combined` above is restricted to signal-bearing surfaces;
+            # a SUCCESS result whose answer text discusses session limits never
+            # reaches here.
+            if any(kw in combined for kw in
+                   ("rate limit", "usage limit", "session limit", "quota", "overloaded")):
                 return RunResult(success=False, error="rate_limit", **tokens)
 
             # No better classification matched — but ONLY trust this at rc == 0.

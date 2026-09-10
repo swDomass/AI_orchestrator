@@ -586,13 +586,30 @@ class BaseTool(ABC):
     # the tool is for.
     requires_clean_worktree: bool = False
 
-    def _runtime_deadline(self) -> float:
-        """Monotonic wall-clock deadline for the whole tool run.
+    def resume_permits_dirty(self, cwd: str | None, task: str) -> tuple[bool, str]:
+        """May this task start in a dirty repo because it is RESUMING its own work?
 
-        Bounds the SUM of all phases/iterations via the tool's
-        ToolContract.max_runtime_sec (falls back to TOOL_DEFAULT_MAX_RUNTIME_SEC).
-        Prevents 20 iterations × multiple long phases from binding 10+ hours of
-        wall-clock when a high #timeout: hard backstop is set per call.
+        Second, narrower reason for the worktree gate to let a task through, next to
+        `#allow-dirty`. It exists because the gate and the capacity park contradict
+        each other: a tool parked mid-run (quota exhausted) leaves the tree dirty
+        WITH ITS OWN CHANGES, and on the next poll the gate would refuse the very
+        task that made the mess — terminally, which is worse than not parking at all.
+
+        Returns (allowed, reason). Default False: a tool that cannot prove the dirt
+        is its own does not get the exemption. The proof is the tool's business —
+        `DevLoopTool` compares the current dirty path set against the one recorded
+        when it parked — because only the tool knows what it was doing.
+
+        Asked ONLY for tools with requires_clean_worktree, and only after the
+        `#allow-dirty` and missing-cwd checks, so it can never widen those.
+        """
+        return (False, "")
+
+    def _max_runtime_sec(self) -> int:
+        """Total wall-clock budget for this tool, in seconds.
+
+        ToolContract.max_runtime_sec, falling back to TOOL_DEFAULT_MAX_RUNTIME_SEC
+        when the contract omits the field.
         """
         from config import TOOL_DEFAULT_MAX_RUNTIME_SEC
         max_runtime = TOOL_DEFAULT_MAX_RUNTIME_SEC
@@ -603,7 +620,26 @@ class BaseTool(ABC):
                 max_runtime = contract.max_runtime_sec
         except Exception:
             pass
-        return time.monotonic() + max_runtime
+        return max_runtime
+
+    def _runtime_deadline(self, consumed_sec: float = 0.0) -> float:
+        """Monotonic wall-clock deadline for the whole tool run.
+
+        Bounds the SUM of all phases/iterations via the tool's
+        ToolContract.max_runtime_sec (falls back to TOOL_DEFAULT_MAX_RUNTIME_SEC).
+        Prevents 20 iterations × multiple long phases from binding 10+ hours of
+        wall-clock when a high #timeout: hard backstop is set per call.
+
+        `consumed_sec` is wall-clock already spent on this task by EARLIER processes
+        (a run that was parked and is now resuming). It is subtracted, so the budget
+        is a statement about the TASK and not about one process — without that, every
+        resume would start a fresh full budget and the bound would evaporate exactly
+        the way orchestrator.py:2451-2457 warns about. The returned deadline is never
+        in the past: an already-exhausted budget clamps to `now`, and the caller's
+        `remaining <= 0` branch takes it from there.
+        """
+        remaining = self._max_runtime_sec() - max(0.0, consumed_sec)
+        return time.monotonic() + max(0.0, remaining)
 
     @staticmethod
     def _phase_cap(task_timeout: int | None, phase_default: int) -> int:

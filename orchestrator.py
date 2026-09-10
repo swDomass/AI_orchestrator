@@ -543,7 +543,9 @@ def _worktree_gate_violation(task: str, tool_name: str | None, cwd: str | None) 
     where a task may be explicitly told not to write) keep running as before.
 
     `#allow-dirty` waives it for the rare legitimate case, so the escape hatch does
-    not require a code change at 03:00.
+    not require a code change at 03:00. A second, narrower waiver is
+    `tool.resume_permits_dirty()` — see the comment at the check itself; it covers
+    the one case where the dirt provably belongs to the task being started.
 
     No automatic reset or branch switch: a reset can destroy work that belongs to
     somebody else's session, and refusing to start makes the same mistake just as
@@ -579,13 +581,46 @@ def _worktree_gate_violation(task: str, tool_name: str | None, cwd: str | None) 
     ok, reason = _is_clean_git_repo(Path(cwd))
     if ok:
         return None
+
+    # Second, narrower exemption: the task is RESUMING work it parked itself. The
+    # gate and the capacity park contradicted each other until 2026-09-10 — a
+    # dev-loop parked mid-run (quota exhausted, `capacity_exhausted` →
+    # `mark_retry`) leaves the tree dirty WITH ITS OWN CHANGES, so on the next poll
+    # this gate refused the very task that made the mess, and refused it TERMINALLY
+    # (call site :2165 stamps ❌, it does not park). Parking a task into a
+    # guaranteed terminal failure is worse than never parking it.
+    #
+    # The tool answers, not the gate: only it knows what it was doing. DevLoopTool
+    # proves ownership by comparing today's dirty path set against the one it
+    # recorded when it parked — a path that was clean then and is dirty now means
+    # somebody else worked here, and the normal refusal below stands.
+    #
+    # Deliberately asked AFTER `#allow-dirty` and after the missing-cwd refusal, so
+    # it can only ever narrow, never widen, those two.
+    try:
+        resume_ok, resume_reason = tool.resume_permits_dirty(cwd, task)
+    except Exception as exc:  # a broken resume check must not take the run down
+        logging.getLogger(__name__).warning(
+            "resume_permits_dirty(%s) fehlgeschlagen: %s", tool_name, exc)
+        resume_ok, resume_reason = False, ""
+    if resume_ok:
+        print(f"  [worktree] Fortsetzung erkannt → Sauberkeits-Check für {tool_name} "
+              f"übersprungen ({resume_reason})")
+        return None
+
+    # A rejected resume carries the ONLY explanation of why the exemption did not
+    # apply (which path appeared after the park). Dropping it left the 03:00 reader
+    # with a generic "uncommitted changes present" and no way to tell an ordinary
+    # dirty repo from a continuation that a foreign edit invalidated.
+    resume_note = f" [Fortsetzung nicht möglich: {resume_reason}]" if resume_reason else ""
+
     return (
         f"Arbeitsbaum-Check fehlgeschlagen für '{tool_name}': {reason} "
         f"(cwd: {cwd}, Branch: {_current_branch(cwd)}). "
         f"{tool_name} erzeugt den Diff, über den seine eigenen Reviewer urteilen — "
         f"fremde Änderungen im Baum verfälschen den Prüfgegenstand. Task nicht gestartet. "
         f"Aufräumen (committen/verwerfen) und Task wieder öffnen, oder #allow-dirty setzen, "
-        f"wenn dieses Repo dauerhaft ungebundene Änderungen trägt."
+        f"wenn dieses Repo dauerhaft ungebundene Änderungen trägt.{resume_note}"
     )
 
 

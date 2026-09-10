@@ -475,6 +475,48 @@ TOOL_MAX_ITERATIONS = 20
 # omits max_runtime_sec. Caps the SUM of all phases/iterations (wall-clock),
 # independent of the per-phase TOOL_*_TIMEOUT_SEC caps.
 TOOL_DEFAULT_MAX_RUNTIME_SEC = _parse_int_env("TOOL_DEFAULT_MAX_RUNTIME_SEC", 3600)  # 60 min
+
+# Wall-clock kept back from the total-runtime budget so an iterative tool can LAND
+# instead of being cut off mid-flight. Crossing (deadline - this) does not end the
+# run: it marks the current iteration as the last one, tells the executor to
+# stabilise rather than start new work, and still runs the reviews — so a run that
+# finishes cleanly under the wire is stamped done, not failed.
+#
+# 2400 s is derived, not guessed. The longest COMPLETE dev-loop iteration ever
+# traced is 1829 s (2026-09-09, .dev-loop/traces/00b2378d-*.jsonl: 1829 / 1142 /
+# 1153 / 1128 / 974 s). A landing round IS one complete iteration, so the reserve
+# has to carry the worst case, not the 1142 s median — 2400 s covers the measured
+# maximum with 31 % headroom.
+TOOL_LANDING_RESERVE_SEC = _parse_int_env("TOOL_LANDING_RESERVE_SEC", 2400)  # 40 min
+
+# Floor for a phase timeout once it is clamped to the remaining wall-clock. Without
+# a floor the clamp can hand a provider 0 or a negative timeout, which spends a full
+# prompt on a call that cannot finish. If less than 3x this is left, the landing
+# round is not started at all.
+#
+# The floor is therefore also the ONE deliberate way the total budget can be
+# exceeded — but only since the clamp was applied to EVERY round rather than to the
+# landing round alone. While it was landing-only, an ordinary iteration starting one
+# second above the reserve was still granted 7200 + 3600 + 1800 s, i.e. up to ~10200 s
+# past the deadline, and this comment claimed a 120 s cap. Found by an external pass.
+#
+# Honest bound now: every provider call is granted at most max(this, remaining), so a
+# run overruns by (number of calls that hit the floor) x this. That is 2 x for the
+# usual case (execution eats the rest, the two reviews take the floor) and at most
+# 6 x if all three phases additionally need a session-missing retry — 120 s to 360 s
+# against a 3 h budget. Measured, not assumed: the tests drive a fake clock and pin
+# the granted timeouts at [600, 60, 60] for a 600 s budget.
+TOOL_LANDING_MIN_PHASE_SEC = _parse_int_env("TOOL_LANDING_MIN_PHASE_SEC", 60)
+
+# Both values come from the environment and nothing validated them: a zero or
+# negative floor hands a provider a useless timeout, and a reserve smaller than one
+# minimal round means the landing round is refused the moment it is scheduled — the
+# feature would be off, silently, with no error anywhere. Normalising here rather
+# than in doctor.py because the constants are read at import time by every entry
+# point, so an invalid value must never reach the loop in the first place.
+TOOL_LANDING_MIN_PHASE_SEC = max(1, TOOL_LANDING_MIN_PHASE_SEC)
+TOOL_LANDING_RESERVE_SEC = max(TOOL_LANDING_MIN_PHASE_SEC * 3, TOOL_LANDING_RESERVE_SEC)
+
 TOOL_REVIEW_TIMEOUT_SEC = 1_200  # 20 min per review
 TOOL_FIX_TIMEOUT_SEC = 2_400     # 40 min per fix
 TOOL_INTER_STEP_SLEEP_SEC = 2    # pause between review/fix iterations

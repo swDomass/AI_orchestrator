@@ -22,6 +22,11 @@ Task format in agent-queue.md:
 import argparse
 from dataclasses import dataclass
 import hashlib
+# Module level on purpose, against this file's habit of lazy `import logging as
+# _logging` inside functions: main()'s BaseException handler and
+# _charge_process_crash() run while the process is already dying, and a crash
+# handler should not be performing imports. The five lazy ones elsewhere stay.
+import logging
 import os
 from pathlib import Path
 import re
@@ -35,7 +40,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime, timedelta
 
-from logging_setup import setup_logging
+from logging_setup import install_thread_excepthook, setup_logging
 
 from config import (
     GIT_AUTO_STASH,
@@ -89,6 +94,7 @@ from queue_manager import (
     ensure_queue_file,
     extract_cwd,
     extract_effort_tag,
+    extract_every_tag,
     extract_effort_tag_raw,
     has_effort_tag_attempt,
     extract_id_tag,
@@ -119,6 +125,269 @@ from providers.process_runner import run_with_watchdog
 import replay
 from telegram_listener import TelegramListener
 from tools import extract_tool_tag, get_tool, list_tools
+
+
+# ---------------------------------------------------------------------------
+# Process-crash circuit breaker
+#
+# A Python exception that escapes run_once() kills the process, and
+# run_orchestrator.ps1 restarts it straight back into the SAME first queue task.
+# Measured 2026-09-09/10: 96 crashes between 20:09 and 07:38, 91 of them in an
+# unbroken 5-minute cadence, zero tasks executed, and nothing whatsoever in
+# logs/orchestrator.log.
+#
+# The top-level handler in main() is the only place that knows for certain "an
+# unexpected exception happened here". What it lacks is WHICH queue task was
+# running. This register carries that one fact from run_once() to main(), and
+# _charge_process_crash() turns it into an attempt on the queue line.
+#
+# In-memory on purpose (precedent for transient module state: shutdown.py). A
+# persistent breadcrumb file cannot tell a crash apart from a user kill, a
+# reboot or a power cut — exactly the distinction the breaker is judged on. A
+# register that only the handler which caught the exception can read makes
+# Ctrl+C, taskkill and Windows Update STRUCTURALLY uncountable instead of
+# heuristically filtered (measured: 1 of 97 process ends that night was a user
+# kill). The price, named rather than discovered later: a hard process death
+# (OOM kill, segfault in a C extension) is not counted at all.
+#
+# Main thread only — run_once() is called from main() and run_watch(), both on
+# the main thread — so no lock.
+# ---------------------------------------------------------------------------
+
+
+# The one wording every message that quotes the counter has to carry.
+#
+# `<!-- hang: N -->` is the queue's ONLY persistent per-task counter, and since
+# 2026-09-10 THREE failure classes write it: hang, format_error and an
+# attributable process crash. An ordinal taken from a shared counter is a lie
+# unless the message says so — the 2026-08-15 lesson, when two format errors
+# plus a FIRST genuine hang blocked at 3 and the message sent someone hunting
+# for two hangs that never happened. It was a string in one branch then; adding
+# a third sharer made it a constant, so a fourth cannot quietly forget it.
+JOINT_ATTEMPT_NOTE = "Hang/Format-Fehler/Absturz zusammen gezählt"
+
+
+@dataclass(frozen=True)
+class _InFlightTask:
+    """The queue task run_once() is working on right now (None between tasks)."""
+
+    task_text: str
+    line_no: int | None
+    subtasks: tuple[str, ...] | None
+    raw_line: str
+    tool: str
+    task_id: str
+    started_at: float
+
+
+_in_flight_task: _InFlightTask | None = None
+
+
+def _set_in_flight(queue_task) -> None:
+    """Arm the crash register for one queue task.
+
+    Every field is read via getattr with a default: the neighbouring tests drive
+    run_once() with SimpleNamespace stand-ins that carry only task_text/line_no,
+    and arming the register must never be the thing that breaks a task run.
+    """
+    global _in_flight_task
+    try:
+        task_text = getattr(queue_task, "task_text", "") or ""
+        _in_flight_task = _InFlightTask(
+            task_text=task_text,
+            line_no=getattr(queue_task, "line_no", None),
+            subtasks=getattr(queue_task, "subtasks", None) or None,
+            raw_line=getattr(queue_task, "raw_line", "") or "",
+            tool=extract_tool_tag(task_text) or "",
+            task_id=extract_id_tag(task_text) or "",
+            started_at=time.time(),
+        )
+    except Exception:  # pragma: no cover — defence in depth, never block a task
+        _in_flight_task = None
+
+
+def _clear_in_flight() -> None:
+    """Disarm the crash register (end of a task, end of run_once()).
+
+    Deliberately NOT a try/finally around the task iteration: a finally would
+    also run while the exception is propagating and would wipe the one piece of
+    context main() needs to attribute the crash.
+    """
+    global _in_flight_task
+    _in_flight_task = None
+
+
+def _charge_process_crash(exc: BaseException) -> None:
+    """Charge one process crash to the queue task that was in flight.
+
+    Counted in the queue's existing ``<!-- hang: N -->`` marker rather than in a
+    second persistent marker or a sidecar state file. Three reasons, all of them
+    already settled in this repo: a second marker splits the queue's only
+    persistent state across two parsers that every rewrite has to keep in sync;
+    a sidecar file needs a task identity of its own, a reset hook and a stale
+    policy; and either one would RAISE the unattended budget from 3 dead
+    attempts to 3+N. So a crash is simply a third kind of unsuccessful attempt
+    at the task, alongside hang and format_error — which is why the message
+    spells the shared count out instead of claiming three crashes.
+
+    Past ``MAX_HANG_RETRIES`` the task is quarantined as ``- [x] … ❌ …``: out of
+    OPEN_TASK_RE, satisfying no ``#needs:`` dependency, archived after 48 h like
+    any other finished line, and reopenable via ``/retry``.
+
+    How the user finds out, stated exactly, because the first version of this
+    docstring got it wrong: the Telegram notify below and the ❌ in the queue —
+    NOT queue_healing. ``queue_healing.detect_candidates()`` iterates
+    ``read_queue_items()``, which only yields OPEN lines, so a quarantined task
+    is invisible to it; it surfaces a *dependent* task that is now stuck, and
+    only if one exists. There is no replay record either: ``_span`` is never
+    emitted for the iteration that crashed, so ``logs/runs.jsonl``, taxonomy,
+    the dashboard and the status recap all stay blind. Inherited limit: an
+    ``#every:`` task is not
+    quarantinable — ``_completion_replacement()`` reschedules it instead of
+    stamping it — the same limit the existing hang-block path has.
+
+    Never raises. A failed queue write here must not cost the caller its
+    traceback logging, which is the half of this feature that always works. The
+    RAW queue_manager functions are used rather than the ``_checked`` wrappers:
+    those call notify_error(), i.e. a Telegram round trip inside a dying
+    process.
+    """
+    _log = logging.getLogger(__name__)
+    # Bound before the try so the handler can name the task even if the very
+    # first statement below throws.
+    label, ident = "<unbekannt>", ""
+    try:
+        snapshot = _in_flight_task
+        _clear_in_flight()  # read once, disarm immediately — never charge twice
+
+        if snapshot is None:
+            _log.warning(
+                "Prozess-Absturz (%s) außerhalb eines Queue-Tasks — nichts zuzurechnen",
+                type(exc).__name__,
+            )
+            return
+
+        # Everything the 03:00 reader needs to find the task again without the
+        # queue file in front of them: what it was, its #id:, which tool it was
+        # routed to, and how far in it died — a crash after 2 s is a different
+        # animal from one after 40 min, and the log line carries either.
+        label = snapshot.task_text[:80]
+        ident = f" [#id:{snapshot.task_id}]" if snapshot.task_id else ""
+        if snapshot.tool:
+            ident += f" [#tool:{snapshot.tool}]"
+        ran_for = max(0.0, time.time() - snapshot.started_at)
+        joint = JOINT_ATTEMPT_NOTE
+
+        count = extract_hang_count(snapshot.raw_line) + 1
+        quarantine = count > MAX_HANG_RETRIES
+        recurring = extract_every_tag(snapshot.task_text) is not None
+        if quarantine:
+            # `#every:` is the honest exception: _completion_replacement() does
+            # not stamp a recurring line, it REschedules it, so "wird nicht
+            # erneut gestartet" would be a lie there — measured, the line comes
+            # back as `- [ ] … <!-- retry: … -->` with the counter gone.
+            outcome = (
+                "→ wiederkehrender Task, wird zum nächsten Slot neu geplant "
+                "(nicht quarantänierbar)"
+                if recurring else
+                "→ Task quarantäniert (❌, wird nicht erneut gestartet)"
+            )
+            msg = (
+                f"Prozess-Absturz ({type(exc).__name__}) bei Task '{label}'{ident} "
+                f"nach {ran_for:.0f}s — {count}. erfolgloser Versuch ({joint}) "
+                f"{outcome}"
+            )
+        else:
+            reset_dt = datetime.now() + timedelta(seconds=HANG_RETRY_BACKOFF_SEC)
+            msg = (
+                f"Prozess-Absturz ({type(exc).__name__}) bei Task '{label}'{ident} "
+                f"nach {ran_for:.0f}s — Versuch {count}/{MAX_HANG_RETRIES} ({joint}) "
+                f"→ Requeue um ~{reset_dt.strftime('%H:%M')}"
+            )
+
+        # THE QUEUE WRITE GOES FIRST. Everything after it is reporting, and
+        # reporting must never cost the write: append_log touches a second file
+        # and notify_error does an HTTPS round trip whose own failure path calls
+        # print() (notifier._send) — which can itself raise on the broken stdout
+        # of a hidden-window --watch process. With the write behind them, one
+        # throw meant the counter stood still and the unbounded crash loop this
+        # function exists to stop simply continued. Found in review round 2.
+        if quarantine:
+            written = finalize_task_with_result(
+                snapshot.task_text,
+                msg,
+                "crash",
+                line_no=snapshot.line_no,
+                subtasks=snapshot.subtasks,
+                failed=True,
+            )
+        else:
+            written = mark_retry(
+                snapshot.task_text,
+                reset_dt.strftime("%Y-%m-%d %H:%M"),
+                line_no=snapshot.line_no,
+                subtasks=snapshot.subtasks,
+                hang_count=count,
+            )
+
+        # From here on it is REPORTING, and no reporter may cost another one.
+        # The CRITICAL line states what actually happened, not what was intended:
+        # `msg` already claims "→ Task quarantäniert" / "→ Requeue um ~HH:MM", so
+        # emitting it unconditionally would put a false outcome at CRITICAL and
+        # the correction below it at WARNING — and whoever greps for CRITICAL at
+        # 03:00 reads the wrong one. Measured in review round 3, together with
+        # the chaining bug: a throwing append_log used to skip BOTH the Telegram
+        # message and the not-written warning, because all three sat in one flow.
+        if written:
+            _log.critical(msg)
+        else:
+            # The conservative direction, by construction: a queue line that was
+            # edited (or already finalized) while the task ran is not found, so
+            # NOTHING is counted rather than something wrong being counted.
+            _log.critical(
+                "Prozess-Absturz bei Task '%s'%s — NICHT angerechnet, Queue-Zeile %s "
+                "nicht gefunden (editiert oder bereits finalisiert). Verworfene "
+                "Meldung war: %s",
+                label, ident, snapshot.line_no, msg,
+            )
+
+        try:
+            # Same honesty rule as the CRITICAL line above: `msg` claims an
+            # outcome, so the event log must not carry it unqualified when the
+            # queue write did not happen.
+            append_log(msg if written else f"{msg} — NICHT angerechnet")
+        except Exception as e:  # a broken log file is not the crash
+            _log.warning("append_log nach Prozess-Absturz fehlgeschlagen (%s: %s)",
+                         type(e).__name__, e)
+
+        # Parity with the two OTHER terminal outcomes (the tool path and the
+        # single-shot path both notify when they block a task). A quarantine is
+        # the one state the user cannot discover by waiting: the line is gone
+        # from the open queue and a crashed iteration writes no replay record,
+        # so without this the only trace is a log file nobody reads at 03:00.
+        # The requeue branch stays silent on purpose — it is not terminal, the
+        # task comes back by itself, and one Telegram message per crash is noise.
+        if quarantine and written:
+            try:
+                notify_error(snapshot.task_text, "crash", msg)
+            except Exception as e:  # Telegram is best effort
+                _log.warning("Telegram-Meldung der Quarantäne fehlgeschlagen (%s: %s)",
+                             type(e).__name__, e)
+    except BaseException as e:
+        # BaseException, not Exception: this runs inside main()'s crash handler,
+        # and the docstring above promises it never raises. A KeyboardInterrupt
+        # arriving mid-charge, or a SystemExit out of some library, would
+        # otherwise travel on — and while main()'s try/finally now guarantees the
+        # exit code either way, a promise in a docstring should be true on its
+        # own terms (external review, Codex, 2026-09-10).
+        try:
+            _log.warning(
+                "Zurechnung des Prozess-Absturzes für Task '%s'%s fehlgeschlagen "
+                "(%s: %s) — der Traceback oben bleibt davon unberührt",
+                label, ident, type(e).__name__, e,
+            )
+        except BaseException:  # logging itself is the last thing left
+            pass
 
 
 def fmt_time(seconds: int) -> str:
@@ -164,19 +433,50 @@ def _rate_limit_cooldown_sec(limits: AllLimits, provider_name: str) -> int:
 
 
 def _snapshot_dir(cwd: str) -> dict[str, tuple[float, int]]:
-    """Recursively snapshot files as {relative_path: (mtime, size)}."""
+    """Recursively snapshot files as {relative_path: (mtime, size)}.
+
+    The relative path is derived from ``os.walk``'s directory, never from the
+    file path: ``os.path.relpath`` resolves its argument, and a file named
+    ``nul`` resolves to a different mount, raising ``ValueError`` -- which is
+    not an ``OSError`` and used to escape this function, ``run_once`` and
+    ``main``, killing the process. With the watchdog restarting into the same
+    first queue task that is an unbounded crash loop, not a skipped file:
+    measured 2026-09-09/10, 96 process crashes, caused by a 0-byte ``nul``
+    left in a repo by a ``> nul`` shell redirect. ``root`` is built by string
+    join from ``cwd`` and cannot cross a mount.
+
+    ``nul`` specifically, not reserved device names in general: measured on
+    Windows 11 / CPython 3.14.2, ``con``, ``aux``, ``prn``, ``com1``, ``lpt1``
+    and ``nul.txt`` all resolve to an ordinary path and relpath fine. Only
+    bare ``nul`` is rewritten by ``_getfullpathname``. Do not widen this claim
+    without re-measuring.
+
+    Keys are identical to the old per-file ``relpath`` for ordinary paths. The
+    two deliberate divergences, both reachable only through the extended-length
+    path prefix: a name that ``nul``-crashed before is now simply reported, and a
+    trailing dot/space (``"report."``) keeps the real name instead of being
+    normalised away -- the truer answer for a change detector.
+
+    The outer handler takes ``ValueError`` as well as ``OSError``: an embedded
+    NUL character in ``cwd`` makes ``os.walk``'s own ``scandir`` raise it, past
+    the inner guard. Same defect class as the crash above, so it is closed at
+    the same boundary rather than left for the next unattended night.
+    """
     snapshot: dict[str, tuple[float, int]] = {}
     try:
         for root, _dirs, files in os.walk(cwd):
+            try:
+                rel_root = os.path.relpath(root, cwd)
+            except ValueError:  # pragma: no cover - defence in depth
+                continue
             for name in files:
-                path = os.path.join(root, name)
                 try:
-                    stat = os.stat(path)
-                    rel = os.path.relpath(path, cwd)
-                    snapshot[rel] = (stat.st_mtime, stat.st_size)
+                    stat = os.stat(os.path.join(root, name))
                 except OSError:
-                    pass
-    except OSError:
+                    continue
+                rel = name if rel_root == os.curdir else os.path.join(rel_root, name)
+                snapshot[rel] = (stat.st_mtime, stat.st_size)
+    except (OSError, ValueError):
         pass
     return snapshot
 
@@ -850,6 +1150,7 @@ def _mark_done_checked(
     task, which powered the machine down with the fix unwritten).
     """
     if mark_done(task, provider, line_no=queue_line_no, subtasks=subtasks, failed=failed):
+        _clear_in_flight()  # fate persisted — see _finalize_task_with_result_checked
         return True
     msg = "Queue-Update fehlgeschlagen: Task konnte nicht als erledigt markiert werden"
     print(f"  ❌ {msg}")
@@ -1127,6 +1428,15 @@ def _finalize_task_with_result_checked(
     if finalize_task_with_result(
         task, result, provider, line_no=queue_line_no, subtasks=subtasks, failed=failed,
     ):
+        # The task's fate is now persisted, so it is no longer "in flight" and a
+        # crash in the tail that follows (verify script, memory store, notify,
+        # replay emit) must not be charged to it. For a normal task that would be
+        # harmless — the line is `[x]` and mark_retry finds nothing — but a
+        # `#every:` line has already been rewritten as `- [ ] … <!-- retry: … -->`
+        # by _completion_replacement(), so the charge WOULD land: measured in
+        # review round 2, a successful daily task came back 5 minutes later with
+        # a fresh retry marker and a fruitless attempt against its name.
+        _clear_in_flight()
         return True
     msg = "Queue-Update fehlgeschlagen: Ergebnis+Status konnten nicht atomar persistiert werden"
     print(f"  ❌ {msg}")
@@ -1150,8 +1460,9 @@ def _mark_retry_checked(
     approval denied/timeout/skipped, parallel error. Deliberately passes no
     `hang_count` — mark_retry() then carries the existing `<!-- hang: N -->`
     counter forward unchanged, so such a park neither raises nor resets it.
-    The two paths that DO judge the task (hang, format_error) bypass this helper
-    and call mark_retry(hang_count=previous+1) directly.
+    The three paths that DO judge the task (hang, format_error and — since
+    2026-09-10 — an attributable process crash, see _charge_process_crash)
+    bypass this helper and call mark_retry(hang_count=previous+1) directly.
     """
     if mark_retry(task, retry_at, line_no=queue_line_no, subtasks=subtasks):
         return True
@@ -1510,6 +1821,23 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
     print(f"{'='*60}")
 
     for i, queue_task in enumerate(task_items, 1):
+        # Disarm FIRST, at the top of the body — not only at the bottom. The
+        # `#tool:` and `#parallel` branches leave the iteration via `continue`
+        # and never reach the bottom, so a disarm placed only there would leave
+        # the previous task armed across the ~30 lines that follow before this
+        # iteration arms its own (task_text access, replay.new_run_id(), _RunSpan
+        # with extract_id_tag, the blocked-dependency branch with
+        # extract_needs_tags). A crash in any of them would be charged to a task
+        # that had already finished — and if the previous task was requeued, its
+        # line is still open, so the charge would land.
+        #
+        # (An earlier version of this comment named `_span.emit()` as the risk.
+        # It is not: `_RunSpan.emit()` swallows `except Exception` itself and
+        # cannot throw. The `continue` branches are the real reason, and a false
+        # invariant in a comment is worse than none — it gets weighed in the next
+        # refactor. Corrected in review round 2.)
+        _clear_in_flight()
+
         if pause_event and pause_event.is_set():
             print("\n[pause] Queue-Verarbeitung pausiert.")
             append_log("Queue-Verarbeitung pausiert")
@@ -1518,8 +1846,11 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         task = queue_task.task_text
         task_subtasks: tuple[str, ...] | None = getattr(queue_task, "subtasks", None)  # getattr for test-mock compat
 
-        # Replay-Telemetrie: pro Task allokieren. Wird im finally am Ende der
-        # Iteration emittiert; Branches setzen den Status via span.ok/retry/...
+        # Replay-Telemetrie: pro Task allokieren. Wird in JEDEM Zweig explizit
+        # emittiert (`_span.emit()`), nicht über ein iterationsweites finally —
+        # es gibt keins. Branches setzen den Status via span.ok/retry/...
+        # Folge, auf die sich _charge_process_crash stützt: eine Iteration, die
+        # abstürzt, emittiert nichts, also kennt logs/runs.jsonl den Vorgang nicht.
         _span = _RunSpan(
             run_id=replay.new_run_id(),
             ts_start=datetime.now(),
@@ -1537,6 +1868,29 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             continue
 
         print(f"\n[{i}/{len(task_items)}] Task: {task[:80]}{'...' if len(task) > 80 else ''}")
+
+        # Arm the process-crash register. From here to the end of this iteration an
+        # unexpected exception is attributable to THIS queue line — every execution
+        # path lives inside it: single-shot, #tool: (via _execute_tool_task) and
+        # #parallel (via run_parallel → _run_single_subtask → _execute_tool_task).
+        # For the #parallel SUBTASK path that is defence in depth, not the working
+        # mechanism: parallel_runner._run_group already catches every exception out
+        # of _execute_tool_task one level down and turns it into a failed
+        # SubTaskResult, so a subtask crash never reaches this process at all. The
+        # arming matters for run_parallel()'s OWN code (worktree setup, aggregation).
+        # Not under dry_run: a dry run writes nothing and must therefore count
+        # nothing (tests/test_orchestrator_crash_breaker.py gates that guard).
+        #
+        # KNOWN GAP, and deliberately not closed: the ~30 lines ABOVE this point
+        # (task_text, replay.new_run_id(), _RunSpan with extract_id_tag, the
+        # blocked-dependency branch with extract_needs_tags) run unarmed, so a
+        # crash there is not charged to anyone. Arming earlier would close it but
+        # would also arm tasks that turn out to be BLOCKED and never execute, and
+        # the trade is settled by the feature's own priority: a false charge
+        # silently skips a real task at 03:00, a missed charge only leaves the
+        # status quo. Not charging is the safe direction, so the window stays.
+        if not dry_run:
+            _set_in_flight(queue_task)
 
         # --- Feature 6: Load execution profile ---
         profile_name: str | None = None
@@ -1894,6 +2248,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 else:
                     _span.ok()
             except Exception as e:
+                # Full traceback into the LOG FILE. Everything below carries only
+                # str(e), and run_orchestrator.ps1 starts --watch without stdout
+                # redirection — so at 03:00 the print() reaches nobody and the
+                # Telegram line names a symptom without a location. The subtask side
+                # already logs with exc_info (parallel_runner._run_group); this is
+                # the parent half of the same guarantee.
+                _log.exception("Parallel-Ausführung fehlgeschlagen (Task: %.80s)", task)
                 msg = f"Parallel-Ausführung fehlgeschlagen: {e}"
                 print(f"  ❌ {msg}")
                 append_log(msg)
@@ -2109,10 +2470,15 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 # joint one it is. A second marker was weighed and rejected: it would
                 # split the queue's only persistent state across two markers that every
                 # rewrite has to keep in sync, bought for a nicer ordinal, and it would
-                # RAISE the unattended budget from 3 dead attempts to 5.
+                # RAISE the unattended budget from 3 dead attempts to 3+N.
                 #
-                # These two paths are the ONLY ones that pass a hang_count, because they
-                # are the only ones that judge the task. Every other park goes through
+                # ("to 5" until 2026-09-10, when the arithmetic still assumed two
+                # sharers. There are three now — hang, format_error and an
+                # attributable process crash — so the cost of a second marker is
+                # 3+N, not a fixed 5.)
+                #
+                # These three paths are the ONLY ones that pass a hang_count, because
+                # they are the only ones that judge the task. Every other park goes through
                 # _mark_retry_checked() without one, and mark_retry() then carries the
                 # existing counter forward — see its docstring for why "no count" must
                 # mean "preserve" rather than "erase".
@@ -2120,7 +2486,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     is_hang = outcome.error_code == "hang"
                     label = "Tool-Hang" if is_hang else "Tool-Format-Fehler"
                     hang_count = extract_hang_count(getattr(queue_task, "raw_line", "")) + 1
-                    joint = "Hang/Format-Fehler zusammen gezählt"
+                    joint = JOINT_ATTEMPT_NOTE
                     if hang_count > MAX_HANG_RETRIES:
                         msg = (
                             f"{label} ({provider.name}/{tool_name}) — "
@@ -2405,8 +2771,15 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if error == "hang":
                 hang_count = extract_hang_count(getattr(queue_task, "raw_line", "")) + 1
                 if hang_count > MAX_HANG_RETRIES:
+                    # Same honesty as the tool path: the ordinal comes from a
+                    # counter three failure classes share, so it must not be
+                    # reported as "the Nth hang". This branch kept the old
+                    # wording until 2026-09-10 — harmless while only the tool
+                    # path could mix hang with format_error, wrong as soon as a
+                    # process crash could raise the count on ANY task.
                     msg = (
-                        f"Hang ({provider.name}) zum {hang_count}. Mal "
+                        f"Hang ({provider.name}) — {hang_count}. erfolgloser "
+                        f"Versuch ({JOINT_ATTEMPT_NOTE}) "
                         f"→ Task blockiert (kein weiterer Retry)"
                     )
                     print(f"  🚫 {msg}")
@@ -2422,7 +2795,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 reset_dt = datetime.now() + timedelta(seconds=HANG_RETRY_BACKOFF_SEC)
                 reset_at_marker = reset_dt.strftime("%Y-%m-%d %H:%M")
                 msg = (
-                    f"Hang ({provider.name}) #{hang_count} "
+                    f"Hang ({provider.name}) — Versuch {hang_count}/{MAX_HANG_RETRIES} "
+                    f"({JOINT_ATTEMPT_NOTE}) "
                     f"→ Requeue um ~{reset_dt.strftime('%H:%M')}"
                 )
                 print(f"  {msg}")
@@ -2511,6 +2885,14 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             if request_shutdown():
                 print("  [shutdown] #shutdown erkannt → Shutdown ausstehend")
             return False
+
+    # The last iteration's disarm: the one at the TOP of the body only runs when
+    # there IS a next iteration, so after the final task the register would stay
+    # armed while the tail below runs — and a read_queue() that raises there
+    # (vault offline) would be charged to a task that had nothing to do with it.
+    # The ~15 early `return False` exits inside the loop stay armed on purpose
+    # and are disarmed by run_once()'s callers instead.
+    _clear_in_flight()
 
     if dry_run:
         print("\n[DRY-RUN] Keine Tasks ausgeführt.")
@@ -2618,6 +3000,10 @@ def run_watch(dry_run: bool = False) -> None:
 
             set_queue_idle(False)  # task found → wake bg thread for fresh limits check
             done = run_once(dry_run=dry_run, pause_event=pause_event)
+            # run_once returned normally — whatever happens next in this loop is
+            # not attributable to a queue task. Covers the ~15 early `return False`
+            # exits inside the task loop, which skip the disarm at its end.
+            _clear_in_flight()
 
             # Run heartbeat checks after each queue cycle
             heartbeat.run_due(read_queue)
@@ -2688,8 +3074,59 @@ def run_watch(dry_run: bool = False) -> None:
 
 
 def main() -> None:
-    setup_logging()
+    """Entry point: install the logging + crash net, then run the real main.
 
+    The body below used to live here directly; it moved to `_main()` so that this
+    wrapper can exist without re-indenting anything. Almost unchanged: the single
+    addition there is a `_clear_in_flight()` after the non-watch `run_once()`. Its whole job is
+    that an unexpected exception in the main run reaches `logs/orchestrator.log`
+    WITH its traceback before the process dies — measured 2026-09-09/10, 96
+    crashes left `grep -c "path is on mount" logs/orchestrator.log == 0` and the
+    only copy of the traceback was the terminal the user happened to have open.
+    """
+    setup_logging()
+    # Explicit, not a hidden side effect of setup_logging(): the thread hook is a
+    # global process-wide mutation and an embedder/test may not want it.
+    install_thread_excepthook()
+    try:
+        _main()
+    except (KeyboardInterrupt, SystemExit):
+        # MUST stay ahead of the BaseException clause below. KeyboardInterrupt is
+        # the documented way to stop --watch and drives shutdown.py; SystemExit
+        # carries the exit codes of --doctor / --lint-queue. Swallowing either here
+        # would be a behaviour change, and neither is an unsuccessful attempt at a
+        # queue task, so neither may charge the circuit breaker.
+        raise
+    except BaseException as exc:  # broad on purpose: last net before the process dies
+        # try/finally, not a plain sequence: the exit code is the ONE thing this
+        # branch owes the watchdog, and it must not depend on logging or on queue
+        # I/O succeeding. A throwing logging handler or a BaseException out of the
+        # queue write used to skip sys.exit(1) entirely, which would have let the
+        # process end on the ORIGINAL exception's default excepthook — a different
+        # exit code and a duplicated traceback (external review, Codex, 2026-09-10).
+        try:
+            # Each of the two owes the other nothing — the same rule that
+            # _charge_process_crash applies to ITS two reporters, and the same
+            # mistake made one level up: with the logging call ahead of the charge
+            # in one flow, a throwing handler skipped the charge entirely, so the
+            # counter stood still and the unbounded loop continued. Measured in
+            # the closing delta review, 2026-09-10.
+            try:
+                logging.getLogger(__name__).critical(
+                    "Unerwarteter Fehler im Hauptlauf (%s) — Orchestrator bricht ab",
+                    type(exc).__name__, exc_info=exc,
+                )
+            except BaseException:
+                pass
+            _charge_process_crash(exc)
+        finally:
+            # sys.exit rather than re-raise: re-raising would make the default
+            # excepthook print the same traceback a second time. Exit code 1 is
+            # what run_orchestrator.ps1 already treats as a crash.
+            sys.exit(1)
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(description="AI Task Orchestrator")
     parser.add_argument("--watch", "-w", action="store_true",
                         help="Läuft kontinuierlich, retried automatisch")
@@ -2770,6 +3207,7 @@ def main() -> None:
             notify_queue_complete(len(read_queue()))
     else:
         run_once()
+        _clear_in_flight()
 
 
 if __name__ == "__main__":

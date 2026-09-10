@@ -51,7 +51,7 @@ from config import (
     get_system_prompt,
 )
 from dispatcher import select_provider
-from limits import get_limits
+from limits import display_provider_names, get_limits
 from notifier import send_message
 from queue_manager import CWD_RE, append_task, extract_cwd, read_queue
 import memory as memory_module
@@ -559,8 +559,13 @@ class TelegramListener:
         limits = get_limits()
 
         lines = [f"📊 *Status*\n\nQueue: {len(tasks)} offene Task(s)\n"]
-        for name in ("claude", "gemini", "codex"):
-            lim = getattr(limits, name)
+        # Derived from AllLimits' fields, filtered by policy — see
+        # limits.display_provider_names(). A hand-written tuple stood here and
+        # showed gemini (retired 2026-08-15) while never showing opencode.
+        for name in display_provider_names():
+            lim = getattr(limits, name, None)
+            if lim is None:
+                continue
             if lim.available:
                 status = f"✅ {lim.remaining_pct:.1f}%"
                 reset = f" (reset ~{_fmt_time(lim.resets_in_sec)})" if lim.resets_in_sec else ""
@@ -576,8 +581,11 @@ class TelegramListener:
     def _cmd_limits(self) -> None:
         limits = get_limits()
         lines = ["📋 *Provider Limits*\n"]
-        for name in ("claude", "gemini", "codex"):
-            lim = getattr(limits, name)
+        # See _cmd_status() — same derived list, same reason.
+        for name in display_provider_names():
+            lim = getattr(limits, name, None)
+            if lim is None:
+                continue
             if lim.available:
                 reset = f", reset in {_fmt_time(lim.resets_in_sec)}" if lim.resets_in_sec else ""
                 lines.append(f"  *{name}*: {lim.remaining_pct:.1f}% remaining{reset}")

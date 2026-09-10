@@ -672,7 +672,13 @@ PROMPT_SKILL_TOKENS           = 2_000
 PROFILES_DIR = VAULT_PATH / "99_System" / "AI" / "profiles"
 
 # --- Policy ---
-POLICY_FILE = VAULT_PATH / "99_System" / "AI" / "policy.yaml"
+# The layout is written down ONCE, here: POLICY_FILE is the default-vault
+# instance of it, policy.policy_file_path(vault) the parametrised one (an engine
+# built against an explicit vault — every test does that). Both derive from this
+# relative path, so the linter and the running engine cannot end up checking
+# files assembled from two different literals.
+POLICY_FILE_RELATIVE = Path("99_System") / "AI" / "policy.yaml"
+POLICY_FILE = VAULT_PATH / POLICY_FILE_RELATIVE
 POLICY_APPROVAL_TIMEOUT_SEC = 600  # 10 minutes
 
 # --- Usage Suggester ---

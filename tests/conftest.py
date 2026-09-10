@@ -121,11 +121,95 @@ def _isolate_policy_engine(tmp_path: Path, monkeypatch):
     except ImportError:
         yield
         return
-    # Path deliberately not created: PolicyEngine tolerates a missing policy.yaml
-    # (_reload_if_changed returns early), so this costs one stat() per test.
+    # A real but empty policy.yaml is written rather than left absent. The engine
+    # itself treats the two identically (no rules, no tool_providers either way),
+    # but queue_linter._policy_status() does not, and must not: "policy.yaml is
+    # missing" is a finding it exists to report. An empty mapping is the hermetic
+    # stand-in for "a policy file is present and imposes nothing" — the state the
+    # rest of the suite assumes. Tests that exercise the missing/corrupt cases
+    # point the linter at their own path.
+    vault = tmp_path / "_empty_vault"
+    (vault / "99_System" / "AI").mkdir(parents=True, exist_ok=True)
+    (vault / "99_System" / "AI" / "policy.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(
         policy_module,
         "_engine",
-        policy_module.PolicyEngine(vault_path=tmp_path / "_empty_vault"),
+        policy_module.PolicyEngine(vault_path=vault),
     )
     yield
+
+
+@pytest.fixture
+def with_opencode():
+    """Register opencode in ``dispatcher._providers`` regardless of local CLI/config
+    presence, and hand the instance back.
+
+    NOT autouse: it exists so a test that reasons about opencode says so out loud.
+    Registration is a real precondition, not a detail — ``resolve_forced_provider()``
+    returns None for an unregistered name, so ``forced_provider_policy_violation()``
+    reports nothing and a policy test asserting a finding turns into a test that
+    passes only on machines with the opencode CLI installed (measured 2026-09-09:
+    both queue-linter policy tests went green here and red with the provider popped).
+    Shared by tests/test_dispatcher_routing.py and tests/test_queue_linter_policy.py.
+    """
+    import dispatcher
+    from providers.opencode import OpencodeProvider
+
+    had_it = "opencode" in dispatcher._providers
+    if not had_it:
+        dispatcher._providers["opencode"] = OpencodeProvider()
+    yield dispatcher._providers["opencode"]
+    if not had_it:
+        dispatcher._providers.pop("opencode", None)
+
+
+@pytest.fixture
+def without_opencode():
+    """The mirror image: guarantee opencode is absent from the registry."""
+    import dispatcher
+
+    saved = dispatcher._providers.pop("opencode", None)
+    yield
+    if saved is not None:
+        dispatcher._providers["opencode"] = saved
+
+
+@pytest.fixture
+def with_vibe():
+    """Register vibe in ``dispatcher._providers`` regardless of local CLI presence,
+    and hand the instance back.
+
+    Same contract and same reason as ``with_opencode`` above: vibe is registered
+    conditionally (``dispatcher.py``: ``if VibeProvider.is_available()``), so any
+    test that reasons about vibe routing is machine-dependent without this. It
+    lives here rather than in one test file because three files need it —
+    test_dispatcher_routing.py, test_provider_list_derivation.py and
+    test_queue_linter_policy.py each grew their own copy or, worse, went without
+    (measured 2026-09-09: ``_selection_order("do X #vibe", ...)`` yields
+    ``['vibe', 'claude', 'codex']`` here and ``['claude', 'codex']`` on a box
+    without the Mistral binary, so the assertion pinning the forced-tag gap was
+    green only on this machine).
+
+    The constructor runs without the CLI present — nothing is invoked on it by
+    the routing tests.
+    """
+    import dispatcher
+    from providers.vibe import VibeProvider
+
+    had_it = "vibe" in dispatcher._providers
+    if not had_it:
+        dispatcher._providers["vibe"] = VibeProvider()
+    yield dispatcher._providers["vibe"]
+    if not had_it:
+        dispatcher._providers.pop("vibe", None)
+
+
+@pytest.fixture
+def without_vibe():
+    """The mirror image: guarantee vibe is absent from the registry."""
+    import dispatcher
+
+    saved = dispatcher._providers.pop("vibe", None)
+    yield
+    if saved is not None:
+        dispatcher._providers["vibe"] = saved

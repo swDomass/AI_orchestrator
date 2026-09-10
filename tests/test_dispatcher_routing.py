@@ -292,28 +292,9 @@ def test_force_refresh_can_unblock_false_when_nothing_transient():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def with_vibe():
-    """Register Vibe in dispatcher._providers regardless of local CLI presence."""
-    import dispatcher
-    from providers.vibe import VibeProvider
-
-    had_it = "vibe" in dispatcher._providers
-    if not had_it:
-        dispatcher._providers["vibe"] = VibeProvider()
-    yield dispatcher._providers["vibe"]
-    if not had_it:
-        dispatcher._providers.pop("vibe", None)
-
-
-@pytest.fixture
-def without_vibe():
-    import dispatcher
-
-    saved = dispatcher._providers.pop("vibe", None)
-    yield
-    if saved is not None:
-        dispatcher._providers["vibe"] = saved
+# with_vibe / without_vibe live in tests/conftest.py, next to the opencode pair —
+# three test files need them and vibe is registered conditionally, so a local copy
+# is one more place for the two to drift apart.
 
 
 def test_vibe_not_in_default_fallback_chain(with_vibe):
@@ -400,29 +381,9 @@ def test_profile_provider_order_fails_closed_on_uncapped_provider(with_vibe):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def with_opencode():
-    """Register opencode in dispatcher._providers regardless of local CLI/config
-    presence."""
-    import dispatcher
-    from providers.opencode import OpencodeProvider
-
-    had_it = "opencode" in dispatcher._providers
-    if not had_it:
-        dispatcher._providers["opencode"] = OpencodeProvider()
-    yield dispatcher._providers["opencode"]
-    if not had_it:
-        dispatcher._providers.pop("opencode", None)
-
-
-@pytest.fixture
-def without_opencode():
-    import dispatcher
-
-    saved = dispatcher._providers.pop("opencode", None)
-    yield
-    if saved is not None:
-        dispatcher._providers["opencode"] = saved
+# ``with_opencode`` / ``without_opencode`` now live in tests/conftest.py — the
+# queue-linter policy tests need the same registration guarantee, and two copies
+# of a fixture whose whole job is hermeticity is exactly how one copy drifts.
 
 
 def test_opencode_not_in_default_fallback_chain(with_opencode):

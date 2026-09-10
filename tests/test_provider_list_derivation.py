@@ -25,7 +25,6 @@ from profiles import (
     _build_profile_config,
 )
 from providers.openrouter import OpenRouterProvider
-from providers.vibe import VibeProvider
 from queue_linter import lint_queue
 
 
@@ -184,22 +183,8 @@ def test_openrouter_tag_matching_or_alias_passes():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def without_vibe():
-    saved = dispatcher._providers.pop("vibe", None)
-    yield
-    if saved is not None:
-        dispatcher._providers["vibe"] = saved
-
-
-@pytest.fixture
-def with_vibe():
-    had_it = "vibe" in dispatcher._providers
-    if not had_it:
-        dispatcher._providers["vibe"] = VibeProvider()
-    yield
-    if not had_it:
-        dispatcher._providers.pop("vibe", None)
+# with_vibe / without_vibe come from tests/conftest.py — see the note there on why
+# they are shared rather than copied per file.
 
 
 @pytest.fixture

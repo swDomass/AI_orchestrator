@@ -15,19 +15,22 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Run all tests (2709 passed / 0 failed in 152 s — measured 2026-09-10 as the
+# Run all tests (2711 passed / 0 failed in 148 s — measured 2026-09-10 as the
 # LAST step of the per-task auto-commit package, against 2643 earlier the same
 # day, 2571 before that, 2533 in 93 s
 # on 2026-09-09, 2447 in
 # 123 s / 102 s on 2026-09-05 and ~90 s on 2026-09-04.
-# The +66 is fully attributed, counted with --collect-only rather than estimated:
-#   tests/test_git_commit.py            45  (NEW — real git repos in tmp_path)
+# The +68 is fully attributed, counted with --collect-only rather than estimated:
+#   tests/test_git_commit.py            47  (NEW — real git repos in tmp_path)
 #   tests/test_orchestrator_commit.py   16  (NEW — the wiring, commit_run_result mocked)
 #   tests/test_queue_manager_regressions.py  63 -> 68  (+5, the #no-commit tag)
-# 2643 + 45 + 16 + 5 = 2709 exactly, so there is no unexplained drift in this
+# 2643 + 47 + 16 + 5 = 2711 exactly, so there is no unexplained drift in this
 # package. The count grew twice during the package as review rounds landed: the
 # last 9 tests exist only because the fourth and fifth reviewers went at the
-# ALREADY-FIXED code — see the Review-Bilanz under Key Patterns. Treat 90-155 s as the
+# ALREADY-FIXED code — see the Review-Bilanz under Key Patterns. The final two
+# are the Auftrag DONE criterion itself (two dev-loops in one repo) plus its
+# counter-probe with GIT_AUTO_COMMIT=False, which is what proves that test can
+# see the defect at all. Treat 90-155 s as the
 # normal band (a 146 s outlier was measured under load, and the 141 s above is
 # the same shape with 57 more tests, ~35 of which drive real git subprocesses in
 # tmp_path — those are seconds, not milliseconds, and that is the deliberate

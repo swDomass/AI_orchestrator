@@ -1165,3 +1165,92 @@ def test_a_configured_identity_is_not_overridden(repo, monkeypatch):
     assert "GIT_AUTHOR_NAME" not in env, "die Repo-Identitaet muss gewinnen"
     assert "GIT_COMMITTER_EMAIL" not in env
     assert env["GIT_INDEX_FILE"] == str(repo / "idx")
+
+
+# ===========================================================================
+# 17. Das DONE-Kriterium des Auftrags, als Test
+#
+# `.dev-loop/auftrag.md` definiert Fertigsein so: zwei #tool:dev-loop-Tasks für
+# DASSELBE Repo, und am nächsten Morgen genau zwei orch/*-Branches, ein leerer
+# `git status`, `master` unverändert, ein Commit pro Branch und im zweiten nur
+# die Dateien des zweiten Tasks.
+#
+# Der Test fährt beide Läufe nacheinander durch dieselben Funktionen, die der
+# Orchestrator benutzt -- inklusive `_worktree_gate_violation`, also genau der
+# Stelle, an der der zweite Task bisher terminal starb (gemessen 2026-09-03/04,
+# nightstash -> nightfloor). Die Gegenprobe mit abgeschaltetem Feature gehört
+# dazu: ohne sie wäre nicht belegt, dass der Test den Defekt überhaupt sehen
+# kann.
+# ===========================================================================
+
+
+def _simulate_run(repo: Path, task: str, files: dict[str, str]) -> str:
+    """Ein erfolgreicher Lauf: Baseline + Snapshot, Dateien schreiben, committen.
+
+    Genau die Reihenfolge, die `orchestrator._execute_tool_task` fährt.
+    """
+    dirty_before = git_commit.dirty_paths_snapshot(str(repo))
+    snap_before = orchestrator._snapshot_dir(str(repo))
+    for name, content in files.items():
+        (repo / name).write_text(content, encoding="utf-8")
+    return orchestrator._commit_run_changes(
+        task, str(repo), "claude+dev-loop", snap_before, dirty_before=dirty_before,
+    )
+
+
+def test_two_dev_loops_in_one_repo_meet_the_auftrag_done_criterion(repo):
+    """Die fünf Prüfungen aus `.dev-loop/auftrag.md`, alle an einem echten Repo."""
+    (repo / "app.py").write_text("v1\n", encoding="utf-8")
+    (repo / "util.py").write_text("u1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    task_a = "Baue Feature A #tool:dev-loop #id:taska"
+    task_b = "Baue Feature B #tool:dev-loop #id:taskb"
+
+    assert orchestrator._worktree_gate_violation(task_a, "dev-loop", str(repo)) is None
+    _simulate_run(repo, task_a, {"app.py": "v2 von task A\n"})
+
+    # Genau hier starb der zweite Task bisher.
+    assert orchestrator._worktree_gate_violation(task_b, "dev-loop", str(repo)) is None, \
+        "nach dem Auto-Commit muss der Baum sauber genug fuer den zweiten dev-loop sein"
+    _simulate_run(repo, task_b, {"util.py": "u2 von task B\n", "neu.py": "vom task B\n"})
+
+    branches = sorted(
+        b.strip().lstrip("* ") for b in
+        _git(repo, "branch", "--list", "orch/*").splitlines() if b.strip()
+    )
+    assert len(branches) == 2, branches
+    second = next(b for b in branches if "taskb" in b)
+
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    assert _git(repo, "branch", "--show-current").strip() == "master"
+    assert len(_git(repo, "log", "--oneline", f"master..{second}").strip().splitlines()) == 1
+    stat = _git(repo, "show", "--stat", "--format=", second)
+    assert "util.py" in stat and "neu.py" in stat
+    assert "app.py" not in stat, "der zweite Branch darf die Arbeit des ersten nicht tragen"
+
+
+def test_without_the_feature_the_second_dev_loop_still_dies(repo, monkeypatch):
+    """Gegenprobe: mit `GIT_AUTO_COMMIT=False` bleibt der gemessene Defekt.
+
+    Ohne diese Hälfte wäre der Test oben nicht als Gate belegt — er könnte aus
+    einem beliebigen anderen Grund grün sein.
+    """
+    monkeypatch.setattr(config, "GIT_AUTO_COMMIT", False)
+    (repo / "app.py").write_text("v1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    task_a = "Baue Feature A #tool:dev-loop #id:taska"
+    task_b = "Baue Feature B #tool:dev-loop #id:taskb"
+
+    assert orchestrator._worktree_gate_violation(task_a, "dev-loop", str(repo)) is None
+    note = _simulate_run(repo, task_a, {"app.py": "v2 von task A\n"})
+
+    assert note == "", "abgeschaltet heisst still, nicht laut"
+    assert _git(repo, "status", "--porcelain").strip() == "M app.py"
+    violation = orchestrator._worktree_gate_violation(task_b, "dev-loop", str(repo))
+    assert violation is not None, "genau das ist der Defekt, den das Feature behebt"
+    assert "dev-loop" in violation
+    assert _git(repo, "branch", "--list", "orch/*").strip() == ""

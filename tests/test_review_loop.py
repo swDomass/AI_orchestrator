@@ -1,12 +1,18 @@
 from providers.base import RunResult
 from tools.review_loop import (
+    ROUND_REFLECTION_INSTRUCTION,
     ReviewLoopTool,
     _FIX_PROMPT_STABLE,
+    _REVIEW_PROMPT_BODY,
     _is_no_findings_output,
     _merge_findings,
     _parse_drift_check,
     _resolve_second_opinion,
     _should_drift_check,
+    format_known_limits,
+    is_deferred_known_limit,
+    parse_known_limits,
+    validate_known_limits,
 )
 
 
@@ -976,3 +982,281 @@ def test_review_loop_classifies_provider_error_instead_of_passing_it_through(mon
     result = ReviewLoopTool().run("Review", _Failing("Traceback: boom"), cwd=str(tmp_path))
     assert result.error_code == ""
     assert result.retryable is False
+
+
+# ─── Rundenreflexion / BEKANNTE GRENZE ─────────────────────────────────────
+
+def _patch_review_loop(monkeypatch):
+    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _s: None)
+    monkeypatch.setattr("tools.review_loop.is_cached_provider_available", lambda _n: True)
+
+
+def test_review_loop_iteration1_review_prompt_is_byte_identical_to_before(monkeypatch, tmp_path):
+    """Moving review_prompt construction into the loop (for the known-limits block)
+    must not change iteration 1 at all — known_limits is always empty then."""
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop._build_system_prompt", lambda *a, **kw: "SYSTEM")
+
+    provider = _ScriptedProvider(outputs=["No P1/P2/P3 findings.", "VERIFIED"])
+    ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    expected = f"SYSTEM\n\nReview now\n\n{_REVIEW_PROMPT_BODY}"
+    assert provider.prompts[0] == expected
+    assert "BEKANNTE GRENZE" not in provider.prompts[0]
+
+
+def test_review_loop_fix_prompt_reflection_instruction_from_iteration_2(monkeypatch, tmp_path):
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop._build_system_prompt", lambda *a, **kw: "SYSTEM")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P2] issue A",     # review iter 1
+        "Fixed A",            # fix iter 1 — must NOT see the reflection instruction
+        "- [P2] issue B",     # review iter 2 (different finding, avoids repeat-detect)
+        "Fixed B",            # fix iter 2 — MUST see the reflection instruction
+        "No P1/P2/P3 findings.",  # review iter 3 — clean
+        "VERIFIED",
+    ])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    fix1_prompt, fix2_prompt = provider.prompts[1], provider.prompts[3]
+    assert "Rundenreflexion" not in fix1_prompt
+    assert "BEKANNTE GRENZE" not in fix1_prompt
+    assert ROUND_REFLECTION_INSTRUCTION.strip() in fix2_prompt
+
+
+def test_review_loop_deferred_known_limit_unblocks_and_is_reported_separately(monkeypatch, tmp_path):
+    """A P2 deferred in iteration 2's fix output no longer blocks in iteration 3,
+    the next review prompt carries the deferred block, and the final output lists
+    it under 'Bekannte Grenzen', separate from the P3 offer.
+
+    The deferral happens in round 2 on purpose (not round 1): a marker in the very
+    first fix output must be ignored (see
+    test_review_loop_iteration1_known_limit_marker_is_ignored)."""
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop._build_system_prompt", lambda *a, **kw: "SYSTEM")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P2] flaky heuristic",                          # review iter 1
+        "Investigated the heuristic, need another pass.",  # fix iter 1 — no defer yet
+        "- [P2] persistent flaky heuristic\n- [P3] naming nit",  # review iter 2
+        (
+            "## Rundenreflexion\nOverbuilding a second heuristic on top of the first.\n"
+            "- [BEKANNTE GRENZE] - [P2] persistent flaky heuristic — needs a constructed input\n"
+        ),  # fix iter 2 — defers the P2 instead of fixing it
+        "- [P3] naming nit",  # review iter 3 — P2 no longer reported, P3 rides along
+        "VERIFIED",
+        "Pattern: x\nTool-Hint: y",  # summarizer (iterations > 1)
+    ])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 3, "the deferred P2 must not force a third fix round"
+    # No fix prompt for iteration 3 — the only remaining finding is P3 (non-blocking)
+    # and the P2 is a known limit, so nothing blocks.
+    assert "--- Fix 3 ---" not in result.output
+
+    review_prompt_iter3 = provider.prompts[4]
+    assert "flaky heuristic" in review_prompt_iter3
+    assert "do not report these again as P2" in review_prompt_iter3
+
+    assert "--- Bekannte Grenzen" in result.output
+    known_limits_block = result.output.split("--- Bekannte Grenzen")[1]
+    assert "flaky heuristic" in known_limits_block
+    assert "needs a constructed input" in known_limits_block
+    # Separate from the P3 offer, not merged into it.
+    p3_block = result.output.split("--- P3 offen")[1].split("--- Bekannte Grenzen")[0]
+    assert "flaky heuristic" not in p3_block
+
+
+def test_review_loop_iteration1_known_limit_marker_is_ignored(monkeypatch, tmp_path):
+    """A BEKANNTE GRENZE marker in the iteration-1 fix output has no effect —
+    deferrals are only accepted from iteration 2 on ("ab Runde 2")."""
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop._build_system_prompt", lambda *a, **kw: "SYSTEM")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P2] flaky heuristic",  # review iter 1
+        (
+            "- [BEKANNTE GRENZE] - [P2] flaky heuristic — needs a constructed input\n"
+        ),  # fix iter 1 — deferral attempt, must be ignored (iteration 1)
+        "- [P2] flaky heuristic",  # review iter 2 — must still be reported/blocking
+    ])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is False, (
+        "an iteration-1 deferral marker must be ignored — the P2 keeps blocking, "
+        "which trips the repeat detector on the identical iteration-2 finding"
+    )
+    assert "wiederholen" in result.error
+
+
+def test_review_loop_known_limit_escalated_to_p1_is_retracted(monkeypatch, tmp_path):
+    """A known limit's lifecycle ends when a later review reports the SAME
+    underlying issue as P1: the entry is removed, the finding blocks normally
+    again, and the next review prompt no longer calls it deferred.
+
+    MUTATION TARGET (P1-escalation retraction) — see report for the proof.
+    """
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop._build_system_prompt", lambda *a, **kw: "SYSTEM")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P2] flaky heuristic",                        # review iter 1
+        "Investigating, not touched yet.",                # fix iter 1 — no defer (gated)
+        "- [P2] persistent flaky heuristic",              # review iter 2
+        (
+            "## Rundenreflexion\nDeferring the heuristic.\n"
+            "- [BEKANNTE GRENZE] - [P2] persistent flaky heuristic — "
+            "needs a constructed input\n"
+        ),                                                  # fix iter 2 — defers
+        "- [P1] persistent flaky heuristic",              # review iter 3 — escalated to P1
+        "Actually fixed the root cause now.",              # fix iter 3
+        "No P1/P2/P3 findings.",                           # review iter 4 — clean
+        "VERIFIED",
+        "Pattern: x\nTool-Hint: y",                        # summarizer (iterations > 1)
+    ])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 4, (
+        "the escalated P1 must have blocked iteration 3 — it is not a known limit any more"
+    )
+    # prompts: review1(0), fix1(1), review2(2), fix2(3), review3(4), fix3(5), review4(6)
+    review3_prompt = provider.prompts[4]
+    review4_prompt = provider.prompts[6]
+    assert "do not report these again as P2" in review3_prompt, (
+        "the deferral must still be active going into round 3's review"
+    )
+    assert "do not report these again as P2" not in review4_prompt, (
+        "the retracted entry must not be offered to the reviewer again"
+    )
+    assert "--- Bekannte Grenzen" not in result.output, (
+        "the retracted entry must not survive into the final report"
+    )
+    assert "--- Bekannte Grenzen" not in result.output
+
+
+def test_review_loop_p1_marked_known_limit_stays_blocking(monkeypatch, tmp_path):
+    """Gegenprobe: an attempted BEKANNTE GRENZE deferral of a P1 finding has no
+    effect — the loop does not finish clean while the P1 keeps recurring."""
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop._build_system_prompt", lambda *a, **kw: "SYSTEM")
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P1] critical crash",  # review iter 1
+        (
+            "## Rundenreflexion\nThis looks like an edge case, deferring it.\n"
+            "- [BEKANNTE GRENZE] - [P1] critical crash — false alarm\n"
+        ),  # fix iter 1 — illegitimate deferral attempt on a P1
+        "- [P1] critical crash",  # review iter 2 — same P1 again → repeat-detect abort
+    ])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is False, "a P1 must never be silently absorbed as a known limit"
+    assert "wiederholen" in result.error, (
+        "the P1 stayed in blocking_findings both rounds, tripping the repeat detector — "
+        "proof it was never excluded"
+    )
+
+
+def test_review_loop_max_iterations_failure_lists_known_limits(monkeypatch, tmp_path):
+    """A known limit accepted in round 2 must still be visible when the loop ends
+    on max-iterations — a stated deferral, not a silently dropped one."""
+    _patch_review_loop(monkeypatch)
+    monkeypatch.setattr("tools.review_loop.TOOL_MAX_ITERATIONS", 2)
+
+    provider = _ScriptedProvider(outputs=[
+        "- [P1] crash A\n- [P2] flaky heuristic",  # review iter 1
+        "Investigating crash A, heuristic not touched yet.",  # fix iter 1 — no defer
+        "- [P1] crash A (still occurring)\n- [P2] flaky heuristic",  # review iter 2
+        (
+            "## Rundenreflexion\nDeferring the heuristic, still chasing crash A.\n"
+            "- [BEKANNTE GRENZE] - [P2] flaky heuristic — needs a constructed input\n"
+        ),  # fix iter 2 — defers the P2 (allowed from iteration 2 on)
+    ])
+    result = ReviewLoopTool().run("Review now", provider, cwd=str(tmp_path))
+
+    assert result.success is False
+    assert "Max Iterationen" in result.error
+    assert "bekannte Grenze" in result.error
+    assert "--- Bekannte Grenzen" in result.output
+    block = result.output.split("--- Bekannte Grenzen")[1]
+    assert "flaky heuristic" in block
+    assert "needs a constructed input" in block
+
+
+# ─── Known-limit helpers (unit level) ───────────────────────────────────────
+
+def test_parse_known_limits_extracts_finding_and_reason():
+    text = (
+        "## Rundenreflexion\nSome reflection prose.\n"
+        "- [BEKANNTE GRENZE] - [P2] some issue — needs a constructed input\n"
+        "- [P2] a real fix I did apply\n"
+    )
+    assert parse_known_limits(text) == [
+        ("- [P2] some issue", "needs a constructed input"),
+    ]
+
+
+def test_parse_known_limits_accepts_plain_dash_fallback_separator():
+    # Em dash is the primary separator; a plain " - " is a trivial fallback.
+    text = "- [BEKANNTE GRENZE] [P2] some issue - needs a constructed input"
+    assert parse_known_limits(text) == [
+        ("[P2] some issue", "needs a constructed input"),
+    ]
+
+
+def test_parse_known_limits_ignores_unrelated_lines():
+    assert parse_known_limits("Just fixed the bug.\n- [P2] unrelated finding") == []
+
+
+def test_validate_known_limits_accepts_matching_p2():
+    accepted = validate_known_limits(
+        [("- [P2] flaky heuristic", "needs a constructed input")],
+        ["- [P2] flaky heuristic", "- [P1] unrelated crash"],
+    )
+    assert accepted == {"- [P2] flaky heuristic": "needs a constructed input"}
+
+
+def test_validate_known_limits_rejects_p1_never_deferrable():
+    """MUTATION TARGET 1 (P1 guard) — see report for the mutation proof."""
+    accepted = validate_known_limits(
+        [("- [P1] critical crash", "false alarm")],
+        ["- [P1] critical crash"],
+    )
+    assert accepted == {}
+
+
+def test_validate_known_limits_fail_closed_when_no_match():
+    """MUTATION TARGET 2 (fail-closed match) — see report for the mutation proof."""
+    accepted = validate_known_limits(
+        [("- [P2] nonexistent finding", "reason")],
+        ["- [P2] something else entirely"],
+    )
+    assert accepted == {}
+
+
+def test_validate_known_limits_is_whitespace_and_bullet_tolerant():
+    accepted = validate_known_limits(
+        [("[P2]   some\nissue   text", "reason")],
+        ["- [P2] some issue text"],
+    )
+    assert accepted == {"- [P2] some issue text": "reason"}
+
+
+def test_is_deferred_known_limit_excludes_matching_p2_not_p1():
+    known_limits = {"- [P2] flaky heuristic": "needs a constructed input"}
+    assert is_deferred_known_limit("- [P2] flaky heuristic", known_limits) is True
+    # A re-report as P1 must never be excluded, even against matching known text.
+    assert is_deferred_known_limit("- [P1] flaky heuristic", known_limits) is False
+    # No matching entry at all.
+    assert is_deferred_known_limit("- [P2] unrelated", known_limits) is False
+
+
+def test_format_known_limits_joins_finding_and_reason():
+    rendered = format_known_limits({"- [P2] issue": "reason text"})
+    assert rendered == "- [P2] issue — reason text"

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from providers.base import RunResult
 from tools.test_loop import _tests_passed, TestLoopTool
 from tools.base_tool import ToolResult
 
@@ -112,3 +113,118 @@ def test_test_loop_classifies_provider_errors(
     assert result.success is False
     assert result.error_code == expected_code
     assert result.retryable is expected_retryable
+
+
+# ── Rundenreflexion / BEKANNTE GRENZE ───────────────────────────────────────
+
+class _MultiScriptedProvider:
+    """Returns pre-scripted outputs in order; records every prompt."""
+    name = "claude"
+    supports_sessions = False
+
+    def __init__(self, outputs: list[str]):
+        self._outputs = list(outputs)
+        self.prompts: list[str] = []
+
+    def run(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        if not self._outputs:
+            return RunResult(success=False, error="no scripted output left")
+        return RunResult(success=True, output=self._outputs.pop(0))
+
+
+def _patch_test_loop(monkeypatch):
+    monkeypatch.setattr("tools.test_loop.notify_tool_done", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.test_loop.notify_tool_progress", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.test_loop.time.sleep", lambda _s: None)
+
+
+def test_test_loop_iteration1_fix_prompt_has_no_reflection_iteration2_does(monkeypatch, tmp_path):
+    _patch_test_loop(monkeypatch)
+    provider = _MultiScriptedProvider([
+        "2 failed, 3 passed",   # test run iter 1
+        "Fixed one.",           # fix iter 1 — no reflection instruction yet
+        "1 failed, 4 passed",   # test run iter 2 (different text avoids repeat-detect)
+        "Fixed another.",       # fix iter 2 — reflection instruction present
+        "5 passed in 0.2s",     # test run iter 3 — all green
+    ])
+    result = TestLoopTool().run("Run tests", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    # prompts: test1(0), fix1(1), test2(2), fix2(3), test3(4)
+    fix1_prompt, fix2_prompt = provider.prompts[1], provider.prompts[3]
+    assert "Rundenreflexion" not in fix1_prompt
+    assert "BEKANNTE GRENZE" not in fix1_prompt
+    assert "Rundenreflexion" in fix2_prompt
+    assert "BEKANNTE GRENZE" in fix2_prompt
+
+
+def test_test_loop_known_limit_appears_in_repeat_detected_failure_message(monkeypatch, tmp_path):
+    """A test deferred as BEKANNTE GRENZE stays red — the run cannot end green while
+    it is outstanding, and the deferral is listed under 'Bekannte Grenzen'.
+
+    The deferral happens in round 2 on purpose (not round 1): a marker in the very
+    first fix output must be ignored (see
+    test_test_loop_iteration1_known_limit_marker_is_ignored)."""
+    _patch_test_loop(monkeypatch)
+    same_failure = "1 failed, 6 passed -- tests/test_x.py::test_edge_case"
+    provider = _MultiScriptedProvider([
+        "2 failed, 5 passed -- tests/test_x.py::test_edge_case, tests/test_y.py::test_other",
+        "Fixed test_other, investigating test_edge_case further.",  # fix iter 1 — no defer
+        same_failure,  # test run iter 2
+        (
+            "## Rundenreflexion\nThis is an edge case beyond the task.\n"
+            "- [BEKANNTE GRENZE] tests/test_x.py::test_edge_case — "
+            "pre-existing flake unrelated to this task\n"
+        ),             # fix iter 2 — defers instead of fixing
+        same_failure,  # test run iter 3 — identical to iter 2's output → repeat-detect
+    ])
+    result = TestLoopTool().run("Run tests", provider, cwd=str(tmp_path))
+
+    assert result.success is False, "a known limit must never turn the run green"
+    assert "bekannte Grenze" in result.error
+    assert "--- Bekannte Grenzen" in result.output
+    block = result.output.split("--- Bekannte Grenzen")[1]
+    assert "tests/test_x.py::test_edge_case" in block
+    assert "pre-existing flake unrelated to this task" in block
+
+
+def test_test_loop_known_limit_appears_in_max_iterations_failure_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("tools.test_loop.TOOL_MAX_ITERATIONS", 2)
+    _patch_test_loop(monkeypatch)
+    provider = _MultiScriptedProvider([
+        "1 failed, 4 passed -- iter1",
+        "Attempted fix, no change yet.",  # fix iter 1 — no defer (would be ignored anyway)
+        "1 failed, 5 passed -- iter2",    # different text avoids repeat-detect, still red
+        (
+            "## Rundenreflexion\nEdge case beyond scope.\n"
+            "- [BEKANNTE GRENZE] tests/test_x.py::test_edge_case — flaky, unrelated\n"
+        ),                                 # fix iter 2 — defers instead of fixing
+    ])
+    result = TestLoopTool().run("Run tests", provider, cwd=str(tmp_path))
+
+    assert result.success is False
+    assert result.iterations == 2
+    assert "Max Iterationen" in result.error
+    assert "bekannte Grenze" in result.error
+    assert "--- Bekannte Grenzen" in result.output
+
+
+def test_test_loop_iteration1_known_limit_marker_is_ignored(monkeypatch, tmp_path):
+    """A BEKANNTE GRENZE marker in the iteration-1 fix output has no effect —
+    deferrals are only accepted from iteration 2 on ("ab Runde 2")."""
+    _patch_test_loop(monkeypatch)
+    same_failure = "1 failed, 4 passed -- tests/test_x.py::test_edge_case"
+    provider = _MultiScriptedProvider([
+        same_failure,  # test run iter 1
+        (
+            "- [BEKANNTE GRENZE] tests/test_x.py::test_edge_case — "
+            "pre-existing flake unrelated to this task\n"
+        ),             # fix iter 1 — deferral attempt, must be ignored (iteration 1)
+        same_failure,  # test run iter 2 — identical output → repeat-detect
+    ])
+    result = TestLoopTool().run("Run tests", provider, cwd=str(tmp_path))
+
+    assert result.success is False
+    assert "bekannte Grenze" not in result.error
+    assert "--- Bekannte Grenzen" not in result.output

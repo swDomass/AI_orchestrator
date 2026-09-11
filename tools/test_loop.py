@@ -13,6 +13,7 @@ from config import TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC, TOOL_INTER_STEP_SL
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, ToolResult, _build_system_prompt
+from tools.review_loop import format_known_limits, parse_known_limits
 
 _TEST_PROMPT_BODY = """
 Run the test suite in the current working directory.
@@ -36,6 +37,21 @@ Instructions:
 
 Test failures:
 {failures}
+"""
+
+# From iteration 2 on, appended to the fix prompt. No P1/P2/P3 model exists
+# here — a "known limit" is a failing test judged to be an edge case beyond
+# the task, marked instead of fixed. Deferring one does NOT turn the run
+# green; the marker only replaces silent re-failure with a stated reason.
+_TEST_ROUND_REFLECTION_INSTRUCTION = """
+Before fixing anything, write a section `## Rundenreflexion` that answers \
+two questions: (a) Am I over-building — more mechanism than the task's \
+core needs? (b) Am I chasing an edge case that goes beyond what the task \
+requires?
+
+A failing test judged to be such an edge case may be deferred instead of \
+fixed: `- [BEKANNTE GRENZE] <test id> — <one-sentence reason>`. A deferred \
+test stays failing — the run cannot end green while it is outstanding.
 """
 
 
@@ -88,6 +104,10 @@ class TestLoopTool(BaseTool):
         test_prompt = f"{system_prompt}\n\n{task}\n\n{_TEST_PROMPT_BODY}"
         all_outputs: list[str] = []
         last_failures: str = ""
+        # {test_id: reason} deferred as BEKANNTE GRENZE by the fixer. No P1/P2/P3
+        # model here — every deferral is listed, none is validated against a
+        # severity, and none can turn the run green (see the two failure paths below).
+        known_limits: dict[str, str] = {}
 
         # Per-phase cap: a high task #timeout: hard backstop is an upper deckel
         # only — it never raises a phase above its TOOL_FIX_TIMEOUT_SEC constant.
@@ -148,6 +168,12 @@ class TestLoopTool(BaseTool):
             current_failures = test_result.output
             if current_failures == last_failures:
                 msg = f"Gleiche Test-Fehler nach {iteration} Iterationen. Loop beendet."
+                if known_limits:
+                    msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+                    all_outputs.append(
+                        "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                        + format_known_limits(known_limits)
+                    )
                 print(f"  [test-loop] ⚠️ {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(success=False, output="\n\n".join(all_outputs),
@@ -162,6 +188,8 @@ class TestLoopTool(BaseTool):
                                  "Fixing test failures...")
 
             fix_prompt = f"{system_prompt}\n\n" + _FIX_PROMPT_BODY.format(iteration=iteration, failures=test_result.output)
+            if iteration >= 2:
+                fix_prompt += "\n" + _TEST_ROUND_REFLECTION_INSTRUCTION
             fix_result = provider.run(fix_prompt, cwd=cwd, timeout=step_timeout)
             total_input_tokens += fix_result.input_tokens
             total_output_tokens += fix_result.output_tokens
@@ -178,9 +206,20 @@ class TestLoopTool(BaseTool):
                                   output_tokens=total_output_tokens)
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
+            # Only from iteration 2 on — the order says "ab Runde 2", matching the
+            # reflection instruction itself (also gated at iteration >= 2 above).
+            if iteration >= 2:
+                for finding, reason in parse_known_limits(fix_result.output):
+                    known_limits[finding] = reason
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht."
+        if known_limits:
+            msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+            all_outputs.append(
+                "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                + format_known_limits(known_limits)
+            )
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)
         return ToolResult(success=False, output="\n\n".join(all_outputs),
                           iterations=TOOL_MAX_ITERATIONS, error=msg,

@@ -546,4 +546,210 @@ def test_dev_loop_respects_max_iterations(monkeypatch, tmp_path):
     result = DevLoopTool().run("Fix bug", _AlwaysFailing(), cwd=str(tmp_path))
 
     assert result.success is False
+
+
+# ── Rundenreflexion / BEKANNTE GRENZE ───────────────────────────────────────
+
+def test_dev_loop_iteration1_exec_prompt_has_no_reflection_iteration2_does(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "Bad impl.",                        # execution iter 1
+        "- [P2] Missing error handling",    # quality iter 1 — fail
+        "RESOLVED: done.",                  # resolution iter 1
+        "Better impl.",                     # execution iter 2
+        "No P1/P2/P3 findings.",            # quality iter 2 — pass
+        "RESOLVED: done.",                  # resolution iter 2
+    ])
+    DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
+
+    # prompts: research+plan(0), exec1(1), qual1(2), res1(3), exec2(4)
+    exec_prompt_iter1 = provider.prompts[1]
+    exec_prompt_iter2 = provider.prompts[4]
+    assert "Rundenreflexion" not in exec_prompt_iter1
+    assert "BEKANNTE GRENZE" not in exec_prompt_iter1
+    assert "Rundenreflexion" in exec_prompt_iter2
+    assert "BEKANNTE GRENZE" in exec_prompt_iter2
+
+
+def test_dev_loop_round_002_contains_rundenreflexion_section(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "First attempt.",
+        "- [P1] Null pointer in auth.py",
+        "RESOLVED: task done.",
+        "## Rundenreflexion\nNot overbuilding, straightforward fix.\nFixed null pointer.",
+        "No P1/P2/P3 findings.",
+        "RESOLVED: task done.",
+    ])
+    result = DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    round2 = (
+        _run_dir(str(tmp_path), _task_hash("Fix bug")) / "round-002.md"
+    ).read_text(encoding="utf-8")
+    assert "## Rundenreflexion" in round2
+
+
+def test_dev_loop_deferred_p2_no_longer_blocks_and_reported_separately(monkeypatch, tmp_path):
+    """A P2 deferred in iteration 2's execution no longer blocks that same round's
+    quality review, the quality-review prompt carries the deferred block, and the
+    final output lists it under 'Bekannte Grenzen', separate from the P3 offer."""
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "Impl 1.",                                               # execution iter 1
+        "- [P2] flaky heuristic\n- [P3] naming nit",              # quality iter 1
+        "RESOLVED: done.",                                        # resolution iter 1
+        (
+            "## Rundenreflexion\nOverbuilding a second heuristic, deferring.\n"
+            "- [BEKANNTE GRENZE] - [P2] flaky heuristic — needs a constructed input\n"
+        ),                                                         # execution iter 2 — defers
+        "- [P3] naming nit",                                      # quality iter 2 — only P3 left
+        "RESOLVED: done.",                                        # resolution iter 2
+    ])
+    result = DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
+
+    assert result.success is True
     assert result.iterations == 2
+
+    # prompts: research+plan(0), exec1(1), qual1(2), res1(3), exec2(4), qual2(5), res2(6)
+    quality_prompt_iter2 = provider.prompts[5]
+    assert "flaky heuristic" in quality_prompt_iter2
+    assert "do not report these again as P2" in quality_prompt_iter2
+
+    assert "--- Bekannte Grenzen" in result.output
+    known_limits_block = result.output.split("--- Bekannte Grenzen")[1]
+    assert "flaky heuristic" in known_limits_block
+    assert "needs a constructed input" in known_limits_block
+    # Separate from the P3 offer, not merged into it.
+    p3_block = result.output.split("--- P3 offen")[1].split("--- Bekannte Grenzen")[0]
+    assert "flaky heuristic" not in p3_block
+
+
+def test_dev_loop_p1_marked_known_limit_stays_blocking(monkeypatch, tmp_path):
+    """Gegenprobe (DONE criterion 2): an attempted BEKANNTE GRENZE deferral of a P1
+    finding has no effect — the loop does not finish clean while the P1 recurs."""
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "Attempt 1.",
+        "- [P1] Missing auth check",           # quality iter 1
+        "RESOLVED: done.",                     # resolution iter 1
+        (
+            "## Rundenreflexion\nThis looks like an edge case, deferring it.\n"
+            "- [BEKANNTE GRENZE] - [P1] Missing auth check — false alarm\n"
+        ),                                       # execution iter 2 — illegitimate deferral
+        "- [P1] Missing auth check",            # quality iter 2 — same P1 again
+        "RESOLVED: done.",
+    ])
+    result = DevLoopTool().run("Fix auth", provider, cwd=str(tmp_path))
+
+    assert result.success is False, "a P1 must never be silently absorbed as a known limit"
+    assert "wiederholen" in result.error, (
+        "the P1 stayed in blocking_findings both rounds, tripping the repeat detector — "
+        "proof it was never excluded"
+    )
+    assert result.iterations == 2
+
+
+def test_dev_loop_max_iterations_failure_lists_known_limits(monkeypatch, tmp_path):
+    """A known limit accepted in iteration 2 must still be visible when the loop ends
+    on max-iterations — a stated deferral, not a silently dropped one."""
+    monkeypatch.setattr("tools.dev_loop.TOOL_MAX_ITERATIONS", 2)
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "Attempt 1.",                                             # execution iter 1
+        "- [P1] crash A\n- [P2] flaky heuristic",                 # quality iter 1
+        "RESOLVED: done.",                                         # resolution iter 1
+        (
+            "## Rundenreflexion\nDeferring the heuristic, still chasing crash A.\n"
+            "- [BEKANNTE GRENZE] - [P2] flaky heuristic — needs a constructed input\n"
+        ),                                                          # execution iter 2 — defers
+        "- [P1] crash A",                                          # quality iter 2 — P1 still open
+        "RESOLVED: done.",                                         # resolution iter 2
+    ])
+    result = DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
+
+    assert result.success is False
+    assert "Max Iterationen" in result.error
+    assert "bekannte Grenze" in result.error
+    assert "--- Bekannte Grenzen" in result.output
+    block = result.output.split("--- Bekannte Grenzen")[1]
+    assert "flaky heuristic" in block
+
+
+def test_dev_loop_resolution_prompt_gets_known_limits_block_from_iteration_2(monkeypatch, tmp_path):
+    """The resolution-review prompt must also learn about accepted deferrals, with
+    resolution-specific wording, so it does not read a deferred quality finding as
+    an unmet task requirement. Iteration 1's resolution prompt (known_limits still
+    empty) must not carry the block."""
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "Impl 1.",                                    # execution iter 1
+        "- [P2] flaky heuristic",                     # quality iter 1
+        "RESOLVED: done.",                             # resolution iter 1
+        (
+            "## Rundenreflexion\nOverbuilding a heuristic, deferring.\n"
+            "- [BEKANNTE GRENZE] - [P2] flaky heuristic — needs a constructed input\n"
+        ),                                              # execution iter 2 — defers
+        "No P1/P2/P3 findings.",                       # quality iter 2 — clean
+        "RESOLVED: done.",                              # resolution iter 2
+    ])
+    DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
+
+    # prompts: research+plan(0), exec1(1), qual1(2), res1(3), exec2(4), qual2(5), res2(6)
+    res1_prompt = provider.prompts[3]
+    res2_prompt = provider.prompts[6]
+    assert "do not count them as missing unless the task itself" not in res1_prompt
+    assert "flaky heuristic" not in res1_prompt
+    assert "do not count them as missing unless the task itself" in res2_prompt
+    assert "flaky heuristic" in res2_prompt
+    assert "needs a constructed input" in res2_prompt
+
+
+def test_dev_loop_known_limit_escalated_to_p1_is_retracted(monkeypatch, tmp_path):
+    """A known limit's lifecycle ends when the reviewer later reports the SAME
+    underlying issue as P1: the entry is removed, the finding blocks normally
+    again, and the next quality prompt no longer calls it deferred.
+
+    MUTATION TARGET (P1-escalation retraction) — see report for the proof.
+    """
+    _patch(monkeypatch)
+    provider = _ScriptedProvider([
+        "## Problem Analysis\nResearch.\n## Implementation Plan\n1. Fix it.",
+        "Impl 1.",                                    # execution iter 1
+        "- [P2] flaky heuristic",                     # quality iter 1
+        "RESOLVED: done.",                              # resolution iter 1
+        (
+            "## Rundenreflexion\nDeferring the heuristic.\n"
+            "- [BEKANNTE GRENZE] - [P2] flaky heuristic — needs a constructed input\n"
+        ),                                              # execution iter 2 — defers
+        "- [P1] flaky heuristic",                      # quality iter 2 — escalated to P1
+        "RESOLVED: done.",                              # resolution iter 2
+        "Actually fixed the root cause now.",           # execution iter 3
+        "No P1/P2/P3 findings.",                        # quality iter 3 — clean
+        "RESOLVED: done.",                               # resolution iter 3
+    ])
+    result = DevLoopTool().run("Fix bug", provider, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert result.iterations == 3, (
+        "the escalated P1 must have blocked iteration 2 — it is not a known limit any more"
+    )
+    # prompts: r+p(0), exec1(1), qual1(2), res1(3), exec2(4), qual2(5), res2(6),
+    #          exec3(7), qual3(8), res3(9)
+    qual2_prompt = provider.prompts[5]
+    qual3_prompt = provider.prompts[8]
+    assert "do not report these again as P2" in qual2_prompt, (
+        "the deferral must still be active going into iteration 2's review"
+    )
+    assert "do not report these again as P2" not in qual3_prompt, (
+        "the retracted entry must not be offered to the reviewer again"
+    )
+    assert "--- Bekannte Grenzen" not in result.output, (
+        "the retracted entry must not survive into the final report"
+    )

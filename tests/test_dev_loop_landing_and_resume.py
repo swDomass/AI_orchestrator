@@ -500,6 +500,48 @@ class TestCheckpointAndResume:
         resume = _resume_checkpoint(str(tmp_path), _task_hash(task))
         assert resume["tokens"]["input_tokens"] == 1234
 
+    def test_known_limits_round_trips_through_checkpoint(self, tmp_path):
+        """Rundenreflexion: known_limits must survive a park exactly like deferred_p3,
+        or a capacity park silently loses every accepted BEKANNTE GRENZE deferral."""
+        task = "Fix bug"
+        _write_checkpoint(
+            str(tmp_path), _task_hash(task),
+            cache_phase="research_and_plan_done", research_and_plan=_PLAN,
+            next_iteration=3, elapsed_budget_sec=50.0,
+            previous_quality_findings=["- [P2] carried over"],
+            previous_resolution_output="",
+            deferred_p3={}, seen_quality_signatures=set(),
+            seen_review_signatures=set(), tokens=TokenCounter(),
+            park_reason=_PARK_CAPACITY,
+            known_limits={"- [P2] flaky heuristic": "needs a constructed input"},
+        )
+        resume = _resume_checkpoint(str(tmp_path), _task_hash(task))
+        assert resume is not None
+        assert resume["known_limits"] == {
+            "- [P2] flaky heuristic": "needs a constructed input"
+        }
+
+    def test_known_limits_defaults_to_empty_when_absent_from_an_older_checkpoint(
+        self, tmp_path
+    ):
+        """A checkpoint written before this feature carries no `known_limits` key at
+        all — must read back as {}, not crash, same defensive coercion as every
+        other field in _resume_checkpoint."""
+        task = "Fix bug"
+        _write_checkpoint(
+            str(tmp_path), _task_hash(task),
+            cache_phase="research_and_plan_done", research_and_plan=_PLAN,
+            next_iteration=2, elapsed_budget_sec=1.0,
+            previous_quality_findings=[], previous_resolution_output="",
+            deferred_p3={}, seen_quality_signatures=set(),
+            seen_review_signatures=set(), tokens=TokenCounter(),
+            park_reason=_PARK_CAPACITY,
+            # known_limits deliberately omitted — exercises the default.
+        )
+        resume = _resume_checkpoint(str(tmp_path), _task_hash(task))
+        assert resume is not None
+        assert resume["known_limits"] == {}
+
     def test_a_version_one_state_is_still_only_a_research_cache(self, tmp_path):
         """G16 — a file written by the orchestrator BEFORE this upgrade must not
         be mistaken for a checkpoint, and must still skip Research+Plan."""

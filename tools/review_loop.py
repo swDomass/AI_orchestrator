@@ -8,6 +8,7 @@ Usage in queue:
     - [ ] Review uncommitted changes #tool:review-loop #codex cwd:/d/programmieren/projekt
 """
 
+import logging
 import re
 import subprocess
 import time
@@ -30,6 +31,8 @@ from limits import is_cached_provider_available
 from notifier import notify_tool_progress, notify_tool_done
 from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result
+
+logger = logging.getLogger(__name__)
 
 # Matches priority findings like: - [P1] Some issue
 FINDING_RE = re.compile(r"^\s*-\s+\[P[1-3]\]\s+.+", re.MULTILINE)
@@ -94,6 +97,219 @@ def strip_p3_lines(text: str) -> str:
             continue
         kept.append(line)
     return "\n".join(kept).strip()
+
+
+# ── Round Reflection ────────────────────────────────────────────────────────
+# From iteration 2 on, the executor/fixer is asked to reflect before fixing
+# anything and may defer a P2 finding as a "known limit" instead of
+# fixing it. The two markers below (`## Rundenreflexion`,
+# `- [BEKANNTE GRENZE] ...`) are matched verbatim by parse_known_limits() and
+# must stay in sync with the interactive commands
+# (~/.claude/commands/{dev,review}-loop.md), which carry the same text.
+ROUND_REFLECTION_INSTRUCTION = """
+Before fixing anything, write a section `## Rundenreflexion` that answers \
+two questions: (a) Am I over-building — more mechanism than the task's \
+core needs? (b) Am I chasing edge cases — signs: the finding needs a \
+constructed input, the same mechanism is being fixed for the second time, \
+or your own previous fix created this finding.
+
+Then one line per open finding: either fix it, or defer it as \
+`- [BEKANNTE GRENZE] <the finding line copied verbatim> — <one-sentence reason>`.
+
+A P1 (crash, security, data loss, core requirement broken) is never a \
+known limit. For guard/watchdog heuristics a false alarm is cheaper than \
+blindness: if your own fix created a blind spot, retract it instead of \
+stacking another heuristic. A fix is not proven just because the test for \
+exactly that case is green.
+"""
+
+# Appended to a review/quality prompt once known limits exist, so the reviewer
+# does not simply re-report what was deliberately deferred as a fresh P2 —
+# while a genuine escalation to P1 (the one thing a known limit can never be)
+# still gets through, see is_deferred_known_limit() below.
+KNOWN_LIMITS_REVIEW_BLOCK = """
+Deliberately deferred known limits from an earlier round (with reason) — \
+do not report these again as P2; report one only if you judge it a P1:
+{known_limits}
+"""
+
+# Appended to a RESOLUTION-style prompt instead (dev_loop's "does this solve the
+# task" review) — different question from KNOWN_LIMITS_REVIEW_BLOCK above, so
+# different wording: a resolution reviewer does not grade quality, so it must not
+# read a deferred quality finding as an unmet requirement, UNLESS the task itself
+# specifically demanded fixing that finding — in which case it should say so.
+KNOWN_LIMITS_RESOLUTION_BLOCK = """
+Deliberately deferred known limits (quality findings the executor chose not to \
+fix, with reason) — do not count them as missing unless the task itself \
+requires them; if it does, say so explicitly:
+{known_limits}
+"""
+
+_KNOWN_LIMIT_LINE_RE = re.compile(r"^\s*-\s*\[BEKANNTE GRENZE\]\s*(.+)$")
+# Em dash first (what the instruction asks for); ` -- ` and ` - ` are trivial
+# fallbacks for a plain dash the model typed instead — not a fuzzy parser.
+_KNOWN_LIMIT_SEPARATORS = (" — ", " -- ", " - ")
+
+
+def parse_known_limits(text: str) -> list[tuple[str, str]]:
+    """Extract (finding, reason) pairs from ``- [BEKANNTE GRENZE] <finding> — <reason>`` lines.
+
+    Only lines matching this exact bullet shape are read; the `## Rundenreflexion`
+    prose, fixed findings and everything else in `text` is ignored. The LAST
+    occurrence of the separator in the line wins, so a finding that itself
+    contains a dash does not truncate the match early.
+    """
+    out: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        m = _KNOWN_LIMIT_LINE_RE.match(line)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        for sep in _KNOWN_LIMIT_SEPARATORS:
+            idx = rest.rfind(sep)
+            if idx == -1:
+                continue
+            finding = rest[:idx].strip()
+            reason = rest[idx + len(sep):].strip()
+            if finding and reason:
+                out.append((finding, reason))
+            break
+    return out
+
+
+_FINDING_SEVERITY_RE = re.compile(r"^-?\s*\[P([123])\]", re.IGNORECASE)
+
+
+def _finding_severity(finding: str) -> str | None:
+    """'P1'/'P2'/'P3', or None when `finding` does not start with a severity tag."""
+    m = _FINDING_SEVERITY_RE.match(finding.strip())
+    return f"P{m.group(1)}" if m else None
+
+
+def _normalize_finding(text: str) -> str:
+    """Whitespace-collapsed, bullet-marker-tolerant form for known-limit matching.
+
+    Collapses every whitespace run (including newlines) to a single space and
+    strips one leading "- " bullet marker, so a copied "- [P2] ..." bullet and
+    a bare "[P2] ..." compare equal. Exact otherwise — normalization, not a
+    fuzzy match.
+    """
+    collapsed = " ".join(text.split())
+    if collapsed.startswith("- "):
+        collapsed = collapsed[2:]
+    return collapsed
+
+
+def validate_known_limits(
+    candidates: list[tuple[str, str]],
+    blocking_findings: list[str],
+    *,
+    tool_name: str = "",
+) -> dict[str, str]:
+    """Fail-closed check of BEKANNTE GRENZE deferrals against the current round.
+
+    A deferral takes effect ONLY if its finding text matches (whitespace-
+    normalized, exact otherwise) one of `blocking_findings` AND that finding
+    is P2. No match, or a match against a P1, has no effect: the finding
+    stays blocking and a warning is logged (not printed) explaining why —
+    silence there would make an ignored deferral indistinguishable from an
+    accepted one.
+
+    Returns ``{original_finding_text: reason}``, keyed by the finding line as
+    it appears in `blocking_findings` (not the candidate's own copy), so the
+    later exact-text filter does not depend on how faithfully the copy was
+    made.
+    """
+    accepted: dict[str, str] = {}
+    by_normalized = {_normalize_finding(f): f for f in blocking_findings}
+    prefix = f"[{tool_name}] " if tool_name else ""
+    for finding_text, reason in candidates:
+        original = by_normalized.get(_normalize_finding(finding_text))
+        if original is None:
+            logger.warning(
+                "%sBEKANNTE GRENZE deferral matches no current blocking finding, "
+                "ignored: %r", prefix, finding_text,
+            )
+            continue
+        if _finding_severity(original) != "P2":
+            logger.warning(
+                "%sBEKANNTE GRENZE deferral targets a %s finding — only P2 is "
+                "deferrable, ignored: %r",
+                prefix, _finding_severity(original) or "untagged", original,
+            )
+            continue
+        accepted[original] = reason
+    return accepted
+
+
+def is_deferred_known_limit(finding: str, known_limits: dict[str, str]) -> bool:
+    """True when `finding`'s normalized text matches an accepted deferral.
+
+    Severity is part of that text: `known_limits` keys always carry "[P2]",
+    since validate_known_limits() never accepts a P1 original. A finding
+    re-reported as "[P1]" for the same underlying issue therefore has
+    different normalized text and is never matched — it stays blocking on
+    its own, with no separate severity check needed here. A single guard
+    (validate_known_limits' P2-only acceptance) is what enforces "P1 is
+    never a known limit"; duplicating it here would be exactly the kind of
+    unrequested second heuristic ROUND_REFLECTION_INSTRUCTION warns against.
+    """
+    target = _normalize_finding(finding)
+    return any(_normalize_finding(k) == target for k in known_limits)
+
+
+def format_known_limits(known_limits: dict[str, str]) -> str:
+    """Render {finding: reason} as one line per entry, mirroring the P3 offer list."""
+    return "\n".join(f"{finding} — {reason}" for finding, reason in known_limits.items())
+
+
+_SEVERITY_TAG_RE = re.compile(r"^-?\s*\[P[123]\]\s*", re.IGNORECASE)
+
+
+def _finding_body(text: str) -> str:
+    """`_normalize_finding()`, with the bullet marker AND the severity tag also
+    stripped. Used only by release_escalated_known_limits() below, where a known
+    limit's "[P2]" tag must not hide that the SAME underlying issue is now being
+    reported as "[P1]" — the one comparison in this module that deliberately
+    ignores severity, because recognising the escalation is the whole point.
+    """
+    return " ".join(_SEVERITY_TAG_RE.sub("", text.strip()).split())
+
+
+def release_escalated_known_limits(
+    findings: list[str],
+    known_limits: dict[str, str],
+    *,
+    tool_name: str = "",
+) -> list[str]:
+    """Retract known limits a reviewer has since escalated back to P1.
+
+    A known limit only ever came from an ORIGINAL P2 (validate_known_limits()
+    enforces that). If a later round reports the same underlying issue as P1,
+    the deferral is retracted rather than merely outvoted for that one round:
+    without this, the entry would keep telling later prompts "deliberately
+    deferred, do not report as P2" and keep listing it in the final report even
+    after the reviewer stopped agreeing it was minor — and a later de-escalation
+    back to P2 would silently inherit the stale acceptance instead of blocking
+    again. Mutates `known_limits` in place; returns the removed keys (for
+    logging by the caller's test, and so a caller that wants the list does not
+    have to diff the dict before and after).
+    """
+    if not known_limits:
+        return []
+    escalated_bodies = {_finding_body(f) for f in findings if _finding_severity(f) == "P1"}
+    if not escalated_bodies:
+        return []
+    removed = [k for k in known_limits if _finding_body(k) in escalated_bodies]
+    if removed:
+        prefix = f"[{tool_name}] " if tool_name else ""
+        for key in removed:
+            del known_limits[key]
+            logger.warning(
+                "%sKnown limit escalated back to P1, deferral retracted: %r",
+                prefix, key,
+            )
+    return removed
 
 
 def _is_no_findings_output(text: str) -> bool:
@@ -474,13 +690,15 @@ class ReviewLoopTool(BaseTool):
                     second_opinion=second_opinion[0].name if second_opinion else None)
 
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
-        review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
         seen_signatures: set[tuple[str, ...]] = set()
         last_findings_tuple: tuple[str, ...] = ()
         all_outputs: list[str] = []
         # Ordered set of every P3 seen in any iteration — emitted once as an offer when
         # the loop succeeds. Must outlive a single round; see the accumulation below.
         deferred_p3: dict[str, None] = {}
+        # {finding: reason} accepted BEKANNTE GRENZE deferrals, validated against the
+        # round that produced them. Same accumulate-and-survive contract as deferred_p3.
+        known_limits: dict[str, str] = {}
         drift_check_mode = self._drift_check_mode()
         drift_warning = ""  # injected into next iteration's fix prompt when drift detected
         previous_findings_count = 0  # for "findings grew" drift trigger
@@ -543,6 +761,16 @@ class ReviewLoopTool(BaseTool):
                 print(f"  [review-loop] ⏸ {msg}")
                 return _make_capacity_exhausted_result(
                     msg, "\n\n".join(all_outputs), iteration - 1, **tokens.as_kwargs(),
+                )
+
+            # Built fresh each iteration (not once before the loop): once a BEKANNTE
+            # GRENZE deferral was accepted, the reviewer must be told not to re-report
+            # it as P2. Iteration 1 has no known_limits yet, so this is byte-identical
+            # to the prompt built once before the loop used to be.
+            review_prompt = f"{system_prompt}\n\n{task}\n\n{_REVIEW_PROMPT_BODY}"
+            if known_limits:
+                review_prompt += "\n" + KNOWN_LIMITS_REVIEW_BLOCK.format(
+                    known_limits=format_known_limits(known_limits)
                 )
 
             # Step 1: Review
@@ -695,12 +923,25 @@ class ReviewLoopTool(BaseTool):
                                     f"ohne parsbare Findings — ignoriert"
                                 )
 
+            # A known limit's lifecycle ends here if the reviewer (primary or second
+            # opinion — `findings` already carries any merge) has since escalated the
+            # same underlying issue back to P1: the deferral is retracted (not merely
+            # overridden for this round), so later prompts stop calling it
+            # "deliberately deferred" and a future re-report as P2 blocks normally.
+            release_escalated_known_limits(findings, known_limits, tool_name=self.name)
+
             # P3 is non-blocking: it does NOT keep the loop running. Fixing cosmetics
             # on working code widens the diff without functional gain, and since each
             # iteration re-reviews the fresh diff, every P3 fix can surface new P3 —
             # the loop would feed itself and burn iterations on style. Mirrors
             # dev_loop.py's `blocking_findings` split; see skills/review-loop/SKILL.md.
-            blocking_findings = [f for f in findings if not f.startswith("- [P3]")]
+            # A finding matching an accepted known limit is excluded the same way —
+            # unless the reviewer re-tagged it P1, which always blocks regardless of
+            # an earlier deferral (is_deferred_known_limit() enforces that).
+            blocking_findings = [
+                f for f in findings
+                if not f.startswith("- [P3]") and not is_deferred_known_limit(f, known_limits)
+            ]
             # Accumulate across iterations, deduplicated, insertion order kept. A per-round
             # list loses them: round 1 reports P2+P3, round 2 comes back clean after the P2
             # fix, and the round-1 P3 is gone from the final offer — the opposite of the
@@ -756,6 +997,14 @@ class ReviewLoopTool(BaseTool):
                     )
                 else:
                     msg = f"Keine P1/P2/P3 Findings nach {iteration} Iteration(en)."
+                if known_limits:
+                    msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+                    # Separate from the P3 offer — these were once blocking (P2) and
+                    # deliberately deferred with a reason, not merely non-blocking.
+                    all_outputs.append(
+                        "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                        + format_known_limits(known_limits)
+                    )
                 print(f"  [review-loop] ✅ {msg}")
 
                 # Auto-lesson: generate LLM summary if it took more than 1 iteration
@@ -781,6 +1030,12 @@ class ReviewLoopTool(BaseTool):
             signature = tuple(sorted(blocking_findings))
             if signature in seen_signatures:
                 msg = f"Findings wiederholen sich nach {iteration} Iterationen. Loop beendet."
+                if known_limits:
+                    msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+                    all_outputs.append(
+                        "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                        + format_known_limits(known_limits)
+                    )
                 print(f"  [review-loop] ⚠️ {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(
@@ -884,6 +1139,8 @@ class ReviewLoopTool(BaseTool):
                     lessons_hint=lessons_hint,
                 )
             )
+            if iteration >= 2:
+                fix_prompt += "\n" + ROUND_REFLECTION_INSTRUCTION
 
             fix_result = provider.run(
                 fix_prompt,
@@ -916,6 +1173,18 @@ class ReviewLoopTool(BaseTool):
                 )
 
             all_outputs.append(f"--- Fix {iteration} ---\n{fix_result.output}")
+            # Deferrals the fixer marked BEKANNTE GRENZE, validated fail-closed against
+            # THIS round's blocking findings (what the fixer was actually shown). Only
+            # from iteration 2 on — the order says "ab Runde 2", and the fix prompt
+            # itself carries ROUND_REFLECTION_INSTRUCTION only from there too; a marker
+            # in an iteration-1 output (unsolicited, or copied from an earlier run's
+            # session history) must not be honoured.
+            if iteration >= 2:
+                candidates = parse_known_limits(fix_result.output)
+                if candidates:
+                    known_limits.update(
+                        validate_known_limits(candidates, blocking_findings, tool_name=self.name)
+                    )
             print(f"  [review-loop] Fix durchgeführt. Starte Re-Review...")
             previous_findings_count = len(blocking_findings)
 
@@ -936,6 +1205,12 @@ class ReviewLoopTool(BaseTool):
 
         # Max iterations reached
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht. Noch Findings offen."
+        if known_limits:
+            msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+            all_outputs.append(
+                "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                + format_known_limits(known_limits)
+            )
         print(f"  [review-loop] ⚠️ {msg}")
         tracer.emit("run_end", success=False, reason="max_iterations", iterations=TOOL_MAX_ITERATIONS)
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)

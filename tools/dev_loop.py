@@ -39,7 +39,19 @@ from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
-from tools.review_loop import _is_clean_output, _parse_findings, strip_p3_lines
+from tools.review_loop import (
+    ROUND_REFLECTION_INSTRUCTION,
+    KNOWN_LIMITS_REVIEW_BLOCK,
+    KNOWN_LIMITS_RESOLUTION_BLOCK,
+    _is_clean_output,
+    _parse_findings,
+    format_known_limits,
+    is_deferred_known_limit,
+    parse_known_limits,
+    release_escalated_known_limits,
+    strip_p3_lines,
+    validate_known_limits,
+)
 
 # The PARENT directory, deliberately kept as-is. Per-task output goes one level
 # deeper (_run_dir below) rather than into a sibling `.dev-loop-<hash>`, because
@@ -260,6 +272,12 @@ def _resume_checkpoint(cwd: str | None, task_hash: str) -> "dict | None":
         val = state.get(key)
         return [v for v in val if isinstance(v, str)] if isinstance(val, list) else []
 
+    def _str_dict(key: str) -> dict[str, str]:
+        val = state.get(key)
+        if not isinstance(val, dict):
+            return {}
+        return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, str)}
+
     def _str_tuple(val: object) -> tuple[str, ...]:
         """A flat tuple of strings, whatever the file actually contained.
 
@@ -302,6 +320,10 @@ def _resume_checkpoint(cwd: str | None, task_hash: str) -> "dict | None":
         # unchanged and then blows up in the f-string that builds review_context.
         "previous_resolution_output": prev_res if isinstance(prev_res, str) else "",
         "deferred_p3": _strs("deferred_p3"),
+        # {finding: reason} accepted BEKANNTE GRENZE deferrals — absent in a file
+        # written before this feature, which _str_dict reads as {} like any other
+        # unrecognised shape (defensive coercion, same reasoning as every field above).
+        "known_limits": _str_dict("known_limits"),
         # Nested lists round-trip as lists; the in-memory sets hold tuples of strings.
         "seen_quality_signatures": _sig_list("seen_quality_signatures"),
         "seen_review_signatures": _review_sigs(),
@@ -335,8 +357,13 @@ def _write_checkpoint(
     tokens: "TokenCounter",
     park_reason: str | None = None,
     park_count: int = 0,
+    known_limits: dict | None = None,
 ) -> bool:
     """Write the version-2 state. Returns True only if it is durably on disk.
+
+    `known_limits` defaults to None/{} rather than being required like
+    `deferred_p3` — it round-trips identically once passed, the default just
+    keeps every pre-existing direct caller (tests included) working unchanged.
 
     `park_reason` decides whether the record may ever be RESUMED from:
     `_PARK_CAPACITY` for a run parked by an exhausted quota, None for a plain
@@ -367,6 +394,7 @@ def _write_checkpoint(
             "previous_quality_findings": list(previous_quality_findings),
             "previous_resolution_output": previous_resolution_output,
             "deferred_p3": list(deferred_p3.keys()),
+            "known_limits": dict(known_limits or {}),
             "seen_quality_signatures": [list(t) for t in seen_quality_signatures],
             "seen_review_signatures": [
                 [list(sig), verdict, text] for sig, verdict, text in seen_review_signatures
@@ -827,6 +855,9 @@ class DevLoopTool(BaseTool):
         # success — same contract as review_loop. Outlives a single round on purpose:
         # a P3 from round 1 must not vanish because round 2 came back clean.
         deferred_p3: dict[str, None] = {}
+        # {finding: reason} accepted BEKANNTE GRENZE deferrals. Same accumulate-and-
+        # survive contract as deferred_p3 — round-tripped through the checkpoint below.
+        known_limits: dict[str, str] = {}
         seen_quality_signatures: set[tuple[str, ...]] = set()
         last_quality_tuple: tuple[str, ...] = ()
         seen_review_signatures: set[tuple[tuple[str, ...], str, str]] = set()
@@ -852,6 +883,7 @@ class DevLoopTool(BaseTool):
             previous_quality_findings_seed = list(resume["previous_quality_findings"])
             previous_resolution_output_seed = resume["previous_resolution_output"]
             deferred_p3.update(dict.fromkeys(resume["deferred_p3"]))
+            known_limits.update(resume["known_limits"])
             seen_quality_signatures.update(resume["seen_quality_signatures"])
             seen_review_signatures.update(resume["seen_review_signatures"])
             print(f"  [dev-loop] ▶ Fortsetzung ab Iteration {start_iteration} "
@@ -1103,6 +1135,7 @@ class DevLoopTool(BaseTool):
                         deferred_p3={}, seen_quality_signatures=set(),
                         seen_review_signatures=set(), tokens=tokens,
                         park_reason=_PARK_CAPACITY, park_count=park_count + 1,
+                        known_limits={},
                     )
                     msg = f"Kontingent erschöpft in Research+Plan → Suspend: {rp_result.error}"
                     print(f"  [dev-loop] ⏸ {msg}")
@@ -1148,6 +1181,7 @@ class DevLoopTool(BaseTool):
                 previous_quality_findings=previous_quality_findings_seed,
                 previous_resolution_output=previous_resolution_output_seed,
                 deferred_p3=deferred_p3,
+                known_limits=known_limits,
                 seen_quality_signatures=seen_quality_signatures,
                 seen_review_signatures=seen_review_signatures,
                 tokens=tokens,
@@ -1215,6 +1249,7 @@ class DevLoopTool(BaseTool):
                 previous_quality_findings=prev_quality,
                 previous_resolution_output=prev_resolution,
                 deferred_p3=deferred_p3,
+                known_limits=known_limits,
                 seen_quality_signatures=seen_quality_signatures,
                 seen_review_signatures=seen_review_signatures,
                 tokens=tokens,
@@ -1307,9 +1342,12 @@ class DevLoopTool(BaseTool):
                         + previous_resolution_output
                     )
                 review_context = (
-                    "\nPREVIOUS REVIEWS — fix all issues listed here:\n\n"
+                    "\nPREVIOUS REVIEWS — fix all issues listed here, unless you "
+                    "defer a P2 finding as BEKANNTE GRENZE in your "
+                    "Rundenreflexion:\n\n"
                     + "\n\n".join(parts)
                     + "\n"
+                    + ROUND_REFLECTION_INSTRUCTION
                 )
 
             # Search lessons for hints related to current review findings
@@ -1374,11 +1412,22 @@ class DevLoopTool(BaseTool):
 
             exec_output = exec_result.output.strip()
             all_outputs.append(f"--- Execution {iteration} ---\n{exec_output}")
+            # Deferrals the executor marked BEKANNTE GRENZE, validated fail-closed
+            # against the findings it was actually shown in review_context above.
+            candidates = parse_known_limits(exec_output)
+            if candidates:
+                known_limits.update(
+                    validate_known_limits(candidates, previous_quality_findings, tool_name=self.name)
+                )
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
             # ── Phase 3a: Code Quality Review ────────────────────────────────
             print(f"  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: QUALITY REVIEW ===")
             quality_prompt = system_prompt + "\n\n" + _QUALITY_REVIEW_PROMPT.format(task=task)
+            if known_limits:
+                quality_prompt += "\n" + KNOWN_LIMITS_REVIEW_BLOCK.format(
+                    known_limits=format_known_limits(known_limits)
+                )
             quality_result = provider.run(
                 quality_prompt, cwd=cwd, timeout=_landing_cap(quality_timeout),
                 read_only=True,  # safe-by-CLI: review must not edit files
@@ -1439,8 +1488,19 @@ class DevLoopTool(BaseTool):
                     retryable=True,
                     **tokens.as_kwargs(),
                 )
-            # P3-only findings are non-blocking; only P1/P2 block progress
-            blocking_findings = [f for f in quality_findings if not f.startswith("- [P3]")]
+            # A known limit's lifecycle ends here if the reviewer has since escalated
+            # the same underlying issue back to P1: the deferral is retracted (not
+            # merely overridden for this round), so later prompts stop calling it
+            # "deliberately deferred" and a future re-report as P2 blocks normally.
+            release_escalated_known_limits(quality_findings, known_limits, tool_name=self.name)
+            # P3-only findings are non-blocking; only P1/P2 block progress. A finding
+            # matching an accepted known limit is excluded the same way — unless the
+            # reviewer re-tagged it P1, which always blocks regardless of an earlier
+            # deferral (is_deferred_known_limit() enforces that).
+            blocking_findings = [
+                f for f in quality_findings
+                if not f.startswith("- [P3]") and not is_deferred_known_limit(f, known_limits)
+            ]
             for p3 in (f for f in quality_findings if f.startswith("- [P3]")):
                 deferred_p3.setdefault(p3, None)
             quality_ok = no_quality_findings or not blocking_findings
@@ -1449,6 +1509,10 @@ class DevLoopTool(BaseTool):
             # ── Phase 3b: Resolution Review ───────────────────────────────────
             print(f"  [dev-loop] === Iteration {iteration}/{TOOL_MAX_ITERATIONS}: RESOLUTION REVIEW ===")
             resolution_prompt = system_prompt + "\n\n" + _RESOLUTION_REVIEW_PROMPT.format(task=task)
+            if known_limits:
+                resolution_prompt += "\n" + KNOWN_LIMITS_RESOLUTION_BLOCK.format(
+                    known_limits=format_known_limits(known_limits)
+                )
             resolution_result = provider.run(
                 resolution_prompt, cwd=cwd, timeout=_landing_cap(resolution_timeout),
                 read_only=True,  # safe-by-CLI: review must not edit files
@@ -1551,6 +1615,14 @@ class DevLoopTool(BaseTool):
                         "--- P3 offen (nicht-blockierend, Angebot) ---\n"
                         + "\n".join(deferred_p3)
                     )
+                if known_limits:
+                    msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+                    # Separate from the P3 offer — these were once blocking (P2) and
+                    # deliberately deferred with a reason, not merely non-blocking.
+                    all_outputs.append(
+                        "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                        + format_known_limits(known_limits)
+                    )
                 print(f"  [dev-loop] {msg}")
                 _write_tool_file(
                     dev_loop_dir,
@@ -1602,6 +1674,12 @@ class DevLoopTool(BaseTool):
                         f"Quality-Findings wiederholen sich nach {iteration} Iterationen. "
                         "Loop abgebrochen."
                     )
+                    if known_limits:
+                        msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+                        all_outputs.append(
+                            "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                            + format_known_limits(known_limits)
+                        )
                     print(f"  [dev-loop] {msg}")
                     notify_tool_done(self.name, iteration, False, msg)
                     return ToolResult(
@@ -1620,6 +1698,12 @@ class DevLoopTool(BaseTool):
                     f"Review-Ergebnis wiederholt sich nach {iteration} Iterationen. "
                     "Loop abgebrochen."
                 )
+                if known_limits:
+                    msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+                    all_outputs.append(
+                        "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                        + format_known_limits(known_limits)
+                    )
                 print(f"  [dev-loop] {msg}")
                 notify_tool_done(self.name, iteration, False, msg)
                 return ToolResult(
@@ -1690,6 +1774,12 @@ class DevLoopTool(BaseTool):
 
         # Max iterations reached
         msg = f"Max Iterationen ({TOOL_MAX_ITERATIONS}) erreicht. Reviews noch nicht vollstaendig bestanden."
+        if known_limits:
+            msg += f" {len(known_limits)} bekannte Grenze(n) zurückgestellt."
+            all_outputs.append(
+                "--- Bekannte Grenzen (zurückgestellt, mit Begründung) ---\n"
+                + format_known_limits(known_limits)
+            )
         print(f"  [dev-loop] {msg}")
         tracer.emit("run_end", success=False, reason="max_iterations", iterations=TOOL_MAX_ITERATIONS)
         notify_tool_done(self.name, TOOL_MAX_ITERATIONS, False, msg)

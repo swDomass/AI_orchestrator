@@ -301,8 +301,10 @@ name is printed and logged on creation, because `git stash list` does not show i
 Two limits: `git stash create` does **not** capture untracked files, so a snapshot
 rolls back modifications to tracked files only; and each new snapshot prunes the
 namespace by `age >= 14 d AND (age > 30 d OR outside the newest 50)`. The 14-day
-window is a veto over both caps — night tasks do not commit, so a young snapshot is
-the only undo for work still waiting in the working tree — which means the count cap
+window is a veto over both caps — a successful run now commits its own paths to an
+`orch/*` branch, but the snapshot is the only copy of the state *before* the run and
+the only copy at all for paths the commit deliberately left behind or for runs that
+failed — which means the count cap
 can be starved in a high-churn repo. Nothing outside `refs/orchestrator-backup/` is
 ever touched, so moving a ref elsewhere keeps it forever. Age is the commit date, not
 the date the ref appeared: a ref moved into the namespace by hand keeps the *old*

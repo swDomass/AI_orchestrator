@@ -190,10 +190,14 @@ The snapshot now goes to `refs/orchestrator-backup/<timestamp>` via
 `oldvalue` (create-only), so two snapshots in the same second in one repo cannot
 overwrite each other — the second retries with a `_2` suffix.
 
-**Why not "delete on task success".** The night tasks deliberately do not commit;
-the changes sit in the working tree until the morning review. The snapshot is
-therefore the *only* undo for them, and deleting it on success would destroy the
-one artefact the feature exists to produce. Retention has to outlive a review
+**Why not "delete on task success".** Originally: the night tasks deliberately do
+not commit, the changes sit in the working tree until the morning review, and the
+snapshot is therefore the *only* undo for them. The first half stopped being true on
+2026-09-11, when the per-task auto-commit landed — but the conclusion holds for a
+different reason. The `orch/*` branch holds the run's *result*; the snapshot holds
+the state *before* it, index included, and is still the only copy for the paths the
+commit deliberately left behind and for every run that failed or skipped its commit.
+Deleting it on success would destroy the one artefact the feature exists to produce. Retention has to outlive a review
 cycle, which makes the policy a **veto** structure rather than an LRU:
 
 | Constant | Value | Reasoning |

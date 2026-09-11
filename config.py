@@ -328,10 +328,17 @@ GIT_SNAPSHOT_REF_PREFIX = "refs/orchestrator-backup/"
 GIT_SNAPSHOT_REF_MAX_ATTEMPTS = 4
 
 # --- Snapshot retention -----------------------------------------------------
-# The binding constraint: night tasks deliberately do NOT commit, so this snapshot
-# is the ONLY undo for the changes waiting in the working tree for the morning
-# review. Deleting on task success would therefore destroy the one artefact the
-# feature exists to provide. Retention must outlive at least one review cycle,
+# The binding constraint (restated 2026-09-11, when the per-task auto-commit
+# landed and the old wording -- "night tasks deliberately do NOT commit, so this
+# snapshot is the ONLY undo" -- stopped being true). The conclusion survives, the
+# reason changed: the snapshot and the orch/* branch cover DIFFERENT things.
+# The branch holds the run's RESULT for the paths the commit took; the snapshot
+# holds the state BEFORE the run, index included, for everything it deliberately
+# did not take -- a path someone else had staged, a path already dirty when the
+# run started, a merge conflict, a rename -- plus every run that failed or whose
+# commit was skipped, where no branch exists at all. Those are exactly the cases
+# where foreign work is in play, so the undo is still unique and still the one
+# artefact worth protecting. Retention must outlive at least one review cycle,
 # which makes the policy a VETO structure rather than a plain LRU.
 #
 # Veto over BOTH caps below: nothing younger than this is ever pruned, no matter

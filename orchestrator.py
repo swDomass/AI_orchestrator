@@ -674,11 +674,15 @@ def _prune_snapshot_refs(cwd: str, now: float | None = None) -> list[str]:
         age >= GIT_SNAPSHOT_PROTECT_DAYS
         AND (age > GIT_SNAPSHOT_MAX_AGE_DAYS OR outside the newest GIT_SNAPSHOT_MAX_COUNT)
 
-    The protect window is a VETO over both caps, not a third condition among equals:
-    night tasks do not commit, so a young snapshot is the only undo for work still
-    waiting in the working tree. In a high-churn repo that lets the count cap be
-    starved -- more than MAX_COUNT snapshots survive because they are all young.
-    That is the deliberate trade: the undo guarantee outranks tidiness.
+    The protect window is a VETO over both caps, not a third condition among equals.
+    Since 2026-09-11 a successful run commits its own paths to ``orch/*``, so the
+    snapshot is no longer the only copy of everything -- but it remains the only
+    copy of the state BEFORE the run, index included, and the only copy at all for
+    the paths the commit deliberately left behind (foreign-staged, already dirty at
+    start, conflicts, renames) and for every run that failed or skipped its commit.
+    In a high-churn repo the window lets the count cap be starved -- more than
+    MAX_COUNT snapshots survive because they are all young. That is the deliberate
+    trade: the undo guarantee outranks tidiness.
 
     Only refs under GIT_SNAPSHOT_REF_PREFIX are ever considered; branches, tags and
     refs/stash are out of reach by construction. Never raises.

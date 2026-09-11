@@ -265,7 +265,7 @@ durable copy is `round-NNN.md`), so a resumed run's final output points at earli
 rounds instead of quoting them.
 
 **The worktree gate had to learn about this or the park would be a trap.** After a park
-the tree is dirty *with the run's own work*, and `orchestrator.py:2202` refuses that
+the tree is dirty *with the run's own work*, and `orchestrator.py:2358` refuses that
 **terminally** rather than parking again — a parked task would end up worse off than an
 unparked one. `BaseTool.resume_permits_dirty()` (default `False`; only `DevLoopTool`
 overrides) answers it with a subset check against the dirty path set recorded at park
@@ -336,6 +336,12 @@ Codex and Gemini providers also have CLI-level resume capabilities, but `support
 
 
 ## Per-task auto-commit — HEAD never moves
+
+> Cross-reference for the safety rules above: since 2026-09-11 the orchestrator writes
+> git state itself. The provider still must not (`Do NOT commit` stays in the dev-loop
+> executor prompt, because the reviewers judge the uncommitted working-tree diff), so
+> the orchestrator does it *after* the loop instead — which is also why it works for
+> Codex and opencode, which cannot commit at all. Nothing is ever pushed.
 
 Added 2026-09-10 (`git_commit.py`). The counterpart to the clean-worktree gate: the gate stops a
 dirty tree from corrupting a dev-loop's own review subject, this stops the dirty tree from

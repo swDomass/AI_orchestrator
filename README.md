@@ -21,7 +21,7 @@ This is the orchestrator built around that reality.
 
 The codebase prioritises auditability, safety, and operational fitness over feature breadth. If you're evaluating the architecture rather than the feature list:
 
-- **2533 tests / ~90–125 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls. Run them with `-p no:randomly`: `tests/test_telegram_listener.py` is order-dependent, so a random seed can turn the suite red without a code change (known, unfixed — see [Known Limitations](#known-limitations)).
+- **2711 tests / ~90–155 s** — full pytest suite covers queue parsing, dispatcher fallback, policy classification, provider mocks, stdin delivery verification, post-task verify checks, parallel execution, idempotency, quota calibration + SoTH state + live estimation, and per-tool phase logic. Tests are synchronous (no asyncio), pure stdlib + pytest fixtures, no live network calls. Run them with `-p no:randomly`: `tests/test_telegram_listener.py` is order-dependent, so a random seed can turn the suite red without a code change (known, unfixed — see [Known Limitations](#known-limitations)).
 - **Defence in depth.** `scripts/safety_hook.py` is a Claude Code `PreToolUse` hook that hard-denies destructive commands (`rm -rf`, force-push, `DROP TABLE`, raw disk writes, `git push`, …) even under `--dangerously-skip-permissions`. A second, softer layer (`SAFETY_RULES`) rides in the system prompt — but know its exact reach before relying on it, because it is narrower *and* wider than "the non-Claude providers", and a `SOUL.md` switches it off entirely. `config.SYSTEM_PROMPTS` has entries for **claude, codex, gemini and opencode** — so Claude gets the rules as well, while **`vibe` and `openrouter` get an empty string** (`get_system_prompt()` does a `.get(name, "")`). And the moment a `SOUL.md` exists, `get_system_prompt()` returns that file's `base` section plus an optional per-provider override and never consults `SYSTEM_PROMPTS` at all — so the `SAFETY_RULES` constant then reaches **no** provider, and whatever safety text ships is whatever your `SOUL.md` happens to carry. If you use a `SOUL.md`, repeat the rules in its `base` section, and re-check that copy whenever `SAFETY_RULES` changes: nothing keeps the two in sync, and the hook (`SAFETY_DENY_PATTERNS`) is unaffected either way. CWD validation against `ALLOWED_CWD_ROOTS` blocks writes outside whitelisted roots.
 - **Three-tier approval policy.** `policy.py` classifies every task as `AUTO`, `APPROVE`, or `DENY`. `APPROVE` tasks block until a Telegram `/approve` arrives; `DENY` never runs. Per-tool budgets and stop conditions (`max_iterations`, `max_runtime_sec`, `max_files_touched`, `reporting_path`) are declared in a YAML `tool_contracts:` section with schema validation at startup — one auditable place for every guard rail.
 - **Operational resilience.** Three-tier HTTP 429 fallback (cclimits → local JSONL → optimistic), provider cooldowns with model-alias routing, OAuth-aware capacity polling (5 min active / 10 min idle, matching `cclimits --cache-ttl`), and a crash-resistant PowerShell watchdog with exponential backoff and Telegram alerts on every restart.
@@ -144,7 +144,7 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `ORCH_QUOTA_LIVE_ESTIMATE` | No | `false` | Phase 2: decrement the cached quota snapshot by a live per-task estimate between cclimits polls |
 | `ORCH_QUOTA_AUTO_RECALIBRATE` | No | `false` | Requires the flag above: re-derive the per-window `tokens_per_pct` factors daily from `logs/quota-calibration.csv` (min-samples + clamp guarded) |
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
-| ~~`TELEGRAM_MAX_TASK_LENGTH`~~ | — | `500` | Max characters for `/task`. **Not readable from `.env`** — `config.py:468` assigns it literally, with no `os.getenv()`. Listed here only because it was documented as configurable until 2026-09-05; change the constant, or wire it through `_parse_int_env()`. |
+| ~~`TELEGRAM_MAX_TASK_LENGTH`~~ | — | `500` | Max characters for `/task`. **Not readable from `.env`** — `config.py:519` assigns it literally, with no `os.getenv()`. Listed here only because it was documented as configurable until 2026-09-05; change the constant, or wire it through `_parse_int_env()`. |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
 | `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
 | `PR_BABYSITTER_REPOS` | No | *(empty)* | Semicolon-separated `owner/name` list for `#tool:pr-babysitter` without an explicit `#repos:` tag. Empty = tool requires the tag. |
@@ -313,7 +313,7 @@ logged with ref name and sha (recoverable with `git stash apply <sha>` until `gi
 deleting more than one ref in a single pass is logged at `WARNING`, because routine
 ageing retires at most one at a time.
 
-**`select_provider()` is still fail-open for a bare `#vibe`/`#openrouter` tag when the policy is missing.** The fail-closed rule described above lives in `policy_allows_provider()` / `dispatcher._allows()`. Half of `select_provider()` has since been converted: the **profile branch** consults `_allows()` per candidate as of 2026-09-04 (`dispatcher.py:387-388`, test `test_profile_provider_order_fails_closed_on_uncapped_provider`), which became necessary once `profiles._KNOWN_PROVIDERS` started deriving from `_TAG_MAP` and a profile could legitimately name `vibe`/`openrouter`. The **tag/forced path was not**: it tests `allowed` for truthiness only (`:376`, `:392`) and prepends the forced provider unconditionally (`:395-399`), so a task carrying a bare `#vibe` or `#openrouter` tag can still reach that provider if `policy.yaml` is absent or unreadable. Deliberately left open — closing it means reworking roughly ten routing tests — but it is the one hole left in the pay-per-token ceiling, and it matters exactly in the scenario the ceiling was built for (a synced `policy.yaml` that failed to arrive before an unattended run).
+**`select_provider()` is still fail-open for a bare `#vibe`/`#openrouter` tag when the policy is missing.** The fail-closed rule described above lives in `policy_allows_provider()` / `dispatcher._allows()`. Half of `select_provider()` has since been converted: the **profile branch** consults `_allows()` per candidate as of 2026-09-04 (`dispatcher.py:389`, test `test_profile_provider_order_fails_closed_on_uncapped_provider`), which became necessary once `profiles._KNOWN_PROVIDERS` started deriving from `_TAG_MAP` and a profile could legitimately name `vibe`/`openrouter`. The **tag/forced path was not**: it tests `allowed` for truthiness only (`:376`, `:392`) and prepends the forced provider unconditionally (`:395-399`), so a task carrying a bare `#vibe` or `#openrouter` tag can still reach that provider if `policy.yaml` is absent or unreadable. Deliberately left open — closing it means reworking roughly ten routing tests — but it is the one hole left in the pay-per-token ceiling, and it matters exactly in the scenario the ceiling was built for (a synced `policy.yaml` that failed to arrive before an unattended run).
 
 **An unregistered value in `#pass1:`/`#pass2:` is dropped without a word.** Since 2026-09-02 the regex accepts `vibe` and `openrouter` alongside `claude`/`gemini`/`codex`, but anything else — a typo, a provider that was never registered — fails twice over: `extract_pass_providers()` drops the pass silently, and `strip_metadata_tags()` does not recognise the tag either, so it survives into the prompt as literal text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. The queue linter has no check for it.
 
@@ -329,7 +329,7 @@ ageing retires at most one at a time.
 
 **The capacity log is deliberately not filtered.** `heartbeat._append_capacity_log()` uses the unfiltered `limits.all_provider_names()` instead, because `logs/capacity-log.md` is not a message but the input of `analytics._parse_capacity_log()`, which feeds the dashboard's current-limits panel and its historical series. Filtering a recorder does not tidy anything — it ends a provider's history, including for a provider that is still running: with `default: [claude]` and `dev-loop: [claude, codex]`, Codex keeps executing dev-loop tasks while the `default:` lookup drops it, so no Codex row is ever appended again and the dashboard reports no Codex capacity at all.
 
-Three consequences worth knowing. The display filter asks the **`default:` entry**, so a provider allowed only for one specific tool and absent from `default:` is hidden from the *messages* even though tasks route to it (no such provider exists today; the log still records it). The filter is **fail-open and never empty**: a lost or unreadable policy.yaml re-adds gemini to every status message, and a policy barring everything still prints all four — noise in the safe direction, chosen over blanking the status display at 03:00. And the list is *not* universal: `limits.py`'s own cclimits enumerations (in `_providers_with_429()` and `_apply_429_fallback()` — named rather than line-numbered, because the two pointers written here on 2026-09-09 were already off by six lines when they were committed) and `quota_state.py:51` stay hand-written on purpose (opencode has no cclimits quota to probe), while `orchestrator.py:2744` (`--check-limits`) still hand-counts all four — complete today, and left alone deliberately; see ROADMAP.
+Three consequences worth knowing. The display filter asks the **`default:` entry**, so a provider allowed only for one specific tool and absent from `default:` is hidden from the *messages* even though tasks route to it (no such provider exists today; the log still records it). The filter is **fail-open and never empty**: a lost or unreadable policy.yaml re-adds gemini to every status message, and a policy barring everything still prints all four — noise in the safe direction, chosen over blanking the status display at 03:00. And the list is *not* universal: `limits.py`'s own cclimits enumerations (in `_providers_with_429()` and `_apply_429_fallback()` — named rather than line-numbered, because the two pointers written here on 2026-09-09 were already off by six lines when they were committed) and `quota_state.py:51` stay hand-written on purpose (opencode has no cclimits quota to probe), while `orchestrator.py:3379` (`--check-limits`) still hand-counts all four — complete today, and left alone deliberately; see ROADMAP.
 
 **`.dev-loop/` grows one subdirectory per distinct task text, and nothing prunes it.** Output is keyed by task since 2026-09-09 — `{cwd}/.dev-loop/<task-hash>/`, so two dev-loop tasks pointed at the same repo no longer overwrite each other's `research-and-plan.md`, `round-00N.md`, `summary.md` or `state.json` (they did until then: the path used the cwd alone and `_task_hash()` only ever reached the *inside* of `state.json`). The parent `.dev-loop/` deliberately keeps its name, because `ToolTracer` derives `{cwd}/.dev-loop/traces/` from the *tool name* and `analytics` globs `**/.*/traces/*.jsonl` — a renamed parent would move every trace file and change tool attribution. Two consequences: **pre-2026-09-09 artefacts are not migrated, moved or deleted** (they stay directly under `.dev-loop/`, and a run interrupted by the upgrade still resumes — `_load_state()` falls back to the shared `.dev-loop/state.json` after validating its task hash), and **neither location is ever cleaned up**. Editing a task's text creates a new subdirectory rather than continuing the old one. Deleting run artefacts automatically was rejected as destructive housekeeping; do it by hand.
 
@@ -387,6 +387,10 @@ remember. Plain tasks (no `#tool:`) in permanently dirty repos are unaffected.
   are what actually runs; the parent itself is exempt.
 - There is **no** automatic branch switch or reset: a reset can destroy work from
   another session, and refusing to start makes the same mistake just as visible.
+- Terminal rather than parked: nothing cleans the tree on its own, so a park would
+  re-check the same dirty tree every poll, forever and unattended.
+- **Not covered:** a *clean* tree left on a foreign branch. The orchestrator cannot
+  know which branch a task expects — that lives only in the prompt text.
 
 ### Per-task auto-commit (`orch/<id>-<date>`)
 
@@ -433,10 +437,7 @@ determined, nothing is committed at all rather than guessed.
 Not covered (deliberate): `#parallel`/`#worktree`, push/PR/merge, model-written
 commit messages, and retention for old `orch/*` branches — a recurring `#every:` task
 therefore accrues one branch per day.
-- Terminal rather than parked: nothing cleans the tree on its own, so a park would
-  re-check the same dirty tree every poll, forever and unattended.
-- **Not covered:** a *clean* tree left on a foreign branch. The orchestrator cannot
-  know which branch a task expects — that lives only in the prompt text.
+
 
 ### Terminal failures (`- [x] … ❌ …`)
 
@@ -749,20 +750,33 @@ A battle-tested 8-step queue pattern for implementing a plan end-to-end with cos
 
 **Recommendation:** keep plans small (one feature / one phase per plan file) and apply this flow per plan. For multi-phase changes, split the plan file into several smaller ones — one commit per plan is cleaner than one commit for many phases.
 
+> **Why every writing step carries `#no-commit`.** This whole chain is built on one
+> thing: each step inspects the *uncommitted* changes the previous step left in the
+> working tree. Since the per-task auto-commit landed (2026-09-11) a successful run
+> commits its own paths and restores them — so without the tag, step 1 would leave an
+> empty tree and step 2 would audit nothing. The prose "dont commit the changes!" that
+> used to stand here is an instruction to the *provider*; the orchestrator's own commit
+> does not read prose, only the tag. Step 6 (`critical-review`) needs no tag because it
+> is `read_only`, and step 8 is the one that is *supposed* to commit.
+>
+> This is the general shape, not a quirk of this template: **any `#needs:` chain whose
+> later steps consume the earlier steps' uncommitted diff needs `#no-commit` on every
+> writing step but the last.**
+
 ```markdown
-- [ ] Implement docs\plan-XXX.md. dont commit the changes! #id:ID1 #tool:dev-loop #claude_opus cwd:<repo>
+- [ ] Implement docs\plan-XXX.md. #no-commit #id:ID1 #tool:dev-loop #claude_opus cwd:<repo>
 
-- [ ] security-audit of the uncommitted changes. dont commit the changes! #id:ID2 #need:ID1 #tool:security-audit #claude_opus cwd:<repo>
+- [ ] security-audit of the uncommitted changes. #no-commit #id:ID2 #need:ID1 #tool:security-audit #claude_opus cwd:<repo>
 
-- [ ] use your simplify skill for the uncommitted changes. dont commit the changes! #id:ID3 #need:ID2 #claude_sonnet cwd:<repo>
+- [ ] use your simplify skill for the uncommitted changes. #no-commit #id:ID3 #need:ID2 #claude_sonnet cwd:<repo>
 
-- [ ] Review-fix loop for the uncommitted changes. dont commit the changes! #tool:review-loop #id:ID4 #need:ID3 #codex_mini cwd:<repo>
+- [ ] Review-fix loop for the uncommitted changes. #no-commit #tool:review-loop #id:ID4 #need:ID3 #codex_mini cwd:<repo>
 
-- [ ] Review-fix loop for the uncommitted changes. dont commit the changes! #tool:review-loop #id:ID5 #need:ID4 #codex cwd:<repo>
+- [ ] Review-fix loop for the uncommitted changes. #no-commit #tool:review-loop #id:ID5 #need:ID4 #codex cwd:<repo>
 
 - [ ] Critical review (read-only) of the uncommitted changes against docs\plan-XXX.md #tool:critical-review #pass1:claude #pass2:codex #id:ID6 #need:ID5 cwd:<repo>
 
-- [ ] Review-fix loop for the uncommitted changes. Also incorporate findings from the most recent critical-review report in docs/. dont commit the changes! #tool:review-loop #id:ID7 #need:ID6 #claude_opus cwd:<repo>
+- [ ] Review-fix loop for the uncommitted changes. Also incorporate findings from the most recent critical-review report in docs/. #no-commit #tool:review-loop #id:ID7 #need:ID6 #claude_opus cwd:<repo>
 
 - [ ] 1. check the uncommitted changes. 2. update all docs in the repo and the Obsidian Project. 3. commit it. #need:ID7 #claude_haiku cwd:<repo>
 ```
@@ -951,12 +965,18 @@ The calibrated factors are plan- and workload-specific (env-overridable, not uni
 - Non-destructive git rollback point before each task, written to
   `refs/orchestrator-backup/<timestamp>` (not to your `git stash` list) and capped
   by age/count. Restore: `git stash apply refs/orchestrator-backup/<timestamp>`
+- **The orchestrator writes git state itself**, on by default: after a successful task
+  it commits that run's paths to `orch/<id>-<date>` and restores them in the working
+  tree. HEAD is never moved, nothing is ever pushed, and a path is only touched when
+  the index agrees with HEAD *and* the path was clean when the run started. Switch it
+  off with `GIT_AUTO_COMMIT=false`, or per queue line with `#no-commit`. See
+  [Per-task auto-commit](#per-task-auto-commit-orchid-date)
 
 ## Prompt Budget (Token Allocation)
 
 | Component | Budget | Source |
 |---|---|---|
-| Core (task + safety) | uncapped | `SOUL.md`, falling back to `SYSTEM_PROMPTS` (`config.py:325`) — `get_system_prompt` (`config.py:906`), called without truncation in `orchestrator.py:371` |
+| Core (task + safety) | uncapped | `SOUL.md`, falling back to `SYSTEM_PROMPTS` (`config.py:402`) — `get_system_prompt` (`config.py:1091`), called without truncation in `orchestrator.py:1089` |
 | Curated Memory (L1) | ~500 tokens | `MEMORY.md` |
 | Daily Log (L2) | ~500 tokens | `daily/` |
 | TF-IDF Memory (L3) | ~2000 tokens | `memory.py` |
@@ -1037,14 +1057,14 @@ orchestrator.py
 ## Testing
 
 ```bash
-# Run all tests (2533 tests, ~90-125 s) — fixed order, see below
+# Run all tests (2711 tests, ~90-155 s) — fixed order, see below
 python -m pytest tests/ -q -p no:randomly
 
 # Run a single test file
 python -m pytest tests/test_parallel_runner.py -v
 ```
 
-`-p no:randomly` is not cosmetic: `tests/test_telegram_listener.py` leaks state under some orderings, so `pytest-randomly` can colour the suite red without a code change. Last measured green run: **2533 passed / 0 failed in 93 s** (2026-09-09; the same suite took 123 s at 2447 tests on 2026-09-05 and 99 s at 2098 on 2026-08-15, so treat 90-125 s as the band — the spread is machine load, not test count).
+`-p no:randomly` is not cosmetic: `tests/test_telegram_listener.py` leaks state under some orderings, so `pytest-randomly` can colour the suite red without a code change. Last measured green run: **2711 passed / 0 failed in 148 s** (2026-09-11; 2533 in 93 s on 2026-09-09, 123 s at 2447 tests on 2026-09-05, 99 s at 2098 on 2026-08-15 — so treat 90-155 s as the band; the spread is machine load, plus the ~35 tests that drive real git subprocesses in `tmp_path` since the per-task auto-commit landed, which are seconds rather than milliseconds by design).
 
 ## Contributing
 

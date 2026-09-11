@@ -34,6 +34,61 @@ Provider selection with fallback chain (**`_PRIORITY = ["claude", "codex"]`** si
 
 **`_NO_FALLBACK_PROVIDERS = {"vibe", "opencode"}`** (renamed from `_REVIEWER_ONLY` 2026-09-04 when opencode joined it — "reviewer-only" stopped describing a set containing a writing provider). Tag resolution normally uses `_providers.get(name)`, so a tag for an unregistered provider falls through to the default chain. That is fine for OpenRouter (executor replaced by executor) but wrong for these two, for two DIFFERENT reasons: Vibe is a non-writing reviewer, so a silent fallback would hand the job to a file-writing executor (blast radius); opencode DOES write, but the tag itself is the ask — avoiding Claude quota, or (customer code) the only ZDR-guaranteed path — so a silent fallback would defeat the point of tagging it at all, not widen a blast radius. `_tags_unregistered_no_fallback_provider(task)` returns the specific provider name (not just a bool) so `select_provider()`'s park log line names which one — "vibe fehlt" and "opencode fehlt" read as different problems in an unattended run. Precedence detail unchanged: an explicit forced provider (`resolve_forced_provider`) wins, so the guard only fires when no other provider was explicitly demanded.
 
+## `git_commit.py`
+
+Per-task auto-commit, added 2026-09-10. `commit_run_result(cwd, task, provider, snap_before, snap_after=None)`
+returns a `CommitOutcome(branch, sha, files, skipped, error, skipped_paths)` and **never raises**
+(outer `except BaseException`, with `KeyboardInterrupt`/`SystemExit` deliberately re-raised
+BEFORE it — the same ordering rule `orchestrator.main()` documents, so a `#shutdown` task's
+`SystemExit` cannot be swallowed by a commit attempt).
+
+Sequence, all of it plumbing so **HEAD never moves**:
+
+1. Preconditions, each a silent no-op with its own `skipped` code: `disabled`, `no_snapshot`,
+   `not_a_repo`, `no_head`. A git binary that cannot be executed still returns "not a repo"
+   (the conservative direction) but now logs a WARNING first — a systemic failure must not
+   look like an expected skip.
+2. `snap_after` (passed in by the caller, else `orchestrator._snapshot_dir` imported LAZILY —
+   `orchestrator` imports this module at module level, so a top-level import here would cycle;
+   `limits.py`'s lazy `dispatcher` import is the existing precedent).
+3. Candidates = created ∪ modified ∪ deleted, `/`-normalised, `.git/` dropped. Over
+   `GIT_COMMIT_MAX_FILES` → WARNING skip.
+4. One `git status --porcelain -z -uall` for the whole repo (no pathspecs on the command line:
+   Windows argv limit). `-z` is load-bearing — without it git octal-quotes non-ASCII paths and
+   every filename with an umlaut silently drops out of the intersection. Candidates are
+   cwd-relative, status is worktree-root-relative, so `git rev-parse --show-prefix` bridges the
+   two. Rename/copy entries carry a second NUL-terminated origin field that must be consumed or
+   every following entry parses one field short.
+5. **The touchability rule.** Only paths whose index column X is `' '` or `'?'` (`_TOUCHABLE_INDEX_X`,
+   an allow-list, so an unknown future status character is skipped rather than committed), and
+   with no `R`/`C` in either column. Everything else is skipped, counted into `skipped_paths` and
+   logged at WARNING. This one rule covers foreign staging, merge conflicts (`UU`) and renames.
+6. The orchestrator's own bookkeeping files (queue, its `.lock`, `agent-queue-erledigt.md`,
+   derived from `queue_manager.QUEUE_FILE`) are dropped — see the CLAUDE.md entry for why
+   committing the queue file would re-open a finished task forever.
+7. Commit: temp index via `GIT_INDEX_FILE` (child env is a COPY of `os.environ`; providers are
+   shared singletons across threads), `read-tree <head_sha>` — the sha, never the symbolic
+   `HEAD`, or tree and parent could describe different starting points — `git add -A` in
+   argv-safe chunks (`_pathspec_chunks`, budgeted by BYTES with a count cap), `write-tree`,
+   `commit-tree ... -F -` (message via stdin: a task text can carry quotes and newlines).
+   Every pathspec is prefixed `:(literal)`; `--` ends option parsing but does NOT literalise,
+   so a filename containing glob metacharacters would otherwise reach neighbouring files.
+8. `update-ref refs/heads/<branch> <sha> ""` — empty oldvalue = create-only, `_2` suffix on
+   collision, same pattern as `_git_snapshot`. All attempts used → `error="branch_collision"`
+   and the worktree is left untouched (the dangling commit is gc'd; nothing is lost).
+9. Cleanup, only after the ref exists: a SECOND `git status` first, and any path whose status
+   changed since the first read is left alone (closes the destructive half of the race window).
+   Then `git checkout <head_sha> -- <literal paths>` for tracked paths and `os.remove` for
+   untracked ones — never `git clean -f`, which is in `SAFETY_DENY_PATTERNS` and would be a
+   blunter instrument than an explicit, auditable list.
+10. Success on `print` AND `logger` (`run_orchestrator.ps1` starts `--watch` without stdout
+    redirection).
+
+Caller: `orchestrator._commit_run_changes()` owns the WHETHER (the `#no-commit` tag, the
+read-only-tool gate, containment of anything that escapes) and `_with_commit_note()` puts the
+commit line in FRONT of the change summary, because `notifier.notify_task_done` truncates that
+field to 500 characters and an appended branch name is exactly what a large diff would cut off.
+
 ## `queue_manager.py`
 
 Obsidian MD queue parsing with sidecar `.lock` file locking (msvcrt on Windows, fcntl on Unix). Regex-based metadata extraction (`cwd:`, `#tool:`, `#agent:`, `#parallel`, `#claude_*`, `#id:`, `#needs:`, `#pass1:`, `#pass2:`, etc.). `extract_pass_providers()` returns `{1: "claude", 2: "gemini"}` for cross-provider tool support. UTF-8 with cp1252 fallback. Smart wikilink/file context injection with TF-IDF section extraction; the 7 500-char budget (`PROMPT_WIKILINK_TOKENS` × 5) is split by `_share_budget()` across **only the refs that resolve and read**, smallest need first, so an unresolvable ref no longer claims a share (fixed 2026-08-28). All of `collect_file_context()` reports through `logger`, not `print`. `_parse_subtask_line()` shared helper used by both `read_queue_items()` and `_replace_open_task_line()`. Subtask-aware task matching in queue mutations (mark_done/mark_retry/finalize) prevents wrong-task collisions in parallel queues. Two-pass dependency resolution in `read_queue_items()`: Pass 1 collects open tasks, Pass 2 resolves `#needs:` deps against completed IDs (`_collect_completed_ids()` scans `[x]` and `[-]` lines but skips a `[x]` carrying the terminal-failure stamp ❌ — `line_is_failed()`). `mark_done()`/`finalize_task_with_result()` take `failed=` and share `_completion_line()`; `_DONE_TASK_TS_RE` archives ✅ and ❌ lines alike. Blocked tasks get `QueueTask.blocked_reason != ""` and are skipped by `run_once()` without marking done.

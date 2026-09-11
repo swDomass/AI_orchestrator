@@ -179,6 +179,45 @@ def test_strip_metadata_tags_removes_second_opinion():
     assert "Review changes" in stripped
 
 
+def test_has_no_commit_tag_is_case_insensitive():
+    assert queue_manager.has_no_commit_tag("Task #no-commit") is True
+    assert queue_manager.has_no_commit_tag("Task #NO-COMMIT") is True
+    assert queue_manager.has_no_commit_tag("Task #No-Commit") is True
+    assert queue_manager.has_no_commit_tag("Task #tool:dev-loop") is False
+
+
+def test_has_no_commit_tag_requires_left_word_boundary():
+    # No boundary before '#' (preceded by 'C', not whitespace/start) — must not match,
+    # same rule PROVIDER_TAG_RE/MODEL_TAG_RE enforce via (?<!\S).
+    assert queue_manager.has_no_commit_tag("Implement C#no-commit bridge") is False
+
+
+def test_has_no_commit_tag_does_not_partially_match_hyphenated_continuation():
+    # Mirrors ALLOW_DIRTY_TAG_RE's measured behaviour: the lookahead `(?=\s|$)` only
+    # allows whitespace or end-of-string after "no-commit", so "-later" blocks the
+    # match entirely (not just the tag reading) — there is no other position in the
+    # string where the literal "#no-commit" recurs, so the tag goes undetected and
+    # the raw text is left untouched by strip_metadata_tags, same as #allow-dirty-later
+    # would be.
+    task = "Task #no-commit-later"
+    assert queue_manager.has_no_commit_tag(task) is False
+    assert queue_manager.strip_metadata_tags(task) == task
+
+
+def test_strip_metadata_tags_removes_no_commit():
+    task = "Ship the fix #no-commit #tool:dev-loop cwd:/d/proj"
+    stripped = queue_manager.strip_metadata_tags(task)
+    assert "#no-commit" not in stripped
+    assert "Ship the fix" in stripped
+
+
+def test_strip_metadata_tags_all_metadata_line_strips_to_empty_string():
+    # Load-bearing case: orchestrator.run_once() uses an empty string after stripping
+    # to detect "this line was nothing but routing tags" — see the comment above the
+    # EFFORT_ATTEMPT_RE call in strip_metadata_tags().
+    assert queue_manager.strip_metadata_tags("#tool:dev-loop #no-commit") == ""
+
+
 def test_mark_done_handles_backslashes_in_task_text(mock_queue_file):
     task = r"Fix path handling in C:\proj\file.py"
     mock_queue_file.write_text(f"## Queue\n- [ ] {task}\n", encoding="utf-8")

@@ -333,3 +333,50 @@ Codex and Gemini providers also have CLI-level resume capabilities, but `support
 - CWD validation against `ALLOWED_CWD_ROOTS` — rejects relative paths and parent escapes.
 - Skill gating checks requirements (bins, env vars, OS, provider) before execution.
 - Policy layer can block tasks pending Telegram approval.
+
+
+## Per-task auto-commit — HEAD never moves
+
+Added 2026-09-10 (`git_commit.py`). The counterpart to the clean-worktree gate: the gate stops a
+dirty tree from corrupting a dev-loop's own review subject, this stops the dirty tree from
+existing in the first place. A successful run's paths land on `orch/<slug>-<date>` and are then
+restored in the working tree.
+
+**Why plumbing and not a checkout dance.** `git checkout -b` + `git checkout <orig>` is two
+commands shorter and leaves HEAD on a foreign branch if the process dies between them — the
+measured `nightstash` failure of 2026-09-03 that this feature exists to remove. Building the
+commit through a temporary index (`GIT_INDEX_FILE`) + `commit-tree` + `update-ref` never touches
+HEAD, the real index or the worktree until the commit object is safely referenced, so the worst
+crash state is "branch exists, tree still dirty" — today's status quo, never worse.
+
+**Two independent rules carry the safety argument, and one of them alone is not enough.**
+
+*Rule 1 — the index must agree with HEAD* (`X in {' ', '?'}`, an allow-list so a future git
+status character is skipped rather than committed). Measured justification: `git checkout
+HEAD -- <path>` on a path whose index already differs discards that staged content from index
+AND worktree, and it does not reach our commit either (`git add` takes the worktree state).
+The same rule falls out correctly for merge conflicts (`UU`) and, with an `R`/`C` check on both
+columns, for renames — three cases, no special-casing.
+
+*Rule 2 — the path must have been CLEAN when the run started* (`dirty_before`, captured by the
+orchestrator next to `snap_before`). Rule 1 covers the **staged** half and only that half: it
+asks whether something is staged, never who wrote it, and nobody stages mid-typing. Without
+rule 2 the module's whole attribution is a `(mtime, size)` diff across the entire task
+duration — minutes to hours for a dev-loop, while `--watch` keeps running and the user is at
+the same machine. Anything a human edits in that window reads as the run's own work: committed
+under our message and reset on disk, with `git status` reporting a clean tree afterwards.
+Measured on a throwaway repo in the adversarial review, not reasoned about. `dirty_before is
+None` means "baseline unavailable" and is deliberately **not** the same as "nothing was dirty":
+it skips the commit entirely, because the attribution would be unprovable. The rule costs
+nothing where the feature is actually used — `requires_clean_worktree` guarantees an empty
+baseline for every `#tool:dev-loop` run — and only bites on a single-shot task in an already
+dirty tree, which is exactly the case it exists for.
+
+An earlier version of this section claimed rule 1 ruled the destructive case out
+"structurally". It ruled out one of its two halves.
+
+**Ordering is a guardrail, in both directions.** The call sits inside `if verify.ok:` at both
+success paths, i.e. after finalization and after the `#verify:` outcome check. A verify script
+inspects artefacts that the commit removes from the tree, so it must run first; and a red
+`#verify:` means the run reported success without producing the result, which must not be
+committed. No `#verify:` tag yields `VerifyOutcome().ok == True`, so one branch covers both.

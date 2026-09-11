@@ -346,6 +346,50 @@ GIT_SNAPSHOT_MAX_AGE_DAYS = 30
 # routine pruner. The protect window can starve it; see _prune_snapshot_refs.
 GIT_SNAPSHOT_MAX_COUNT = 50
 
+# --- Auto-commit (git_commit.py) --------------------------------------------
+# A successful unattended run left its work uncommitted in the tree, which is
+# why the SECOND dev-loop in the same repo died terminal on worktree_dirty
+# (nightstash -> nightfloor, measured 2026-09-03/04). Default ON so the normal
+# case is "work lands on its own branch"; toggle in .env (GIT_AUTO_COMMIT=false)
+# for instant rollback -- same _parse_bool_env pattern as CLAUDE_SESSION_ENABLED.
+GIT_AUTO_COMMIT = _parse_bool_env("GIT_AUTO_COMMIT", True)
+# Own namespace, mirroring GIT_SNAPSHOT_REF_PREFIX: never touches branches the
+# user made by hand, so a `git branch` listing tells "mine" from "the orchestrator's"
+# at a glance.
+GIT_COMMIT_BRANCH_PREFIX = "orch/"
+# Bounded retries when two branch names collide (same #id:/task-hash on the same
+# day) -- analogous to GIT_SNAPSHOT_REF_MAX_ATTEMPTS, same reasoning: bail out
+# loudly instead of looping forever on a name that will never free up.
+GIT_COMMIT_BRANCH_MAX_ATTEMPTS = 4
+# A normal task run touches a handful of files; anything past this is more likely
+# a stray build/vendor directory than deliberate work, and committing it silently
+# would bury the real diff. Surfaced as a WARNING skip, not a hard error.
+GIT_COMMIT_MAX_FILES = 200
+# `git log --oneline` / GitHub PR titles are read as single lines; a longer
+# subject just wraps ugly instead of communicating more.
+GIT_COMMIT_SUBJECT_MAX_LEN = 72
+# Used only when `git config user.email` is unset in the target repo -- commit-tree
+# refuses an empty identity, and a fresh clone or CI checkout often has none.
+GIT_COMMIT_FALLBACK_AUTHOR_NAME = "AI Orchestrator"
+GIT_COMMIT_FALLBACK_AUTHOR_EMAIL = "orchestrator@localhost"
+# Pathspecs are passed to `git add` / `git checkout` in chunks. The binding unit is
+# BYTES, not the file count: Windows caps a CreateProcess command line at 32767
+# characters, and 100 paths near MAX_PATH (260) already come to ~26000 -- close
+# enough that a slightly deeper tree crosses it, with an opaque git error as the
+# failure mode. 6000 leaves an order of magnitude of headroom and costs only a few
+# extra subprocess calls in the rare large-diff case.
+GIT_COMMIT_ARGV_BUDGET_BYTES = 6000
+# Second, cheap ceiling next to the byte budget -- bounds the per-call work for
+# short paths, where the byte budget alone would allow thousands per call.
+GIT_COMMIT_PATHS_PER_CALL = 100
+# Timeout fuer die `git checkout`-Aufrufe des Cleanups. Deutlich groesser als die
+# 30 s der uebrigen Aufrufe, weil hier das REPO auf dem Spiel steht und nicht nur
+# der Commit: wird ein `git checkout` gekillt, kann `.git/index.lock` liegen
+# bleiben und danach scheitert jeder git-Aufruf in diesem Repo. Ein Checkout auf
+# einem OneDrive-Repo muss Platzhalter rehydrieren und einen Virenscanner
+# passieren -- 30 s sind dafuer knapp, 120 s sind es nicht.
+GIT_COMMIT_CLEANUP_TIMEOUT_SEC = 120
+
 # System prompts per provider (prepended to each task)
 _BASE_PROMPT = "Antworte auf Deutsch, praegnant und strukturiert."
 SYSTEM_PROMPTS: dict[str, str] = {

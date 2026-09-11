@@ -152,6 +152,12 @@ KEEP_WORKTREE_TAG_RE = re.compile(r"(?i)(?<!\S)#keep-worktree(?=\s|$)")
 # uncommitted work permanently, where a task is explicitly told not to write.
 ALLOW_DIRTY_TAG_RE = re.compile(r"(?i)(?<!\S)#allow-dirty(?=\s|$)")
 
+# Matches #no-commit tag — opt-OUT of automatic committing of a run's result, for
+# this single queue line. Per-line rather than a global switch, because most tasks
+# in the same queue should keep auto-committing; this is for the repo or task where
+# a human wants to review the diff before it becomes a commit.
+NO_COMMIT_TAG_RE = re.compile(r"(?i)(?<!\S)#no-commit(?=\s|$)")
+
 # Matches model selection tags across ALL providers (claude/gemini/codex/vibe/openrouter).
 # Derived from dispatcher._TAG_MAP instead of hand-copied, so this cannot silently fall
 # behind again — that drift is exactly how this regex used to cover only 6 of the 20
@@ -824,6 +830,11 @@ def has_allow_dirty_tag(task: str) -> bool:
     return bool(ALLOW_DIRTY_TAG_RE.search(task))
 
 
+def has_no_commit_tag(task: str) -> bool:
+    """Return True if #no-commit is present (skip auto-commit of the run result)."""
+    return bool(NO_COMMIT_TAG_RE.search(task))
+
+
 def extract_model_tag(task: str) -> str | None:
     """Extract a model alias tag for any provider.
 
@@ -986,6 +997,7 @@ def strip_metadata_tags(task: str) -> str:
     task = KEEP_WORKTREE_TAG_RE.sub("", task)   # must precede WORKTREE_TAG_RE — shared "worktree" stem
     task = WORKTREE_TAG_RE.sub("", task)
     task = ALLOW_DIRTY_TAG_RE.sub("", task)
+    task = NO_COMMIT_TAG_RE.sub("", task)
     task = MODEL_TAG_RE.sub("", task)
     # Routing metadata like the model tag — must be stripped, or the level ends up in
     # the prompt as literal text AND the "line was nothing but metadata" guard in

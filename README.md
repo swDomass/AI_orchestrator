@@ -277,6 +277,7 @@ The orchestrator automatically appends `## Results` and `## Log` sections to eac
 | Skip stale slot | `#freshonly` | `- [ ] Daily brief #at:08:00 #every:24h #freshonly` |
 | Stale grace window | `#grace:<duration>` | `- [ ] Recap #at:19:00 #every:24h #freshonly #grace:4h` |
 | Shutdown after task | `#shutdown` | `- [ ] Backup #shutdown` |
+| Skip the per-task auto-commit | `#no-commit` | `- [ ] Try something #no-commit cwd:D:\repo` |
 | Post-task outcome check | `#verify:<script>` | `- [ ] Daily brief #verify:scripts\check_brief.ps1` |
 | Cross-provider pass | `#pass1:<provider>`, `#pass2:<provider>` — provider is `claude`, `gemini`, `codex`, `vibe`, `openrouter` or `opencode` | `#pass1:claude #pass2:codex` |
 | Preapproval | `#approve:<category,...>` | `#approve:push,publish` |
@@ -384,6 +385,52 @@ remember. Plain tasks (no `#tool:`) in permanently dirty repos are unaffected.
   are what actually runs; the parent itself is exempt.
 - There is **no** automatic branch switch or reset: a reset can destroy work from
   another session, and refusing to start makes the same mistake just as visible.
+
+### Per-task auto-commit (`orch/<id>-<date>`)
+
+A successful run commits **its own** changes onto a branch of its own and leaves the
+working tree clean, so the next `#tool:dev-loop` in the same repo does not die on
+`worktree_dirty` and the morning review gets one branch per task to read, merge or
+throw away. On by default; `GIT_AUTO_COMMIT=false` in `.env` turns it off globally,
+`#no-commit` for a single queue line.
+
+**HEAD is never moved.** The commit is built through a temporary index
+(`GIT_INDEX_FILE`) plus `commit-tree` and `update-ref`; only afterwards are the
+committed paths restored in the working tree. A `git checkout -b` / `git checkout
+<orig>` pair would be shorter but leaves HEAD on a foreign branch if the process
+dies between the two commands — the measured `nightstash` failure this exists to fix.
+
+Which paths: exactly the ones the before/after `_snapshot_dir` comparison reports,
+intersected with what git actually sees, **and only where the index agrees with
+HEAD**. A path someone else has staged (`MM`, `AM`, a merge conflict's `UU`, a
+rename) is skipped entirely and reported — touching it would discard that staged
+content. Pathspecs are passed as `:(literal)` so a filename containing glob
+metacharacters cannot reach a neighbouring file.
+
+Silent no-op when: no git repo, no diff, unborn HEAD, `#no-commit`, a read-only
+tool, or a **red `#verify:`** — a run that reported success without producing the
+result must not be committed. A commit that fails does not make the task red; it
+rides along in the Telegram report as a warning.
+
+Two rules decide which paths may be touched, and both must hold: the **index must
+agree with HEAD** (so nothing someone staged is ever discarded) and the path must have
+been **clean when the run started** (so a file a human edits during a `--watch` run is
+never mistaken for the run's own work — measured: without it, an unstaged live edit ends
+up in the branch and back at its HEAD content on disk). If the pre-run state cannot be
+determined, nothing is committed at all rather than guessed.
+
+> **Upgrading an existing install:** this is ON by default and it *writes git state* —
+> after a successful task it commits the run's paths and restores them in the working
+> tree. If your workflow is "read the diff in the tree in the morning", that diff now
+> lives on an `orch/*` branch instead. Set `GIT_AUTO_COMMIT=false` to keep the old
+> behaviour. Note that `#allow-dirty` (which waives the clean-worktree gate for a repo
+> that permanently carries uncommitted work) does **not** imply `#no-commit` — the
+> clean-at-start rule protects that work, but combining the two tags is the explicit way
+> to keep the orchestrator out of git entirely for such a repo.
+
+Not covered (deliberate): `#parallel`/`#worktree`, push/PR/merge, model-written
+commit messages, and retention for old `orch/*` branches — a recurring `#every:` task
+therefore accrues one branch per day.
 - Terminal rather than parked: nothing cleans the tree on its own, so a park would
   re-check the same dirty tree every poll, forever and unattended.
 - **Not covered:** a *clean* tree left on a foreign branch. The orchestrator cannot

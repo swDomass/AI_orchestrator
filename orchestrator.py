@@ -44,6 +44,7 @@ from logging_setup import install_thread_excepthook, setup_logging
 
 from config import (
     GIT_AUTO_STASH,
+    GIT_COMMIT_MAX_FILES,
     GIT_SNAPSHOT_MAX_AGE_DAYS,
     GIT_SNAPSHOT_MAX_COUNT,
     GIT_SNAPSHOT_PROTECT_DAYS,
@@ -112,6 +113,7 @@ from queue_manager import (
     finalize_task_with_result,
     has_allow_dirty_tag,
     has_cwd_tag,
+    has_no_commit_tag,
     has_verify_tag,
     mark_done,
     mark_retry,
@@ -122,6 +124,7 @@ from queue_manager import (
     strip_metadata_tags,
 )
 from providers.process_runner import run_with_watchdog
+import git_commit
 import replay
 from telegram_listener import TelegramListener
 from tools import extract_tool_tag, get_tool, list_tools
@@ -865,6 +868,140 @@ def _get_change_summary(cwd: str | None, snap_before: dict | None, is_git: bool 
         return _diff_snapshot(snap_before, snap_after)
 
     return ""
+
+
+def _commit_run_changes(
+    task: str,
+    cwd: str | None,
+    provider_label: str,
+    snap_before: dict[str, tuple[float, int]] | None,
+    *,
+    dirty_before: frozenset[str] | None = frozenset(),
+    read_only: bool = False,
+) -> str:
+    """Commit this run's own changes onto a per-task branch; return a note for the report.
+
+    The WHETHER lives here, the HOW lives in ``git_commit``. Three gates, each a
+    silent no-op:
+
+    * ``#no-commit`` on the queue line -- the per-task opt-out.
+    * ``read_only`` -- the same predicate ``_git_snapshot`` already uses to decide
+      "this run is expected to change the repo". A read-only tool's report file is
+      an artefact, not work, and keeping the two decisions on one predicate means
+      they cannot drift apart.
+    * everything ``git_commit.commit_run_result`` itself refuses (no repo, no diff,
+      unborn HEAD, feature switched off).
+
+    Placement, deliberately: both call sites invoke this INSIDE ``if verify.ok:``,
+    i.e. after finalization and after the ``#verify:`` outcome check. That order is
+    load-bearing in both directions. A verify script inspects the artefacts the run
+    produced, and after the commit those artefacts are out of the working tree --
+    running it afterwards would check an empty tree. And a red ``#verify:`` means
+    the run reported success without doing the work, which must not be committed.
+    A task with no ``#verify:`` tag gets ``VerifyOutcome()`` with ``ok=True``, so
+    the single branch covers "no tag" and "tag green" alike.
+
+    A failed commit does NOT make the task red (Auftrag KERN 3): the work happened,
+    only its filing did not. It goes out as a WARNING on both sinks and rides along
+    in the Telegram report instead of raising a second alarm.
+    """
+    if read_only or not cwd or snap_before is None:
+        return ""
+    if has_no_commit_tag(task):
+        logging.getLogger(__name__).debug("git_commit: #no-commit gesetzt, kein Commit")
+        return ""
+
+    try:
+        outcome = git_commit.commit_run_result(
+            cwd, task, provider_label, snap_before, snap_after=_snapshot_dir(cwd),
+            dirty_before=dirty_before,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise  # deliberate abort -- same ordering rule as main() and git_commit
+    except BaseException as exc:  # see below
+        # git_commit.commit_run_result promises "never raises", and this is the
+        # belt to that braces: a promise is not a guarantee, and the _snapshot_dir
+        # call in the argument list above runs OUTSIDE the module's own handler.
+        # Without this, an exception here leaves run_once() entirely -- for a
+        # #tool: task the only enclosing block is a try/FINALLY (restoring the
+        # forced model/effort), so nothing catches it and the whole poll iteration
+        # dies. That contradicts Auftrag KERN 3: a failed commit must be folgenlos
+        # for the task and surface as a WARNING, not ride the process-crash breaker
+        # and charge the task a fruitless attempt it did not earn.
+        logging.getLogger(__name__).warning(
+            "git_commit: unerwartete Exception beim Commit (cwd=%s): %s", cwd, exc,
+            exc_info=exc,
+        )
+        return f"⚠️ Commit fehlgeschlagen (unerwartet): {str(exc)[:300]}"
+
+    if outcome.branch:
+        note = (
+            f"Commit: {outcome.branch} ({(outcome.sha or '')[:8]}, "
+            f"{outcome.files} Datei(en))"
+        )
+        if outcome.skipped_paths:
+            # Ein Commit kann erfolgreich UND unvollständig sein: Pfade mit fremdem
+            # Index-Stand bleiben bewusst liegen. Ohne diesen Zusatz meldet die
+            # Morgenmeldung einen grünen Branch und verschweigt, dass Arbeit im
+            # Baum zurückblieb — und dass der nächste dev-loop im selben Repo
+            # deshalb an worktree_dirty stirbt.
+            note += (
+                f"\n⚠️ {outcome.skipped_paths} Pfad(e) nicht committet "
+                f"(fremder Index-Stand, bleiben im Baum)"
+            )
+        if outcome.unrestored_paths:
+            # Zweiter Weg zu derselben Konsequenz wie skipped_paths: die Datei steckt
+            # im Commit, wurde im Baum aber nicht zurueckgesetzt (jemand hat sie
+            # waehrend des Commits angefasst). Ohne diese Zeile meldet der Morgen
+            # einen sauberen Abschluss, und der naechste dev-loop stirbt trotzdem.
+            note += (
+                f"\n⚠️ {outcome.unrestored_paths} Pfad(e) committet, aber nicht "
+                f"aufgeräumt (während des Commits verändert) — Baum bleibt schmutzig"
+            )
+        if outcome.error:
+            # Branch steht, aber der Baum ist noch nicht sauber -- das ist genau der
+            # Zustand, der den naechsten dev-loop im selben Repo an worktree_dirty
+            # sterben laesst, also gehoert er in die Morgenmeldung.
+            note += f"\n⚠️ Commit unvollständig: {outcome.error}"
+        return note
+
+    if outcome.error:
+        return f"⚠️ Commit fehlgeschlagen: {outcome.error}"
+
+    # Nicht jeder `skipped`-Grund ist harmlos. Die meisten sind es ("kein Repo",
+    # "kein Diff", "abgeschaltet") und bleiben bewusst still. Diese beiden nicht:
+    # sie bedeuten "es GAB Arbeit, sie liegt uncommittet im Baum", und genau daran
+    # stirbt der nächste #tool:dev-loop im selben Repo an worktree_dirty. Ohne
+    # diesen Zweig wäre der Task grün, die Morgenmeldung ohne jeden Hinweis, und
+    # die Ursache erst am nächsten Fehlschlag sichtbar. Aus dem externen Review.
+    if outcome.skipped == "no_dirty_baseline":
+        return (
+            "⚠️ Kein Commit: der Git-Zustand vor dem Lauf war nicht ermittelbar, "
+            "eigene und fremde Änderungen wären nicht unterscheidbar gewesen."
+        )
+    if outcome.skipped == "too_many_files":
+        return (
+            f"⚠️ Kein Commit: mehr als {GIT_COMMIT_MAX_FILES} geänderte Pfade "
+            f"(sieht nach Build-Artefakten aus). Die Arbeit liegt uncommittet im Baum."
+        )
+    if outcome.skipped == "nothing_git_visible" and outcome.skipped_paths:
+        return (
+            f"⚠️ Kein Commit: alle {outcome.skipped_paths} geänderten Pfade tragen "
+            f"fremden Index-Stand und bleiben uncommittet im Baum."
+        )
+    return ""
+
+
+def _with_commit_note(note: str, change_summary: str) -> str:
+    """Put the commit note in FRONT of the change list.
+
+    ``notifier.notify_task_done`` truncates ``change_summary`` to 500 characters
+    (notifier.py:124). Appended, the branch name -- the one thing the morning
+    review starts from -- is exactly what falls off a large diff.
+    """
+    if not note:
+        return change_summary
+    return f"{note}\n{change_summary}" if change_summary else note
 
 
 def _truncate_tokens(text: str, max_tokens: int) -> str:
@@ -1665,6 +1802,11 @@ def _execute_tool_task(
     tool_is_read_only = getattr(tool, "read_only", False)
     is_git = bool(cwd) and _is_git_repo(cwd)
     snap_before = _snapshot_dir(cwd) if cwd and TRACK_FILE_CHANGES else None
+    # Muss HIER stehen, vor dem Lauf: was jetzt schon schmutzig ist, ist nicht die
+    # Arbeit dieses Laufs und darf vom Auto-Commit weder committet noch aufgeraeumt
+    # werden. Nach dem Lauf genommen waere die Aufnahme wertlos, weil dann alles
+    # schmutzig ist. Siehe git_commit.dirty_paths_snapshot().
+    dirty_before = git_commit.dirty_paths_snapshot(cwd) if (cwd and is_git) else frozenset()
     if cwd and not tool_is_read_only:
         _git_snapshot(cwd, is_git=is_git)
 
@@ -1736,6 +1878,14 @@ def _execute_tool_task(
                 cache_read_input_tokens=tool_result.cache_read_input_tokens,
             )
             if verify.ok:
+                change_summary = _with_commit_note(
+                    _commit_run_changes(
+                        task, cwd, provider_tool, snap_before,
+                        dirty_before=dirty_before,
+                        read_only=tool_is_read_only,
+                    ),
+                    change_summary,
+                )
                 append_log(f"Tool {tool.name} erledigt via {provider.name} ({tool_result.iterations}x): {task[:60]}")
                 notify_task_done(
                     task, provider_tool, tool_result.output,
@@ -2609,6 +2759,8 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # Safety: snapshot before execution
         is_git = bool(cwd) and _is_git_repo(cwd)
         snap_before = _snapshot_dir(cwd) if cwd and TRACK_FILE_CHANGES else None
+        # Vor dem Lauf, aus demselben Grund wie im #tool:-Pfad oben.
+        dirty_before = git_commit.dirty_paths_snapshot(cwd) if (cwd and is_git) else frozenset()
         if cwd:
             _git_snapshot(cwd, is_git=is_git)
 
@@ -2775,6 +2927,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 # the alarm already went out, and reporting success on both channels is
                 # exactly the contradiction this mechanism exists to remove.
                 if verify.ok:
+                    change_summary = _with_commit_note(
+                        _commit_run_changes(
+                            task, cwd, provider.name, snap_before,
+                            dirty_before=dirty_before,
+                        ),
+                        change_summary,
+                    )
                     append_log(f"Task erledigt via {provider.name}: {task[:60]}")
                     notify_task_done(
                         task, provider.name, result.output,

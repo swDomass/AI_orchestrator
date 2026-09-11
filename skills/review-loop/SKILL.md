@@ -43,3 +43,12 @@ Why: touching working code for cosmetics widens the diff without functional gain
 because the re-review re-reads the diff fresh, every P3 fix produces new diff that can
 surface new P3 — the loop feeds itself and burns iterations on style. Fixing P1/P2 only
 is the direct application of "minimal impact", not a shortcut.
+
+**Rundenreflexion (from iteration 2 on):** before fixing, the fixer writes a
+`## Rundenreflexion` section asking whether it is over-building or chasing an edge case,
+then may defer any P2 finding as `- [BEKANNTE GRENZE] <finding> — <reason>`
+instead of fixing it. A P1 can never be deferred this way — enforced in
+`tools/review_loop.py` (`validate_known_limits`), not only in the prompt. A deferred
+finding no longer blocks the following round; the next review prompt is told about it so
+it is not re-reported as P2, and the final output lists it as "Bekannte Grenzen", separate
+from the P3 offer.

@@ -500,9 +500,9 @@ Both schedule tags reuse the existing retry primitive — no separate scheduler.
 
 | Tool | Description |
 |---|---|
-| `dev-loop` | Research → Execute → Dual-Review loop (Code Quality + Issue Resolution). Both reviews must pass. Same **P1 + P2** semantics as `review-loop`: only blocking findings reach the executor, P3 is collected across all iterations and appended once as a closing offer. Output in `{cwd}/.dev-loop/<task-hash>/`. |
-| `review-loop` | Iterative Review → Fix → Re-Review loop. Fixes all **P1 + P2**; **P3 is non-blocking** and is reported once at the end as an offer instead of being fixed (cosmetics on working code widen the diff, and since each round re-reads the fresh diff, a P3 fix can surface new P3). A reviewer output that lists findings *and* the "no findings" sentinel counts as having findings — the sentinel alone used to pass the success gate with an unfixed blocker. Max 20 iterations with infinite-loop detection. Optional drift-check (`policy.yaml` `tool_phases.review-loop.drift_check_mode`, default `auto`) injiziert eine Refocus-Warning in den nächsten Fix-Prompt, wenn der Reviewer in unrelated Refactoring abgedriftet ist. |
-| `test-loop` | Iterative test / fix loop until tests pass or max iterations. |
+| `dev-loop` | Research → Execute → Dual-Review loop (Code Quality + Issue Resolution). Both reviews must pass. Same **P1 + P2** semantics as `review-loop`: only blocking findings reach the executor, P3 is collected across all iterations and appended once as a closing offer. From iteration 2 on, the executor writes a `## Rundenreflexion` section (over-building? chasing an edge case?) and may defer any P2 finding as `- [BEKANNTE GRENZE] <finding> — <reason>` instead of fixing it; a P1 can never be deferred this way. Deferred findings are listed as "Bekannte Grenzen" in the final output, separate from the P3 offer. Output in `{cwd}/.dev-loop/<task-hash>/`. |
+| `review-loop` | Iterative Review → Fix → Re-Review loop. Fixes all **P1 + P2**; **P3 is non-blocking** and is reported once at the end as an offer instead of being fixed (cosmetics on working code widen the diff, and since each round re-reads the fresh diff, a P3 fix can surface new P3). A reviewer output that lists findings *and* the "no findings" sentinel counts as having findings — the sentinel alone used to pass the success gate with an unfixed blocker. Max 20 iterations with infinite-loop detection. Optional drift-check (`policy.yaml` `tool_phases.review-loop.drift_check_mode`, default `auto`) injiziert eine Refocus-Warning in den nächsten Fix-Prompt, wenn der Reviewer in unrelated Refactoring abgedriftet ist. Same Rundenreflexion/BEKANNTE GRENZE mechanism as `dev-loop`, from iteration 2 of the fix prompt on. |
+| `test-loop` | Iterative test / fix loop until tests pass or max iterations. From iteration 2 on, the fixer may defer a test it judges an edge case beyond the task as `- [BEKANNTE GRENZE] <test id> — <reason>`; no P1/P2/P3 model here, and a deferral never turns the run green — it is listed as "Bekannte Grenzen" in the failure message. |
 | `research-qa` | Read-only pre-implementation research: Discovery → Analysis → Question catalogue. Output in `{cwd}/.research-qa/`. No code changes. |
 | `knowledge-transfer` | Cross-domain knowledge transfer: Vault expertise → industry applications (via web search) → Obsidian idea note. |
 | `critical-review` | 3-pass adversarial review: analysis → challenge → synthesis. Reference a plan file to get `{name}-v2.md`. Cross-provider via `#pass1:claude #pass2:codex`. Output in `{cwd}/docs/critical-review-*.md`. |
@@ -528,7 +528,10 @@ Phase 1 — Research + Plan  (merged into ONE subprocess call)
 
 Phase 2 — Execution
   Implements the solution based on the merged research+plan output.
-  On iteration > 1: includes findings from both prior reviews.
+  On iteration > 1: includes findings from both prior reviews, plus a
+  Rundenreflexion prompt (over-building? chasing an edge case?) that lets
+  the executor defer any P2 finding as a BEKANNTE GRENZE instead
+  of fixing it.
 
 Phase 3a — Code Quality Review  (P1/P2/P3, read-only)
   Checks: Correctness, Clean, Secure, Performant, Maintainable,

@@ -35,6 +35,13 @@ Implement tasks in a structured 3-phase loop:
    Why: touching working code for cosmetics widens the diff without functional gain, and
    since each review re-reads the diff fresh, every P3 fix can surface new P3 — the loop
    would feed itself and burn iterations on style.
+   **Rundenreflexion (from iteration 2 on):** before fixing, the executor writes a
+   `## Rundenreflexion` section asking whether it is over-building or chasing an edge
+   case, then may defer any P2 finding as `- [BEKANNTE GRENZE] <finding> — <reason>`
+   instead of fixing it. A P1 can never be deferred this way — enforced in
+   `tools/review_loop.py`, not only in the prompt. A deferred finding no longer blocks the
+   following round and is listed in the final output as "Bekannte Grenzen", separate from
+   the P3 offer.
 
 3. **Dual-Review** (both must pass before finishing, both read-only):
    - **Quality Review** (P1/P2/P3): correctness, security, performance, maintainability,

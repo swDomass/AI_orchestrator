@@ -472,6 +472,7 @@ def recalibrate_claude_factors(
     *,
     min_samples: int,
     clamp: float,
+    window_days: int,
     percentile: float = 25.0,
 ) -> "dict[str, int] | None":
     """Recompute conservative per-window ``io_only`` tokens-per-pct from the
@@ -481,18 +482,35 @@ def recalibrate_claude_factors(
 
     - **Schema-aware:** trusts only rows whose column count matches the current
       schema, sidestepping a stale/mixed CSV header (no DictReader).
+    - **Windowed:** rows older than ``window_days`` (measured against
+      ``timestamp_utc``, ISO-8601 with an explicit UTC offset) are dropped before
+      anything else. No default — every caller must decide the window explicitly
+      (see ``config.QUOTA_RECALIBRATE_WINDOW_DAYS``), the same "no silent default"
+      shape as ``min_samples``/``clamp`` below. Without this the function read the
+      CSV's entire history (15652 rows since 2026-05-21, measured 2026-09-16),
+      so a factor computed "now" could be a percentile over four months of
+      possibly-drifted usage rather than the recent behaviour Phase-2 drift
+      correction is about. A row with an unparsable ``timestamp_utc`` is dropped
+      too — treated as "cannot prove it's in the window", not "assume it is".
     - **Filtered:** drops rolling-fallback / low-pct / cm-unavailable rows.
-    - **Min samples:** each window needs ``>= min_samples`` usable rows.
+    - **Min samples:** each window needs ``>= min_samples`` usable rows *within
+      the lookback window* — a window with only old data does not fall back to
+      counting the old rows anyway.
     - **Clamped:** each factor is clamped to ``[default/clamp, default*clamp]``.
     - **All-or-nothing:** if either Claude window lacks data, returns None.
 
     The ``percentile`` (default 25) is a conservative low percentile — a smaller
     tokens-per-pct overestimates consumption, the safe side for gating.
+
+    Other readers of the same CSV with the same "reads everything" property
+    (``quota_calibration_backfill.py``) are not touched here — out of scope for
+    this fix, flagged for a separate look.
     """
     try:
         path = Path(csv_path)
         if not path.exists() or path.stat().st_size == 0:
             return None
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)
         expected = len(CSV_FIELDS)
         usable: list = []
         with path.open(encoding="utf-8", newline="") as fh:
@@ -500,6 +518,14 @@ def recalibrate_claude_factors(
                 if len(raw) != expected:
                     continue
                 row = dict(zip(CSV_FIELDS, raw))
+                try:
+                    ts = dt.datetime.fromisoformat(row.get("timestamp_utc") or "")
+                except ValueError:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=dt.timezone.utc)
+                if ts < cutoff:
+                    continue
                 if (
                     row.get("flag_rolling_fallback") == "false"
                     and row.get("flag_low_pct") == "false"

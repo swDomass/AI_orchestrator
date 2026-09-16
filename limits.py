@@ -709,6 +709,7 @@ def _maybe_recalibrate() -> None:
             QUOTA_RECALIBRATE_CLAMP,
             QUOTA_RECALIBRATE_MIN_SAMPLES,
             QUOTA_RECALIBRATE_PERCENTILE,
+            QUOTA_RECALIBRATE_WINDOW_DAYS,
         )
         from quota_calibration import recalibrate_claude_factors
         new_factors = recalibrate_claude_factors(
@@ -716,6 +717,7 @@ def _maybe_recalibrate() -> None:
             ESTIMATE_TOKENS_PER_PCT_CLAUDE_WINDOWS,
             min_samples=QUOTA_RECALIBRATE_MIN_SAMPLES,
             clamp=QUOTA_RECALIBRATE_CLAMP,
+            window_days=QUOTA_RECALIBRATE_WINDOW_DAYS,
             percentile=QUOTA_RECALIBRATE_PERCENTILE,
         )
         if new_factors:

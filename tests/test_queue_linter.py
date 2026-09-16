@@ -432,6 +432,77 @@ def test_glued_verify_tag_flagged():
 
 
 # ---------------------------------------------------------------------------
+# #verify: script existence (verify_script_missing) — Betriebsprüfung 2026-09-16:
+# a relative #verify: path resolved against the wrong cwd: (the haus-repo) instead of
+# the vault it actually lived in, reported "Skript nicht gefunden" 8 times at runtime
+# with no offline warning at all. This is a RESOLUTION defect, distinct from the parse
+# defects above (verify_without_path etc.) — the tag is syntactically perfect.
+# ---------------------------------------------------------------------------
+
+def test_verify_script_missing_flagged_without_cwd(tmp_path, monkeypatch):
+    """No cwd: tag → resolved exactly like the runtime: the bare relative path,
+    unresolved against anything (orchestrator._resolve_verify_path returns it
+    untouched when cwd is None) — and the message says so explicitly rather than
+    implying a resolved absolute path that would be misleading."""
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    monkeypatch.chdir(tmp_path)
+    content = "## Queue\n- [ ] Brief #verify:gibtsnicht.ps1 #every:24h\n"
+    findings = lint_queue(content)
+    codes = _codes(findings)
+    assert "verify_script_missing" in codes
+    assert exit_code_for(findings) == 2
+    msg = next(f.message for f in findings if f.code == "verify_script_missing")
+    assert "gibtsnicht.ps1" in msg
+    assert "Prozess-cwd" in msg
+
+
+def test_verify_script_missing_flagged_with_cwd_tag(tmp_path, monkeypatch):
+    """The real incident: cwd: points at a real, existing directory (e.g. the
+    haus-repo), but the #verify: script the task actually needs lives elsewhere."""
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    project = tmp_path / "haus-repo"
+    project.mkdir()
+    content = f"## Queue\n- [ ] Brief cwd:{project} #verify:scripts\\check.ps1 #every:24h\n"
+    findings = lint_queue(content)
+    codes = _codes(findings)
+    assert "verify_script_missing" in codes
+    msg = next(f.message for f in findings if f.code == "verify_script_missing")
+    assert str(project / "scripts" / "check.ps1") in msg
+    assert str(project) in msg
+
+
+def test_verify_script_present_is_clean(tmp_path, monkeypatch):
+    """Gegenprobe: the script actually exists at the resolved path — no finding."""
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "check.ps1").write_text("exit 0", encoding="utf-8")
+    content = f"## Queue\n- [ ] Brief cwd:{project} #verify:check.ps1 #every:24h\n"
+    findings = lint_queue(content)
+    assert "verify_script_missing" not in _codes(findings)
+    assert findings == []
+
+
+def test_verify_script_missing_skipped_when_cwd_itself_is_invalid(tmp_path, monkeypatch):
+    """A cwd: that does not exist is already reported as invalid_cwd — resolving the
+    verify script against the process cwd instead would just add a misleading second
+    finding for a task that dies before the verify step is ever reached."""
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    missing = tmp_path / "does_not_exist"
+    content = f"## Queue\n- [ ] Brief cwd:{missing} #verify:check.ps1 #every:24h\n"
+    findings = lint_queue(content)
+    codes = _codes(findings)
+    assert "invalid_cwd" in codes
+    assert "verify_script_missing" not in codes
+
+
+def test_verify_script_missing_absent_without_any_verify_tag(tmp_path, monkeypatch):
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    content = "## Queue\n- [ ] Brief #every:24h\n"
+    assert "verify_script_missing" not in _codes(lint_queue(content))
+
+
+# ---------------------------------------------------------------------------
 # HTML comments in the task body
 # ---------------------------------------------------------------------------
 

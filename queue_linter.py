@@ -29,6 +29,15 @@ Catches bad queue entries before they reach a provider:
   - #parallel with no/single subtask, or subtasks sharing CWD
   - HTML comments inside the task body (silently truncate the task text), or at the
     line end without being a valid retry/hang marker (silently dropped on rewrite)
+  - #verify: script that resolves to a path which does not exist (`verify_script_missing`)
+    — resolved EXACTLY like the runtime (orchestrator._resolve_verify_path is reused,
+    not reimplemented): relative against the task's `cwd:`, or against the process cwd
+    when there is none. A queue/config defect distinct from `verify_without_path`
+    above (that one is a parse failure — no path at all; this one is a resolution
+    failure — the path parses fine but nothing lives there, so the check WILL run and
+    is certain to fail every single time). Skipped when `cwd:` itself is invalid —
+    `invalid_cwd` already covers that line, and the task dies before the verify step
+    either way.
 
 CLI: ``python orchestrator.py --lint-queue``
 Exit codes: 0 = clean, 1 = warnings, 2 = errors.
@@ -49,6 +58,7 @@ from config import (
     _MODEL_ALIASES_BY_PROVIDER,
     is_known_model_tag,
 )
+from orchestrator import _resolve_verify_path
 from providers.opencode import OpencodeProvider
 from queue_manager import (
     AT_TAG_RE,
@@ -366,6 +376,7 @@ def _check_task(
     out.extend(_check_grace_tag(line_no, task_text))
     out.extend(_check_freshonly_tag(line_no, task_text))
     out.extend(_check_verify_tag(line_no, task_text))
+    out.extend(_check_verify_script_missing(line_no, task_text))
     out.extend(_check_effort_tag(line_no, task_text))
     # #effort: is also honoured on subtasks (parallel_runner.SubTask.effort), so the
     # check has to see them too — otherwise `  - [ ] Teil A #effort:ultra` runs at the
@@ -509,6 +520,62 @@ def _check_verify_tag(line_no: int, task_text: str) -> list[LintFinding]:
         ))
 
     return out
+
+
+def _check_verify_script_missing(line_no: int, task_text: str) -> list[LintFinding]:
+    """Flag a ``#verify:`` script that resolves to a path which does not exist.
+
+    Resolves EXACTLY like the runtime: ``orchestrator._resolve_verify_path`` is
+    reused rather than reimplemented, so linter and runtime cannot disagree about
+    where a relative path lands. That function's rule — relative resolves against
+    the task's ``cwd:`` tag, and without one against the orchestrator PROCESS's cwd
+    — means this check can only ever PROVE a problem, not rule one out, for a task
+    with no ``cwd:`` tag: the process cwd ``--lint-queue`` happens to run from need
+    not match the one the orchestrator uses later.
+
+    Distinct from ``verify_without_path`` above: that one is a *parse* failure (no
+    path at all — fail-OPEN, the check silently never runs). This one is a
+    *resolution* failure: the tag parses fine, but nothing lives at that path, so
+    the check WILL run and is certain to fail every single time with "Skript nicht
+    gefunden" — this was the real incident (`cwd:` pointed at the haus-repo, the
+    `#verify:` path was relative to the vault instead, 8x since 2026-09-05). At
+    runtime this now surfaces as the orchestrator's own ``verify_missing`` outcome/
+    error_code (``orchestrator._verify_missing``) rather than ``verify_failed`` — a
+    distinct alarm from a script that ran and found the result missing.
+
+    A ``cwd:`` tag that is itself invalid is skipped here — ``_check_cwd`` already
+    reports it as ``invalid_cwd``, and the task dies on THAT before ever reaching
+    the verify step, so resolving against the process cwd instead here would just
+    print a misleading path.
+
+    ERROR, matching the severity of the other ``#verify:`` defects in this file.
+    That is a judgement about how loud the report is, not about blocking anything:
+    ``--lint-queue`` is wired to no hook or CI gate in this repo (see the module
+    docstring), so this can never "lahmlegen" (paralyze) the rest of the queue —
+    only the tagged task's own outcome goes unchecked, and it is finalized either
+    way (fail-closed, not fail-open, at runtime).
+    """
+    script = extract_verify_tag(task_text)
+    if not script:
+        return []  # no usable path at all — verify_without_path's job
+
+    cwd_present = has_cwd_tag(task_text)
+    cwd = extract_cwd(task_text)
+    if cwd_present and cwd is None:
+        return []  # invalid cwd: already reported as invalid_cwd; task never reaches verify
+
+    resolved = _resolve_verify_path(script, cwd)
+    if resolved.exists():
+        return []
+
+    cwd_desc = cwd or "Prozess-cwd (kein cwd: gesetzt)"
+    return [LintFinding(
+        LEVEL_ERROR, line_no, task_text,
+        f"#verify:-Skript nicht gefunden — aufgelöst zu '{resolved}' (cwd: {cwd_desc}). "
+        f"Der Task würde laufen und trotzdem als 'verify_missing' (Konfigurationsfehler) "
+        f"statt geprüft enden — Pfad oder cwd: korrigieren",
+        code="verify_script_missing",
+    )]
 
 
 def _check_html_comment(line_no: int, task_text: str, raw_line: str) -> list[LintFinding]:

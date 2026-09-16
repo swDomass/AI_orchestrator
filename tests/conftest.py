@@ -1,19 +1,195 @@
 """Pytest fixtures shared across the suite.
 
 - ``sys.path``: makes project packages importable.
+- **Root vault redirect** (module-level, below): Isolation for `memory.py`'s path
+  constants, preventing test writes to the real vault. Root-cause fix for a
+  2026-09-16 finding (Runde 2, code review): `_refuse_real_vault_writes_under_pytest()`
+  in `memory.py` was called only from `_ensure_dirs()`, missing `_cleanup_lessons()`
+  and other writers that never touch that function — measured on 2026-09-16 14:19:33,
+  `archive_old_memories()` moved a real file during a test run. Mechanics:
+  (1) `ORCH_VAULT_PATH` is set in `os.environ` to a scratch directory BEFORE
+  `config` is imported for the first time — `config._load_dotenv()` respects
+  pre-existing env vars, so the redirected value propagates to every `from config
+  import VAULT_PATH`. (2) The real vault path is obtained independently via
+  `_find_real_vault_path()` and exported as `_ORCH_TEST_REAL_VAULT_PATH` — this
+  reference never touches `config`, so it cannot be computed against the wrong
+  vault. (3) `memory._refuse_real_vault_writes_under_pytest()` is called at every
+  write/move/delete operation (9 locations), comparing the target path against the
+  real root — a distributed check that cannot miss a writer. (4) Session-level
+  verification in `_guard_real_vault_and_docs_untouched`: file counts and content
+  hashes of `lessons.md` and `MEMORY.md` at session start and end.
 - ``_isolate_replay_store``: autouse — prevents tests from polluting the
   production ``logs/runs.jsonl`` when they exercise code paths that emit
   replay records (e.g. orchestrator ``_RunSpan.emit``). Individual test
   files can still override the path with their own fixture.
+- ``_isolate_memory_and_docs_output``: autouse — the process cwd half of the leak
+  above (tools defaulting to ``Path(".")``/``Path.cwd()`` when no ``cwd=`` is
+  given); the memory-path half is now handled entirely by the root redirect, so
+  this fixture no longer lists `memory.py` constants by hand. See the fixture's
+  own docstring for the measured `docs/` leak this closes.
+- ``_guard_real_vault_and_docs_untouched``: autouse, SESSION-scoped — the
+  belt-and-suspenders check for the redirect above. Compares file counts AND
+  content hashes (`lessons.md`, the curated `MEMORY.md`) in the real vault, and
+  file counts in this repo's own `docs/`, once at session start and once at
+  session end; a mismatch fails the run even if something bypasses the redirect.
+  Lives here (not in a standalone test module) so a `-k`/single-file selection
+  still gets it — an autouse fixture in an ordinary test file only applies to
+  tests collected from THAT module.
 """
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+
+def _find_real_vault_path() -> Path:
+    """Standalone `.env`/environment read for `ORCH_VAULT_PATH`, deliberately NOT
+    done by importing `config` — importing it would freeze `config.py`'s OWN
+    internally-derived constants (`POLICY_FILE`, `QUEUE_FILE`, …) against
+    whatever VAULT_PATH is current at THAT moment. Those are computed once, in
+    config.py's own module body, from a LOCAL variable — overwriting the
+    `config.VAULT_PATH` ATTRIBUTE afterward (what an earlier version of this file
+    did) does not retroactively recompute them, and broke
+    `tests/test_queue_linter_policy.py::test_policy_file_path_has_no_layout_literal_of_its_own`
+    (measured 2026-09-16, Runde 2). Mirrors config._load_dotenv()'s own precedence
+    (a real env var wins over `.env`) and its fallback default, on purpose, so this
+    reads the exact same value config.py would have — just without the side effect
+    of importing it before the redirect below is in place.
+    """
+    override = os.environ.get("ORCH_VAULT_PATH")
+    if override:
+        return Path(override)
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if env_file.is_file():
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("ORCH_VAULT_PATH="):
+                _, _, value = line.partition("=")
+                value = value.strip()
+                if value and value[0] in "\"'" and value[-1] == value[0]:
+                    value = value[1:-1]
+                return Path(value)
+    return Path.home() / "obsidian_vault"  # config.py's own fallback, mirrored
+
+
+# The value the guard below verifies stays untouched.
+_REAL_VAULT_PATH = _find_real_vault_path()
+
+# Exported so memory._refuse_real_vault_writes_under_pytest() has an independent
+# reference to compare against — memory.py's OWN constants are derived from
+# config.VAULT_PATH, which IS the redirected value by the time memory.py runs, so
+# memory.py comparing against its own derived state would be a tautology. This is
+# the pre-redirect value, read nowhere else.
+os.environ["_ORCH_TEST_REAL_VAULT_PATH"] = str(_REAL_VAULT_PATH)
+
+# Root redirect — set BEFORE the first `import config` anywhere in this process
+# (this file included), so config.py's OWN module-level derived constants
+# (`POLICY_FILE`, `QUEUE_FILE`, …) compute correctly from the redirected value
+# from the start, rather than needing to be patched retroactively one by one —
+# which is the exact enumeration problem this fix replaces, just one layer up.
+#
+# Kill switch: `_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION=1` skips this, leaving
+# `ORCH_VAULT_PATH` (and therefore `config.VAULT_PATH`) exactly as the real
+# environment/`.env` resolves it — or as a test-provided stand-in, for `tests/
+# test_no_real_writes_guard.py`'s subprocess mutation proof, which needs the
+# redirect OFF to simulate "isolation bypassed" for the memory-path half, not
+# just the chdir half.
+if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
+    _TEST_VAULT_ROOT = Path(tempfile.mkdtemp(prefix="orch_test_vault_"))
+    os.environ["ORCH_VAULT_PATH"] = str(_TEST_VAULT_ROOT)
+
 import replay  # noqa: E402 — must follow sys.path tweak
+
+
+@pytest.fixture(scope="session")
+def real_vault_path() -> Path:
+    """The REAL vault path (or the mutation-proof's stand-in under the kill
+    switch) — for tests that need to simulate "isolation bypassed" and must
+    therefore reference the pre-redirect value, not `config.VAULT_PATH` (which
+    is the redirected one from the moment this file finishes loading)."""
+    return _REAL_VAULT_PATH
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_vault_and_docs_untouched():
+    """Fail the whole test session if the REAL vault memory or this repo's own
+    ``docs/`` changed between session start and session end.
+
+    Session-scoped so its teardown runs once, after every test — a mismatch
+    surfaces as a session teardown error regardless of which test caused it,
+    which is the point: this is a safety net for writes the root redirect
+    (module-level, top of this file) and `memory._refuse_real_vault_writes_
+    under_pytest()` were supposed to prevent but did not, not a duplicate of
+    either mechanism's own job.
+
+    Checks TWO different things for a reason. File counts for `task_results/`,
+    `archive/` and `daily/` catch a create/move/delete — a count cannot drift
+    without one of those actually happening. But `archive_old_memories()`
+    (`orchestrator.py:2025`) also PRUNES CONTENT from two files it never
+    replaces wholesale (`lessons.md` via `_cleanup_lessons()`, `memory.py:1258`;
+    the curated `MEMORY.md`) — a count-only guard cannot see a file that keeps
+    existing but loses lines. Hashing catches that: measured 2026-09-16, this is
+    exactly the gap the Runde-1 guard had, found by code review, not by a red
+    test (`_LESSONS_FILE` was never redirected by the Runde-1 fixture at all).
+    ``tests/test_no_real_writes_guard.py`` proves this guard trips by disabling
+    the root redirect and pointing the constants at the real vault directly.
+    """
+    real_root = _REAL_VAULT_PATH / "99_System" / "AI" / "memory"
+    real_task_results = real_root / "task_results"
+    real_archive = real_root / "archive"
+    real_daily = real_root / "daily"
+    real_lessons = real_root / "lessons.md"
+    real_curated = real_root / "MEMORY.md"
+    repo_docs = Path(__file__).resolve().parent.parent / "docs"
+
+    def _file_count(d: Path) -> int:
+        return sum(1 for p in d.rglob("*") if p.is_file()) if d.is_dir() else -1
+
+    def _hash(p: Path) -> str | None:
+        if not p.is_file():
+            return None
+        import hashlib
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    before = {
+        "task_results": _file_count(real_task_results),
+        "archive": _file_count(real_archive),
+        "daily": _file_count(real_daily),
+        "docs": _file_count(repo_docs),
+        "lessons_hash": _hash(real_lessons),
+        "curated_hash": _hash(real_curated),
+    }
+    yield
+    after = {
+        "task_results": _file_count(real_task_results),
+        "archive": _file_count(real_archive),
+        "daily": _file_count(real_daily),
+        "docs": _file_count(repo_docs),
+        "lessons_hash": _hash(real_lessons),
+        "curated_hash": _hash(real_curated),
+    }
+
+    for key, path in (
+        ("task_results", real_task_results),
+        ("archive", real_archive),
+        ("daily", real_daily),
+        ("docs", repo_docs),
+    ):
+        assert after[key] == before[key], (
+            f"REAL {path} changed during the test session: "
+            f"{before[key]} -> {after[key]} files — a test wrote/moved/deleted "
+            f"outside the redirected scratch path"
+        )
+    for key, path in (("lessons_hash", real_lessons), ("curated_hash", real_curated)):
+        assert after[key] == before[key], (
+            f"REAL {path} content changed during the test session (hash "
+            f"{before[key]} -> {after[key]}) — a test edited it in place, which a "
+            f"file-count check alone cannot see"
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -100,6 +276,66 @@ def _isolate_active_runs_dir(tmp_path: Path, monkeypatch):
         return
     monkeypatch.setattr(base_tool, "ACTIVE_RUNS_DIR", tmp_path / "active_runs")
     yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_memory_and_docs_output(tmp_path_factory):
+    """Redirect the process cwd for the ENTIRE session, so tools that default an
+    unset ``cwd`` to ``Path(".")``/``Path.cwd()`` never land in this repo's own
+    ``docs/``.
+
+    Measured 2026-09-16 (Betriebsprüfung finding #2): `tools/critical_review.py`,
+    `tools/deep_security_audit.py`, `tools/brainstorm.py` and `tools/security_audit.py`
+    each compute `cwd_path = Path(cwd) if cwd else Path(".")` (`Path.cwd()` for
+    brainstorm) and write into `{cwd_path}/docs`. There is no module constant to
+    patch — the path is a per-call default. Exactly two tests currently omit `cwd=`
+    (`test_critical_review.py::test_no_cwd_defaults_to_dot`, `test_deep_security_audit.
+    py::test_no_cwd_defaults_to_dot`), and every pytest invocation that reaches them
+    adds new timestamped files nothing ever deletes — 4491 accumulated in the live
+    repo's `docs/` as of 2026-09-16, reproduced live in THIS worktree's own `docs/`
+    (5 → 14 files) by one `-p no:randomly` full run. Redirecting the process cwd
+    fixes this generically for those two tests AND any future tool/test with the
+    same `Path(".")` fallback, rather than special-casing two test names.
+
+    **The `memory.py` half of this fixture (patching its five path constants by
+    hand) was removed 2026-09-16 (Runde 2, code review)** in favour of the module-
+    level root redirect above (`config.VAULT_PATH` overwritten before `memory` is
+    ever imported): the hand-enumerated list had already missed `_LESSONS_FILE`
+    (`memory.py:906`), whose own writer, `_cleanup_lessons()` (`memory.py:1258`),
+    never calls `_ensure_dirs()` and therefore bypassed every guard silently.
+    Measured proof this was live: 2026-09-16 14:19:33, live orchestrator idle,
+    `archive_old_memories()` (`orchestrator.py:2025`, runs from every real
+    `run_once()`) moved a real file from the vault's `task_results/` to `archive/`
+    during a test run. Redirecting `VAULT_PATH` itself closes the class of bug
+    (an unlisted derived constant) rather than one instance of it, and needs no
+    per-test teardown — it is set once, for the whole process, before `memory.py`
+    is ever imported.
+
+    `memory._refuse_real_vault_writes_under_pytest()` remains as a second,
+    independent layer, now called at every write/move/delete operation `memory.py`
+    performs (not only inside `_ensure_dirs()`) — see that function's own
+    docstring. It is the belt to this fixture's suspenders, not the other way
+    round: the root redirect above is what actually prevents the write in the
+    overwhelming majority of cases.
+
+    Kill switch: ``_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION=1`` skips the chdir below
+    and is checked nowhere else in this codebase — its only purpose is to let
+    ``tests/test_no_real_writes_guard.py`` spawn a pytest SUBPROCESS with this fixture
+    deliberately inert and assert that `_guard_real_vault_and_docs_untouched` then fails
+    the run, proving the guard is load-bearing rather than merely present (see that
+    file). Never set in normal use.
+    """
+    if os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
+        yield
+        return
+
+    scratch = tmp_path_factory.mktemp("memory_docs_isolation")
+    original_cwd = os.getcwd()
+    os.chdir(scratch)
+    try:
+        yield
+    finally:
+        os.chdir(original_cwd)
 
 
 @pytest.fixture(autouse=True)

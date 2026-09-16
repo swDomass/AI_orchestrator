@@ -39,6 +39,7 @@ Task result file format:
 
 import logging
 import math
+import os
 import re
 import shutil
 import threading
@@ -93,8 +94,76 @@ _STOPWORDS = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _refuse_real_vault_writes_under_pytest(path: Path) -> None:
+    """Hard safety net: no write/move/delete THIS MODULE performs may touch the
+    REAL vault while pytest is running — checked against the specific ``path``
+    about to be touched, at the OPERATION, not at a single call site.
+
+    Deliberately independent of `_MEMORY_ROOT`/`VAULT_PATH`: since 2026-09-16
+    (Runde 2, code review) `tests/conftest.py` redirects `config.VAULT_PATH`
+    itself, before `memory.py` is ever imported — by the time this module's own
+    code runs, `VAULT_PATH` (and everything derived from it, `_MEMORY_ROOT`
+    included) already IS the redirected value. Comparing `_MEMORY_ROOT` against
+    `VAULT_PATH` here would therefore be a tautology, not a check — both are
+    computed from the same, already-redirected source, so it could never fire.
+    `tests/conftest.py` separately exports the PRE-redirect value via the
+    `_ORCH_TEST_REAL_VAULT_PATH` env var (read here, nowhere else), which this
+    function compares the actual target path against — a reference this module
+    cannot itself get wrong, because it never derives it.
+
+    Called at every write/move/delete this module performs (not only inside
+    `_ensure_dirs()`): a Runde-1 version of this check sat solely in
+    `_ensure_dirs()` and missed `_cleanup_lessons()` (`:1258`), whose writer
+    (`open(_LESSONS_FILE, "a")` / `_write_bytes_atomic`) never calls it —
+    `_LESSONS_FILE` (`:906`) is itself a case in point: a derived constant
+    the Runde-1 per-attribute patch never listed. Measured live, not
+    theoretical: 2026-09-16 14:19:33, live orchestrator idle,
+    `archive_old_memories()` (`orchestrator.py:2025`, runs from every real
+    `run_once()`) moved a real file from the vault's `task_results/` to
+    `archive/` during a test run.
+
+    ``PYTEST_CURRENT_TEST`` is set by pytest itself for the duration of every
+    test and unset otherwise — this can never fire in a real, unattended
+    orchestrator run. Also a no-op when the hint env var is absent (e.g. this
+    module imported without `tests/conftest.py` ever having run) — nothing to
+    compare against, and a real run never sets it either way.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    real_vault_hint = os.environ.get("_ORCH_TEST_REAL_VAULT_PATH")
+    if not real_vault_hint:
+        return
+    try:
+        real_root = (Path(real_vault_hint) / "99_System" / "AI" / "memory").resolve()
+        resolved = path.resolve()
+        if resolved == real_root or resolved.is_relative_to(real_root):
+            raise RuntimeError(
+                f"memory.py refuses to write into the real vault ({path}) "
+                f"while pytest is running — this operation's target path was "
+                f"not redirected away from the real vault"
+            )
+    except OSError:
+        # Fallback for systems where resolve() fails: normalize both paths and
+        # compare as strings with path-separator guard to avoid false matches
+        # (e.g., "memory2" should not match "memory").
+        real_root_normalized = os.path.normcase(
+            os.path.abspath(real_vault_hint + os.sep + "99_System" + os.sep +
+                           "AI" + os.sep + "memory")
+        )
+        path_normalized = os.path.normcase(os.path.abspath(str(path)))
+        if path_normalized == real_root_normalized or path_normalized.startswith(
+            real_root_normalized + os.sep
+        ):
+            raise RuntimeError(
+                f"memory.py refuses to write into the real vault ({path}) "
+                f"while pytest is running — this operation's target path was "
+                f"not redirected away from the real vault"
+            )
+
+
 def _ensure_dirs() -> None:
     """Create memory directory tree if missing."""
+    _refuse_real_vault_writes_under_pytest(_MEMORY_ROOT)
     for d in (_TASK_RESULTS_DIR, _ARCHIVE_DIR, _DAILY_DIR,
               _MEMORY_ROOT / "error_patterns",
               _MEMORY_ROOT / "preferences"):
@@ -435,6 +504,7 @@ def store_result(
             dest = _TASK_RESULTS_DIR / f"{original_stem}_{counter}.md"
             counter += 1
 
+        _refuse_real_vault_writes_under_pytest(dest)
         dest.write_text(content, encoding="utf-8")
         logger.debug("Memory stored: %s", dest.name)
 
@@ -731,6 +801,7 @@ def append_daily_log(
         # Parallel subtasks run in threads within the same orchestrator process.
         # Guard creation so only one writer emits the daily header.
         with _daily_log_lock:
+            _refuse_real_vault_writes_under_pytest(path)
             if not path.exists():
                 path.write_text(f"# Memory {today.isoformat()}\n{entry}", encoding="utf-8")
             else:
@@ -1008,6 +1079,7 @@ def append_lesson(
         new_tokens = _tokenize(pattern)
 
         with _lessons_lock:
+            _refuse_real_vault_writes_under_pytest(_LESSONS_FILE)
             if _LESSONS_FILE.exists():
                 try:
                     content = _LESSONS_FILE.read_text(encoding="utf-8")
@@ -1159,6 +1231,8 @@ def archive_old_memories() -> int:
                     while dest.exists():
                         dest = _ARCHIVE_DIR / f"{path.stem}_{counter}.md"
                         counter += 1
+                    _refuse_real_vault_writes_under_pytest(path)
+                    _refuse_real_vault_writes_under_pytest(dest)
                     shutil.move(str(path), str(dest))
                     archived += 1
                     logger.debug("Archived memory: %s", path.name)
@@ -1192,6 +1266,7 @@ def _cleanup_archive() -> int:
             mem = _parse_memory_file(path)
             ts = mem["timestamp"] if mem else datetime.fromtimestamp(path.stat().st_mtime)
             if ts < delete_cutoff:
+                _refuse_real_vault_writes_under_pytest(path)
                 path.unlink()
                 deleted += 1
                 logger.debug("Deleted archive: %s", path.name)
@@ -1211,6 +1286,7 @@ def _cleanup_daily_logs() -> int:
             date_str = path.stem[len("Memory "):]
             file_date = datetime.strptime(date_str, "%Y-%m-%d")
             if file_date < cutoff:
+                _refuse_real_vault_writes_under_pytest(path)
                 path.unlink()
                 deleted += 1
                 logger.debug("Deleted daily log: %s", path.name)
@@ -1257,6 +1333,7 @@ def _cleanup_lessons() -> int:
 
         try:
             new_content = header + "".join(kept)
+            _refuse_real_vault_writes_under_pytest(_LESSONS_FILE)
             _write_bytes_atomic(_LESSONS_FILE, new_content.encode("utf-8"))
             logger.info("Pruned %d old lesson(s) from lessons.md", removed)
         except OSError as e:

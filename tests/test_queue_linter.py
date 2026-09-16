@@ -496,6 +496,21 @@ def test_verify_script_missing_skipped_when_cwd_itself_is_invalid(tmp_path, monk
     assert "verify_script_missing" not in codes
 
 
+def test_verify_script_missing_flagged_when_path_is_a_directory(tmp_path, monkeypatch):
+    """P3-5 (oc r1): a `#verify:` path resolving to an existing DIRECTORY (no file
+    inside it) must still be flagged `verify_script_missing` — `resolved.exists()`
+    was True for a directory too, so this used to slip past the linter exactly the
+    way it slipped past the runtime's own identical check (orchestrator.py)."""
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "scripts").mkdir()  # directory exists; no file lives inside it
+    content = f"## Queue\n- [ ] Brief cwd:{project} #verify:scripts #every:24h\n"
+    findings = lint_queue(content)
+    codes = _codes(findings)
+    assert "verify_script_missing" in codes
+
+
 def test_verify_script_missing_absent_without_any_verify_tag(tmp_path, monkeypatch):
     monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
     content = "## Queue\n- [ ] Brief #every:24h\n"

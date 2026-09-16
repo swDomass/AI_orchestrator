@@ -304,6 +304,87 @@ def test_memory_refuses_subdirectory_even_with_resolve_failure(monkeypatch, real
         memory_module._ensure_dirs()
 
 
+# ---------------------------------------------------------------------------
+# 5. P2-2 (oc r1): the guard's failure MESSAGE, not just whether it fires.
+# Direct unit tests against the two message builders `conftest` now exposes
+# module-level (`_describe_dir_drift`, `_describe_hash_drift`), rather than
+# driving the whole session-scoped autouse fixture a second time (it only
+# tears down once per session). Proves: (a) no drift -> None, still hard
+# otherwise; (b) new/missing files are named individually with an mtime, not
+# just a before/after count; (c) both known causes — a leaking test OR a
+# parallel live orchestrator (`run_orchestrator.ps1 --watch`) finishing a task
+# inside the test window — are named, with the re-run-idle suggestion; (d) a
+# hash-only change (content pruned in place) is reported as "Hash geändert"
+# with its own mtime. This is what makes the mutation proof at #3 above
+# trustworthy: it shows what the guard WOULD have said had memory.py's hard
+# refusal not intercepted the write first.
+# ---------------------------------------------------------------------------
+
+def test_describe_dir_drift_is_none_when_unchanged(tmp_path):
+    import conftest
+
+    before = conftest._snapshot_dir_files(tmp_path)
+    after = conftest._snapshot_dir_files(tmp_path)
+    assert conftest._describe_dir_drift(tmp_path, before, after) is None
+
+
+def test_describe_dir_drift_names_new_and_missing_files_with_mtime(tmp_path):
+    import conftest
+
+    before = frozenset({"keep.txt", "removed.txt"})
+    (tmp_path / "keep.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "added.txt").write_text("y", encoding="utf-8")
+    after = conftest._snapshot_dir_files(tmp_path)  # {"keep.txt", "added.txt"}
+
+    msg = conftest._describe_dir_drift(tmp_path, before, after)
+    assert msg is not None
+    assert "added.txt" in msg and "mtime=" in msg
+    assert "removed.txt" in msg
+    # Both known causes must be named, not just "a test wrote ... outside".
+    assert "test that wrote" in msg
+    assert "run_orchestrator.ps1 --watch" in msg
+    assert "idle" in msg
+
+
+def test_describe_dir_drift_handles_directory_appearing_or_disappearing(tmp_path):
+    import conftest
+
+    missing_dir = tmp_path / "does_not_exist"
+    now_exists = tmp_path / "now_exists"
+    now_exists.mkdir()
+    (now_exists / "f.txt").write_text("x", encoding="utf-8")
+
+    # Directory absent before, present with a file after.
+    msg = conftest._describe_dir_drift(
+        now_exists, conftest._snapshot_dir_files(missing_dir),
+        conftest._snapshot_dir_files(now_exists),
+    )
+    assert msg is not None
+    assert "f.txt" in msg
+
+
+def test_describe_hash_drift_reports_content_change_with_mtime(tmp_path):
+    import conftest
+
+    p = tmp_path / "lessons.md"
+    p.write_text("pruned content", encoding="utf-8")
+
+    msg = conftest._describe_hash_drift(p, "old_hash", conftest._hash_file(p))
+    assert msg is not None
+    assert "Hash geändert" in msg
+    assert "mtime=" in msg
+    assert "run_orchestrator.ps1 --watch" in msg
+
+
+def test_describe_hash_drift_is_none_when_unchanged(tmp_path):
+    import conftest
+
+    p = tmp_path / "lessons.md"
+    p.write_text("stable", encoding="utf-8")
+    h = conftest._hash_file(p)
+    assert conftest._describe_hash_drift(p, h, h) is None
+
+
 def test_memory_allows_paths_outside_real_vault_even_with_resolve_failure(monkeypatch):
     """The OSError fallback must not become a blanket refusal — paths genuinely
     outside the real vault must still be allowed even when resolve() fails."""

@@ -554,6 +554,14 @@ def _check_verify_script_missing(line_no: int, task_text: str) -> list[LintFindi
     docstring), so this can never "lahmlegen" (paralyze) the rest of the queue —
     only the tagged task's own outcome goes unchecked, and it is finalized either
     way (fail-closed, not fail-open, at runtime).
+
+    Only sees the PARENT line (called once per task from ``_check_task``, not from
+    the per-subtask loop that re-runs ``_check_effort_tag``) — a ``#verify:`` on a
+    ``#parallel`` **subtask** line is invisible to this check, which matches the
+    runtime: ``_execute_tool_task(skip_queue=True)`` on the subtask path never reads
+    a subtask's own verify tag either, only the parent's. Pre-existing gap (P3-3, oc
+    r1), same shape as the model-tag blind spot noted elsewhere in this file — a
+    ``#verify:`` written on a subtask line is silently dead markup, not fixed here.
     """
     script = extract_verify_tag(task_text)
     if not script:
@@ -564,8 +572,12 @@ def _check_verify_script_missing(line_no: int, task_text: str) -> list[LintFindi
     if cwd_present and cwd is None:
         return []  # invalid cwd: already reported as invalid_cwd; task never reaches verify
 
+    # `is_file()`, not `exists()` (P3-5, oc r1) — a directory would otherwise pass
+    # this check and the runtime's identical one (orchestrator.py) equally, both
+    # then misreporting the eventual failure as `verify_failed` instead of the
+    # correct `verify_missing`/`verify_script_missing`.
     resolved = _resolve_verify_path(script, cwd)
-    if resolved.exists():
+    if resolved.is_file():
         return []
 
     cwd_desc = cwd or "Prozess-cwd (kein cwd: gesetzt)"

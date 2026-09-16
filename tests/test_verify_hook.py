@@ -455,6 +455,22 @@ def test_missing_script_without_cwd_names_process_cwd(calls):
     assert "Prozess-cwd" in calls["notify"][0][2]
 
 
+def test_verify_script_pointing_at_a_directory_is_reported_as_missing_not_failed(calls, tmp_path):
+    """P3-5 (oc r1): `#verify:` resolving to an existing DIRECTORY (script never
+    created inside it) must be `verify_missing` (config defect), not `verify_failed`
+    (the task ran, the result is missing) — `exists()` was True for a directory too,
+    so this used to fall through into `_run_verify_script()`, which fails closed
+    either way but with the wrong diagnosis. `is_file()` closes the gap."""
+    (tmp_path / "scripts").mkdir()  # the directory exists; no file lives inside it
+    outcome = orchestrator._verify_task_result(
+        "Task #verify:scripts", str(tmp_path), "claude"
+    )
+    assert outcome.ok is False
+    assert outcome.missing is True
+    assert "Konfigurationsfehler" in outcome.note
+    assert "Prüfskript nicht gefunden" in outcome.note
+
+
 def test_existing_script_that_fails_is_not_flagged_missing(calls, tmp_path, monkeypatch):
     """Gegenprobe: a script that EXISTS and runs but reports failure must keep
     `missing=False` — the distinction is existence, not exit code."""

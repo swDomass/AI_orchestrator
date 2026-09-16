@@ -105,7 +105,10 @@ def _run_single_subtask(
     """Execute a single subtask and return its result."""
     from dispatcher import select_provider
     from queue_manager import strip_metadata_tags
-    from orchestrator import _build_prompt, _run_with_retry, _execute_tool_task, _notify_auth_expired_once
+    from orchestrator import (
+        _build_prompt, _run_with_retry, _execute_tool_task,
+        _notify_auth_expired_once, _clear_auth_expired_notice,
+    )
     from providers.base import error_code_of
 
     if pause_event and pause_event.is_set():
@@ -175,7 +178,13 @@ def _run_single_subtask(
                 memory_context=memory_context,
                 skip_queue=True,      # parent handles finalization
             )
-            if not outcome.success and outcome.error_code == "auth_expired":
+            if outcome.success:
+                # Re-arm the one-time notice on every success, same as both
+                # run_once() paths (orchestrator.py:2703/:3054) — otherwise the
+                # NEXT outage after a `claude login` stays silent because
+                # _AUTH_EXPIRED_NOTIFIED was never cleared on this path (P2-1).
+                _clear_auth_expired_notice(provider.name)
+            elif outcome.error_code == "auth_expired":
                 # Same one-time actionable notice as the non-parallel paths
                 # (orchestrator.py) — reused via the shared dedup helper rather
                 # than a second mechanism. Cooldown is deliberately NOT applied
@@ -200,7 +209,10 @@ def _run_single_subtask(
             pause_event=pause_event,
         )
         duration = time.time() - start_time
-        if not result.success and error_code_of(result.error) == "auth_expired":
+        if result.success:
+            # Re-arm, same as the tool branch above and both run_once() paths.
+            _clear_auth_expired_notice(provider.name)
+        elif error_code_of(result.error) == "auth_expired":
             # Same one-time notice + same non-fix for the missing cooldown as
             # the tool-based branch above.
             _notify_auth_expired_once(provider.name)

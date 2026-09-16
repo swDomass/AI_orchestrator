@@ -37,6 +37,7 @@
   tests collected from THAT module.
 """
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -44,6 +45,28 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def _normalize_dotenv_value(value: str) -> str:
+    """Mirror of ``config._normalize_dotenv_value`` (config.py:7) — duplicated
+    byte-for-byte, not imported, because this file must read ORCH_VAULT_PATH
+    from ``.env`` BEFORE the first ``import config`` anywhere in the process
+    (see ``_find_real_vault_path``'s own docstring below for why importing
+    config here would be wrong). P3-2 (oc r1): an earlier version of
+    ``_find_real_vault_path`` stripped only surrounding quotes and did not
+    handle an inline ``#`` comment the way ``config._normalize_dotenv_value``
+    does — a future ``ORCH_VAULT_PATH=D:\\… # comment`` line in ``.env`` would
+    make `config` and this file disagree on the real vault path, and the
+    guard above would then compare against a directory that does not exist
+    (silent failure, exactly the class this guard exists to close).
+    ``tests/test_dotenv_normalization_mirror.py`` holds this copy equal to
+    ``config._normalize_dotenv_value`` across a battery of example values so
+    the two cannot silently drift apart again.
+    """
+    m = re.match(r'^(["\'])(.*)\1(?:\s*#.*)?$', value)
+    if m:
+        return m.group(2)
+    return re.split(r'\s+#', value)[0].strip()
 
 
 def _find_real_vault_path() -> Path:
@@ -58,7 +81,9 @@ def _find_real_vault_path() -> Path:
     (measured 2026-09-16, Runde 2). Mirrors config._load_dotenv()'s own precedence
     (a real env var wins over `.env`) and its fallback default, on purpose, so this
     reads the exact same value config.py would have — just without the side effect
-    of importing it before the redirect below is in place.
+    of importing it before the redirect below is in place. Value normalization
+    (quotes, inline comments) is mirrored via `_normalize_dotenv_value` above,
+    same reason (P3-2, oc r1).
     """
     override = os.environ.get("ORCH_VAULT_PATH")
     if override:
@@ -67,12 +92,14 @@ def _find_real_vault_path() -> Path:
     if env_file.is_file():
         for raw_line in env_file.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
-            if line.startswith("ORCH_VAULT_PATH="):
-                _, _, value = line.partition("=")
-                value = value.strip()
-                if value and value[0] in "\"'" and value[-1] == value[0]:
-                    value = value[1:-1]
-                return Path(value)
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            # Key selection mirrors config._load_dotenv() too (partition, then
+            # strip the key), so `ORCH_VAULT_PATH = D:\…` is found here exactly
+            # when config.py finds it (oc r2 P3-1).
+            key, _, value = line.partition("=")
+            if key.strip() == "ORCH_VAULT_PATH":
+                return Path(_normalize_dotenv_value(value.strip()))
     return Path.home() / "obsidian_vault"  # config.py's own fallback, mirrored
 
 
@@ -114,6 +141,98 @@ def real_vault_path() -> Path:
     return _REAL_VAULT_PATH
 
 
+def _snapshot_dir_files(d: Path) -> frozenset[str] | None:
+    """Relative file paths under ``d``, or ``None`` if ``d`` doesn't exist.
+
+    A SET of names rather than a count (P2-2, oc r1): a bare integer tells you
+    something drifted but not what, so every failure message used to read the
+    same regardless of cause. A set lets the caller name exactly which files
+    are new or missing.
+    """
+    if not d.is_dir():
+        return None
+    return frozenset(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file())
+
+
+def _hash_file(p: Path) -> str | None:
+    if not p.is_file():
+        return None
+    import hashlib
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _mtime_of(path: Path) -> str:
+    try:
+        return f"{path.stat().st_mtime:.3f}"
+    except OSError:
+        return "?"
+
+
+# Shared by both drift-message builders below — the P2-2 finding is that the
+# ORIGINAL message asserted a single cause ("a test wrote/moved/deleted
+# outside the redirected scratch path") when a second, entirely innocent cause
+# produces the identical symptom on this machine: the live orchestrator
+# (`run_orchestrator.ps1 --watch`) runs continuously and finishes tasks on its
+# own schedule — a completion landing inside the ~2-minute test window moves or
+# creates a real file the SAME WAY a leaking test would (see this file's module
+# docstring, measured 2026-09-16 14:19:33). The guard stays hard (it still
+# fails the run either way — "Fehlalarm billiger als Blindheit"); only the
+# diagnosis in the message is corrected to name both candidates and tell them
+# apart by re-running with the live orchestrator idle.
+_DUAL_CAUSE_HINT = (
+    "Two known causes produce this: (1) a test that wrote past the "
+    "redirected scratch path, or (2) a parallel live orchestrator "
+    "(`run_orchestrator.ps1 --watch`) that completed a task during this "
+    "test session's ~2-minute window — its writes land in the SAME real "
+    "vault this guard watches (see this file's module docstring for a "
+    "measured 2026-09-16 14:19:33 collision). Re-run the suite with the "
+    "live orchestrator idle to tell the two apart."
+)
+
+
+def _describe_dir_drift(
+    path: Path, before: frozenset[str] | None, after: frozenset[str] | None
+) -> str | None:
+    """``None`` if unchanged, else a message naming every new/missing file
+    under ``path`` (each with its current mtime) plus the dual-cause hint."""
+    if before == after:
+        return None
+    added = sorted((after or frozenset()) - (before or frozenset()))
+    removed = sorted((before or frozenset()) - (after or frozenset()))
+
+    def _list(names: list[str]) -> str:
+        if not names:
+            return "    (none)"
+        lines = []
+        for name in names:
+            p = path / name
+            lines.append(f"    {name} (mtime={_mtime_of(p)})" if p.is_file() else f"    {name} (gone)")
+        return "\n".join(lines)
+
+    return (
+        f"REAL {path} changed during the test session "
+        f"({len(before or ())} -> {len(after or ())} files).\n"
+        f"  new:\n{_list(added)}\n"
+        f"  missing:\n{_list(removed)}\n"
+        f"{_DUAL_CAUSE_HINT}"
+    )
+
+
+def _describe_hash_drift(
+    path: Path, before: str | None, after: str | None
+) -> str | None:
+    """``None`` if unchanged, else a message naming the hash change and the
+    file's current mtime, plus the dual-cause hint. Catches content pruned
+    in place (``_cleanup_lessons()`` etc.) that a file-count check cannot see."""
+    if before == after:
+        return None
+    return (
+        f"REAL {path} content changed during the test session "
+        f"(hash {before} -> {after}, mtime={_mtime_of(path)}) — Hash geändert.\n"
+        f"{_DUAL_CAUSE_HINT}"
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _guard_real_vault_and_docs_untouched():
     """Fail the whole test session if the REAL vault memory or this repo's own
@@ -126,17 +245,26 @@ def _guard_real_vault_and_docs_untouched():
     under_pytest()` were supposed to prevent but did not, not a duplicate of
     either mechanism's own job.
 
-    Checks TWO different things for a reason. File counts for `task_results/`,
-    `archive/` and `daily/` catch a create/move/delete — a count cannot drift
-    without one of those actually happening. But `archive_old_memories()`
-    (`orchestrator.py:2025`) also PRUNES CONTENT from two files it never
-    replaces wholesale (`lessons.md` via `_cleanup_lessons()`, `memory.py:1258`;
-    the curated `MEMORY.md`) — a count-only guard cannot see a file that keeps
-    existing but loses lines. Hashing catches that: measured 2026-09-16, this is
-    exactly the gap the Runde-1 guard had, found by code review, not by a red
-    test (`_LESSONS_FILE` was never redirected by the Runde-1 fixture at all).
+    Checks TWO different things for a reason. File SETS (not mere counts —
+    see `_snapshot_dir_files`) for `task_results/`, `archive/` and `daily/`
+    catch a create/move/delete and name exactly which file. But
+    `archive_old_memories()` (`orchestrator.py:2025`) also PRUNES CONTENT from
+    two files it never replaces wholesale (`lessons.md` via
+    `_cleanup_lessons()`, `memory.py:1258`; the curated `MEMORY.md`) — a
+    count/set-only guard cannot see a file that keeps existing but loses
+    lines. Hashing catches that: measured 2026-09-16, this is exactly the gap
+    the Runde-1 guard had, found by code review, not by a red test
+    (`_LESSONS_FILE` was never redirected by the Runde-1 fixture at all).
     ``tests/test_no_real_writes_guard.py`` proves this guard trips by disabling
     the root redirect and pointing the constants at the real vault directly.
+
+    This check stays HARD on purpose (P2-2, oc r1): it is a rare but real
+    false positive when a live orchestrator (`run_orchestrator.ps1 --watch`)
+    finishes a task during the ~2-minute test window — see `_DUAL_CAUSE_HINT`
+    above for how the message now names that second cause instead of only
+    blaming "a test". Softening the check (ignoring drift instead of naming
+    its likely sources) was rejected: a false alarm here is cheaper than
+    silently missing a real leak.
     """
     real_root = _REAL_VAULT_PATH / "99_System" / "AI" / "memory"
     real_task_results = real_root / "task_results"
@@ -146,31 +274,22 @@ def _guard_real_vault_and_docs_untouched():
     real_curated = real_root / "MEMORY.md"
     repo_docs = Path(__file__).resolve().parent.parent / "docs"
 
-    def _file_count(d: Path) -> int:
-        return sum(1 for p in d.rglob("*") if p.is_file()) if d.is_dir() else -1
-
-    def _hash(p: Path) -> str | None:
-        if not p.is_file():
-            return None
-        import hashlib
-        return hashlib.sha256(p.read_bytes()).hexdigest()
-
     before = {
-        "task_results": _file_count(real_task_results),
-        "archive": _file_count(real_archive),
-        "daily": _file_count(real_daily),
-        "docs": _file_count(repo_docs),
-        "lessons_hash": _hash(real_lessons),
-        "curated_hash": _hash(real_curated),
+        "task_results": _snapshot_dir_files(real_task_results),
+        "archive": _snapshot_dir_files(real_archive),
+        "daily": _snapshot_dir_files(real_daily),
+        "docs": _snapshot_dir_files(repo_docs),
+        "lessons_hash": _hash_file(real_lessons),
+        "curated_hash": _hash_file(real_curated),
     }
     yield
     after = {
-        "task_results": _file_count(real_task_results),
-        "archive": _file_count(real_archive),
-        "daily": _file_count(real_daily),
-        "docs": _file_count(repo_docs),
-        "lessons_hash": _hash(real_lessons),
-        "curated_hash": _hash(real_curated),
+        "task_results": _snapshot_dir_files(real_task_results),
+        "archive": _snapshot_dir_files(real_archive),
+        "daily": _snapshot_dir_files(real_daily),
+        "docs": _snapshot_dir_files(repo_docs),
+        "lessons_hash": _hash_file(real_lessons),
+        "curated_hash": _hash_file(real_curated),
     }
 
     for key, path in (
@@ -179,17 +298,11 @@ def _guard_real_vault_and_docs_untouched():
         ("daily", real_daily),
         ("docs", repo_docs),
     ):
-        assert after[key] == before[key], (
-            f"REAL {path} changed during the test session: "
-            f"{before[key]} -> {after[key]} files — a test wrote/moved/deleted "
-            f"outside the redirected scratch path"
-        )
+        msg = _describe_dir_drift(path, before[key], after[key])
+        assert msg is None, msg
     for key, path in (("lessons_hash", real_lessons), ("curated_hash", real_curated)):
-        assert after[key] == before[key], (
-            f"REAL {path} content changed during the test session (hash "
-            f"{before[key]} -> {after[key]}) — a test edited it in place, which a "
-            f"file-count check alone cannot see"
-        )
+        msg = _describe_hash_drift(path, before[key], after[key])
+        assert msg is None, msg
 
 
 @pytest.fixture(autouse=True)

@@ -456,6 +456,104 @@ def test_run_single_subtask_notifies_once_on_auth_expired_tool_task(monkeypatch)
     assert notified == ["claude"]
 
 
+def test_run_single_subtask_success_rearms_auth_expired_notice_plain_task(monkeypatch):
+    """P2-1 (oc r1): a successful #parallel subtask must re-arm the one-time
+    auth_expired notice exactly like both run_once() paths do
+    (orchestrator.py:2703/:3054) — otherwise the outage after a fresh
+    `claude login` stays silent because _AUTH_EXPIRED_NOTIFIED was never
+    cleared on the #parallel path. Uses the REAL _clear_auth_expired_notice/
+    _notify_auth_expired_once (only the Telegram send at the bottom is
+    mocked) against a real, pre-seeded _AUTH_EXPIRED_NOTIFIED set, to prove
+    the full cycle: already-notified -> success clears it -> the next outage
+    notifies again."""
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="claude")
+    subtask = SubTask(
+        text="Do the thing", provider_forced=None, cwd=None, tool_name=None, timeout=30,
+    )
+    notified = []
+
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", {"claude"})
+    monkeypatch.setattr(orchestrator, "notify_auth_expired", lambda name: notified.append(name))
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *_args, **_kwargs: "prompt")
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True, output="done", error=""), True),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result.success is True
+    assert "claude" not in orchestrator._AUTH_EXPIRED_NOTIFIED  # re-armed
+    assert notified == []  # success itself never notifies
+
+    # A later outage must notify again — without the fix it would stay silent
+    # because the set was never cleared above.
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *_args, **_kwargs: (SimpleNamespace(success=False, output="", error="auth_expired"), True),
+    )
+    result2 = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result2.success is False
+    assert notified == ["claude"]
+
+
+def test_run_single_subtask_success_rearms_auth_expired_notice_tool_task(monkeypatch):
+    """Same re-arm proof as above, tool-based subtask branch (_execute_tool_task)."""
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="claude")
+    subtask = SubTask(
+        text="Run tool #tool:review-loop", provider_forced=None, cwd=None,
+        tool_name="review-loop", timeout=30,
+    )
+    notified = []
+
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", {"claude"})
+    monkeypatch.setattr(orchestrator, "notify_auth_expired", lambda name: notified.append(name))
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(
+        orchestrator, "_execute_tool_task",
+        lambda *_args, **_kwargs: orchestrator.ToolTaskExecutionOutcome(
+            success=True, finalized=True, retryable=False,
+            error="", error_code="", output="done", output_tokens=10,
+        ),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result.success is True
+    assert "claude" not in orchestrator._AUTH_EXPIRED_NOTIFIED  # re-armed
+    assert notified == []
+
+    monkeypatch.setattr(
+        orchestrator, "_execute_tool_task",
+        lambda *_args, **_kwargs: orchestrator.ToolTaskExecutionOutcome(
+            success=False, finalized=False, retryable=True,
+            error="auth_expired", error_code="auth_expired",
+        ),
+    )
+    result2 = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result2.success is False
+    assert notified == ["claude"]
+
+
 def test_run_single_subtask_does_not_notify_on_other_errors(monkeypatch):
     """Gegenprobe: an unrelated failure (e.g. rate_limit) must not fire the
     auth-expired notice — the check is exact-code, not "any failure"."""

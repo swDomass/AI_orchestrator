@@ -1600,8 +1600,15 @@ def _verify_task_result(
     # into _run_verify_script()'s own "Skript nicht gefunden" branch so that function's
     # two-value `(passed, detail)` return stays untouched (several tests unpack it
     # positionally) and its own not-found message keeps working standalone.
+    # `is_file()`, not `exists()` (P3-5, oc r1): `exists()` is also True for a
+    # DIRECTORY, so `#verify:scripts` (a real dir, the intended file missing inside
+    # it) used to slip past this gate and into `_run_verify_script()`, whose dispatch
+    # for an extensionless path still fires a process against the directory — fails
+    # closed either way, but reported as `verify_failed` ("did not deliver its
+    # result") instead of `verify_missing` (a config defect), the exact diagnosis
+    # mix-up this whole existence check exists to prevent.
     resolved_path = _resolve_verify_path(pin.script, cwd)
-    if not resolved_path.exists():
+    if not resolved_path.is_file():
         return _verify_missing(task, provider_name, resolved_path, cwd)
 
     passed, detail = _run_verify_script(pin.script, cwd, pin=pin)

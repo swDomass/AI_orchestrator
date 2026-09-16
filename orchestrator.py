@@ -78,6 +78,7 @@ from dispatcher import (
 )
 from limits import get_limits, set_queue_idle, set_paused, AllLimits, report_estimated_usage, estimate_task_usage_pct
 from notifier import (
+    notify_auth_expired,
     notify_error,
     notify_providers_exhausted,
     notify_queue_complete,
@@ -85,7 +86,7 @@ from notifier import (
     notify_task_started,
     start_session,
 )
-from providers.base import TRANSIENT_ERRORS, RunResult
+from providers.base import TRANSIENT_ERRORS, RunResult, contains_auth_expired, error_code_of
 from skills import load_skill, check_requirements
 from config import VAULT_PATH
 import memory as memory_module
@@ -218,6 +219,31 @@ def _clear_in_flight() -> None:
     """
     global _in_flight_task
     _in_flight_task = None
+
+
+# Notify-once-per-outage for an expired OAuth login, same technique as
+# limits._429_notified / limits._clear_429_state (a module-level set that gates
+# the Telegram send, cleared once the provider succeeds again) — a separate
+# instance because 429 state and auth state are unrelated conditions and mixing
+# them would clear one outage's dedup on the other's recovery.
+_AUTH_EXPIRED_NOTIFIED: set[str] = set()
+
+
+def _notify_auth_expired_once(provider_name: str) -> None:
+    """Send the actionable "please re-login" Telegram notice at most once per
+    provider while the OAuth outage lasts. Subsequent poll attempts still hit
+    the provider cooldown and taxonomy classification, just not a second alert.
+    """
+    if provider_name in _AUTH_EXPIRED_NOTIFIED:
+        return
+    _AUTH_EXPIRED_NOTIFIED.add(provider_name)
+    notify_auth_expired(provider_name)
+
+
+def _clear_auth_expired_notice(provider_name: str) -> None:
+    """Re-arm the one-time notice — called on every successful run so the NEXT
+    outage (a fresh re-login expiring again later) is announced again."""
+    _AUTH_EXPIRED_NOTIFIED.discard(provider_name)
 
 
 def _charge_process_crash(exc: BaseException) -> None:
@@ -1187,6 +1213,16 @@ def _run_with_retry(
         if result.error in TRANSIENT_ERRORS:
             return result, True
 
+        # "auth_expired": a dead OAuth session will not fix itself in the 10-40s
+        # of local backoff below — every retry against the SAME provider fails
+        # the same way, guaranteed. Bail like the transient codes above, but
+        # WITHOUT joining TRANSIENT_ERRORS itself: that tuple means "worth
+        # retrying automatically" (is_transient()), and auth_expired explicitly
+        # is not — see providers/base.py. Bare-code check only (no "code: detail"
+        # form): providers only ever emit this bare, see providers/claude.py.
+        if error_code_of(result.error) == "auth_expired":
+            return result, True
+
         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
             # Exponential backoff: 10s, 20s, 40s...
             wait = 10 * (2 ** attempt)
@@ -1906,7 +1942,43 @@ def _execute_tool_task(
         )
     else:
         print(f"  ⚠️ Tool beendet: {tool_result.error}")
-        if tool_result.retryable:
+        # Normalize once, up front — tool_result.error can be raw provider prose
+        # (e.g. an OAuth failure a tool surfaced verbatim) when the tool itself
+        # did not set error_code.
+        _tr_error_code = tool_result.error_code or error_code_of(tool_result.error)
+        # auth_expired override (P1, Runde 3): the seven multi-phase tools
+        # (dev_loop, review_loop, research_qa, knowledge_transfer, security_audit,
+        # test_loop, brainstorm) all compute retryable=is_transient(provider_error)
+        # generically for ANY provider failure inside their phases. is_transient()
+        # is deliberately False for auth_expired (providers/base.py — it needs a
+        # human `claude login`, not automatic retry), so without this override
+        # tool_result.retryable comes back False and the branch below finalizes
+        # the task PERMANENTLY on an expired OAuth login — exactly the outcome
+        # the auftrag's ANNAHME and this repo's own docs promise auth_expired
+        # does NOT get. Same "intercept the code before the finalization
+        # decision" shape as capacity_exhausted/tool_runtime_exceeded (those
+        # arrive already retryable=True because the TOOL sets it explicitly;
+        # auth_expired arrives generically, so the override lives here instead
+        # of being taught to all seven call sites).
+        #
+        # auth_expired override (P1, Runde 4): a tool that wraps EVERY provider
+        # failure into its own exception text and classifies THAT text into a
+        # tool-specific code — tools/scientific_investigation.py turns any
+        # phase's provider error into error_code="phaseN_failed", retryable=False,
+        # with the original "auth_expired" surviving only inside the free-text
+        # `error` message — never reaches `_tr_error_code` above at all, because
+        # there is no ":"-prefixed bare code to extract; "phaseN_failed" is a
+        # NEW head, not a passthrough. Rebuilding all eight phase functions to
+        # preserve the original code would mean rewriting error handling this
+        # fix has no business touching for one rarely-used tool (scientific-
+        # investigation runs over the queue in practice essentially never — see
+        # ROADMAP.md); catching the token in the wrapped text here instead closes
+        # this for every current AND future tool that does the same thing, with
+        # one classification source (providers.base.contains_auth_expired(),
+        # word-bounded so a coincidental substring cannot false-positive).
+        if contains_auth_expired(tool_result.error):
+            _tr_error_code = "auth_expired"
+        if tool_result.retryable or _tr_error_code == "auth_expired":
             if not skip_queue:
                 append_log(f"Tool {tool.name} transienter Fehler via {provider.name}: {tool_result.error}")
                 notify_error(task, f"{provider.name}+{tool.name}", tool_result.error)
@@ -1915,7 +1987,12 @@ def _execute_tool_task(
                 finalized=False,
                 retryable=True,
                 error=tool_result.error,
-                error_code=tool_result.error_code or tool_result.error,
+                # Falling back to the raw string here is exactly the runs.jsonl
+                # leak fixed 2026-09-16 (three raw error_code values measured
+                # 2026-09-09, one of them this same OAuth text). "tool_internal_error"
+                # is the taxonomy's own generic bucket for "something failed, no
+                # better code available".
+                error_code=_tr_error_code or "tool_internal_error",
                 output=tool_result.output,
                 output_tokens=tool_result.output_tokens,
             )
@@ -2569,6 +2646,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     setattr(provider, "_forced_effort", previous_forced_effort)
 
                 if outcome.success:
+                    _clear_auth_expired_notice(provider.name)
                     if outcome.verify_failed:
                         _span.error("verify_failed", retry_count=tool_retry_count)
                     else:
@@ -2635,6 +2713,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     provider.set_cooldown(_rate_limit_cooldown_sec(limits, provider.name))
                 elif outcome.error_code in ("timeout", "hang", "format_error"):
                     pass  # not a provider-capacity problem → no cooldown
+                elif outcome.error_code == "auth_expired":
+                    # Needs a human `claude login`, not a quota reset — same cooldown
+                    # duration as "unreachable" (PROVIDER_COOLDOWN_SEC default, reused
+                    # rather than inventing a new number) plus one actionable Telegram
+                    # notice, sent at most once per outage.
+                    provider.set_cooldown()
+                    _notify_auth_expired_once(provider.name)
                 elif outcome.error_code != "":
                     provider.set_cooldown(5 * 60)
 
@@ -2745,7 +2830,15 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _span.error("queue_update_failed", retry_count=tool_retry_count)
                         _span.emit()
                         return False
-                    _span.retry(outcome.error_code or "rate_limit", retry_count=tool_retry_count)
+                    # outcome.error_code is already normalized by the time it gets
+                    # here — _execute_tool_task() (above) guarantees a taxonomy-shaped
+                    # code, never raw provider prose, so this can no longer repeat the
+                    # runs.jsonl leak fixed 2026-09-16 (three raw error_code values
+                    # measured 2026-09-09). The "or" is defensive only: if it ever DID
+                    # arrive empty, "tool_internal_error" is the taxonomy's own generic
+                    # bucket — "rate_limit" (the previous fallback) was actively
+                    # misleading for every non-rate-limit error that reached it.
+                    _span.retry(outcome.error_code or "tool_internal_error", retry_count=tool_retry_count)
                     break
 
                 print(f"  Task bleibt in Queue - versuche nächsten Provider ({outcome.error_code or outcome.error})...")
@@ -2901,6 +2994,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 return False
 
             if result.success:
+                _clear_auth_expired_notice(provider.name)
                 duration = _task_duration
                 print(f"  ✅ Erledigt ({len(result.output)} Zeichen Output)")
                 change_summary = _get_change_summary(cwd, snap_before, is_git=is_git)
@@ -3041,6 +3135,16 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 append_log(msg)
                 print(f"  ⏱ {msg}")
                 # No cooldown: timeout is a task-complexity issue, not a provider health issue
+            elif error == "auth_expired":
+                # OAuth login expired — needs a human `claude login`, not a quota
+                # reset. Same cooldown as "unreachable" above (reused, not a new
+                # number) plus one actionable notice per outage (see
+                # _notify_auth_expired_once — dedup mirrors limits._429_notified).
+                provider.set_cooldown()
+                msg = f"{provider.name} OAuth-Session abgelaufen → Cooldown 30min"
+                append_log(msg)
+                print(f"  🔑 {msg}")
+                _notify_auth_expired_once(provider.name)
             else:
                 msg = f"{provider.name} Fehler nach {MAX_RETRIES_PER_PROVIDER} Versuchen: {error}"
                 append_log(msg)
@@ -3060,7 +3164,18 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     _span.error("queue_update_failed", retry_count=single_shot_retry_count)
                     _span.emit()
                     return False
-                _span.retry(error or "rate_limit", retry_count=single_shot_retry_count)
+                # Normalize through the central classifier before writing to
+                # runs.jsonl. `error` is the raw RunResult.error string — for
+                # rate_limit/unreachable/timeout/auth_expired it is already one of
+                # the bare codes checked above, but for anything else (raw stderr,
+                # an exception message) writing it verbatim is exactly the leak
+                # measured 2026-09-09 (three raw error_code values in runs.jsonl,
+                # among them this same "Failed to authenticate: OAuth session
+                # expired..." text, back when providers/claude.py did not yet
+                # classify it). "provider_unreachable" replaces the previous
+                # "rate_limit" fallback, which mislabelled every non-rate-limit,
+                # non-empty raw error the same way.
+                _span.retry(error_code_of(error) or "provider_unreachable", retry_count=single_shot_retry_count)
                 break
 
             print("  Task bleibt in Queue - versuche nächsten Provider...")

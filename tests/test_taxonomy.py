@@ -68,6 +68,13 @@ def test_error_code_profile_denied():
     assert classify(_rec(error_code="profile_denied")) == CAT_PROFILE
 
 
+def test_error_code_auth_expired_maps_to_auth_category():
+    # auth_expired (Claude OAuth login expired, providers/claude.py) shares
+    # CAT_AUTH with auth_error — its own definition ("credentials missing /
+    # expired") already covers it, no new category was introduced.
+    assert classify(_rec(error_code="auth_expired")) == "auth_error"
+
+
 def test_error_code_cwd_invalid():
     assert classify(_rec(error_code="cwd_invalid")) == CAT_CWD
 

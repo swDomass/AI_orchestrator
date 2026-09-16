@@ -389,6 +389,64 @@ def test_quota_word_in_success_answer_not_flagged_rate_limit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# (i2) auth_expired detection — OAuth login expired (measured 2026-09-09,
+# logs/runs.jsonl: "Failed to authenticate: OAuth session expired and could
+# not be refreshed" landed as a raw, unclassified error_code three times)
+# ---------------------------------------------------------------------------
+
+def test_oauth_session_expired_detected_on_stderr(monkeypatch):
+    # The real CLI failure has no result event at all — a bare non-zero exit
+    # with the message on stderr, exactly as captured in the live incident.
+    monkeypatch.setattr(
+        "providers.claude.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1, stdout="",
+            stderr="Failed to authenticate: OAuth session expired and could not be refreshed",
+        ),
+    )
+    res = ClaudeProvider().run("t")
+    assert res.success is False
+    assert res.error == "auth_expired"
+
+
+def test_oauth_session_expired_success_answer_not_flagged(monkeypatch):
+    # Gegenrichtung: a SUCCESS answer that happens to discuss OAuth/session/
+    # expiry (e.g. a coding task about implementing token refresh) must NOT be
+    # misread as the CLI's own login having expired — success prose is excluded
+    # from the scan the same way the rate_limit/quota test above proves.
+    ndjson = json.dumps({
+        "type": "result", "subtype": "success",
+        "result": "Your OAuth session expired handling should call refresh() before retrying.",
+        "usage": {},
+    })
+    monkeypatch.setattr(
+        "providers.claude.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=ndjson, stderr=""),
+    )
+    res = ClaudeProvider().run("t")
+    assert res.success is True
+    assert res.error != "auth_expired"
+
+
+def test_auth_related_prose_without_exact_phrase_stays_unclassified(monkeypatch):
+    # Gegenrichtung: the match is deliberately the narrow, literally-observed
+    # phrase "oauth session expired" — NOT the broad "auth"/"token"/"expired"
+    # keywords heartbeat._PROBE_TRANSIENT_KEYWORDS uses for its lower-stakes
+    # model-alive probe. A differently-worded auth failure must not silently
+    # become auth_expired; it stays whatever the generic fallback produces.
+    monkeypatch.setattr(
+        "providers.claude.run_with_watchdog",
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1, stdout="",
+            stderr="Error: your token has expired, please refresh your credentials.",
+        ),
+    )
+    res = ClaudeProvider().run("t")
+    assert res.success is False
+    assert res.error != "auth_expired"
+
+
+# ---------------------------------------------------------------------------
 # (j) Byte-granular liveness: a newline-less progress stream is NOT idle-killed
 # ---------------------------------------------------------------------------
 

@@ -105,7 +105,8 @@ def _run_single_subtask(
     """Execute a single subtask and return its result."""
     from dispatcher import select_provider
     from queue_manager import strip_metadata_tags
-    from orchestrator import _build_prompt, _run_with_retry, _execute_tool_task
+    from orchestrator import _build_prompt, _run_with_retry, _execute_tool_task, _notify_auth_expired_once
+    from providers.base import error_code_of
 
     if pause_event and pause_event.is_set():
         return SubTaskResult(
@@ -174,6 +175,14 @@ def _run_single_subtask(
                 memory_context=memory_context,
                 skip_queue=True,      # parent handles finalization
             )
+            if not outcome.success and outcome.error_code == "auth_expired":
+                # Same one-time actionable notice as the non-parallel paths
+                # (orchestrator.py) — reused via the shared dedup helper rather
+                # than a second mechanism. Cooldown is deliberately NOT applied
+                # here: #parallel subtasks never set one for ANY error code
+                # (pre-existing gap, not introduced by this fix — see
+                # docs/architecture/components.md and ROADMAP.md).
+                _notify_auth_expired_once(provider.name)
             return SubTaskResult(
                 text=subtask.text,
                 provider_name=f"{provider.name}+{subtask.tool_name}",
@@ -191,6 +200,10 @@ def _run_single_subtask(
             pause_event=pause_event,
         )
         duration = time.time() - start_time
+        if not result.success and error_code_of(result.error) == "auth_expired":
+            # Same one-time notice + same non-fix for the missing cooldown as
+            # the tool-based branch above.
+            _notify_auth_expired_once(provider.name)
         if result.error not in ("rate_limit", "unreachable", "paused"):
             report_estimated_usage(
                 provider.name,

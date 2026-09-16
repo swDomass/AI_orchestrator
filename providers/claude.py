@@ -204,6 +204,24 @@ class ClaudeProvider(BaseProvider):
             # exact phrase. Tools should fall back to a fresh session + state inject.
             if "no conversation found with session id" in combined:
                 return RunResult(success=False, error="session_missing", **tokens)
+            # OAuth login expired (measured 2026-09-09 in logs/runs.jsonl, three
+            # consecutive task runs 09:25-10:36 all carrying this exact stderr text
+            # verbatim as the raw, unclassified error_code): "Failed to authenticate:
+            # OAuth session expired and could not be refreshed". Distinct from
+            # "auth_error" (the code the HTTP-based providers use for a missing/
+            # rejected API key) — this is the interactive CLI login itself, which
+            # only a human `claude login` fixes. Matched narrowly on the literal
+            # observed phrase rather than the broader "auth"/"token"/"expired"
+            # keywords heartbeat._PROBE_TRANSIENT_KEYWORDS uses for its low-stakes
+            # model-alive probe: those three words individually are common enough in
+            # ordinary coding-task prose (a task ABOUT implementing OAuth) that a
+            # broad match risks reclassifying an unrelated failure. The narrow phrase
+            # is still safe against a SUCCESS answer discussing OAuth — `combined`
+            # above already excludes success-result prose (only stderr, the
+            # rate_limit_event/error NDJSON lines, and a non-success result's own
+            # text are scanned).
+            if "oauth session expired" in combined:
+                return RunResult(success=False, error="auth_expired", **tokens)
             # "session limit" was added 2026-09-10 after it cost a finished two-hour
             # dev-loop. The CLI says "You've hit your session limit · resets 1:30am
             # (Europe/Vienna)" — none of the four older keywords match it, so the raw

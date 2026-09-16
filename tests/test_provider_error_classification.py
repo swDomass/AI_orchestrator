@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 with patch("config._load_dotenv"):
-    from providers.base import TRANSIENT_ERRORS, error_code_of, is_transient
+    from providers.base import TRANSIENT_ERRORS, contains_auth_expired, error_code_of, is_transient
 
 
 class TestTransientSetMatchesOrchestrator:
@@ -53,6 +53,14 @@ class TestPrefixedErrors:
     def test_prefixed_non_transient_keeps_its_code(self):
         assert error_code_of("auth_error: invalid api key") == "auth_error"
         assert is_transient("auth_error: invalid api key") is False
+
+    def test_auth_expired_is_known_but_not_transient(self):
+        """auth_expired (Claude OAuth login expired) is a recognised code — but
+        deliberately NOT in TRANSIENT_ERRORS: only a human `claude login` fixes
+        it, so it must not be treated as "worth retrying automatically" the way
+        rate_limit/timeout/hang/stdin_incomplete are."""
+        assert error_code_of("auth_expired") == "auth_expired"
+        assert is_transient("auth_expired") is False
 
     def test_model_refusal_keeps_its_code(self):
         """Gemini emits this prefix; it is its own taxonomy category.
@@ -97,3 +105,29 @@ class TestEmptyAndEdgeCases:
         for code in TRANSIENT_ERRORS:
             assert error_code_of(code) == code
             assert is_transient(code) is True
+
+
+class TestContainsAuthExpired:
+    """Runde 4: recovers auth_expired from inside a tool's own wrapped
+    exception text (tools/scientific_investigation.py turns it into
+    error_code="phaseN_failed", retryable=False, with the original code
+    surviving only in free text)."""
+
+    @pytest.mark.parametrize("text", [
+        "auth_expired",
+        "Phase 0 framing failed: auth_expired",
+        "some prose auth_expired more prose",
+        "auth_expired: could not be refreshed",
+    ])
+    def test_bare_and_embedded_token_detected(self, text):
+        assert contains_auth_expired(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "",
+        "Phase 0 framing failed: timeout",
+        "auth_expired_foo",
+        "not_auth_expired",
+        "the_auth_expired_flag was set",
+    ])
+    def test_non_matching_or_compound_token_not_detected(self, text):
+        assert contains_auth_expired(text) is False

@@ -152,6 +152,22 @@ def notify_error(task: str, provider: str, error: str) -> None:
     )
 
 
+def notify_auth_expired(provider_name: str) -> None:
+    """Notify once per outage that a provider's OAuth login expired and needs
+    a human re-login. Deduplication (only once per outage) is the caller's
+    responsibility — see orchestrator._notify_auth_expired_once(), which mirrors
+    the notify-once-per-state pattern limits._429_notified already uses."""
+    if not NOTIFY_ON_ERROR:
+        return
+    provider_safe = _escape_markdown(provider_name)
+    _send(
+        f"🔑 *Anmeldung abgelaufen* ({provider_safe})\n"
+        f"OAuth-Session ist abgelaufen und konnte nicht automatisch erneuert werden.\n"
+        f"Bitte im Terminal neu anmelden: `claude login`\n"
+        f"Betroffene Tasks bleiben in der Queue und verbrauchen kein Retry-Budget."
+    )
+
+
 def notify_providers_exhausted(reset_in: str) -> None:
     """Notify that all providers are exhausted."""
     if not NOTIFY_ON_ALL_PROVIDERS_EXHAUSTED:

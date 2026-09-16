@@ -1,5 +1,6 @@
 """Base class for all CLI providers."""
 
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -42,9 +43,16 @@ TRANSIENT_ERRORS = ("rate_limit", "unreachable", "timeout", "hang", "stdin_incom
 # error_code_of() returns "" for it and the code evaporates in analytics and the
 # taxonomy — the resulting behaviour (not transient, so terminal) would still be
 # right, but by accident rather than because the code was recognised.
+# "auth_expired" is Claude-CLI-specific (see providers/claude.py): the OAuth login
+# itself expired, distinct from "auth_error" (a missing/rejected API key on the
+# HTTP-based providers). Deliberately NOT in TRANSIENT_ERRORS: is_transient() means
+# "worth retrying automatically", and a dead OAuth session does not fix itself by
+# waiting — it needs a human to run `claude login` again. Blind retries against the
+# same expired session would just burn attempts and mislead analytics into thinking
+# the failure self-heals, the way it does for rate_limit/timeout/hang/stdin_incomplete.
 _KNOWN_ERROR_CODES = TRANSIENT_ERRORS + (
-    "session_missing", "auth_error", "network", "parse_error", "api_error", "model_refusal",
-    "policy_block",
+    "session_missing", "auth_error", "auth_expired", "network", "parse_error", "api_error",
+    "model_refusal", "policy_block",
 )
 
 
@@ -67,6 +75,32 @@ def is_transient(error: str) -> bool:
     Matches bare codes and the "code: detail" form alike.
     """
     return error_code_of(error) in TRANSIENT_ERRORS
+
+
+# Word-bounded so "auth_expired_foo" / "not_auth_expired" cannot match — the
+# hyphen is included in the boundary class deliberately (matches error_code_of()'s
+# own "code: detail" convention, where a stray "-" would otherwise still count
+# as a boundary and let a compound token slip through).
+_AUTH_EXPIRED_TOKEN_RE = re.compile(r"(?<![\w-])auth_expired(?![\w-])")
+
+
+def contains_auth_expired(text: str) -> bool:
+    """True if the literal token ``auth_expired`` appears anywhere in ``text``.
+
+    Distinct from ``error_code_of()``, which only extracts a HEAD code before
+    the first ``:`` — some tools (e.g. ``tools/scientific_investigation.py``)
+    wrap a provider's RunResult.error into their own exception text and then
+    classify THAT text into a tool-specific code (``"phase0_failed"``), so the
+    bare provider code never survives as a head to extract. A tool-side fix
+    would mean teaching every such wrapper about auth_expired specifically;
+    this scan lets the one caller that needs it (``orchestrator._execute_tool_task``)
+    recover the signal from wherever in the text it survived, without a second
+    classification source or a rewrite of unrelated tool code. Word-bounded so
+    a coincidental substring (a task about implementing OAuth, a variable named
+    ``auth_expired_foo``) cannot false-positive — a false negative here is a
+    return to today's existing behaviour (permanent failure), never worse.
+    """
+    return bool(text) and _AUTH_EXPIRED_TOKEN_RE.search(text) is not None
 
 
 class BaseProvider(ABC):

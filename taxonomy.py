@@ -123,6 +123,10 @@ _ERROR_CODE_MAP: dict[str, str] = {
     "tool_runtime_exceeded":  CAT_RUNTIME,
     "auth_error":             CAT_AUTH,
     "auth":                   CAT_AUTH,
+    # Claude-CLI-specific: the OAuth login itself expired (providers/claude.py).
+    # Same category as auth_error — CAT_AUTH's own definition is "credentials
+    # missing / expired", which covers this exactly; no new taxonomy category needed.
+    "auth_expired":           CAT_AUTH,
     "unreachable":            CAT_UNREACHABLE,
     "provider_unreachable":   CAT_UNREACHABLE,
     "no_provider":            CAT_UNREACHABLE,

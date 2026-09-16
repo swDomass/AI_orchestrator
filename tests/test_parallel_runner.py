@@ -386,3 +386,100 @@ def test_run_single_subtask_tool_success_preserves_tool_output(monkeypatch):
     assert result.success is True
     assert result.provider_name == "codex+review-loop"
     assert result.output == "fixed 2 issues"
+
+
+def test_run_single_subtask_notifies_once_on_auth_expired_plain_task(monkeypatch):
+    """P2 (Runde 2): a #parallel subtask with an expired OAuth login must get
+    the same one-time actionable notice as the non-parallel paths, via the
+    shared dedup helper (no second mechanism). Deliberately NOT asserting a
+    cooldown call — #parallel subtasks set no cooldown for ANY error code,
+    a pre-existing gap this fix does not close (see components.md/ROADMAP.md).
+    `provider` carries no `set_cooldown` attribute on purpose: a code path that
+    tried to call it would fail loudly here instead of the gap being silently
+    reintroduced."""
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="claude")
+    subtask = SubTask(
+        text="Do the thing", provider_forced=None, cwd=None, tool_name=None, timeout=30,
+    )
+    notified = []
+
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+    monkeypatch.setattr(orchestrator, "_notify_auth_expired_once", lambda name: notified.append(name))
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *_args, **_kwargs: "prompt")
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *_args, **_kwargs: (SimpleNamespace(success=False, output="", error="auth_expired"), True),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result.success is False
+    assert notified == ["claude"]
+
+
+def test_run_single_subtask_notifies_once_on_auth_expired_tool_task(monkeypatch):
+    """Same guard, tool-based subtask branch (`_execute_tool_task`)."""
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="claude")
+    subtask = SubTask(
+        text="Run tool #tool:review-loop", provider_forced=None, cwd=None,
+        tool_name="review-loop", timeout=30,
+    )
+    notified = []
+
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+    monkeypatch.setattr(orchestrator, "_notify_auth_expired_once", lambda name: notified.append(name))
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(
+        orchestrator, "_execute_tool_task",
+        lambda *_args, **_kwargs: orchestrator.ToolTaskExecutionOutcome(
+            success=False, finalized=False, retryable=True,
+            error="auth_expired", error_code="auth_expired",
+        ),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result.success is False
+    assert notified == ["claude"]
+
+
+def test_run_single_subtask_does_not_notify_on_other_errors(monkeypatch):
+    """Gegenprobe: an unrelated failure (e.g. rate_limit) must not fire the
+    auth-expired notice — the check is exact-code, not "any failure"."""
+    import dispatcher
+    import orchestrator
+
+    provider = SimpleNamespace(name="claude")
+    subtask = SubTask(
+        text="Do the thing", provider_forced=None, cwd=None, tool_name=None, timeout=30,
+    )
+    notified = []
+
+    monkeypatch.setattr(orchestrator, "_notify_auth_expired_once", lambda name: notified.append(name))
+    monkeypatch.setattr(dispatcher, "select_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(queue_manager, "strip_metadata_tags", lambda text: text)
+    monkeypatch.setattr(orchestrator, "_build_prompt", lambda *_args, **_kwargs: "prompt")
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *_args, **_kwargs: (SimpleNamespace(success=False, output="", error="rate_limit"), True),
+    )
+
+    result = parallel_runner_module._run_single_subtask(
+        subtask, idx=0, limits=AllLimits(), memory_context="", pause_event=None,
+    )
+
+    assert result.success is False
+    assert notified == []

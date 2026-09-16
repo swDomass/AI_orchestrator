@@ -65,6 +65,149 @@ def test_execute_tool_task_does_not_mark_done_on_retryable_failure(monkeypatch):
     assert tool.run.call_args.kwargs["timeout"] == 77
 
 
+def test_execute_tool_task_normalizes_error_code_when_tool_leaves_it_empty(monkeypatch):
+    """Regression guard for the runs.jsonl leak fixed 2026-09-16: a tool that
+    forgets to set ToolResult.error_code (defaults to "") must not leak
+    ToolResult.error verbatim into outcome.error_code. When the raw error text
+    itself IS a classifiable bare code, error_code_of() recovers it."""
+    provider = SimpleNamespace(name="claude")
+    tool = Mock()
+    tool.name = "test-loop"
+    tool.description = "Test loop"
+    tool.read_only = False
+    tool.run.return_value = ToolResult(
+        success=False,
+        error="auth_expired",
+        error_code="",  # left unset, as a future/buggy tool might
+        retryable=True,
+    )
+
+    monkeypatch.setattr(orchestrator, "get_tool", lambda _name: tool)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
+
+    outcome = orchestrator._execute_tool_task(
+        "Run tests #tool:test-loop", "test-loop", provider, cwd=None, timeout=77,
+    )
+
+    assert outcome.error_code == "auth_expired"
+
+
+def test_execute_tool_task_falls_back_to_tool_internal_error_for_raw_prose(monkeypatch):
+    """Same guard, the exhaustive case: raw prose that error_code_of() also
+    cannot classify must land on the taxonomy's generic bucket, never on the
+    prose itself — the exact defect measured 2026-09-09 (three raw error_code
+    values in logs/runs.jsonl, one of them this literal OAuth message, back
+    before providers/claude.py classified it)."""
+    provider = SimpleNamespace(name="claude")
+    tool = Mock()
+    tool.name = "test-loop"
+    tool.description = "Test loop"
+    tool.read_only = False
+    tool.run.return_value = ToolResult(
+        success=False,
+        error="Failed to authenticate: OAuth session expired and could not be refreshed",
+        error_code="",
+        retryable=True,
+    )
+
+    monkeypatch.setattr(orchestrator, "get_tool", lambda _name: tool)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
+
+    outcome = orchestrator._execute_tool_task(
+        "Run tests #tool:test-loop", "test-loop", provider, cwd=None, timeout=77,
+    )
+
+    assert outcome.error_code == "tool_internal_error"
+
+
+# ---------------------------------------------------------------------------
+# auth_expired buried inside a wrapped tool exception (Runde 4). Some tools
+# (tools/scientific_investigation.py) turn EVERY provider failure into their
+# own exception text and classify THAT into a tool-specific code
+# (error_code="phaseN_failed", retryable=False) — the original bare
+# "auth_expired" survives only inside the free-text `error` message, never as
+# a ":"-prefixed head error_code_of() could extract. _execute_tool_task()
+# recovers it via providers.base.contains_auth_expired() (word-bounded token
+# scan) before the retryable-vs-finalize decision.
+# ---------------------------------------------------------------------------
+
+def _phase_tool(error: str, error_code: str = "phase0_failed") -> Mock:
+    tool = Mock()
+    tool.name = "scientific-investigation"
+    tool.description = "Scientific investigation"
+    tool.read_only = False
+    tool.run.return_value = ToolResult(
+        success=False, error=error, error_code=error_code, retryable=False,
+    )
+    return tool
+
+
+def _run_execute_tool_task(monkeypatch, tool):
+    provider = SimpleNamespace(name="claude")
+    monkeypatch.setattr(orchestrator, "get_tool", lambda _name: tool)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
+    # Only exercised by the finalized (Gegenprobe) cases below, but harmless to
+    # patch unconditionally — the retryable path never reaches either call.
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", lambda *_a, **_kw: True)
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *_a, **_kw: None)
+    return orchestrator._execute_tool_task(
+        "Investigate #tool:scientific-investigation", "scientific-investigation",
+        provider, cwd=None, timeout=77,
+    )
+
+
+def test_execute_tool_task_recovers_auth_expired_from_wrapped_phase_error(monkeypatch):
+    """Main case: phase0_failed wrapping the auth_expired token → einplanbar,
+    not finalized, retryable, error_code corrected to auth_expired (Cooldown/
+    Hinweis then follow from the existing outer-loop auth_expired branch,
+    unchanged since Runde 2/3 — see that branch's own tests)."""
+    tool = _phase_tool("Phase 0 framing failed: auth_expired")
+    outcome = _run_execute_tool_task(monkeypatch, tool)
+
+    assert outcome.finalized is False
+    assert outcome.retryable is True
+    assert outcome.error_code == "auth_expired"
+
+
+@pytest.mark.parametrize("text", [
+    "Phase 0 framing failed: auth_expired_foo",
+    "Phase 0 framing failed: not_auth_expired",
+])
+def test_execute_tool_task_ignores_compound_auth_expired_lookalikes(monkeypatch, text):
+    """Gegenprobe 1: a compound token must not false-positive — stays exactly
+    the pre-existing phase0_failed/finalized behaviour."""
+    tool = _phase_tool(text)
+    outcome = _run_execute_tool_task(monkeypatch, tool)
+
+    assert outcome.finalized is True
+    assert outcome.error_code == "phase0_failed"
+
+
+def test_execute_tool_task_still_finalizes_phase_failure_without_the_token(monkeypatch):
+    """Gegenprobe 2: phase0_failed with an unrelated error text keeps today's
+    behaviour unchanged — permanent finalization, no auth_expired override."""
+    tool = _phase_tool("Phase 0 framing failed: timeout")
+    outcome = _run_execute_tool_task(monkeypatch, tool)
+
+    assert outcome.finalized is True
+    assert outcome.error_code == "phase0_failed"
+
+
 def test_run_once_marks_tool_task_for_retry_on_timeout_without_provider_fallback(monkeypatch):
     """A tool-task timeout must mark the task for retry and NOT fall back to a
     second provider.  Falling back risks the next provider failing non-retryably,
@@ -858,6 +1001,138 @@ def test_run_once_single_shot_passes_strict_flag_to_force_refresh_check(monkeypa
     assert seen["strict"] is True
 
 
+# ---------------------------------------------------------------------------
+# auth_expired (Claude OAuth login expired): reuses the existing cooldown
+# mechanism (provider.set_cooldown(), same default as "unreachable") and a
+# notify-once-per-outage dedup modelled on limits._429_notified. Must NOT
+# consume the persistent <!-- hang: N --> retry-budget counter — that
+# distinguishes it from hang/format_error, which do.
+# ---------------------------------------------------------------------------
+
+def test_run_once_single_shot_auth_expired_sets_cooldown_and_notifies_once(monkeypatch):
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+
+    _stub_single_shot_env(
+        monkeypatch, raw_line="- [ ] Plain claude task #claude", provider=provider,
+    )
+    monkeypatch.setattr(orchestrator, "has_explicit_provider_tag", lambda _task: True)  # forced
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=False, error="auth_expired"), True),
+    )
+    mark_retry_mock = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1800)
+    notify_mock = Mock()
+    monkeypatch.setattr(orchestrator, "notify_auth_expired", notify_mock)
+
+    orchestrator.run_once()
+
+    # Cooldown reused as-is (no new duration invented) — same call shape as
+    # the "unreachable" branch (provider.set_cooldown() with its default arg).
+    provider.set_cooldown.assert_called_once_with()
+    # Parked via the existing retry mechanic, not the hang counter → no
+    # #-tool: retry-budget consumed.
+    mark_retry_mock.assert_called_once()
+    assert "hang_count" not in mark_retry_mock.call_args.kwargs
+    # Exactly one actionable notice for this outage.
+    notify_mock.assert_called_once_with("claude")
+
+
+def test_run_once_single_shot_auth_expired_notifies_only_once_across_polls(monkeypatch):
+    """A second poll during the SAME outage must not repeat the actionable
+    Telegram notice — only the raw per-attempt notify_error may repeat."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+
+    _stub_single_shot_env(
+        monkeypatch, raw_line="- [ ] Plain claude task #claude", provider=provider,
+    )
+    monkeypatch.setattr(orchestrator, "has_explicit_provider_tag", lambda _task: True)
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=False, error="auth_expired"), True),
+    )
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", Mock(return_value=True))
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1800)
+    notify_mock = Mock()
+    monkeypatch.setattr(orchestrator, "notify_auth_expired", notify_mock)
+
+    orchestrator.run_once()
+    orchestrator.run_once()
+
+    notify_mock.assert_called_once_with("claude")
+
+
+def test_run_once_single_shot_auth_expired_notice_rearms_after_success(monkeypatch):
+    """After a successful run the dedup must clear, so the NEXT outage (a fresh
+    re-login expiring again later) is announced again."""
+    provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", {"claude"})  # already notified
+
+    _stub_single_shot_env(
+        provider=provider,
+        monkeypatch=monkeypatch,
+        raw_line="- [ ] Plain claude task",
+    )
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=True, output="ok"), False),
+    )
+    monkeypatch.setattr(orchestrator, "_get_change_summary", lambda *a, **kw: "")
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    assert "claude" not in orchestrator._AUTH_EXPIRED_NOTIFIED
+
+
+def test_run_once_single_shot_forced_retry_never_writes_raw_text_as_error_code(monkeypatch):
+    """runs.jsonl regression guard (orchestrator-level defense in depth,
+    independent of providers/claude.py's own classification — see
+    test_oauth_session_expired_detected_on_stderr for that layer): the
+    forced-provider retry span must never carry raw provider text as
+    error_code. Feeds the exact raw OAuth string measured 2026-09-09 (three
+    raw error_code values in the live logs) directly as RunResult.error, as
+    if a provider had NOT classified it — the orchestrator must still fall
+    back to a taxonomy-known code instead of writing the raw text verbatim."""
+    import replay
+    replay.reset_for_tests()
+    tmp_store = replay.get_store_path()
+    try:
+        provider = SimpleNamespace(name="claude", set_cooldown=Mock())
+        monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+        _stub_single_shot_env(
+            monkeypatch, raw_line="- [ ] Plain claude task #claude", provider=provider,
+        )
+        monkeypatch.setattr(orchestrator, "has_explicit_provider_tag", lambda _task: True)
+        monkeypatch.setattr(
+            orchestrator, "_run_with_retry",
+            lambda *a, **kw: (
+                orchestrator.RunResult(
+                    success=False,
+                    error="Failed to authenticate: OAuth session expired and could not be refreshed",
+                ),
+                True,
+            ),
+        )
+        monkeypatch.setattr(orchestrator, "_mark_retry_checked", Mock(return_value=True))
+        monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1800)
+        monkeypatch.setattr(orchestrator, "notify_auth_expired", lambda *a, **kw: None)
+
+        orchestrator.run_once()
+
+        records = replay.read_runs()
+        assert len(records) == 1
+        # The raw provider text must never reach error_code (task_text carries
+        # the task, not the error) — only a taxonomy-known code is acceptable.
+        assert records[0]["error_code"] == "provider_unreachable"
+    finally:
+        replay.reset_for_tests()
+
+
 def test_run_once_sets_rate_limit_cooldown_for_tool_task(monkeypatch):
     p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
     p2 = SimpleNamespace(name="codex", set_cooldown=Mock())
@@ -913,6 +1188,163 @@ def test_run_once_sets_rate_limit_cooldown_for_tool_task(monkeypatch):
     assert result is True
     p1.set_cooldown.assert_called_once_with(60)
     p2.set_cooldown.assert_not_called()
+
+
+def test_run_once_tool_task_auth_expired_sets_cooldown_and_notifies_once(monkeypatch):
+    """Same reused-cooldown + notify-once treatment as the single-shot path,
+    for a #tool: task. Rotates to Codex afterwards (auth_expired is not in
+    TRANSIENT_ERRORS but also isn't forced here, so the existing provider
+    rotation still applies — same as any other non-forced failure).
+
+    Goes through the REAL `_execute_tool_task()` (P2, Runde 3) via a fake TOOL
+    whose `run()` computes `retryable=is_transient(error_code_of(error))` —
+    exactly how the seven real multi-phase tools (dev_loop, review_loop, …)
+    derive it from a generic provider failure. A version of this test that
+    mocks `ToolTaskExecutionOutcome` directly (the previous shape) cannot
+    catch the P1 regression: `is_transient("auth_expired")` is False, so a
+    real tool hands back `retryable=False`, and without the P1 override in
+    `_execute_tool_task` that finalizes the task PERMANENTLY before the
+    cooldown/notify branch below is ever reached — the mocked-outcome version
+    stayed green throughout because it never exercised that decision at all.
+    """
+    from providers.base import error_code_of, is_transient
+
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    p2 = SimpleNamespace(name="codex", set_cooldown=Mock())
+    read_queue_calls = iter([[]])
+    monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+    _no_worktree_gate(monkeypatch)
+
+    tool = Mock()
+    tool.name = "test-loop"
+    tool.description = "Test loop"
+    tool.read_only = False
+    tool.run.side_effect = [
+        # First attempt (claude): a provider-level auth_expired failure, translated
+        # the way a real multi-phase tool does — error_code_of() + is_transient(),
+        # NOT a hand-picked retryable=True.
+        ToolResult(
+            success=False,
+            error="Failed to authenticate: OAuth session expired and could not be refreshed",
+            error_code=error_code_of("auth_expired"),
+            retryable=is_transient("auth_expired"),
+        ),
+        # Second attempt (codex): clean success.
+        ToolResult(success=True, output="done", iterations=1),
+    ]
+
+    def fake_select_provider(_task, _limits, exclude=None, **_kwargs):
+        exclude = exclude or set()
+        if "claude" not in exclude:
+            return p1
+        if "codex" not in exclude:
+            return p2
+        return None
+
+    monkeypatch.setattr(
+        orchestrator,
+        "read_queue_items",
+        lambda: [SimpleNamespace(
+            task_text="Task #tool:test-loop", line_no=1,
+            raw_line="- [ ] Task #tool:test-loop",
+        )],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: next(read_queue_calls))
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    fake_limits = SimpleNamespace(
+        claude=SimpleNamespace(resets_in_sec=45),
+        codex=SimpleNamespace(resets_in_sec=0),
+        gemini=SimpleNamespace(resets_in_sec=0),
+        earliest_reset_sec=lambda: 300,
+    )
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: fake_limits)
+    monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
+    monkeypatch.setattr(orchestrator, "get_tool", lambda _name: tool)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "strip_metadata_tags", lambda task: task)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "_get_change_summary", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", lambda *_a, **_kw: True)
+    monkeypatch.setattr(orchestrator, "_verify_task_result", lambda *_a, **_kw: orchestrator.VerifyOutcome())
+    monkeypatch.setattr(orchestrator, "_commit_run_changes", lambda *_a, **_kw: "")
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *_a, **_kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
+    notify_mock = Mock()
+    monkeypatch.setattr(orchestrator, "notify_auth_expired", notify_mock)
+
+    result = orchestrator.run_once()
+
+    assert result is True
+    assert tool.run.call_count == 2
+    # Reused cooldown default (same shape as "unreachable"), not a new number.
+    p1.set_cooldown.assert_called_once_with()
+    p2.set_cooldown.assert_not_called()
+    notify_mock.assert_called_once_with("claude")
+
+
+def test_run_once_tool_task_forced_auth_expired_writes_classified_code_not_raw_text(monkeypatch):
+    """runs.jsonl regression guard for the FORCED tool-task path (`#claude
+    #tool:...`): the final _span.retry() fallback must be the taxonomy's
+    generic "tool_internal_error", never the misleading "rate_limit" the
+    orchestrator wrote here before 2026-09-16 — and never outcome.error
+    verbatim if error_code ever arrived empty (defense in depth alongside
+    the upstream _execute_tool_task fix, which already prevents that)."""
+    import replay
+    replay.reset_for_tests()
+    try:
+        p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+        monkeypatch.setattr(orchestrator, "_AUTH_EXPIRED_NOTIFIED", set())
+        _no_worktree_gate(monkeypatch)
+
+        exec_mock = Mock(return_value=orchestrator.ToolTaskExecutionOutcome(
+            success=False,
+            finalized=False,
+            retryable=True,
+            error="Failed to authenticate: OAuth session expired and could not be refreshed",
+            error_code="",
+        ))
+
+        def fake_select_provider(_task, _limits, exclude=None, **_kwargs):
+            exclude = exclude or set()
+            return None if "claude" in exclude else p1
+
+        monkeypatch.setattr(
+            orchestrator, "read_queue_items",
+            lambda: [SimpleNamespace(
+                task_text="Task #tool:test-loop #claude", line_no=1,
+                raw_line="- [ ] Task #tool:test-loop #claude",
+            )],
+        )
+        monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:test-loop #claude"])
+        monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+        monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+        monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+        monkeypatch.setattr(orchestrator, "has_explicit_provider_tag", lambda _task: True)  # forced
+        monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+        monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1800)
+        monkeypatch.setattr(orchestrator, "select_provider", fake_select_provider)
+        monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+        monkeypatch.setattr(orchestrator, "_mark_retry_checked", Mock(return_value=True))
+        monkeypatch.setattr(orchestrator, "append_log", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(orchestrator, "notify_error", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(orchestrator, "notify_auth_expired", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_args, **_kwargs: None)
+
+        orchestrator.run_once()
+
+        records = replay.read_runs()
+        assert len(records) == 1
+        assert records[0]["error_code"] == "tool_internal_error"
+    finally:
+        replay.reset_for_tests()
 
 
 def test_execute_tool_task_does_not_finalize_when_atomic_queue_update_fails(monkeypatch):
@@ -1225,6 +1657,49 @@ def test_run_with_retry_still_retries_generic_errors(monkeypatch):
         _Provider(), task="t", prompt="p", cwd=None, timeout=60,
     )
     assert len(calls) > 1, "generic errors must still be retried in-run"
+
+
+def test_run_with_retry_does_not_retry_auth_expired_in_run(monkeypatch):
+    """P3 (Runde 2): a dead OAuth session is guaranteed to fail identically on
+    a same-provider retry within 10-40s of local backoff — bail immediately,
+    like "unreachable", instead of burning a doomed second CLI call."""
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda _s: None)
+    calls = []
+
+    class _Provider:
+        name = "claude"
+
+        def run(self, *a, **kw):
+            calls.append(1)
+            return orchestrator.RunResult(success=False, error="auth_expired")
+
+    result, exhausted = orchestrator._run_with_retry(
+        _Provider(), task="t", prompt="p", cwd=None, timeout=60,
+    )
+    assert result.error == "auth_expired"
+    assert exhausted is True
+    assert len(calls) == 1, f"expected no in-run retry, got {len(calls)} attempts"
+
+
+def test_run_with_retry_still_retries_auth_error_in_run(monkeypatch):
+    """Companion to the guard above: auth_expired's bail-out is a bare-code
+    check on its own value, not a widening of TRANSIENT_ERRORS or a broad
+    "any auth failure" rule — auth_error (missing/rejected API key on the
+    HTTP-based providers) must keep its existing in-run retry unchanged."""
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda _s: None)
+    calls = []
+
+    class _Provider:
+        name = "openrouter"
+
+        def run(self, *a, **kw):
+            calls.append(1)
+            return orchestrator.RunResult(success=False, error="auth_error: invalid api key")
+
+    orchestrator._run_with_retry(
+        _Provider(), task="t", prompt="p", cwd=None, timeout=60,
+    )
+    assert len(calls) > 1, "auth_error must be unaffected by the auth_expired bail-out"
 
 
 # ---------------------------------------------------------------------------

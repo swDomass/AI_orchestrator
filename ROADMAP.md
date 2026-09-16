@@ -301,6 +301,8 @@ a separate, still-open item — untouched by this pass.
 | `tests/test_telegram_listener.py` order-dependent; `tests/test_usage_suggester.py` environment-dependent | Run with `-p no:randomly`. A red suite in a fresh worktree is more likely one of these two than a real regression. |
 | `orchestrator.py:3379` (`--check-limits`) still hand-counts the providers | Added 2026-09-09, while fixing the four status sites. This one enumerates `("claude", "gemini", "codex", "opencode")` and is therefore **complete today** — it is the same drift pattern, not a live defect. Deliberately left alone: switching it to `limits.display_provider_names()` would also drop gemini from `--check-limits` output, a visible behaviour change nobody asked for. Fix it together with a decision about whether that command reports *capacity* (all fields) or *reachability* (policy-filtered) — the same question the capacity log answered later that day, in the direction of `all_provider_names()`, on the grounds that a report about quota is about what exists, not about what routing currently permits. `--check-limits` is the closer analogue of the two, so the likely answer is `all_provider_names()` and the gemini row simply stays. |
 | `.dev-loop/<task-hash>/` accumulates one subdirectory per distinct task text | Added 2026-09-09, created by the fix on the same day. Nothing prunes them, and nothing prunes the pre-2026-09-09 files still lying in `.dev-loop/` either. Deleting run artefacts is exactly the kind of destructive housekeeping that should not appear silently in an unattended tool — so it is named here instead of built. |
+| `logs/capacity-log.md` and `logs/queue-events.log` rotation, `idempotency`/`session_registry.prune_old` | No structural test-isolation guard (KERN 2, 2026-09-16). Both log rotations and the two `prune_old` functions can in principle still write/prune inside a test run without a test noticing, the same class of gap the vault/`docs/` guard closes for `memory.py`. Deliberately left alone: `logs/` belongs to whichever tree the orchestrator runs from (worktree or live), not to the vault or this repo's `docs/`, which is where KERN 2 draws the line. Named here rather than built. |
+| Session-wide `chdir` in `tests/conftest.py` | The process cwd is redirected once, for the whole pytest session (2026-09-16), rather than per test. Verified green in a fixed order and two random seeds with no concrete breaker found, but a test that depends on the ORIGINAL process cwd for something other than the two known `docs/`-writing tools would not be caught by anything currently in the suite. |
 
 ---
 
@@ -417,9 +419,11 @@ value expires.
 ### 34. Failure taxonomy
 Deterministic mapping from `error_code` first, keyword heuristics only as a
 fallback. The category list has grown past the original sketch — `taxonomy.py`
-is authoritative (21 categories as of 2026-09-05; `verify_failed` and
-`worktree_dirty` joined on 2026-09-04). Count it, do not quote this number:
-`len(taxonomy.ALL_CATEGORIES)`.
+is authoritative (22 categories as of 2026-09-16; `verify_failed` and
+`worktree_dirty` joined on 2026-09-04, `verify_missing` on 2026-09-16 — a
+`#verify:` script that does not exist is now its own category, distinct from
+a script that ran and reported the artefact missing). Count it, do not quote
+this number: `len(taxonomy.ALL_CATEGORIES)`.
 
 ### 35. Preflight hooks
 Deterministic context collected *before* the LLM call is cheaper than having the

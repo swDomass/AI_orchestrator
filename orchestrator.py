@@ -1219,6 +1219,10 @@ class ToolTaskExecutionOutcome:
     # flipping that would send the caller into the retry path, and a broken check script
     # would then requeue a working task forever. This only downgrades the reporting.
     verify_failed: bool = False
+    # Narrows `verify_failed` to the "the check itself never ran" case (missing
+    # script — a queue/config defect) so the caller can report `verify_missing`
+    # instead of `verify_failed`. Only meaningful when `verify_failed` is True.
+    verify_missing: bool = False
 
 
 @dataclass
@@ -1505,10 +1509,21 @@ def _run_verify_script(script: str, cwd: str | None, pin: VerifyPin | None = Non
 @dataclass(frozen=True)
 class VerifyOutcome:
     """Result of the post-task check. ``ok`` is False ONLY when a check actually ran
-    (or should have) and failed — no tag at all leaves ``ok`` True."""
+    (or should have) and failed — no tag at all leaves ``ok`` True.
+
+    ``missing`` narrows *why* ``ok`` is False to one specific case: the ``#verify:``
+    script itself does not exist at the resolved path, so no check ever ran at all.
+    Kept apart from a script that ran and reported the artefact missing — that is a
+    RESULT failure (the task did not deliver), this is a CONFIGURATION failure (the
+    queue line points nowhere runnable, e.g. a relative path resolved against the
+    wrong ``cwd:``). Both still fail closed identically (task stays finalized, ❌
+    restamp, no ``#needs:`` release) — only the alarm text and the downstream
+    ``error_code`` differ (``verify_missing`` vs. ``verify_failed`` — see
+    ``taxonomy.CAT_VERIFY_MISSING``)."""
 
     ok: bool = True
     note: str = ""
+    missing: bool = False
 
 
 def _verify_task_result(
@@ -1543,6 +1558,16 @@ def _verify_task_result(
             "verify_without_path)",
         )
 
+    # Existence check BEFORE running anything: a script that resolves to nothing is a
+    # queue/config defect (relative path resolved against the wrong — or missing —
+    # `cwd:`), not a sign the task's WORK is missing. Checked here rather than folded
+    # into _run_verify_script()'s own "Skript nicht gefunden" branch so that function's
+    # two-value `(passed, detail)` return stays untouched (several tests unpack it
+    # positionally) and its own not-found message keeps working standalone.
+    resolved_path = _resolve_verify_path(pin.script, cwd)
+    if not resolved_path.exists():
+        return _verify_missing(task, provider_name, resolved_path, cwd)
+
     passed, detail = _run_verify_script(pin.script, cwd, pin=pin)
     if passed:
         print(f"  [verify] OK — {pin.script}")
@@ -1561,6 +1586,34 @@ def _verify_failed(task: str, provider_name: str, msg: str) -> VerifyOutcome:
     append_log(msg)
     notify_error(task, provider_name, msg)
     return VerifyOutcome(ok=False, note=f"\n\n[verify] {msg}")
+
+
+def _verify_missing(
+    task: str, provider_name: str, resolved_path: Path, cwd: str | None
+) -> VerifyOutcome:
+    """A ``#verify:`` script that resolves to a path which does not exist.
+
+    Measured 2026-09-05..09-11: a `#verify:` with a relative path was resolved against
+    the task's `cwd:` (the haus-repo), while the check script itself lived in the vault
+    — "Skript nicht gefunden" fired 8 times, each read (by a human, and by everything
+    downstream that only sees `error_code=="verify_failed"`) as "the task ran and did
+    not deliver its result", when what actually happened is that NO check ever ran at
+    all. Own alarm text and own `VerifyOutcome.missing=True` so the three call sites can
+    emit `error_code="verify_missing"` instead — same fail-closed handling either way
+    (❌ restamp, no `#needs:` release, see `_restamp_after_failed_verify`), only the
+    diagnosis differs.
+    """
+    cwd_desc = cwd or "Prozess-cwd (kein cwd: gesetzt)"
+    msg = (
+        f"Konfigurationsfehler: Prüfskript nicht gefunden: {resolved_path} "
+        f"(aufgelöst gegen cwd {cwd_desc}). Der Task ist gelaufen, sein Ergebnis ist "
+        f"ungeprüft — bitte den #verify:-Pfad oder das cwd: in der Queue-Zeile "
+        f"korrigieren."
+    )
+    print(f"  ⚠️  {msg}")
+    append_log(msg)
+    notify_error(task, provider_name, msg)
+    return VerifyOutcome(ok=False, note=f"\n\n[verify] {msg}", missing=True)
 
 
 def _restamp_after_failed_verify(task: str, queue_line_no: int | None) -> None:
@@ -1903,6 +1956,7 @@ def _execute_tool_task(
             output=tool_result.output,
             output_tokens=tool_result.output_tokens,
             verify_failed=not verify.ok,
+            verify_missing=verify.missing,
         )
     else:
         print(f"  ⚠️ Tool beendet: {tool_result.error}")
@@ -2433,7 +2487,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 if not success_all:
                     _span.error("parallel_subtask_failure")
                 elif not verify.ok:
-                    _span.error("verify_failed")
+                    _span.error("verify_missing" if verify.missing else "verify_failed")
                 else:
                     _span.ok()
             except Exception as e:
@@ -2570,7 +2624,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
                 if outcome.success:
                     if outcome.verify_failed:
-                        _span.error("verify_failed", retry_count=tool_retry_count)
+                        _span.error(
+                            "verify_missing" if outcome.verify_missing else "verify_failed",
+                            retry_count=tool_retry_count,
+                        )
                     else:
                         _span.ok(retry_count=tool_retry_count)
                     break
@@ -2952,7 +3009,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     )
                 else:
                     _restamp_after_failed_verify(task, queue_task.line_no)
-                    _span.error("verify_failed", retry_count=single_shot_retry_count)
+                    _span.error(
+                        "verify_missing" if verify.missing else "verify_failed",
+                        retry_count=single_shot_retry_count,
+                    )
                 single_shot_success = True
                 break
 

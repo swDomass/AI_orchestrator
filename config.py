@@ -971,6 +971,13 @@ QUOTA_AUTO_RECALIBRATE_ENABLED = _parse_bool_env("ORCH_QUOTA_AUTO_RECALIBRATE", 
 QUOTA_RECALIBRATE_MIN_SAMPLES = int(os.getenv("ORCH_QUOTA_RECAL_MIN_SAMPLES", "60"))
 QUOTA_RECALIBRATE_CLAMP = float(os.getenv("ORCH_QUOTA_RECAL_CLAMP", "3.0"))
 QUOTA_RECALIBRATE_PERCENTILE = float(os.getenv("ORCH_QUOTA_RECAL_PERCENTILE", "25"))
+# Lookback window for recalibration: only CSV rows within this many days of "now" are
+# considered. Without it `recalibrate_claude_factors` read the entire
+# quota-calibration.csv (15652 rows since 2026-05-21, measured 2026-09-16) — old rows
+# still pass the min-samples/clamp guards, so a factor computed today could be a
+# percentile over four months of drifted usage patterns rather than the recent ones
+# the docstring's "Phase-0 drift correction" is actually about.
+QUOTA_RECALIBRATE_WINDOW_DAYS = int(os.getenv("ORCH_QUOTA_RECAL_WINDOW_DAYS", "60"))
 
 # --- Parallel Worktrees (P1) ---
 # Subdir name under the parent CWD where #worktree-tagged parallel subtasks

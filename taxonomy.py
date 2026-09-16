@@ -26,6 +26,8 @@ Categories
 * ``queue_update_failed``  — atomic queue mutation failed
 * ``paused``               — task interrupted by /pause
 * ``stdin_incomplete``     — prompt not fully delivered to the CLI over stdin
+* ``verify_missing``       — `#verify:` script does not exist at the resolved path
+                             (queue/config defect — the check never ran at all)
 * ``unknown``              — fallback when no rule matches
 
 Usage::
@@ -72,6 +74,14 @@ CAT_STDIN = "stdin_incomplete"
 # and the WORK did not happen. Lumping it into tool_internal_error would hide exactly
 # the class of silent failure the check exists to surface.
 CAT_VERIFY = "verify_failed"
+# The `#verify:` script itself does not exist at the resolved path — the check never
+# ran at all, so nothing about the run's OUTCOME is known either way. Own category,
+# deliberately not lumped into CAT_VERIFY above: that one means "we checked and the
+# artefact is missing" (a result failure); this one means "we could not check" (a
+# queue/config defect — usually a relative path resolved against the wrong, or a
+# missing, `cwd:`). Conflating the two hid 8 occurrences of the config case as if they
+# were the (much rarer, and differently actionable) result case, 2026-09-05..09-11.
+CAT_VERIFY_MISSING = "verify_missing"
 # A precondition of the ENVIRONMENT was not met, so the task never started: a tool
 # that produces the diff its own reviewers judge (dev-loop) was pointed at a repo
 # with uncommitted changes. Its own category on purpose — it is not a bad `cwd:`
@@ -85,7 +95,8 @@ ALL_CATEGORIES: tuple[str, ...] = (
     CAT_RATE_LIMIT, CAT_TIMEOUT, CAT_HANG, CAT_RUNTIME, CAT_AUTH,
     CAT_UNREACHABLE, CAT_REFUSAL, CAT_TOOL_INTERNAL, CAT_CWD, CAT_POLICY,
     CAT_PROFILE, CAT_APPROVAL, CAT_CAPACITY, CAT_DEP, CAT_TEST, CAT_QUEUE,
-    CAT_PAUSED, CAT_STDIN, CAT_VERIFY, CAT_WORKTREE, CAT_UNKNOWN,
+    CAT_PAUSED, CAT_STDIN, CAT_VERIFY, CAT_VERIFY_MISSING, CAT_WORKTREE,
+    CAT_UNKNOWN,
 )
 
 # error_code → category. The orchestrator emits these codes (see _RunSpan in
@@ -95,6 +106,7 @@ _ERROR_CODE_MAP: dict[str, str] = {
     "rate_limit":             CAT_RATE_LIMIT,
     "stdin_incomplete":       CAT_STDIN,
     "verify_failed":          CAT_VERIFY,
+    "verify_missing":         CAT_VERIFY_MISSING,
     "timeout":                CAT_TIMEOUT,
     # Idle-kill (process froze, no running tool) → its own category so the
     # hang vs. hard-timeout vs. runtime-deadline failure modes stay

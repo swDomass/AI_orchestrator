@@ -60,6 +60,10 @@ def test_no_verify_tag_is_a_no_op(calls, tmp_path):
 
 
 def test_passing_script_produces_no_alarm(calls, tmp_path, monkeypatch):
+    # The new missing-script existence check sits BEFORE _run_verify_script — give it
+    # a real (empty) file to find, or every mocked call below would short-circuit as
+    # "missing" before the mock is ever reached.
+    (tmp_path / "check.ps1").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         orchestrator, "_run_verify_script",
         lambda script, cwd, pin=None: (True, "Block vorhanden"),
@@ -73,6 +77,7 @@ def test_passing_script_produces_no_alarm(calls, tmp_path, monkeypatch):
 
 
 def test_failing_script_alarms_and_annotates_result(calls, tmp_path, monkeypatch):
+    (tmp_path / "check.ps1").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         orchestrator, "_run_verify_script",
         lambda script, cwd, pin=None: (False, "Briefing-Block fehlt in 2026-07-25.md"),
@@ -81,6 +86,7 @@ def test_failing_script_alarms_and_annotates_result(calls, tmp_path, monkeypatch
         "Task #verify:check.ps1", str(tmp_path), "claude"
     )
     assert outcome.ok is False
+    assert outcome.missing is False
     assert "Briefing-Block fehlt" in outcome.note
     assert len(calls["notify"]) == 1
     assert "Briefing-Block fehlt" in calls["notify"][0][2]
@@ -94,6 +100,7 @@ def test_failed_verify_never_touches_the_queue(calls, tmp_path, monkeypatch):
     otherwise loop a working task forever — a new failure mode introduced to report an
     old one. Only the alarm is allowed.
     """
+    (tmp_path / "check.ps1").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         orchestrator, "_run_verify_script",
         lambda script, cwd, pin=None: (False, "Block fehlt"),
@@ -211,6 +218,79 @@ def test_tool_path_reports_success_when_verify_passes(monkeypatch, tmp_path):
     assert "store(success=True)" in order
     assert "notify_done" in order
     assert outcome.verify_failed is False
+
+
+def test_tool_path_carries_verify_missing_through_the_outcome(monkeypatch, tmp_path):
+    """The tool path's ToolTaskExecutionOutcome.verify_missing must mirror
+    VerifyOutcome.missing — this is the field the caller reads to choose
+    error_code='verify_missing' over 'verify_failed'."""
+    tool = SimpleNamespace(
+        name="dummy", description="d", read_only=True,
+        run=lambda *a, **kw: SimpleNamespace(
+            success=True, output="out", iterations=1, error="", error_code="",
+            retryable=False, input_tokens=1, output_tokens=1,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "get_tool", lambda name: tool)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_snapshot_dir", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_get_change_summary", lambda *a, **kw: "")
+    monkeypatch.setattr(orchestrator, "report_estimated_usage", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "estimate_task_usage_pct", lambda *a, **kw: 0.0)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        orchestrator, "_verify_task_result",
+        lambda *a, **kw: orchestrator.VerifyOutcome(ok=False, note="!", missing=True),
+    )
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_restamp_after_failed_verify", lambda *a, **kw: None)
+
+    outcome = orchestrator._execute_tool_task(
+        "Task #verify:check.ps1", "dummy",
+        SimpleNamespace(name="claude"), str(tmp_path),
+    )
+
+    assert outcome.verify_failed is True
+    assert outcome.verify_missing is True
+
+
+def test_tool_path_verify_missing_is_false_on_a_result_failure(monkeypatch, tmp_path):
+    """Gegenprobe: a failing-but-present check must leave verify_missing False even
+    though verify_failed is True — otherwise both paths would collapse into one."""
+    tool = SimpleNamespace(
+        name="dummy", description="d", read_only=True,
+        run=lambda *a, **kw: SimpleNamespace(
+            success=True, output="out", iterations=1, error="", error_code="",
+            retryable=False, input_tokens=1, output_tokens=1,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "get_tool", lambda name: tool)
+    monkeypatch.setattr(orchestrator, "load_skill", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_snapshot_dir", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_get_change_summary", lambda *a, **kw: "")
+    monkeypatch.setattr(orchestrator, "report_estimated_usage", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "estimate_task_usage_pct", lambda *a, **kw: 0.0)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        orchestrator, "_verify_task_result",
+        lambda *a, **kw: orchestrator.VerifyOutcome(ok=False, note="!", missing=False),
+    )
+    monkeypatch.setattr(orchestrator.memory_module, "store_result", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_restamp_after_failed_verify", lambda *a, **kw: None)
+
+    outcome = orchestrator._execute_tool_task(
+        "Task #verify:check.ps1", "dummy",
+        SimpleNamespace(name="claude"), str(tmp_path),
+    )
+
+    assert outcome.verify_failed is True
+    assert outcome.verify_missing is False
 
 
 def test_every_verify_call_site_sits_after_a_finalize_call():
@@ -336,6 +416,75 @@ def test_missing_script_fails_closed(calls, tmp_path):
     assert outcome.ok is False
     assert "nicht gefunden" in outcome.note
     assert len(calls["notify"]) == 1
+
+
+# --- Missing script vs. failing script: config error, not result failure ----
+#
+# Betriebsprüfung 2026-09-16: a relative #verify: path resolved against the wrong
+# cwd: reported "Skript nicht gefunden" 8 times as `error_code=="verify_failed"` —
+# indistinguishable from "the task ran and did not deliver its result", when in
+# truth no check ran at all. VerifyOutcome.missing + orchestrator._verify_missing
+# split the two apart.
+
+def test_missing_script_sets_the_missing_flag(calls, tmp_path):
+    outcome = orchestrator._verify_task_result(
+        "Task #verify:does_not_exist.ps1", str(tmp_path), "claude"
+    )
+    assert outcome.ok is False
+    assert outcome.missing is True
+    assert "Konfigurationsfehler" in outcome.note
+    assert "Prüfskript nicht gefunden" in outcome.note
+
+
+def test_missing_script_alarm_names_the_resolved_path_and_cwd(calls, tmp_path):
+    orchestrator._verify_task_result(
+        "Task #verify:sub/does_not_exist.ps1", str(tmp_path), "claude"
+    )
+    msg = calls["notify"][0][2]
+    assert str(tmp_path / "sub" / "does_not_exist.ps1") in msg
+    assert str(tmp_path) in msg
+
+
+def test_missing_script_without_cwd_names_process_cwd(calls):
+    """No cwd: tag at all — the alarm must say so rather than silently printing
+    a bare relative path that looks like it resolved against something."""
+    outcome = orchestrator._verify_task_result(
+        "Task #verify:does_not_exist.ps1", None, "claude"
+    )
+    assert outcome.missing is True
+    assert "Prozess-cwd" in calls["notify"][0][2]
+
+
+def test_existing_script_that_fails_is_not_flagged_missing(calls, tmp_path, monkeypatch):
+    """Gegenprobe: a script that EXISTS and runs but reports failure must keep
+    `missing=False` — the distinction is existence, not exit code."""
+    (tmp_path / "check.ps1").write_text("exit 1", encoding="utf-8")
+    monkeypatch.setattr(
+        orchestrator, "run_with_watchdog",
+        lambda *a, **kw: __import__("types").SimpleNamespace(
+            returncode=1, stdout="", stderr="Block fehlt", stdin_error=None,
+        ),
+    )
+    outcome = orchestrator._verify_task_result(
+        "Task #verify:check.ps1", str(tmp_path), "claude"
+    )
+    assert outcome.ok is False
+    assert outcome.missing is False
+    assert "Block fehlt" in outcome.note
+    assert "Konfigurationsfehler" not in outcome.note
+
+
+def test_missing_script_is_checked_before_running_anything(calls, tmp_path, monkeypatch):
+    """The existence check must short-circuit _run_verify_script entirely — a
+    missing script must never reach the tamper gate or the watchdog."""
+    def must_not_run(*_a, **_kw):
+        raise AssertionError("_run_verify_script must not be called for a missing script")
+    monkeypatch.setattr(orchestrator, "_run_verify_script", must_not_run)
+
+    outcome = orchestrator._verify_task_result(
+        "Task #verify:does_not_exist.ps1", str(tmp_path), "claude"
+    )
+    assert outcome.missing is True
 
 
 # --- _run_verify_script: command construction + exit handling ---------------

@@ -15,12 +15,16 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Run all tests (2829 passed / 0 failed in 144 s — measured 2026-09-17 as the
-# LAST step of the forced-branch fail-closed fix: +18 over 2811, all in
-# tests/test_dispatcher_routing.py (+17: 6+4 parametrized barred-tag cases, 2
-# capped-unchanged cases, 5 single tests) and tests/test_orchestrator_tool_tasks.py
-# (+1); tests/test_queue_linter_policy.py is unchanged in count (two tests
-# rewritten/renamed). Previously: 2811 passed / 0 failed in 120 s — measured 2026-09-16, +10 aus
+# Run all tests (2816 passed / 14 failed in 165 s — measured 2026-09-17 as the
+# LAST step of a review-loop pass on the forced-branch fail-closed fix, in an
+# environment where tests/test_usage_suggester.py's 14 environment-dependent
+# cases are red on master too, see README Known Limitations; 2830 collected:
+# +19 over 2811, in tests/test_dispatcher_routing.py (+17: 6+4 parametrized
+# barred-tag cases, 2 capped-unchanged cases, 5 single tests),
+# tests/test_orchestrator_tool_tasks.py (+1) and tests/test_queue_linter_policy.py
+# (+1: a review-loop-round-2 test pinning that policy_unreadable/policy_empty no
+# longer claim every provider bar is gone; two OTHER tests there are renamed,
+# not counted). Previously: 2811 passed / 0 failed in 120 s — measured 2026-09-16, +10 aus
 # dem externen Review-Nachzug (oc r1) on top of that day's 2801: 2740 at the
 # start of that day, +27 from fix/verify-and-test-isolation, +34 from
 # fix/error-codes-and-usage-suggest, 2740 + 27 + 34 = 2801, +10 = 2811 exactly.

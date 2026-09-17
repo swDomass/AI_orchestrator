@@ -289,12 +289,12 @@ rejecting the two values outright because `_resolve_pass2_provider()` already
 routed an arbitrary provider name through `policy_allows_provider()` /
 `get_provider_by_name()` (see `test_pass2_tag_barred_by_policy_falls_back`);
 the regex simply never produced `vibe`/`openrouter` for that already-built
-path to receive. `select_provider()`'s own fail-open path (first row below) is
-a separate, still-open item — untouched by this pass.
+path to receive. `select_provider()`'s own fail-open path was a separate item —
+untouched by this pass, closed on 2026-09-17 (the forced branch now consults
+`dispatcher._allows()`; see README "Known limitations").
 
 | Defect | Impact |
 |---|---|
-| `select_provider()` fail-open for a bare `#vibe`/`#openrouter` tag | The pay-per-token ceiling was made fail-closed in `policy_allows_provider()`/`dispatcher._allows()`, but not on the forced-provider path. With `policy.yaml` missing or unreadable, an explicitly tagged task still reaches the uncapped provider. **Halved on 2026-09-04** (`6702e13`): the *profile* branch now clears `_allows()` per candidate (`dispatcher.py:389`, own test); only the *tag/forced* branch remains, where `_allows()` is never consulted at all. Left open deliberately — the rest of the fix reworks ~10 routing tests. |
 | `stdin_incomplete` requeues without bound | `<!-- hang: N -->` is the only persistent per-task counter and only `hang` + `format_error` *increment* it. Every other error code requeues without raising it. Count unbounded, rate still throttled by the 5-min cooldown. Pre-existing. Narrowed 2026-08-15: those parks no longer *reset* the counter either, so a task alternating between real failures and parks does reach the cap. |
 | An unregistered value in `#pass1:`/`#pass2:` is still dropped silently | Narrowed 2026-09-02: `vibe` and `openrouter` are accepted now, but a typo or an unknown provider still fails twice over — `extract_pass_providers()` drops the pass, and `strip_metadata_tags()` leaves the tag in place, so it reaches the model as prompt text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. `queue_linter.py` has no counterpart check. |
 | Safety-hook residuals | `find . -exec git push`, `docker exec c git push`, `xargs git push` are not recognised (needs real argv parsing, not a regex). A heredoc body line starting with a git write command matches — a deliberate false positive in the safe direction. Hook covers Claude only; Codex relies on its own sandbox flag. |

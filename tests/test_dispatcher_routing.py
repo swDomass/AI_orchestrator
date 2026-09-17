@@ -176,16 +176,23 @@ def test_openrouter_not_selected_when_all_others_unavailable(with_openrouter):
     assert provider is None  # explicitly do NOT fall through to openrouter
 
 
+# Since 2026-09-17 a bare uncapped tag needs an explicit authorisation: the
+# suite-wide policy is empty (no allow-list resolved), and the forced branch now
+# fails closed there like _allows() does. The documented route is the task tag.
+_OR_OK = "#tool_providers:openrouter,claude,codex"
+_VIBE_OK = "#tool_providers:vibe,claude,codex"
+
+
 def test_openrouter_tag_selects_openrouter_when_registered(with_openrouter):
     limits = _make_limits()
-    provider = select_provider("Check models #openrouter", limits)
+    provider = select_provider(f"Check models #openrouter {_OR_OK}", limits)
     assert provider is not None
     assert provider.name == "openrouter"
 
 
 def test_or_minimax_free_tag_selects_openrouter(with_openrouter):
     limits = _make_limits()
-    provider = select_provider("Daily summary #or_minimax_free", limits)
+    provider = select_provider(f"Daily summary #or_minimax_free {_OR_OK}", limits)
     assert provider is not None
     assert provider.name == "openrouter"
 
@@ -194,7 +201,7 @@ def test_or_paid_flagship_tags_select_openrouter(with_openrouter):
     """All paid-flagship or_* tags resolve to openrouter."""
     limits = _make_limits()
     for tag in ("#or_glm", "#or_kimi", "#or_qwen", "#or_deepseek", "#or_minimax"):
-        provider = select_provider(f"Task {tag}", limits)
+        provider = select_provider(f"Task {tag} {_OR_OK}", limits)
         assert provider is not None, f"No provider returned for {tag}"
         assert provider.name == "openrouter", f"{tag} did not route to openrouter"
 
@@ -314,7 +321,7 @@ def test_vibe_not_selected_when_all_others_unavailable(with_vibe):
 def test_vibe_tags_select_vibe_when_registered(with_vibe):
     limits_ = _make_limits()
     for tag in ("#vibe", "#vibe_medium", "#vibe_small"):
-        provider = select_provider(f"Second opinion {tag}", limits_)
+        provider = select_provider(f"Second opinion {tag} {_VIBE_OK}", limits_)
         assert provider is not None, f"No provider returned for {tag}"
         assert provider.name == "vibe", f"{tag} did not route to vibe"
 
@@ -525,3 +532,103 @@ def test_park_log_also_reaches_the_logger_not_only_stdout(without_opencode, capl
         select_provider("Second opinion #opencode", _make_limits())
 
     assert any("opencode" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Forced-tag branch fails closed under a missing policy (2026-09-17)
+#
+# Until then _selection_order() / forced_provider_policy_violation() only
+# checked `allowed and name not in allowed`, so with NO allow-list resolved a
+# bare #openrouter/#vibe tag was prepended and started — the one path the
+# fail-closed rule of dispatcher._allows() never reached.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def missing_policy(tmp_path, monkeypatch):
+    """A PolicyEngine pointed at a vault with NO policy.yaml on disk."""
+    import policy as policy_module
+
+    engine = policy_module.PolicyEngine(vault_path=tmp_path / "no_policy_vault")
+    monkeypatch.setattr(policy_module, "_engine", engine)
+    assert not engine.config_path.exists()
+    return engine
+
+
+@pytest.mark.parametrize("tag", ["#openrouter", "#or_glm", "#or_minimax_free"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_bare_openrouter_tag_is_barred_under_missing_policy(
+    with_openrouter, missing_policy, tag, strict,
+):
+    assert select_provider(f"Task {tag}", _make_limits(), strict=strict) is None
+
+
+@pytest.mark.parametrize("tag", ["#vibe", "#vibe_medium"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_bare_vibe_tag_is_barred_under_missing_policy(with_vibe, missing_policy, tag, strict):
+    assert select_provider(f"Review {tag}", _make_limits(), strict=strict) is None
+
+
+def test_selection_order_is_empty_for_uncapped_forced_tag_without_allow_list(
+    with_vibe, with_openrouter, monkeypatch,
+):
+    """Same case via the patched resolver — `allowed is None`, not just 'no file'."""
+    import dispatcher
+
+    monkeypatch.setattr(dispatcher, "_allowed_by_policy", lambda *a, **kw: None)
+    assert _selection_order("x #vibe", None, None, False, None) == ([], None)
+    assert _selection_order("x #openrouter", None, None, False, None) == ([], None)
+
+
+def test_forced_violation_reports_uncapped_tag_under_missing_policy(
+    with_vibe, with_openrouter, missing_policy,
+):
+    from dispatcher import forced_provider_policy_violation
+
+    for tag, name in (("#vibe", "vibe"), ("#or_kimi", "openrouter")):
+        violation = forced_provider_policy_violation(f"Task {tag}")
+        assert violation is not None, tag
+        got_name, shown = violation
+        assert got_name == name
+        # The effective list, never an empty "erlaubt:" and never an uncapped name.
+        assert "claude" in shown and "codex" in shown
+        assert "vibe" not in shown and "openrouter" not in shown
+
+
+@pytest.mark.parametrize("tag,name", [("#claude", "claude"), ("#codex", "codex")])
+def test_capped_forced_tags_unchanged_under_missing_policy(missing_policy, tag, name):
+    from dispatcher import forced_provider_policy_violation
+
+    order, allowed = _selection_order(f"Task {tag}", None, None, False, None)
+    assert allowed is None
+    assert order[0] == name
+    assert forced_provider_policy_violation(f"Task {tag}") is None
+    assert select_provider(f"Task {tag}", _make_limits()).name == name
+
+
+def test_opencode_forced_tag_stays_fail_open_under_missing_policy(with_opencode, missing_policy):
+    """opencode is capped (pollable OpenRouter key budget) — not in _UNCAPPED_PROVIDERS."""
+    from dispatcher import forced_provider_policy_violation
+
+    order, _ = _selection_order("Task #opencode", None, None, False, None)
+    assert order[0] == "opencode"
+    assert forced_provider_policy_violation("Task #opencode") is None
+
+
+def test_explicit_task_authorisation_still_routes_uncapped_tag(
+    with_vibe, with_openrouter, missing_policy,
+):
+    from dispatcher import forced_provider_policy_violation
+
+    assert select_provider(f"Review #vibe {_VIBE_OK}", _make_limits()).name == "vibe"
+    assert select_provider(f"Task #or_glm {_OR_OK}", _make_limits()).name == "openrouter"
+    assert forced_provider_policy_violation(f"Review #vibe {_VIBE_OK}") is None
+
+
+def test_barred_uncapped_tag_logs_effective_allow_list(with_vibe, missing_policy, capsys):
+    assert select_provider("Review #vibe", _make_limits()) is None
+    out = capsys.readouterr().out
+    assert "[policy] Provider 'vibe'" in out
+    assert "kein Fallback" in out
+    line = next(ln for ln in out.splitlines() if "[policy]" in ln)
+    erlaubt = line.split("erlaubt:")[1].split(")")[0]
+    assert "claude" in erlaubt and "vibe" not in erlaubt

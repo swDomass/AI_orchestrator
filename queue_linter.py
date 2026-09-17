@@ -831,21 +831,18 @@ def _policy_status() -> LintFinding | None:
         )
 
     if not path.exists():
-        # Deliberately does NOT claim vibe/openrouter are barred. Measured with
-        # no policy.yaml: _selection_order("... #vibe", ...) -> (['vibe',
-        # 'claude', 'codex'], None) and forced_provider_policy_violation(...) ->
-        # None, while policy_allows_provider('vibe', None) -> False. _allows()'s
-        # fail-CLOSED half only reaches the TOOL-INTERNAL lookups; the
-        # forced-tag branch (dispatcher._selection_order) never consults it -
-        # the gap CLAUDE.md and README document. An operator reading this at
-        # 03:00 must not be told an uncapped, pay-per-token provider is fenced
-        # off when it will in fact run.
+        # Describes the runtime as it is since 2026-09-17: with no policy.yaml
+        # the forced-tag branch (dispatcher._selection_order /
+        # forced_provider_policy_violation) consults _allows() too, so a bare
+        # #vibe/#openrouter tag ends terminal with provider_not_allowed - the
+        # per-task check below reports exactly that as an ERROR. Capped
+        # providers (claude, codex, opencode) keep running (fail-open).
         return LintFinding(
             LEVEL_WARN, None, str(path),
             f"policy.yaml nicht gefunden ({path}) - die Provider-Policy kann hier "
-            "nicht geprueft werden. Achtung: ein direktes #vibe/#openrouter-Tag "
-            "laeuft dann trotzdem (die Fail-Closed-Regel greift nur bei "
-            "Second-Opinion/Pass-2, nicht beim erzwungenen Provider-Tag)",
+            "nicht geprueft werden. Folge: claude/codex/opencode laufen weiter, "
+            "ein direktes #vibe/#openrouter-Tag endet ohne ausdrueckliche Freigabe "
+            "(#tool_providers:) terminal mit provider_not_allowed",
             code="policy_missing",
         )
 
@@ -999,9 +996,9 @@ def _check_policy_providers(line_no: int, task_text: str) -> list[LintFinding]:
 
     The verdict comes from ``dispatcher.forced_provider_policy_violation()``
     itself rather than a reimplementation, so linter and runtime cannot disagree
-    about what the policy says. That inherits the known open gap in
-    ``_selection_order()``'s forced branch (CLAUDE.md) - which is correct for a
-    linter whose job is predicting runtime, not describing the intent.
+    about what the policy says - including the fail-closed rule for a bare
+    #vibe/#openrouter tag when no allow-list resolves (closed in the runtime on
+    2026-09-17, inherited here without linter code of its own).
     """
     try:
         from dispatcher import forced_provider_policy_violation, policy_allows_provider

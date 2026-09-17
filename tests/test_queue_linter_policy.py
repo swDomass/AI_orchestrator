@@ -391,54 +391,58 @@ def test_policy_status_failure_degrades_to_a_warning(monkeypatch):
 # it stood before the fix, so they are regression tests, not restatements.
 # ---------------------------------------------------------------------------
 
-def test_missing_policy_warning_does_not_claim_uncapped_providers_are_barred(
+def test_missing_policy_warning_describes_the_fail_closed_forced_tag(
     monkeypatch, tmp_path, open_cwd,
 ):
-    """The message must not tell an operator vibe/openrouter are fenced off.
+    """The message must describe the runtime correctly, in both directions.
 
-    Measured with no policy.yaml: the forced-tag branch of _selection_order()
-    never consults _allows(), so a bare `#vibe` tag RUNS — only the
-    tool-internal lookups fail closed. The old wording asserted the opposite,
-    i.e. the one report that has to be trustworthy said an uncapped,
-    pay-per-token provider was blocked while it was about to start.
+    Until 2026-09-17 a bare `#vibe` tag RAN under a missing policy (the
+    forced-tag branch never consulted _allows()), and the wording said so. The
+    gap is closed now, so the warning must say the tag ends terminal - and must
+    not claim the capped providers are blocked, which would read as an outage.
     """
     _install_policy(monkeypatch, tmp_path, None)
     findings = lint_queue(f"## Queue\n- [ ] Baue X cwd:{open_cwd}\n")
     msg = next(f for f in findings if f.code == "policy_missing").message
 
-    # Whatever the wording, it must not read as "vibe/openrouter are barred".
-    assert "gesperrt" not in msg
-    assert "Fail-Closed" not in msg or "nicht beim erzwungenen Provider-Tag" in msg
+    assert "provider_not_allowed" in msg
+    assert "laeuft dann trotzdem" not in msg
+    assert "claude/codex/opencode laufen weiter" in msg
 
 
-def test_bare_uncapped_tag_under_a_missing_policy_is_reported_as_running(
+def test_bare_uncapped_tag_under_a_missing_policy_is_reported_as_barred(
     monkeypatch, tmp_path, open_cwd, with_vibe,
 ):
     """Pins the runtime behaviour the warning above describes.
 
-    If dispatcher ever closes the forced-branch gap (CLAUDE.md tracks it as
-    open), this test goes red and the warning text has to be revisited with it.
+    This test used to pin the OPEN gap (order[0] == 'vibe'); it was flipped when
+    dispatcher closed it on 2026-09-17. The linter inherits the verdict from
+    forced_provider_policy_violation(), so the per-task check must now report
+    an ERROR for exactly the line the runtime rejects.
 
-    ``with_vibe`` (tests/conftest.py) is load-bearing, not decoration: vibe is
-    registered conditionally, and with the provider popped ``_selection_order``
-    returns ``['claude', 'codex']`` — the assertion below would fail on every
-    box without the Mistral binary. Same machine-dependence the opencode pair
-    exists for.
+    ``with_vibe`` (tests/conftest.py) is load-bearing: with vibe unregistered,
+    resolve_forced_provider() returns None and no violation can be reported.
     """
     import dispatcher
 
+    real_allowed_by_policy = dispatcher._allowed_by_policy
     monkeypatch.setattr(dispatcher, "_allowed_by_policy", lambda *a, **kw: None)
 
     order, allowed = dispatcher._selection_order("do X #vibe", None, None, False, None)
 
     assert allowed is None
-    assert order and order[0] == "vibe", (
-        "forced-tag branch now honours _allows(); update the policy_missing wording"
-    )
-    assert dispatcher.forced_provider_policy_violation("do X #vibe") is None
-    # ... while the tool-internal lookup DOES fail closed. Both halves are the
-    # asymmetry the warning has to describe correctly.
+    assert order == []
+    violation = dispatcher.forced_provider_policy_violation("do X #vibe")
+    assert violation is not None and violation[0] == "vibe"
+    assert "vibe" not in violation[1]
     assert dispatcher.policy_allows_provider("vibe", None) is False
+
+    # Linter level, with a real missing policy.yaml instead of the patch.
+    monkeypatch.setattr(dispatcher, "_allowed_by_policy", real_allowed_by_policy)
+    _install_policy(monkeypatch, tmp_path, None)
+    findings = lint_queue(f"## Queue\n- [ ] Baue X cwd:{open_cwd} #vibe\n")
+    errors = [f for f in findings if f.code == "provider_not_allowed"]
+    assert errors and errors[0].level == LEVEL_ERROR
 
 
 def test_second_opinion_alias_outside_review_loops_maps_is_not_a_policy_finding(

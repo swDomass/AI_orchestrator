@@ -15,11 +15,14 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Run all tests (2816 passed / 14 failed in 165 s — measured 2026-09-17 as the
-# LAST step of a review-loop pass on the forced-branch fail-closed fix, in an
-# environment where tests/test_usage_suggester.py's 14 environment-dependent
-# cases are red on master too, see README Known Limitations; 2830 collected:
-# +19 over 2811, in tests/test_dispatcher_routing.py (+17: 6+4 parametrized
+# Run all tests (2844 passed / 0 failed in 180 s — measured 2026-09-17 in the main
+# checkout on master after merging orch/orchroute-2026-09-17 (+19) and
+# orch/orchscicodes-2026-09-17 (+14): 2811 + 19 + 14 = 2844 exactly. The review-loop
+# on orchroute had measured 2816 passed / 14 failed in a git worktree, where
+# tests/test_usage_suggester.py's 14 environment-dependent cases are red on master
+# too, see README Known Limitations. The +14 from orchscicodes are the
+# ProviderCallError tests across tests/test_scientific_investigation_*.py.
+# orchroute's +19 over 2811: tests/test_dispatcher_routing.py (+17: 6+4 parametrized
 # barred-tag cases, 2 capped-unchanged cases, 5 single tests),
 # tests/test_orchestrator_tool_tasks.py (+1) and tests/test_queue_linter_policy.py
 # (+1: a review-loop-round-2 test pinning that policy_unreadable/policy_empty no

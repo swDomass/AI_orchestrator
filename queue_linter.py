@@ -795,6 +795,18 @@ def _check_opencode(line_no: int, task_text: str) -> list[LintFinding]:
     )]
 
 
+# Single source of truth for the runtime consequence of get_allowed_providers()
+# -> None, whatever the reason (missing file, unreadable file, empty document,
+# non-mapping tool_providers:). Every _policy_status() finding below describes
+# the SAME PolicyEngine outcome and must therefore say the SAME thing about it -
+# see the docstring of _policy_status() for the self-contradiction this removes.
+_NO_ALLOWLIST_CONSEQUENCE = (
+    "claude/codex/opencode laufen weiter, ein direktes #vibe/#openrouter-Tag "
+    "endet ohne ausdrueckliche Freigabe (#tool_providers:) terminal mit "
+    "provider_not_allowed"
+)
+
+
 def _policy_status() -> LintFinding | None:
     """One file-level finding about policy.yaml itself, or None when it is usable.
 
@@ -817,6 +829,18 @@ def _policy_status() -> LintFinding | None:
     * **present but not usable** (parse error, non-mapping root, ``tool_providers``
       that is not a mapping) -> ERROR. That is corruption, and the OneDrive-sync
       collision is exactly the case that must not pass quietly.
+
+    All four findings below (missing/unreadable x3/empty) land on the exact same
+    ``get_allowed_providers() -> None`` outcome, so they must describe the exact
+    same runtime consequence via ``_NO_ALLOWLIST_CONSEQUENCE`` - "no restriction"
+    is only true for claude/codex/opencode; ``dispatcher._allows()`` stays
+    fail-closed for vibe/openrouter regardless of *why* no allow-list resolved.
+    Saying "jede Provider-Sperre ist weg" for the unreadable/empty cases while
+    ``policy_missing`` next to it correctly says the opposite would be the exact
+    self-contradiction the 2026-09-17 forced-branch fix removed from the
+    ``policy_missing`` text alone (found in review: the two findings can fire in
+    the SAME lint run - an unreadable file with a ``#vibe`` line yields both
+    ``policy_unreadable`` and ``provider_not_allowed`` together).
     """
     try:
         from policy import get_engine
@@ -840,9 +864,7 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_WARN, None, str(path),
             f"policy.yaml nicht gefunden ({path}) - die Provider-Policy kann hier "
-            "nicht geprueft werden. Folge: claude/codex/opencode laufen weiter, "
-            "ein direktes #vibe/#openrouter-Tag endet ohne ausdrueckliche Freigabe "
-            "(#tool_providers:) terminal mit provider_not_allowed",
+            f"nicht geprueft werden. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_missing",
         )
 
@@ -853,15 +875,15 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml nicht lesbar/parsebar ({exc}) - PolicyEngine meldet das als "
-            "'keine Einschraenkung', jede Provider-Sperre ist damit still weg",
+            f"'keine Einschraenkung'. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
     if data is None:
         return LintFinding(
             LEVEL_WARN, None, str(path),
-            "policy.yaml ist leer - entweder Absicht oder ein abgeschnittener Sync; "
-            "in beiden Faellen greift keine tool_providers-Regel",
+            "policy.yaml ist leer - entweder Absicht oder ein abgeschnittener Sync. "
+            f"Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_empty",
         )
 
@@ -869,7 +891,7 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml enthaelt kein Mapping (got {type(data).__name__}) - "
-            "PolicyEngine verwirft das still, jede Provider-Sperre ist damit weg",
+            f"PolicyEngine verwirft das still. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
@@ -878,8 +900,8 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml: tool_providers ist kein Mapping (got "
-            f"{type(providers_raw).__name__}) - wird still ignoriert, der "
-            "Provider-Deckel greift dann nirgends",
+            f"{type(providers_raw).__name__}) - wird still ignoriert. "
+            f"Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 

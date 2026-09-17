@@ -318,6 +318,37 @@ def test_unparseable_policy_file_is_an_error(monkeypatch, tmp_path, open_cwd):
     assert exit_code_for(findings) == 2
 
 
+def test_unreadable_policy_warning_does_not_claim_every_bar_is_gone(
+    monkeypatch, tmp_path, open_cwd, with_vibe,
+):
+    """Found in re-review (2026-09-17): `policy_unreadable`, `policy_empty` and the
+    non-mapping variants all land on the exact same PolicyEngine "no restriction"
+    outcome as `policy_missing` — but only `policy_missing` was reworded when the
+    forced branch became fail-closed, so `policy_unreadable`'s old text ("jede
+    Provider-Sperre ist damit still weg") could fire in the SAME lint run right
+    next to a `provider_not_allowed` finding for a `#vibe` line on the same
+    (unreadable) file — the exact self-contradiction the 2026-09-17 fix removed
+    from `policy_missing` alone. All four now share `_NO_ALLOWLIST_CONSEQUENCE`,
+    so this pins the unreadable-file case; a changed shared constant would break
+    this test the same way it would break test_missing_policy_warning_describes_
+    the_fail_closed_forced_tag, so policy_empty/non-mapping are not re-tested
+    per state.
+    """
+    _install_policy(monkeypatch, tmp_path, "tool_providers: [unclosed\n")
+    findings = lint_queue(f"## Queue\n- [ ] Baue X cwd:{open_cwd} #vibe\n")
+
+    unreadable = next(f for f in findings if f.code == "policy_unreadable")
+    assert "claude/codex/opencode laufen weiter" in unreadable.message
+    assert "jede Provider-Sperre" not in unreadable.message
+    assert "keine tool_providers-Regel" not in unreadable.message
+    assert "greift dann nirgends" not in unreadable.message
+
+    # The self-contradiction, made concrete: the SAME run also bars the #vibe
+    # line terminally — exactly what the finding above must not claim is moot.
+    errors = [f for f in findings if f.code == "provider_not_allowed"]
+    assert errors and errors[0].level == LEVEL_ERROR
+
+
 def test_non_mapping_policy_root_is_an_error(monkeypatch, tmp_path):
     _install_policy(monkeypatch, tmp_path, "- just\n- a\n- list\n")
     finding = queue_linter._policy_status()
@@ -448,6 +479,16 @@ def test_bare_uncapped_tag_under_a_missing_policy_is_reported_as_barred(
     # is missing here, and must name the actual remedy.
     assert "per tool_providers-Policy" not in errors[0].message
     assert "#tool_providers:vibe" in errors[0].message
+    # Not just similar wording — the literal same function call, so the two
+    # cannot drift apart the way a hand-copied second string could. The allow-
+    # list is derived, not hardcoded: which capped providers are registered
+    # (opencode in particular) depends on the box running the suite.
+    import orchestrator
+
+    expected_allowed = dispatcher._effective_allowed(None)
+    assert errors[0].message.startswith(
+        orchestrator._policy_violation_message("vibe", expected_allowed, None)
+    )
 
 
 def test_second_opinion_alias_outside_review_loops_maps_is_not_a_policy_finding(

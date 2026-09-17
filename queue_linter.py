@@ -795,6 +795,28 @@ def _check_opencode(line_no: int, task_text: str) -> list[LintFinding]:
     )]
 
 
+# Single source of truth for the runtime consequence of get_allowed_providers()
+# -> None, whatever the reason (missing file, unreadable file, empty document,
+# non-mapping tool_providers:). Every _policy_status() finding below describes
+# the SAME PolicyEngine outcome and must therefore say the SAME thing about it -
+# see the docstring of _policy_status() for the self-contradiction this removes.
+#
+# "terminal mit provider_not_allowed" presumes the tagged provider is itself
+# REGISTERED (API key / CLI present) - forced_provider_policy_violation() only
+# fires once resolve_forced_provider() resolves a provider at all. An
+# unregistered #openrouter falls back to the default chain
+# (openrouter_missing_key) and an unregistered #vibe is parked
+# (vibe_missing_cli) - the per-task checks below report those separately, so
+# this file-level line does not contradict them, but it also does not repeat
+# that qualifier per occurrence (found in external review: 2026-09-17).
+_NO_ALLOWLIST_CONSEQUENCE = (
+    "claude/codex/opencode laufen weiter, ein direktes #vibe/#openrouter-Tag "
+    "auf einem registrierten Provider endet ohne ausdrueckliche Freigabe "
+    "(#tool_providers:) terminal mit provider_not_allowed (unregistriert: "
+    "vibe_missing_cli/openrouter_missing_key statt dessen)"
+)
+
+
 def _policy_status() -> LintFinding | None:
     """One file-level finding about policy.yaml itself, or None when it is usable.
 
@@ -817,6 +839,18 @@ def _policy_status() -> LintFinding | None:
     * **present but not usable** (parse error, non-mapping root, ``tool_providers``
       that is not a mapping) -> ERROR. That is corruption, and the OneDrive-sync
       collision is exactly the case that must not pass quietly.
+
+    All four findings below (missing/unreadable x3/empty) land on the exact same
+    ``get_allowed_providers() -> None`` outcome, so they must describe the exact
+    same runtime consequence via ``_NO_ALLOWLIST_CONSEQUENCE`` - "no restriction"
+    is only true for claude/codex/opencode; ``dispatcher._allows()`` stays
+    fail-closed for vibe/openrouter regardless of *why* no allow-list resolved.
+    Saying "jede Provider-Sperre ist weg" for the unreadable/empty cases while
+    ``policy_missing`` next to it correctly says the opposite would be the exact
+    self-contradiction the 2026-09-17 forced-branch fix removed from the
+    ``policy_missing`` text alone (found in review: the two findings can fire in
+    the SAME lint run - an unreadable file with a ``#vibe`` line yields both
+    ``policy_unreadable`` and ``provider_not_allowed`` together).
     """
     try:
         from policy import get_engine
@@ -831,21 +865,16 @@ def _policy_status() -> LintFinding | None:
         )
 
     if not path.exists():
-        # Deliberately does NOT claim vibe/openrouter are barred. Measured with
-        # no policy.yaml: _selection_order("... #vibe", ...) -> (['vibe',
-        # 'claude', 'codex'], None) and forced_provider_policy_violation(...) ->
-        # None, while policy_allows_provider('vibe', None) -> False. _allows()'s
-        # fail-CLOSED half only reaches the TOOL-INTERNAL lookups; the
-        # forced-tag branch (dispatcher._selection_order) never consults it -
-        # the gap CLAUDE.md and README document. An operator reading this at
-        # 03:00 must not be told an uncapped, pay-per-token provider is fenced
-        # off when it will in fact run.
+        # Describes the runtime as it is since 2026-09-17: with no policy.yaml
+        # the forced-tag branch (dispatcher._selection_order /
+        # forced_provider_policy_violation) consults _allows() too, so a bare
+        # #vibe/#openrouter tag ends terminal with provider_not_allowed - the
+        # per-task check below reports exactly that as an ERROR. Capped
+        # providers (claude, codex, opencode) keep running (fail-open).
         return LintFinding(
             LEVEL_WARN, None, str(path),
             f"policy.yaml nicht gefunden ({path}) - die Provider-Policy kann hier "
-            "nicht geprueft werden. Achtung: ein direktes #vibe/#openrouter-Tag "
-            "laeuft dann trotzdem (die Fail-Closed-Regel greift nur bei "
-            "Second-Opinion/Pass-2, nicht beim erzwungenen Provider-Tag)",
+            f"nicht geprueft werden. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_missing",
         )
 
@@ -856,15 +885,15 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml nicht lesbar/parsebar ({exc}) - PolicyEngine meldet das als "
-            "'keine Einschraenkung', jede Provider-Sperre ist damit still weg",
+            f"'keine Einschraenkung'. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
     if data is None:
         return LintFinding(
             LEVEL_WARN, None, str(path),
-            "policy.yaml ist leer - entweder Absicht oder ein abgeschnittener Sync; "
-            "in beiden Faellen greift keine tool_providers-Regel",
+            "policy.yaml ist leer - entweder Absicht oder ein abgeschnittener Sync. "
+            f"Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_empty",
         )
 
@@ -872,7 +901,7 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml enthaelt kein Mapping (got {type(data).__name__}) - "
-            "PolicyEngine verwirft das still, jede Provider-Sperre ist damit weg",
+            f"PolicyEngine verwirft das still. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
@@ -881,8 +910,8 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml: tool_providers ist kein Mapping (got "
-            f"{type(providers_raw).__name__}) - wird still ignoriert, der "
-            "Provider-Deckel greift dann nirgends",
+            f"{type(providers_raw).__name__}) - wird still ignoriert. "
+            f"Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
@@ -999,12 +1028,17 @@ def _check_policy_providers(line_no: int, task_text: str) -> list[LintFinding]:
 
     The verdict comes from ``dispatcher.forced_provider_policy_violation()``
     itself rather than a reimplementation, so linter and runtime cannot disagree
-    about what the policy says. That inherits the known open gap in
-    ``_selection_order()``'s forced branch (CLAUDE.md) - which is correct for a
-    linter whose job is predicting runtime, not describing the intent.
+    about what the policy says - including the fail-closed rule for a bare
+    #vibe/#openrouter tag when no allow-list resolves (closed in the runtime on
+    2026-09-17, inherited here without linter code of its own). The finding text
+    reuses ``orchestrator._policy_violation_message()`` too, for the same reason:
+    that function already knows not to blame a ``tool_providers``-Policy that may
+    not exist (missing/unreadable policy.yaml), and a second copy here could only
+    drift from it.
     """
     try:
         from dispatcher import forced_provider_policy_violation, policy_allows_provider
+        from orchestrator import _policy_violation_message
     except Exception as exc:  # noqa: BLE001 - provider construction can fail on a half-set-up box
         return [LintFinding(
             LEVEL_WARN, line_no, task_text,
@@ -1027,11 +1061,16 @@ def _check_policy_providers(line_no: int, task_text: str) -> list[LintFinding]:
         )
         if violation:
             name, allowed = violation
+            # Same wording as the runtime's own terminal message (single source of
+            # truth, like the ERROR verdict above) - see its docstring for why it
+            # deliberately does not say "per tool_providers-Policy": `allowed` can be
+            # a real configured list OR the _UNCAPPED_PROVIDERS fail-closed default
+            # synthesised when none resolved at all, and the two are indistinguishable
+            # by the time they get here.
             out.append(LintFinding(
                 LEVEL_ERROR, line_no, task_text,
-                f"Provider '{name}' ist fuer {scope} per tool_providers-Policy nicht "
-                f"zugelassen (erlaubt: {', '.join(allowed)}) - der Task endet zur "
-                f"Laufzeit terminal mit provider_not_allowed, ohne Fallback",
+                _policy_violation_message(name, allowed, tool_name)
+                + " (Lint-Vorhersage: endet zur Laufzeit terminal mit provider_not_allowed, ohne Fallback)",
                 code="provider_not_allowed",
             ))
 

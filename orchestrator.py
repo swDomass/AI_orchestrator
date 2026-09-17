@@ -1751,12 +1751,28 @@ def _policy_violation_message(name: str, allowed: list[str], tool_name: str | No
     Terminal on purpose: retrying cannot change a policy, and silently routing the
     task to a different provider would hide which model actually did the work —
     the worst outcome in an unattended run.
+
+    Deliberately does NOT say "per tool_providers-Policy nicht zugelassen": ``allowed``
+    (``forced_provider_policy_violation()``'s ``_effective_allowed()`` result) is either
+    a real, configured allow-list that excludes *name*, OR a SYNTHESISED one — the
+    _UNCAPPED_PROVIDERS fail-closed default that fires when NO allow-list resolved at
+    all (missing/unreadable policy.yaml, or one without a tool_providers: section). The
+    two are structurally indistinguishable by the time they reach this function (same
+    problem `_policy_dead_end_message()` solves for the untagged case via
+    `profile_dead_end_reason()`'s uncapped_barred/policy_barred split) — naming a policy
+    that may not exist as the cause pointed an operator at 03:00 at the wrong file.
+    Wording it generically ("keine ausdrückliche Freigabe") keeps the sentence true
+    either way, and the remedy is identical in both cases regardless of cause: the
+    task-level `#tool_providers:` tag is layer 1 of `_allowed_by_policy()` and wins
+    over everything else, including a missing policy.yaml.
     """
     scope = f"Tool '{tool_name}'" if tool_name else "diesen Task"
     return (
-        f"Provider '{name}' ist für {scope} per tool_providers-Policy nicht zugelassen "
-        f"(erlaubt: {', '.join(allowed)}). Kein Fallback auf einen anderen Provider — "
-        f"Task abgebrochen."
+        f"Provider '{name}' ist für {scope} nicht zugelassen — keine ausdrückliche "
+        f"tool_providers-Freigabe (aktuell erreichbar: {', '.join(allowed)}). "
+        f"`#tool_providers:{name}` in der Queue-Zeile oder ein `tool_providers:`-"
+        f"Eintrag in der policy.yaml gibt ihn frei. Kein Fallback auf einen anderen "
+        f"Provider — Task abgebrochen."
     )
 
 

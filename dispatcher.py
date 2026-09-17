@@ -252,8 +252,12 @@ def _allows(provider_name: str, allowed: list[str] | None) -> bool:
 
     That case is split, deliberately asymmetrically:
 
-    * fail-OPEN for the capped providers (claude, codex, gemini) — a policy file
-      that failed to load must not take the whole orchestrator offline at 03:00.
+    * fail-OPEN for the capped providers (claude, codex, gemini, opencode) — a
+      policy file that failed to load must not take the whole orchestrator
+      offline at 03:00. opencode joined this set on 2026-09-04 (its own,
+      pollable OpenRouter-key budget caps it, see _UNCAPPED_PROVIDERS above) —
+      named here explicitly because the forced/tag branch below now relies on
+      this exact asymmetry directly, not just the tool-internal lookups.
     * fail-CLOSED for _UNCAPPED_PROVIDERS — those are pay-per-token with no cost
       ceiling anywhere (_limits_ok returns True for them unconditionally), so a
       lost policy file would otherwise turn "barred from unattended runs" into
@@ -340,14 +344,20 @@ def forced_provider_policy_violation(
     Lets the orchestrator tell "policy rejected the #tag" apart from "everything is
     capacity-exhausted", which both surface as ``select_provider() -> None``. The
     former is terminal (retrying cannot change a policy), the latter is not.
+
+    Judged by ``_allows()`` itself, so a MISSING/unreadable policy (no allow-list
+    resolved) reports a bare #openrouter/#vibe tag as a violation too — the same
+    fail-closed rule every other path applies. Capped providers (claude, codex,
+    gemini, opencode) stay fail-open there. The returned list is
+    ``_effective_allowed()``, so the message never prints an empty "erlaubt:".
     """
     forced = resolve_forced_provider(task, force_name)
     if forced is None:
         return None
     allowed = _allowed_by_policy(task, profile, tool_name)
-    if not allowed or forced.name in allowed:
+    if _allows(forced.name, allowed):
         return None
-    return forced.name, list(allowed)
+    return forced.name, _effective_allowed(allowed)
 
 
 def _selection_order(
@@ -373,8 +383,12 @@ def _selection_order(
     allowed = _allowed_by_policy(task, profile, tool_name)
 
     # A forced provider the policy bars stops the selection outright — no
-    # fallback (see select_provider), so nothing is routable.
-    if forced and allowed and forced.name not in allowed:
+    # fallback (see select_provider), so nothing is routable. Judged by
+    # _allows(), not by `allowed and name not in allowed`: the latter skipped the
+    # check whenever no allow-list resolved (missing/unreadable policy.yaml, or
+    # no tool_providers: section) and let a bare #openrouter/#vibe tag through
+    # to an uncapped provider — the fail-closed rule must hold here as well.
+    if forced and not _allows(forced.name, allowed):
         return [], allowed
 
     # Profile provider order overrides _PRIORITY. Unlike _PRIORITY (which never
@@ -623,7 +637,8 @@ def select_provider(
     # an unattended run a silent swap to a different provider is worse than a
     # clean stop, because nobody sees which model actually did the work.
     # (A forced provider that IS allowed always heads a non-empty order, so an
-    # empty one here can only mean the policy barred it.)
+    # empty one here can only mean the policy barred it — including the
+    # fail-closed case of an uncapped provider with no allow-list resolved.)
     if forced and not order:
         print(
             f"  [policy] Provider '{forced.name}' ist für "

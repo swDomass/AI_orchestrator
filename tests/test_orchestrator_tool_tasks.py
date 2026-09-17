@@ -2238,3 +2238,60 @@ def test_every_verify_site_restamps_on_failure():
     assert calls.count("_restamp_after_failed_verify") == 3, (
         calls.count("_restamp_after_failed_verify")
     )
+
+
+def test_run_once_bare_vibe_tag_under_missing_policy_is_terminal_provider_not_allowed(
+    monkeypatch, tmp_path, with_vibe,
+):
+    """End-to-end half of the 2026-09-17 fix: NOTHING in the policy path mocked.
+
+    The neighbour test above stubs forced_provider_policy_violation() and would
+    stay green while the dispatcher still let a bare #vibe through under a
+    missing policy.yaml. Here the real select_provider() and the real violation
+    check run against a PolicyEngine pointed at a vault with no policy file.
+    """
+    monkeypatch.setattr(policy_module, "_engine", policy_module.PolicyEngine(vault_path=tmp_path))
+
+    finalize_mock = Mock(return_value=True)
+    mark_retry_mock = Mock(return_value=True)
+    spans = []
+
+    _no_worktree_gate(monkeypatch)
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:dev-loop #vibe", line_no=1,
+                                 raw_line="- [ ] Task #tool:dev-loop #vibe")],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: ["Task #tool:dev-loop #vibe"])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "dev-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: limits.AllLimits())
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", Mock(side_effect=AssertionError("must not run")))
+    monkeypatch.setattr(orchestrator, "_finalize_task_with_result_checked", finalize_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "_mark_retry_checked", mark_retry_mock)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+    # Not reached on the correct fail-closed path (the violation is caught before
+    # provider selection succeeds), but a REGRESSION here — the exact mutation
+    # class this test exists to catch — reaches it with a real "vibe" selection
+    # before _execute_tool_task's AssertionError fires. Stubbed so a reverted gate
+    # fails on the assertion below, not on a live Telegram send.
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator._RunSpan, "emit", lambda self: spans.append(self))
+
+    orchestrator.run_once()
+
+    finalize_mock.assert_called_once()
+    assert finalize_mock.call_args.kwargs.get("failed") is True
+    msg = finalize_mock.call_args.args[1]
+    assert "vibe" in msg and "nicht zugelassen" in msg
+    # Pins the 2026-09-17 message-wording fix: must not blame a policy.yaml that
+    # does not exist, and must always name the actual remedy.
+    assert "per tool_providers-Policy" not in msg
+    assert "#tool_providers:vibe" in msg
+    mark_retry_mock.assert_not_called()
+    assert [s.error_code for s in spans] == ["provider_not_allowed"]

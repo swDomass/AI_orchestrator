@@ -252,8 +252,12 @@ def _allows(provider_name: str, allowed: list[str] | None) -> bool:
 
     That case is split, deliberately asymmetrically:
 
-    * fail-OPEN for the capped providers (claude, codex, gemini) — a policy file
-      that failed to load must not take the whole orchestrator offline at 03:00.
+    * fail-OPEN for the capped providers (claude, codex, gemini, opencode) — a
+      policy file that failed to load must not take the whole orchestrator
+      offline at 03:00. opencode joined this set on 2026-09-04 (its own,
+      pollable OpenRouter-key budget caps it, see _UNCAPPED_PROVIDERS above) —
+      named here explicitly because the forced/tag branch below now relies on
+      this exact asymmetry directly, not just the tool-internal lookups.
     * fail-CLOSED for _UNCAPPED_PROVIDERS — those are pay-per-token with no cost
       ceiling anywhere (_limits_ok returns True for them unconditionally), so a
       lost policy file would otherwise turn "barred from unattended runs" into

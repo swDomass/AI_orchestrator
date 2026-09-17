@@ -2275,6 +2275,12 @@ def test_run_once_bare_vibe_tag_under_missing_policy_is_terminal_provider_not_al
     monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
     monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
     monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+    # Not reached on the correct fail-closed path (the violation is caught before
+    # provider selection succeeds), but a REGRESSION here — the exact mutation
+    # class this test exists to catch — reaches it with a real "vibe" selection
+    # before _execute_tool_task's AssertionError fires. Stubbed so a reverted gate
+    # fails on the assertion below, not on a live Telegram send.
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *a, **kw: None)
     monkeypatch.setattr(orchestrator._RunSpan, "emit", lambda self: spans.append(self))
 
     orchestrator.run_once()
@@ -2283,5 +2289,9 @@ def test_run_once_bare_vibe_tag_under_missing_policy_is_terminal_provider_not_al
     assert finalize_mock.call_args.kwargs.get("failed") is True
     msg = finalize_mock.call_args.args[1]
     assert "vibe" in msg and "nicht zugelassen" in msg
+    # Pins the 2026-09-17 message-wording fix: must not blame a policy.yaml that
+    # does not exist, and must always name the actual remedy.
+    assert "per tool_providers-Policy" not in msg
+    assert "#tool_providers:vibe" in msg
     mark_retry_mock.assert_not_called()
     assert [s.error_code for s in spans] == ["provider_not_allowed"]

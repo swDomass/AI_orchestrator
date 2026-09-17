@@ -998,10 +998,15 @@ def _check_policy_providers(line_no: int, task_text: str) -> list[LintFinding]:
     itself rather than a reimplementation, so linter and runtime cannot disagree
     about what the policy says - including the fail-closed rule for a bare
     #vibe/#openrouter tag when no allow-list resolves (closed in the runtime on
-    2026-09-17, inherited here without linter code of its own).
+    2026-09-17, inherited here without linter code of its own). The finding text
+    reuses ``orchestrator._policy_violation_message()`` too, for the same reason:
+    that function already knows not to blame a ``tool_providers``-Policy that may
+    not exist (missing/unreadable policy.yaml), and a second copy here could only
+    drift from it.
     """
     try:
         from dispatcher import forced_provider_policy_violation, policy_allows_provider
+        from orchestrator import _policy_violation_message
     except Exception as exc:  # noqa: BLE001 - provider construction can fail on a half-set-up box
         return [LintFinding(
             LEVEL_WARN, line_no, task_text,
@@ -1024,11 +1029,16 @@ def _check_policy_providers(line_no: int, task_text: str) -> list[LintFinding]:
         )
         if violation:
             name, allowed = violation
+            # Same wording as the runtime's own terminal message (single source of
+            # truth, like the ERROR verdict above) - see its docstring for why it
+            # deliberately does not say "per tool_providers-Policy": `allowed` can be
+            # a real configured list OR the _UNCAPPED_PROVIDERS fail-closed default
+            # synthesised when none resolved at all, and the two are indistinguishable
+            # by the time they get here.
             out.append(LintFinding(
                 LEVEL_ERROR, line_no, task_text,
-                f"Provider '{name}' ist fuer {scope} per tool_providers-Policy nicht "
-                f"zugelassen (erlaubt: {', '.join(allowed)}) - der Task endet zur "
-                f"Laufzeit terminal mit provider_not_allowed, ohne Fallback",
+                _policy_violation_message(name, allowed, tool_name)
+                + " (Lint-Vorhersage: endet zur Laufzeit terminal mit provider_not_allowed, ohne Fallback)",
                 code="provider_not_allowed",
             ))
 

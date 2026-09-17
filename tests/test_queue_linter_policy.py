@@ -443,6 +443,11 @@ def test_bare_uncapped_tag_under_a_missing_policy_is_reported_as_barred(
     findings = lint_queue(f"## Queue\n- [ ] Baue X cwd:{open_cwd} #vibe\n")
     errors = [f for f in findings if f.code == "provider_not_allowed"]
     assert errors and errors[0].level == LEVEL_ERROR
+    # Reuses orchestrator._policy_violation_message() (single source of truth for
+    # the wording too, not just the verdict) — must not blame a policy.yaml that
+    # is missing here, and must name the actual remedy.
+    assert "per tool_providers-Policy" not in errors[0].message
+    assert "#tool_providers:vibe" in errors[0].message
 
 
 def test_second_opinion_alias_outside_review_loops_maps_is_not_a_policy_finding(

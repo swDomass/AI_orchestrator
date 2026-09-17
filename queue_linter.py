@@ -800,10 +800,20 @@ def _check_opencode(line_no: int, task_text: str) -> list[LintFinding]:
 # non-mapping tool_providers:). Every _policy_status() finding below describes
 # the SAME PolicyEngine outcome and must therefore say the SAME thing about it -
 # see the docstring of _policy_status() for the self-contradiction this removes.
+#
+# "terminal mit provider_not_allowed" presumes the tagged provider is itself
+# REGISTERED (API key / CLI present) - forced_provider_policy_violation() only
+# fires once resolve_forced_provider() resolves a provider at all. An
+# unregistered #openrouter falls back to the default chain
+# (openrouter_missing_key) and an unregistered #vibe is parked
+# (vibe_missing_cli) - the per-task checks below report those separately, so
+# this file-level line does not contradict them, but it also does not repeat
+# that qualifier per occurrence (found in external review: 2026-09-17).
 _NO_ALLOWLIST_CONSEQUENCE = (
     "claude/codex/opencode laufen weiter, ein direktes #vibe/#openrouter-Tag "
-    "endet ohne ausdrueckliche Freigabe (#tool_providers:) terminal mit "
-    "provider_not_allowed"
+    "auf einem registrierten Provider endet ohne ausdrueckliche Freigabe "
+    "(#tool_providers:) terminal mit provider_not_allowed (unregistriert: "
+    "vibe_missing_cli/openrouter_missing_key statt dessen)"
 )
 
 

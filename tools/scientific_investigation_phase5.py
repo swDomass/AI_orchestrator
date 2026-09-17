@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Literal
 
 from config import TOOL_SI_PHASE5B_TIMEOUT_SEC
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ProviderCallError
 from tools.crosschecks import audit_trail
 from tools.scientific_investigation_phase2 import _parse_review_findings
 from tools.scientific_investigation_phase4 import CriteriaStatus
@@ -313,8 +313,9 @@ def phase_heuristic_review(
     )
     result = reviewer_provider.run(prompt, timeout=timeout_sec, read_only=True)
     if not getattr(result, "success", False):
-        raise RuntimeError(
-            f"Phase 5b review LLM call failed: {getattr(result, 'error', 'unknown')}"
+        provider_error = getattr(result, "error", "unknown")
+        raise ProviderCallError(
+            f"Phase 5b review LLM call failed: {provider_error}", provider_error
         )
     raw = (result.output or "").strip()
     findings = _parse_review_findings(raw, reviewer="phase5b_heuristic")

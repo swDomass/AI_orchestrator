@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from providers.base import RunResult
+from providers.base import ProviderCallError, RunResult
 from tools.crosschecks import audit_trail, similarity_index
 from tools.scientific_investigation import ScientificInvestigationTool
 from tools.scientific_investigation_approvals import (
@@ -50,11 +50,17 @@ def _reset_manager():
 
 
 class _ScriptedProvider:
-    """Returns pre-scripted outputs in order."""
+    """Returns pre-scripted outputs in order.
+
+    Each scripted item is either a plain string (wrapped as a successful
+    ``RunResult``, as before) or a ``RunResult`` instance used as-is — the
+    latter lets a test inject a failing call (with a specific ``.error``)
+    at a specific step of a multi-phase pipeline.
+    """
     name = "claude"
     supports_sessions = False
 
-    def __init__(self, outputs: list[str]):
+    def __init__(self, outputs: list[str | RunResult]):
         self._outputs = list(outputs)
         self.prompts: list[str] = []
 
@@ -62,7 +68,10 @@ class _ScriptedProvider:
         self.prompts.append(task)
         if not self._outputs:
             return RunResult(success=False, error="no scripted output left")
-        return RunResult(success=True, output=self._outputs.pop(0))
+        item = self._outputs.pop(0)
+        if isinstance(item, RunResult):
+            return item
+        return RunResult(success=True, output=item)
 
 
 def _patch_notifier(monkeypatch):
@@ -370,6 +379,21 @@ def test_phase_framing_flags_similarity_hits(tmp_path):
     assert any(h["run_id"] == "prior" for h in framing.similarity_hits)
 
 
+def test_phase_framing_raises_provider_call_error_with_raw_code(tmp_path):
+    """The raw RunResult.error must survive structurally, not just in prose."""
+    run_dir = tmp_path / "docs" / "x"
+    run_dir.mkdir(parents=True)
+    (run_dir / "audit").mkdir()
+    provider = _ScriptedProvider([RunResult(success=False, error="rate_limit: quota exceeded")])
+    with pytest.raises(ProviderCallError) as exc_info:
+        phase_framing(
+            "x", provider,
+            run_dir=run_dir, root_cwd=tmp_path, run_id="r",
+            timeout_sec=60,
+        )
+    assert exc_info.value.provider_error == "rate_limit: quota exceeded"
+
+
 def test_phase_framing_raises_on_empty_framing_text(tmp_path):
     run_dir = tmp_path / "docs" / "x"
     run_dir.mkdir(parents=True)
@@ -539,6 +563,19 @@ def test_phase_prereg_discipline_warning_rejected_aborts(tmp_path):
         )
 
 
+def test_phase_prereg_raises_provider_call_error_with_raw_code(tmp_path):
+    """The raw RunResult.error must survive structurally, not just in prose."""
+    rd = _make_run_dir(tmp_path)
+    provider = _ScriptedProvider([RunResult(success=False, error="auth_expired")])
+    with pytest.raises(ProviderCallError) as exc_info:
+        phase_prereg(
+            _make_framing(), provider,
+            run_dir=rd, run_id="r",
+            timeout_sec=60, telegram_timeout_sec=1,
+        )
+    assert exc_info.value.provider_error == "auth_expired"
+
+
 def test_phase_prereg_rejects_too_many_thresholds(tmp_path):
     rd = _make_run_dir(tmp_path)
     block = "".join(
@@ -667,6 +704,119 @@ def test_tool_run_returns_phase05_failure_on_bad_prereg(monkeypatch, tmp_path):
     result = tool.run("x", provider, cwd=str(tmp_path))
     assert result.success is False
     assert result.error_code == "phase05_failed"
+
+
+# ── Provider error classification survives phase wrapping ──────────────────
+#
+# Regression coverage for the ROADMAP defect closed 2026-09-17: every phase
+# wrapped a provider failure into a plain RuntimeError, so the original
+# error_code (rate_limit, auth_expired, ...) never reached the orchestrator
+# and transient errors were finalized as permanent instead of requeued.
+# Classification goes exclusively through providers/base.py's error_code_of()/
+# is_transient() — no separate taxonomy list.
+
+
+def test_tool_run_phase0_transient_provider_error_is_retryable(monkeypatch, tmp_path):
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        RunResult(success=False, error="rate_limit: quota exceeded"),
+    ])
+    result = tool.run("x", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "rate_limit"
+    assert result.retryable is True
+
+
+def test_tool_run_phase0_unclassifiable_provider_error_is_not_retryable(monkeypatch, tmp_path):
+    """An opaque provider error falls back to the existing phaseN_failed code,
+    exactly like today's behaviour for a non-provider (ValueError) failure."""
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        RunResult(success=False, error="some opaque stderr dump"),
+    ])
+    result = tool.run("x", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "phase0_failed"
+    assert result.retryable is False
+
+
+def test_tool_run_phase0_auth_expired_provider_error(monkeypatch, tmp_path):
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        RunResult(success=False, error="auth_expired"),
+    ])
+    result = tool.run("x", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "auth_expired"
+    assert result.retryable is False  # is_transient("auth_expired") is False by design
+
+
+def test_tool_run_phase4_transient_provider_error_is_retryable(monkeypatch, tmp_path):
+    """Same mechanism, deeper phase — proves it isn't Phase-0-only."""
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        _good_framing_yaml(),
+        _good_prereg_yaml(),
+        "```yaml\nsub_tasks:\n  - sub_id: S1\n    title: t\n    description: d\n    "
+        "addresses_criteria: [F1]\n    type: data_analysis\n    expected_output: o\n```",
+        "```yaml\nfindings: []\n```",
+        "```yaml\nfindings: []\n```",
+        RunResult(success=False, error="rate_limit: quota exceeded"),  # Phase 4 synthesis
+    ])
+    result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "rate_limit"
+    assert result.retryable is True
+
+
+def test_tool_run_phase05_transient_provider_error_is_retryable(monkeypatch, tmp_path):
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        _good_framing_yaml(),
+        RunResult(success=False, error="timeout: idle watchdog"),  # Phase 0.5 prereg
+    ])
+    result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "timeout"
+    assert result.retryable is True
+
+
+def test_tool_run_phase2_transient_provider_error_is_retryable(monkeypatch, tmp_path):
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        _good_framing_yaml(),
+        _good_prereg_yaml(),
+        RunResult(success=False, error="unreachable: connection reset"),  # Phase 2 author
+    ])
+    result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "unreachable"
+    assert result.retryable is True
+
+
+def test_tool_run_phase7_transient_provider_error_is_retryable(monkeypatch, tmp_path):
+    _patch_notifier(monkeypatch)
+    tool = ScientificInvestigationTool()
+    provider = _ScriptedProvider([
+        _good_framing_yaml(),
+        _good_prereg_yaml(),
+        "```yaml\nsub_tasks:\n  - sub_id: S1\n    title: t\n    description: d\n    "
+        "addresses_criteria: [F1]\n    type: data_analysis\n    expected_output: o\n```",
+        "```yaml\nfindings: []\n```",
+        "```yaml\nfindings: []\n```",
+        "# Investigation Proof\n\nStub synthesis.\n",
+        RunResult(success=False, error="rate_limit: quota exceeded"),  # Phase 7 review
+    ])
+    result = tool.run("investigate diffusion", provider, cwd=str(tmp_path))
+    assert result.success is False
+    assert result.error_code == "rate_limit"
+    assert result.retryable is True
 
 
 # ── Helpers (data fixtures) ─────────────────────────────────────────────────

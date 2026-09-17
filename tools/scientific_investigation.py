@@ -45,7 +45,7 @@ from config import (
     TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC,
 )
 from notifier import notify_tool_done
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ProviderCallError, error_code_of, is_transient
 from tools.base_tool import (
     BaseTool,
     ToolResult,
@@ -429,6 +429,15 @@ class ScientificInvestigationTool(BaseTool):
                 run_id=run_id,
                 timeout_sec=TOOL_SI_PHASE0_TIMEOUT_SEC,
             )
+        except ProviderCallError as exc:
+            msg = f"Phase 0 (Framing) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase0_failed", error=str(exc))
+            notify_tool_done(self.name, 0, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=0, error=msg,
+                error_code=error_code_of(exc.provider_error) or "phase0_failed",
+                retryable=is_transient(exc.provider_error),
+            )
         except (RuntimeError, ValueError) as exc:
             msg = f"Phase 0 (Framing) fehlgeschlagen: {exc}"
             tracer.emit("run_end", success=False, reason="phase0_failed", error=str(exc))
@@ -455,6 +464,15 @@ class ScientificInvestigationTool(BaseTool):
                 telegram_timeout_sec=TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC,
                 notify_callable=notify_threshold_callable,
                 discipline_warning_callable=notify_discipline_warning_callable,
+            )
+        except ProviderCallError as exc:
+            msg = f"Phase 0.5 (Pre-Registration) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase05_failed", error=str(exc))
+            notify_tool_done(self.name, 1, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=1, error=msg,
+                error_code=error_code_of(exc.provider_error) or "phase05_failed",
+                retryable=is_transient(exc.provider_error),
             )
         except (RuntimeError, ValueError) as exc:
             msg = f"Phase 0.5 (Pre-Registration) fehlgeschlagen: {exc}"
@@ -513,6 +531,15 @@ class ScientificInvestigationTool(BaseTool):
                 run_dir=run_dir,
                 run_id=run_id,
                 provider_lookup=provider_lookup,
+            )
+        except ProviderCallError as exc:
+            msg = f"Phase 2 (Investigation-Plan-Review) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase2_failed", error=str(exc))
+            notify_tool_done(self.name, 3, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=3, error=msg,
+                error_code=error_code_of(exc.provider_error) or "phase2_failed",
+                retryable=is_transient(exc.provider_error),
             )
         except (RuntimeError, ValueError) as exc:
             msg = f"Phase 2 (Investigation-Plan-Review) fehlgeschlagen: {exc}"
@@ -579,6 +606,15 @@ class ScientificInvestigationTool(BaseTool):
                 framing, prereg, phase2, phase3, provider,
                 run_dir=run_dir, run_id=run_id,
             )
+        except ProviderCallError as exc:
+            msg = f"Phase 4 (Synthesis) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase4_failed", error=str(exc))
+            notify_tool_done(self.name, 5, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=5, error=msg,
+                error_code=error_code_of(exc.provider_error) or "phase4_failed",
+                retryable=is_transient(exc.provider_error),
+            )
         except RuntimeError as exc:
             msg = f"Phase 4 (Synthesis) fehlgeschlagen: {exc}"
             tracer.emit("run_end", success=False, reason="phase4_failed", error=str(exc))
@@ -644,6 +680,15 @@ class ScientificInvestigationTool(BaseTool):
                 run_dir=run_dir, run_id=run_id,
                 explicit_reviewer_name=tags.engineering_reviewer,
                 provider_lookup=provider_lookup,
+            )
+        except ProviderCallError as exc:
+            msg = f"Phase 7 (Engineering-Reviewer) fehlgeschlagen: {exc}"
+            tracer.emit("run_end", success=False, reason="phase7_failed", error=str(exc))
+            notify_tool_done(self.name, 7, False, msg)
+            return ToolResult(
+                success=False, output="", iterations=7, error=msg,
+                error_code=error_code_of(exc.provider_error) or "phase7_failed",
+                retryable=is_transient(exc.provider_error),
             )
         except RuntimeError as exc:
             msg = f"Phase 7 (Engineering-Reviewer) fehlgeschlagen: {exc}"

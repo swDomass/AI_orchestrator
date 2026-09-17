@@ -34,7 +34,7 @@ from config import (
     TOOL_SI_LIMITATIONS_REQUIRED_CATEGORIES,
     TOOL_SI_PHASE4_TIMEOUT_SEC,
 )
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ProviderCallError
 from tools.personas import AUTHOR
 from tools.scientific_investigation_phase2 import (
     InvestigationPlan,
@@ -408,8 +408,9 @@ def phase_synthesis(
     )
     result = provider.run(prompt, timeout=timeout_sec, read_only=True)
     if not getattr(result, "success", False):
-        raise RuntimeError(
-            f"Phase 4 synthesis LLM call failed: {getattr(result, 'error', 'unknown')}"
+        provider_error = getattr(result, "error", "unknown")
+        raise ProviderCallError(
+            f"Phase 4 synthesis LLM call failed: {provider_error}", provider_error
         )
     proof_md = (result.output or "").strip()
     if not proof_md:

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from providers.base import RunResult
+from providers.base import ProviderCallError, RunResult
 from tools.personas import AUTHOR, DEVILS_ADVOCATE, METHODIKER
 from tools.personas.base import PersonaAllocation
 from tools.scientific_investigation_phase2 import (
@@ -27,6 +27,7 @@ from tools.scientific_investigation_phase2 import (
     SubTask,
     _parse_investigation_plan,
     _parse_review_findings,
+    _run_persona_call,
     phase_investigation_plan_review,
     write_investigation_plan_md,
     write_review_findings_md,
@@ -298,6 +299,20 @@ def test_phase2_propagates_author_call_failure(tmp_path):
             run_id="r1",
             provider_lookup=lambda _: None,
         )
+
+
+def test_run_persona_call_raises_provider_call_error_with_raw_code(tmp_path):
+    """The raw RunResult.error must survive structurally, not just in prose."""
+    class _BrokenProvider:
+        name = "claude"
+        supports_sessions = False
+
+        def run(self, task, **kwargs):
+            return RunResult(success=False, error="rate_limit: quota exceeded")
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        _run_persona_call(_BrokenProvider(), "prompt", 60, "Author")
+    assert exc_info.value.provider_error == "rate_limit: quota exceeded"
 
 
 # ── Provider routing via persona allocation ────────────────────────────────

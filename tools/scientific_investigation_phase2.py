@@ -31,7 +31,7 @@ from config import (
     TOOL_SI_PHASE2_MAX_ITERATIONS,
     TOOL_SI_PHASE2_REVIEW_TIMEOUT_SEC,
 )
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ProviderCallError
 from tools.personas import AUTHOR, DEVILS_ADVOCATE, METHODIKER
 from tools.personas.base import PersonaAllocation
 from tools.scientific_investigation_phases import (
@@ -410,8 +410,9 @@ def _run_persona_call(
     """Wraps provider.run() with logging + error normalisation."""
     result = provider.run(prompt, timeout=timeout_sec, read_only=True)
     if not getattr(result, "success", False):
-        raise RuntimeError(
-            f"Phase 2 {label} failed: {getattr(result, 'error', 'unknown')}"
+        provider_error = getattr(result, "error", "unknown")
+        raise ProviderCallError(
+            f"Phase 2 {label} failed: {provider_error}", provider_error
         )
     return (result.output or "").strip()
 

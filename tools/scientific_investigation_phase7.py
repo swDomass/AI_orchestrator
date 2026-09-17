@@ -32,7 +32,7 @@ from config import (
     TOOL_SI_PHASE7_MAX_REWORK_ITERATIONS,
     TOOL_SI_PHASE7_TIMEOUT_SEC,
 )
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ProviderCallError
 from tools.crosschecks import audit_trail
 from tools.personas import AUTHOR
 from tools.scientific_investigation_phase2 import _parse_review_findings
@@ -278,9 +278,9 @@ def phase_engineering_reviewer(
             review_prompt, timeout=timeout_per_call, read_only=True,
         )
         if not getattr(review_result, "success", False):
-            raise RuntimeError(
-                f"Phase 7 review LLM call failed: "
-                f"{getattr(review_result, 'error', 'unknown')}"
+            provider_error = getattr(review_result, "error", "unknown")
+            raise ProviderCallError(
+                f"Phase 7 review LLM call failed: {provider_error}", provider_error
             )
         p_findings = _parse_review_findings(
             review_result.output or "", reviewer="engineering_reviewer",
@@ -311,9 +311,9 @@ def phase_engineering_reviewer(
             rework_prompt, timeout=timeout_per_call, read_only=True,
         )
         if not getattr(rework_result, "success", False):
-            raise RuntimeError(
-                f"Phase 7 rework LLM call failed: "
-                f"{getattr(rework_result, 'error', 'unknown')}"
+            provider_error = getattr(rework_result, "error", "unknown")
+            raise ProviderCallError(
+                f"Phase 7 rework LLM call failed: {provider_error}", provider_error
             )
         current_proof = (rework_result.output or "").strip() or current_proof
         _emit_audit(run_dir, run_id, iteration, eng_findings, reviewer_name,

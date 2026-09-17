@@ -103,6 +103,32 @@ def contains_auth_expired(text: str) -> bool:
     return bool(text) and _AUTH_EXPIRED_TOKEN_RE.search(text) is not None
 
 
+class ProviderCallError(RuntimeError):
+    """Wraps a failed ``provider.run()`` call while preserving the raw error code.
+
+    Several multi-phase tools (``tools/scientific_investigation*.py``) wrap a
+    failing ``RunResult`` into a human-readable ``RuntimeError`` for their own
+    phase-level error reporting (e.g. "Phase 0 (Framing) fehlgeschlagen: rate_limit: ...").
+    That wrapping loses the original ``RunResult.error`` as a *structured* value —
+    the prose message can't be fed back into ``error_code_of()``/``is_transient()``
+    (the head before the first ``:`` is prose, not a code) — so a transient
+    provider error (rate_limit, timeout, ...) ended up finalized as a permanent
+    tool failure instead of being requeued, and ``auth_expired`` was only
+    recoverable via the separate ``contains_auth_expired()`` text-scan below.
+
+    Raise this instead of a bare ``RuntimeError`` at any site that wraps a
+    provider failure, with ``provider_error`` set to the raw ``RunResult.error``.
+    Callers that want to classify it must catch ``ProviderCallError`` BEFORE any
+    broader ``except (RuntimeError, ValueError)``/``except RuntimeError`` clause
+    in the same ``try`` — this subclasses ``RuntimeError``, so a broader clause
+    listed first would shadow it and this exception would never be seen.
+    """
+
+    def __init__(self, message: str, provider_error: str) -> None:
+        super().__init__(message)
+        self.provider_error = provider_error
+
+
 class BaseProvider(ABC):
     name: str = "base"
     # Whether this provider supports CLI-level conversation sessions

@@ -58,7 +58,7 @@ from config import (
     TOOL_SI_CHERRYPICKING_SIMILARITY_THRESHOLD,
     TOOL_SI_EMBEDDING_MODEL,
 )
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ProviderCallError
 from tools.crosschecks import audit_trail, similarity_index
 from tools.personas import ALL_PHASE2_PERSONAS, Persona, PersonaAllocation
 from tools.scientific_investigation_approvals import get_manager
@@ -272,8 +272,9 @@ def phase_framing(
     prompt = _FRAMING_PROMPT.format(task=task)
     result = provider.run(prompt, cwd=str(root_cwd), timeout=timeout_sec, read_only=True)
     if not getattr(result, "success", False):
-        raise RuntimeError(
-            f"framing LLM call failed: {getattr(result, 'error', 'unknown')}"
+        provider_error = getattr(result, "error", "unknown")
+        raise ProviderCallError(
+            f"framing LLM call failed: {provider_error}", provider_error
         )
     yaml_text = _extract_yaml_block(result.output or "")
     parsed = _parse_yaml_minimal(yaml_text)
@@ -341,8 +342,9 @@ def phase_prereg(
         read_only=True,
     )
     if not getattr(result, "success", False):
-        raise RuntimeError(
-            f"prereg LLM call failed: {getattr(result, 'error', 'unknown')}"
+        provider_error = getattr(result, "error", "unknown")
+        raise ProviderCallError(
+            f"prereg LLM call failed: {provider_error}", provider_error
         )
     yaml_text = _extract_yaml_block(result.output or "")
     parsed = _parse_yaml_minimal(yaml_text)

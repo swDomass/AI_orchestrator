@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from providers.base import RunResult
+from providers.base import ProviderCallError, RunResult
 from tools.crosschecks import audit_trail
 from tools.scientific_investigation_approvals import (
     INVESTIGATION_CRITERION,
@@ -206,6 +206,19 @@ def test_phase5b_raises_on_llm_failure():
         phase_heuristic_review("# Proof", Phase5aReport(), _Broken())
 
 
+def test_phase5b_raises_provider_call_error_with_raw_code():
+    """The raw RunResult.error must survive structurally, not just in prose."""
+    class _Broken:
+        name = "claude"
+
+        def run(self, *a, **kw):
+            return RunResult(success=False, error="unreachable: connection reset")
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        phase_heuristic_review("# Proof", Phase5aReport(), _Broken())
+    assert exc_info.value.provider_error == "unreachable: connection reset"
+
+
 def test_write_phase5_report_md(tmp_path):
     from tools.scientific_investigation_phase5 import CriterionCheck
     phase5a = Phase5aReport(checks=[
@@ -253,6 +266,57 @@ def test_phase7_reworks_on_blocker_then_converges(tmp_path):
     assert result.status == "passed"
     assert result.iterations_used == 2
     assert result.final_proof_md.startswith("# Proof reworked")
+
+
+def test_phase7_review_call_raises_provider_call_error_with_raw_code(tmp_path):
+    """The raw RunResult.error must survive structurally, not just in prose."""
+    rd = tmp_path / "run"
+    (rd / "audit").mkdir(parents=True)
+
+    class _Broken:
+        name = "claude"
+
+        def run(self, *a, **kw):
+            return RunResult(success=False, error="timeout: idle watchdog")
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        phase_engineering_reviewer(
+            "# Proof", {"checks": []}, [], _Broken(),
+            run_dir=rd, run_id="r1",
+            provider_lookup=lambda _: None,
+        )
+    assert exc_info.value.provider_error == "timeout: idle watchdog"
+
+
+def test_phase7_rework_call_raises_provider_call_error_with_raw_code(tmp_path):
+    """The rework call (Author, on a BLOCKER) has its own raise site — distinct
+    from the review call above."""
+    rd = tmp_path / "run"
+    (rd / "audit").mkdir(parents=True)
+
+    class _BlockerThenBroken:
+        name = "claude"
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, *a, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return RunResult(
+                    success=True,
+                    output="```yaml\nfindings:\n  - severity: P1\n    sub_id: S1\n"
+                    "    issue: x\n    suggestion: y\n```",
+                )
+            return RunResult(success=False, error="rate_limit: quota exceeded")
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        phase_engineering_reviewer(
+            "# Proof", {"checks": []}, [], _BlockerThenBroken(),
+            run_dir=rd, run_id="r1",
+            provider_lookup=lambda _: None,
+        )
+    assert exc_info.value.provider_error == "rate_limit: quota exceeded"
 
 
 def test_phase7_cap_reached_returns_needs_revision(tmp_path):

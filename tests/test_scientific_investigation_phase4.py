@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from providers.base import RunResult
+from providers.base import ProviderCallError, RunResult
 from tools.scientific_investigation_phase2 import (
     InvestigationPlan,
     Phase2Result,
@@ -300,3 +300,21 @@ def test_phase_synthesis_raises_on_llm_failure(tmp_path):
     with pytest.raises(RuntimeError, match="boom"):
         phase_synthesis(framing, prereg, phase2, phase3, _Broken(),
                         run_dir=rd, run_id="r1")
+
+
+def test_phase_synthesis_raises_provider_call_error_with_raw_code(tmp_path):
+    """The raw RunResult.error must survive structurally, not just in prose."""
+    rd = tmp_path / "run"
+    (rd / "draft").mkdir(parents=True)
+    framing, prereg, phase2, phase3 = _make_inputs()
+
+    class _Broken:
+        name = "claude"
+
+        def run(self, *a, **kw):
+            return RunResult(success=False, error="auth_expired")
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        phase_synthesis(framing, prereg, phase2, phase3, _Broken(),
+                        run_dir=rd, run_id="r1")
+    assert exc_info.value.provider_error == "auth_expired"

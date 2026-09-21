@@ -11,7 +11,12 @@ build/
 # IDE
 .vscode/
 .idea/
-.claude/
+# .claude/ als Verzeichnis ignorieren würde .claude/rules/ unwiderruflich
+# ausschließen (eine per Verzeichnis ignorierte Datei ist per Negation nicht
+# zurückholbar) — die Regeldateien müssen aber mit ins Repo, sonst fehlen sie
+# in jedem frischen Klon und jedem Worktree/Branch eines Nacht-Tasks.
+.claude/*
+!.claude/rules/
 *.swp
 *.swo
 

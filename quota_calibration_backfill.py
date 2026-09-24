@@ -62,7 +62,7 @@ class RawEntry:
         self.cc_5m = cc_5m
 
 
-def _parse_ts(raw: str) -> "dt.datetime | None":
+def _parse_ts(raw: str) -> dt.datetime | None:
     """Parse an ISO-8601 timestamp; treat naive as UTC, normalise to UTC."""
     if not raw:
         return None
@@ -71,11 +71,11 @@ def _parse_ts(raw: str) -> "dt.datetime | None":
     except ValueError:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=dt.timezone.utc)
-    return ts.astimezone(dt.timezone.utc)
+        ts = ts.replace(tzinfo=dt.UTC)
+    return ts.astimezone(dt.UTC)
 
 
-def load_raw_entries() -> "list[RawEntry]":
+def load_raw_entries() -> list[RawEntry]:
     """Load + dedup all assistant usage records from every project JSONL.
 
     Dedup key is ``(message.id, requestId)`` — the same key claude-monitor
@@ -252,7 +252,7 @@ def grid_search_5h(recomputed) -> None:
                 best = (cv, w1, w5)
     print("=== 5h grid search: io + w1*cc_1h + w5*cc_5m ===")
     print(f"  best CV {best[0]:.1%} at w_1h={best[1]:.2f}, w_5m={best[2]:.2f}")
-    print(f"  (baseline with_cc = w1=w5=1.0; decision gate = CV < 15%)")
+    print("  (baseline with_cc = w1=w5=1.0; decision gate = CV < 15%)")
     print(f"  VERDICT: {'tier reweighting HELPS' if best[0] < 0.15 else 'tier reweighting does NOT reach <15% — 5h noise is not a weighting problem'}")
 
 

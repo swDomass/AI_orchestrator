@@ -1,9 +1,10 @@
 import pytest
-from pathlib import Path
-from limits import AllLimits, ProviderLimits
-from dispatcher import select_provider
-from policy import PolicyEngine, get_engine
+
 import policy as policy_module
+from dispatcher import select_provider
+from limits import AllLimits, ProviderLimits
+from policy import PolicyEngine
+
 
 @pytest.fixture
 def mock_limits():
@@ -308,8 +309,8 @@ def test_policy_dead_end_is_none_while_a_provider_is_merely_busy(tmp_path, monke
     policy_dead_end deliberately ignores limits and cooldowns: it answers "may
     anything be routed to", not "is anything free right now".
     """
-    from limits import AllLimits, ProviderLimits
     from dispatcher import policy_dead_end, select_provider
+    from limits import AllLimits, ProviderLimits
 
     engine = _make_engine(tmp_path, "tool_providers:\n  dev-loop: [claude, codex]\n")
     monkeypatch.setattr(policy_module, "_engine", engine)
@@ -336,6 +337,7 @@ def test_policy_dead_end_is_none_when_the_policy_permits_a_chain_provider(tmp_pa
 def test_policy_dead_end_covers_a_profile_that_cannot_intersect_the_policy(tmp_path, monkeypatch):
     """The other way to reach an empty order: profile order ∩ policy = {}."""
     from types import SimpleNamespace
+
     from dispatcher import policy_dead_end
 
     engine = _make_engine(tmp_path, "tool_providers:\n  dev-loop: [codex]\n")
@@ -369,7 +371,7 @@ def test_policy_dead_end_leaves_the_unregistered_reviewer_park_alone(monkeypatch
 
 def test_policy_dead_end_agrees_with_select_provider_on_the_forced_case(tmp_path, mock_limits, monkeypatch):
     """A barred #tag is a dead end too — the two reporters must not contradict."""
-    from dispatcher import policy_dead_end, select_provider, forced_provider_policy_violation
+    from dispatcher import forced_provider_policy_violation, policy_dead_end, select_provider
 
     engine = _make_engine(tmp_path, "tool_providers:\n  dev-loop: [claude, codex]\n")
     monkeypatch.setattr(policy_module, "_engine", engine)

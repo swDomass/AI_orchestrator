@@ -70,7 +70,7 @@ _SCHEMA_VERSION = 2
 # Worker pool for the non-blocking calibration writes. max_workers=1
 # serialises samples (cheaper than a true thread-safe writer) and lets
 # us drop overlapping submissions instead of building an unbounded queue.
-_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+_executor: concurrent.futures.ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
 _pending_sample = threading.Event()
 
@@ -109,7 +109,7 @@ CSV_FIELDS = [
 # ───────────────────────────── Entry loading ─────────────────────────────────
 
 
-def _load_entries(load_hours: int) -> "list | None":
+def _load_entries(load_hours: int) -> list | None:
     """Load JSONL usage entries for the last ``load_hours`` hours.
 
     Returns ``None`` when claude-monitor is missing or its loader raises —
@@ -135,7 +135,7 @@ def _load_entries(load_hours: int) -> "list | None":
 
 
 def _filter_entries_for_window(
-    entries: list, window_start: "dt.datetime | None",
+    entries: list, window_start: dt.datetime | None,
 ) -> list:
     """Drop entries older than window_start (treating naive timestamps as UTC)."""
     if window_start is None:
@@ -144,7 +144,7 @@ def _filter_entries_for_window(
     for e in entries:
         ts = e.timestamp
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=dt.timezone.utc)
+            ts = ts.replace(tzinfo=dt.UTC)
         if ts >= window_start:
             out.append(e)
     return out
@@ -174,15 +174,15 @@ def _aggregate_entries(entries: list) -> dict:
 # Public for tests + backwards compatibility — combines load + filter + aggregate.
 def _aggregate_tokens(
     window_hours: int,
-    window_start: "dt.datetime | None" = None,
-) -> "dict | None":
+    window_start: dt.datetime | None = None,
+) -> dict | None:
     """Load JSONL, filter for the Anthropic window, and aggregate.
 
     See module docstring for the window-anchoring rationale (Anthropic
     blocks start at first activity, not "last N hours").
     """
     if window_start is not None:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         elapsed_h = max(0.0, (now - window_start).total_seconds() / 3600.0)
         load_hours = int(elapsed_h * _LOAD_HOURS_BUFFER_FACTOR) + _LOAD_HOURS_BUFFER_ABS
     else:
@@ -200,7 +200,7 @@ def _aggregate_tokens(
 # ───────────────────────────── Row building ──────────────────────────────────
 
 
-def _str_bool(value: "bool | None") -> str:
+def _str_bool(value: bool | None) -> str:
     if value is None:
         return ""
     return "true" if value else "false"
@@ -213,9 +213,9 @@ def _build_row(
     resets_in_sec: int,
     now: dt.datetime,
     *,
-    preloaded_entries: "list | None" = None,
+    preloaded_entries: list | None = None,
     claude_plan: str = "",
-    queue_idle: "bool | None" = None,
+    queue_idle: bool | None = None,
 ) -> dict:
     """Build one CSV row. If preloaded_entries is given (already loaded for
     the largest window in this poll), filter+aggregate in-memory; otherwise
@@ -334,11 +334,11 @@ def _resolve_claude_plan() -> str:
 
 
 def log_calibration_sample(
-    limits_result: "AllLimits",
+    limits_result: AllLimits,
     csv_path,
     *,
-    queue_idle: "bool | None" = None,
-    claude_plan: "str | None" = None,
+    queue_idle: bool | None = None,
+    claude_plan: str | None = None,
 ) -> None:
     """Log one calibration row each for the 5h and 7d Claude windows
     (synchronous variant).
@@ -359,7 +359,7 @@ def log_calibration_sample(
         if not claude.windows:
             return
 
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         plan = claude_plan if claude_plan is not None else _resolve_claude_plan()
 
         # Single load sized for the largest window we might inspect.
@@ -403,11 +403,11 @@ def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
 
 
 def log_calibration_sample_async(
-    limits_result: "AllLimits",
+    limits_result: AllLimits,
     csv_path,
     *,
-    queue_idle: "bool | None" = None,
-    claude_plan: "str | None" = None,
+    queue_idle: bool | None = None,
+    claude_plan: str | None = None,
 ) -> None:
     """Non-blocking variant — schedules the sample write on a single worker
     thread so the cclimits BG-refresh loop is never blocked by the multi-
@@ -453,7 +453,7 @@ def shutdown_executor(wait: bool = False) -> None:
 # ───────────────────────────── Phase-2 auto-recalibration ────────────────────
 
 
-def _percentile(values: "list[float]", p: float) -> float:
+def _percentile(values: list[float], p: float) -> float:
     """Linear-interpolation percentile (p in 0..100)."""
     if not values:
         return 0.0
@@ -468,13 +468,13 @@ def _percentile(values: "list[float]", p: float) -> float:
 
 def recalibrate_claude_factors(
     csv_path,
-    defaults: "dict[str, int]",
+    defaults: dict[str, int],
     *,
     min_samples: int,
     clamp: float,
     window_days: int,
     percentile: float = 25.0,
-) -> "dict[str, int] | None":
+) -> dict[str, int] | None:
     """Recompute conservative per-window ``io_only`` tokens-per-pct from the
     running calibration CSV (Phase-2 drift correction).
 
@@ -510,7 +510,7 @@ def recalibrate_claude_factors(
         path = Path(csv_path)
         if not path.exists() or path.stat().st_size == 0:
             return None
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)
+        cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=window_days)
         expected = len(CSV_FIELDS)
         usable: list = []
         with path.open(encoding="utf-8", newline="") as fh:
@@ -523,7 +523,7 @@ def recalibrate_claude_factors(
                 except ValueError:
                     continue
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=dt.timezone.utc)
+                    ts = ts.replace(tzinfo=dt.UTC)
                 if ts < cutoff:
                     continue
                 if (

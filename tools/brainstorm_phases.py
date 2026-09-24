@@ -56,7 +56,7 @@ class BrainstormPersona:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, str]) -> "BrainstormPersona":
+    def from_dict(cls, d: dict[str, str]) -> BrainstormPersona:
         return cls(
             key=str(d["key"]),
             name=str(d["name"]),
@@ -78,7 +78,7 @@ class BrainstormAllocation:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "BrainstormAllocation":
+    def from_dict(cls, d: dict[str, Any]) -> BrainstormAllocation:
         return cls(
             persona=BrainstormPersona.from_dict(d["persona"]),
             provider_name=str(d["provider_name"]),
@@ -101,7 +101,7 @@ class BrainstormIdea:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "BrainstormIdea":
+    def from_dict(cls, d: dict[str, Any]) -> BrainstormIdea:
         return cls(
             text=str(d["text"]),
             persona_key=str(d["persona_key"]),

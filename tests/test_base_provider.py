@@ -12,11 +12,8 @@ Covers:
 import threading
 import time
 
-import pytest
-
 from providers.base import BaseProvider, RunResult
 from providers.claude import ClaudeProvider
-
 
 # ---------------------------------------------------------------------------
 # Minimal concrete provider (BaseProvider is abstract)
@@ -267,7 +264,7 @@ def test_parse_json_response_partial_cache_fields():
         "result": "ok",
         "usage": {"input_tokens": 100, "output_tokens": 50},
     }
-    output, tokens = ClaudeProvider._parse_json_response(json.dumps(data))
+    _output, tokens = ClaudeProvider._parse_json_response(json.dumps(data))
     assert tokens["input_tokens"] == 100
     assert tokens["output_tokens"] == 50
     assert tokens["cache_creation_input_tokens"] == 0

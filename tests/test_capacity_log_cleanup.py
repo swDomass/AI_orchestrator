@@ -1,10 +1,9 @@
 """Tests for _cleanup_capacity_log() in heartbeat.py."""
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import heartbeat
 from heartbeat import _cleanup_capacity_log
-
 
 HEADER = (
     "# AI Provider Capacity Log\n"

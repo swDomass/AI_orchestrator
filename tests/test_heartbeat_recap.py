@@ -218,8 +218,8 @@ class TestLast24hSummary:
         assert out["idle"] is False  # pending approval breaks the idle bit
 
     def test_blocked_count_from_queue(self, monkeypatch):
-        from queue_manager import QueueTask
         import queue_manager
+        from queue_manager import QueueTask
         blocked = [
             QueueTask(task_text="open #needs:foo", line_no=1, blocked_reason="needs foo"),
             QueueTask(task_text="other", line_no=2, blocked_reason=""),  # not blocked

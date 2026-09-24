@@ -1,8 +1,7 @@
-from types import SimpleNamespace
 
 from providers.base import RunResult
-from tools.test_loop import _tests_passed, TestLoopTool
 from tools.base_tool import ToolResult
+from tools.test_loop import TestLoopTool, _tests_passed
 
 
 def test_tests_passed_accepts_zero_failed_zero_errors_summary():

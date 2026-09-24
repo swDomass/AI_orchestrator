@@ -22,7 +22,7 @@ import logging
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from limits import AllLimits, estimate_task_usage_pct, report_estimated_usage
@@ -62,11 +62,11 @@ class SubTaskResult:
 
 def _parse_subtask(text: str) -> SubTask:
     """Extract metadata from a subtask line."""
-    from queue_manager import extract_cwd, extract_timeout, extract_model_tag, extract_effort_tag
     from config import TASK_TIMEOUT_SEC
 
     # Detect forced provider from #claude / #gemini / #codex tags
     from dispatcher import _TAG_MAP, _TAG_RE_BY_PROVIDER
+    from queue_manager import extract_cwd, extract_effort_tag, extract_model_tag, extract_timeout
 
     provider_forced: str | None = None
     text_lower = text.lower()
@@ -104,12 +104,15 @@ def _run_single_subtask(
 ) -> SubTaskResult:
     """Execute a single subtask and return its result."""
     from dispatcher import select_provider
-    from queue_manager import strip_metadata_tags
     from orchestrator import (
-        _build_prompt, _run_with_retry, _execute_tool_task,
-        _notify_auth_expired_once, _clear_auth_expired_notice,
+        _build_prompt,
+        _clear_auth_expired_notice,
+        _execute_tool_task,
+        _notify_auth_expired_once,
+        _run_with_retry,
     )
     from providers.base import error_code_of
+    from queue_manager import strip_metadata_tags
 
     if pause_event and pause_event.is_set():
         return SubTaskResult(
@@ -167,7 +170,6 @@ def _run_single_subtask(
     try:
         # Tool-based subtask
         if subtask.tool_name:
-            from orchestrator import ToolTaskExecutionOutcome
             outcome = _execute_tool_task(
                 subtask.text,
                 subtask.tool_name,
@@ -359,12 +361,12 @@ def run_parallel(
     try:
         from queue_manager import (
             extract_cwd,
-            has_cwd_tag,
             extract_effort_tag,
-            has_effort_tag_attempt,
+            extract_keep_worktree_tag,
             extract_model_tag,
             extract_worktree_tag,
-            extract_keep_worktree_tag,
+            has_cwd_tag,
+            has_effort_tag_attempt,
         )
         parent_cwd = extract_cwd(parent_task)
         parent_model_tag = extract_model_tag(parent_task)

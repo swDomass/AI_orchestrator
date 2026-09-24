@@ -17,20 +17,28 @@ from config import (
     CLAUDE_MODEL_ALIASES,
     CODEX_MODEL_ALIASES,
     OPENROUTER_MODEL_ALIASES,
-    VIBE_MODEL_ALIASES,
-    TOOL_MAX_ITERATIONS,
-    TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_FIX_TIMEOUT_SEC,
     TOOL_INTER_STEP_SLEEP_SEC,
+    TOOL_MAX_ITERATIONS,
+    TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_RL_DRIFT_CHECK_TIMEOUT_SEC,
     TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS,
     TOOL_RL_SECOND_OPINION_TIMEOUT_SEC,
     TOOL_VERIFICATION_TIMEOUT_SEC,
+    VIBE_MODEL_ALIASES,
 )
 from limits import is_cached_provider_available
-from notifier import notify_tool_progress, notify_tool_done
+from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider, error_code_of, is_transient
-from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result
+from tools.base_tool import (
+    BaseTool,
+    SessionContext,
+    TokenCounter,
+    ToolResult,
+    ToolTracer,
+    _build_system_prompt,
+    _make_capacity_exhausted_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -914,13 +922,13 @@ class ReviewLoopTool(BaseTool):
                                 )
                             elif so_no_findings:
                                 print(
-                                    f"  [review-loop] Second-Opinion bestätigt: "
-                                    f"keine zusätzlichen Findings"
+                                    "  [review-loop] Second-Opinion bestätigt: "
+                                    "keine zusätzlichen Findings"
                                 )
                             else:
                                 print(
-                                    f"  [review-loop] Second-Opinion-Output "
-                                    f"ohne parsbare Findings — ignoriert"
+                                    "  [review-loop] Second-Opinion-Output "
+                                    "ohne parsbare Findings — ignoriert"
                                 )
 
             # A known limit's lifecycle ends here if the reviewer (primary or second
@@ -953,7 +961,7 @@ class ReviewLoopTool(BaseTool):
             if no_findings or not blocking_findings:
                 # Verification phase (configurable via policy.yaml)
                 if self._should_verify():
-                    print(f"  [review-loop] === VERIFICATION PHASE ===")
+                    print("  [review-loop] === VERIFICATION PHASE ===")
                     verify_prompt = (
                         f"{system_prompt}\n\n{task}\n\n{_VERIFICATION_PROMPT_BODY}"
                     )
@@ -981,7 +989,7 @@ class ReviewLoopTool(BaseTool):
                         )
                         verified = "VERIFIED" in verify_result.output.upper().replace("NOT VERIFIED", "")
                         if not verified:
-                            print(f"  [review-loop] Verification nicht bestanden, Concerns gefunden.")
+                            print("  [review-loop] Verification nicht bestanden, Concerns gefunden.")
                             # Not a hard failure — log but still succeed
                             # (concerns are informational, findings were already clean)
 
@@ -1009,7 +1017,7 @@ class ReviewLoopTool(BaseTool):
 
                 # Auto-lesson: generate LLM summary if it took more than 1 iteration
                 if iteration > 1 and memory_module is not None:
-                    print(f"  [review-loop] Generiere Lesson Learned...")
+                    print("  [review-loop] Generiere Lesson Learned...")
                     memory_module.create_lesson_from_loop(
                         self.name, task, all_outputs, provider, cwd=cwd
                     )
@@ -1185,7 +1193,7 @@ class ReviewLoopTool(BaseTool):
                     known_limits.update(
                         validate_known_limits(candidates, blocking_findings, tool_name=self.name)
                     )
-            print(f"  [review-loop] Fix durchgeführt. Starte Re-Review...")
+            print("  [review-loop] Fix durchgeführt. Starte Re-Review...")
             previous_findings_count = len(blocking_findings)
 
             # Phase B: rollover session every cap iterations to bound conversation

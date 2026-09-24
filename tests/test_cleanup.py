@@ -363,7 +363,7 @@ class TestCleanupDoneTasks:
         assert "Task B" in erledigt
 
     def test_rate_limited_once_per_day(self, queue_env):
-        mod, qf, ef = queue_env
+        mod, qf, _ef = queue_env
         mod._done_cleanup_last_run_date = date.today()
         ts = _ts(config.QUEUE_DONE_MOVE_HOURS + 1)
         qf.write_text(
@@ -411,12 +411,12 @@ class TestCleanupDoneTasks:
         assert "subtask B" in erledigt
 
     def test_empty_queue_no_error(self, queue_env):
-        mod, qf, ef = queue_env
+        mod, qf, _ef = queue_env
         qf.write_text("# Agent Queue\n\n## Queue\n", encoding="utf-8")
         assert mod.cleanup_done_tasks() == 0
 
     def test_no_queue_file_no_error(self, queue_env):
-        mod, qf, ef = queue_env
+        mod, _qf, _ef = queue_env
         assert mod.cleanup_done_tasks() == 0
 
 
@@ -424,7 +424,7 @@ class TestCleanupDoneTasks:
 
 class TestPruneErledigtFile:
     def test_prunes_old_sections(self, queue_env):
-        mod, qf, ef = queue_env
+        mod, _qf, ef = queue_env
         old_date = (date.today() - timedelta(days=config.QUEUE_DONE_DELETE_DAYS + 1)).isoformat()
         today = date.today().isoformat()
         ef.write_text(
@@ -442,7 +442,7 @@ class TestPruneErledigtFile:
         assert today in content
 
     def test_keeps_all_when_none_old(self, queue_env):
-        mod, qf, ef = queue_env
+        mod, _qf, ef = queue_env
         today = date.today().isoformat()
         ef.write_text(
             f"# Agent Queue — Erledigt\n\n## {today}\n\n- [x] Task\n",
@@ -451,5 +451,5 @@ class TestPruneErledigtFile:
         assert mod._prune_erledigt_file() == 0
 
     def test_missing_file_returns_zero(self, queue_env):
-        mod, qf, ef = queue_env
+        mod, _qf, _ef = queue_env
         assert mod._prune_erledigt_file() == 0

@@ -1,7 +1,6 @@
 """Tests for PR-Babysitter slash-command helpers (P5)."""
 
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -9,7 +8,6 @@ import pytest
 from tools.pr_babysitter import (
     _load_state,
     _parse_pr_key,
-    _save_state,
     cmd_pr_fix,
     cmd_pr_ignore,
     sweep,

@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from config import (
     ALLOWED_CWD_ROOTS,
@@ -39,10 +39,10 @@ from config import (
     USAGE_SUGGEST_MAX_PACE_FACTOR,
     USAGE_SUGGEST_MIN_REMAINING_PCT,
     USAGE_SUGGEST_RESET_WINDOW_SEC,
-    USAGE_SUGGEST_TIMEOUT_SEC,
-    USAGE_SUGGEST_SKILL_COOLDOWN_DAYS,
     USAGE_SUGGEST_RETRY_WINDOW_DAYS,
+    USAGE_SUGGEST_SKILL_COOLDOWN_DAYS,
     USAGE_SUGGEST_TASK_COOLDOWN_DAYS,
+    USAGE_SUGGEST_TIMEOUT_SEC,
     USAGE_SUGGEST_VAULT_TASK_DIRS,
     VAULT_PATH,
 )
@@ -69,9 +69,9 @@ class UsageSuggester:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._suggestion_event: Optional[threading.Event] = None
+        self._suggestion_event: threading.Event | None = None
         self._suggestion_response: str = ""
-        self._last_triggered: Optional[datetime] = None
+        self._last_triggered: datetime | None = None
         self._pending_suggestions: list[Suggestion] = []
         self._limits_cache: tuple[float, Any] = (0.0, None)  # (monotonic_ts, AllLimits)
 
@@ -79,7 +79,7 @@ class UsageSuggester:
     # Public: called from heartbeat handler
     # ------------------------------------------------------------------
 
-    def check_and_suggest(self, queue_read_fn: Callable) -> Optional[str]:
+    def check_and_suggest(self, queue_read_fn: Callable) -> str | None:
         """Main entry point. Returns a status string or None."""
 
         if not TELEGRAM_ENABLED:
@@ -244,7 +244,7 @@ class UsageSuggester:
             logger.debug("usage-suggest: limits fetch failed: %s", e)
             return None
 
-    def _get_claude_limits(self) -> tuple[Optional[float], int]:
+    def _get_claude_limits(self) -> tuple[float | None, int]:
         """Query Claude limits via the cached API.
 
         Returns five_hour window data if available, else top-level aggregate.
@@ -265,7 +265,7 @@ class UsageSuggester:
             logger.debug("usage-suggest: limits check failed: %s", e)
             return None, 0
 
-    def _get_seven_day_pace(self) -> Optional[dict]:
+    def _get_seven_day_pace(self) -> dict | None:
         """Return pace info for Claude's 7-day window, or None if unavailable."""
         try:
             all_limits = self._get_limits_cached()
@@ -632,7 +632,7 @@ class UsageSuggester:
                 return True
             idx = end
 
-    def _filter_vault_task(self, text: str) -> Optional[str]:
+    def _filter_vault_task(self, text: str) -> str | None:
         """Apply hard filters. Returns text if it passes, None if filtered out."""
         # Must have a #Rolle/ tag
         if "#Rolle/" not in text:
@@ -736,8 +736,8 @@ class UsageSuggester:
         )
 
         try:
-            from limits import get_limits
             from dispatcher import select_provider
+            from limits import get_limits
 
             limits = get_limits()
             provider = select_provider("", limits, tool_name=None)
@@ -772,14 +772,14 @@ class UsageSuggester:
             logger.debug("usage-suggest: LLM autonomy assessment failed: %s", e)
             return {}
 
-    def _skill_last_run(self, skill_name: str) -> Optional[datetime]:
+    def _skill_last_run(self, skill_name: str) -> datetime | None:
         """Check memory for the last time a skill was run."""
         try:
             from memory import _TASK_RESULTS_DIR, _parse_memory_file
             if not _TASK_RESULTS_DIR.exists():
                 return None
 
-            latest: Optional[datetime] = None
+            latest: datetime | None = None
             skill_lower = skill_name.lower()
             for path in _TASK_RESULTS_DIR.glob("*.md"):
                 mem = _parse_memory_file(path)
@@ -799,7 +799,7 @@ class UsageSuggester:
 # Module-level singleton
 # ------------------------------------------------------------------
 
-_suggester: Optional[UsageSuggester] = None
+_suggester: UsageSuggester | None = None
 _suggester_init_lock = threading.Lock()
 
 

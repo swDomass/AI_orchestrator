@@ -9,7 +9,6 @@ import policy as policy_module
 from tools.base_tool import ToolResult
 
 
-
 def _no_worktree_gate(monkeypatch):
     """Neutralise the clean-worktree precondition for tests about OTHER mechanisms.
 

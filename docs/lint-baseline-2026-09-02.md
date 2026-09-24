@@ -10,6 +10,41 @@ dem Zeitpunkt noch uncommitteten Aenderungen an `queue_manager.py` und
 (rund 24 Befunde in `queue_manager.py`), aber die Zahlen unten sind damit keine
 reine HEAD-Baseline.
 
+## Status-Nachtrag 2026-09-24 — Pakete 3 und 4 erledigt, CI auf Linux
+
+Gemessen auf **Linux (Cloud), CPython 3.12.3**, ruff `0.16.1`, mypy `2.3.1` —
+also nicht auf der win32-Maschine der Baseline. Ausgangspunkt ist `HEAD` vom
+2026-09-24 (`6cc5c25`), nicht der Stand vom 2026-09-02. Zum Vergleich: 1351
+(2026-09-02) und 1465 (2026-09-10, CLAUDE.md), beide auf win32; der Anstieg auf
+1510 ist nicht einzeln zugeordnet.
+
+| | vorher | nach Paket 3 | nach Paket 4 |
+|---|---:|---:|---:|
+| ruff-Befunde | 1510 | 1352 | **1131** |
+| mypy-Fehler | 132 in 39 Dateien | 132 | **132** (unveraendert) |
+
+- **Paket 3** (`F401`, `F541`, `RUF059`) ist abgebaut. `F401`/`F541` per
+  `ruff check --fix` (nur sichere Fixes), `RUF059` von Hand mit `_`-Praefix.
+  **Eine** `F401`-Stelle bewusst ausgenommen: `analytics.QUEUE_FILE` ist
+  Patch-Ziel in zwei Tests von `tests/test_analytics.py` — der Autofix haette
+  beide rot gemacht, obwohl die Patches wirkungslos sind (`analytics` liest die
+  Queue ueber `queue_manager`). Steht jetzt mit begruendetem `# noqa: F401` auf
+  genau dieser Zeile. Die 5 `unused-ignore` sind wie in [E7](#e7--unused-ignore-5--artefakte-der-lenient-konfiguration)
+  empfohlen unangetastet.
+- **Paket 4** (`I001`, `UP045`, `UP037`, `UP017`) ist abgebaut. `UP037` laesst
+  die D1-Reparatur korrekt stehen. Zwei Folgen des Autofixes von Hand: `I001`
+  zerlegt `import os, signal  # noqa: F401` (`tests/test_process_runner.py`) in
+  zwei Zeilen und laesst das `noqa` an der falschen haengen; `UP045`/`UP017`
+  hinterlassen 14 ungenutzte `Optional`/`timezone`-Importe (nachgeraeumt).
+- Nebenwirkung auf `PLC0415`: 629 → 626 (Paket 3 entfernt drei tote
+  Lazy-Importe) → 632 (Paket 4: `I001` teilt sechs lazy Mehrfach- bzw.
+  Alias-Importe wie `from x import a, b as c` in Einzelzeilen, jede zaehlt
+  einzeln). `PLC0415` macht damit **632 von 1131** aus (56 %) —
+  [E1](#e1--plc0415-524) bewegt jetzt mehr als die Haelfte der Baseline.
+- **CI:** `.github/workflows/ci.yml` — Tests auf ubuntu-latest mit 3.12 und
+  3.13 als Gate, ruff und mypy als eigene Jobs mit `continue-on-error: true`
+  (Offene Frage 3 bleibt offen: noch kein hartes Gate).
+
 ## Kernbefund vorweg
 
 > **Status 2026-09-04: behoben.** `limits.py:85` quotet die Annotation jetzt
@@ -482,8 +517,8 @@ Nichts davon wurde in diesem Task ausgefuehrt.
 |---|---|---|---|
 | **1** | ~~**[D1](#d1--limitspy85--f821-undefined-name) fixen**~~ — **behoben 2026-09-04**, siehe Status-Update oben | 1 Zeile + 1 Entscheidung | keins, hoher Gewinn |
 | 2 | Entscheidung [E1](#e1--plc0415-524) `PLC0415` — vor allem anderen, weil sie 39 % der Baseline bewegt | 1 Konfigzeile | keins |
-| 3 | `F401` + `F541` + `RUF059` autofixen (`ruff check --fix --select F401,F541,RUF059`), Diff durchsehen. **Die 5 `unused-ignore` gehoeren ausdruecklich NICHT dazu** — mypy-Diagnose, von ruff gar nicht erreichbar, und laut [E7](#e7--unused-ignore-5--artefakte-der-lenient-konfiguration) stehen zu lassen | 154 Stellen (134 davon safe-autofixbar, die 20 `RUF059` brauchen `--unsafe-fixes`) | sehr gering |
-| 4 | `I001` + `UP045` + `UP037` + `UP017` autofixen — reine Modernisierung | ~230 Stellen | gering |
+| **3** | ~~`F401` + `F541` + `RUF059` autofixen~~ — **erledigt 2026-09-24**, siehe Status-Nachtrag oben. Urspruenglicher Vorschlag: (`ruff check --fix --select F401,F541,RUF059`), Diff durchsehen. **Die 5 `unused-ignore` gehoeren ausdruecklich NICHT dazu** — mypy-Diagnose, von ruff gar nicht erreichbar, und laut [E7](#e7--unused-ignore-5--artefakte-der-lenient-konfiguration) stehen zu lassen | 154 Stellen (134 davon safe-autofixbar, die 20 `RUF059` brauchen `--unsafe-fixes`) | sehr gering |
+| **4** | ~~`I001` + `UP045` + `UP037` + `UP017` autofixen — reine Modernisierung~~ — **erledigt 2026-09-24**, siehe Status-Nachtrag oben | ~230 Stellen | gering |
 | 5 | [D2](#d2--b023-telegram_listenerpy942944945) `B023`, [D3](#d3--f402-toolsbase_toolpy138) `F402`, `no-redef` — Einzeiler mit Verstaendnis-Bedarf | 3 Stellen | gering, je einzeln pruefen |
 | 6 | [D5](#d5--f841-tote-werte-in-dev_loop-und-review_loop) `F841` — vorher klaeren, ob `last_*_tuple` ein unfertiges Feature ist | 12 Stellen | gering |
 | 7 | [D4](#d4--b905-zip-ohne-strict-7) `B905` + [D6](#d6--union-attr-auf-optional-11) `union-attr` + `PLW1510` — pro Stelle bewerten, meist bewusst | ~52 Stellen | Kopfarbeit, kein Automat |
@@ -504,6 +539,7 @@ optional und sollte nicht als Hygiene-Pflicht missverstanden werden.
 2. ~~**Untere Python-Grenze:** `README.md` sagt 3.10+, real laeuft nur 3.14.
    Reparieren (D1 + CI-Matrix) oder Anspruch zuruecknehmen?~~ — **beantwortet
    2026-09-04:** repariert, `README.md`/`pyproject.toml` auf `3.12+` gezogen.
-   Eine CI-Matrix bleibt offen (kein `.github/workflows` im Repo).
+   Eine CI-Matrix bleibt offen (kein `.github/workflows` im Repo). — **Seit
+   2026-09-24 vorhanden:** `.github/workflows/ci.yml`, Linux, 3.12 und 3.13.
 3. **Pre-commit-Hook / CI-Gate** fuer ruff — sinnvoll erst, wenn die Baseline
    auf ein Niveau gebracht ist, das ein Gate ueberhaupt halten kann.

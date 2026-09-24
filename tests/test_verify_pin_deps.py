@@ -9,6 +9,7 @@ review pass; the internal round had rated the same observation as marginal.
 The tests produce the violation instead of asserting the guard exists.
 """
 
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -70,11 +71,16 @@ def test_deleted_dependency_is_refused(scripts):
     pin = _pin(scripts)
     (scripts / "logic.ps1").unlink()
 
-    passed, detail = orchestrator._run_verify_script("wrapper.ps1", str(scripts), pin=pin)
+    passed, _detail = orchestrator._run_verify_script("wrapper.ps1", str(scripts), pin=pin)
 
     assert not passed
 
 
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None,
+    reason="führt wrapper.ps1 wirklich aus (pwsh -NoProfile -File) — ohne pwsh im PATH "
+    "nicht ausführbar; die GitHub-ubuntu-Runner bringen pwsh mit, dort läuft der Test",
+)
 def test_untouched_dependency_passes(scripts):
     """Counter-probe — without it the matrix only proves the check can say no."""
     pin = _pin(scripts)

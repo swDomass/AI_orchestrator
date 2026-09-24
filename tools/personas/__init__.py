@@ -10,8 +10,8 @@ allocator (``phase_persona_allocation``) decides which provider runs which
 persona; the actual LLM invocation lives in Phase 2 (I3).
 """
 
-from tools.personas.base import Persona, PersonaAllocation
 from tools.personas.author import AUTHOR
+from tools.personas.base import Persona, PersonaAllocation
 from tools.personas.devils_advocate import DEVILS_ADVOCATE
 from tools.personas.methodiker import METHODIKER
 

@@ -13,7 +13,6 @@ import replay
 from replay import (
     EXIT_ERROR,
     EXIT_OK,
-    EXIT_RETRY,
     RunRecord,
     TokenUsage,
     append_run,

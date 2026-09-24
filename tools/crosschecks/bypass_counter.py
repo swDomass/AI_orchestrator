@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from config import TOOL_SI_BYPASS_LIMIT_PER_30_DAYS
@@ -32,7 +32,7 @@ def _counter_path(root_cwd: Path) -> Path:
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _load(root_cwd: Path) -> dict:
@@ -71,7 +71,7 @@ def _recent(data: dict, now: datetime | None = None) -> list[dict]:
         except ValueError:
             continue
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.replace(tzinfo=UTC)
         if ts >= cutoff:
             out.append(entry)
     return out

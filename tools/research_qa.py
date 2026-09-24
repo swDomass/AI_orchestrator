@@ -21,8 +21,8 @@ from pathlib import Path
 
 from config import (
     TOOL_INTER_STEP_SLEEP_SEC,
-    TOOL_RQA_DISCOVERY_TIMEOUT_SEC,
     TOOL_RQA_ANALYSIS_TIMEOUT_SEC,
+    TOOL_RQA_DISCOVERY_TIMEOUT_SEC,
     TOOL_RQA_QUESTIONS_TIMEOUT_SEC,
 )
 from notifier import notify_tool_done, notify_tool_progress
@@ -433,7 +433,7 @@ class ResearchQATool(BaseTool):
         memory_context: str = "",
         **kwargs,
     ) -> ToolResult:
-        print(f"  [research-qa] Starte Research & Fragen-Analyse")
+        print("  [research-qa] Starte Research & Fragen-Analyse")
 
         rqa_dir = Path(cwd or ".") / RQA_DIR
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
@@ -496,7 +496,7 @@ class ResearchQATool(BaseTool):
         all_outputs.append(f"--- Discovery ---\n{discovery_output}")
         _write_tool_file(rqa_dir, "01-discovery.md",
                      f"# Discovery: {task}\n\n{discovery_output}\n")
-        print(f"  [research-qa] Discovery abgeschlossen")
+        print("  [research-qa] Discovery abgeschlossen")
         time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
         if time.monotonic() >= deadline:
@@ -557,7 +557,7 @@ class ResearchQATool(BaseTool):
         all_outputs.append(f"--- Analysis ---\n{analysis_output}")
         _write_tool_file(rqa_dir, "02-analysis.md",
                      f"# Analysis: {task}\n\n{analysis_output}\n")
-        print(f"  [research-qa] Analysis abgeschlossen")
+        print("  [research-qa] Analysis abgeschlossen")
         time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
 
         if time.monotonic() >= deadline:

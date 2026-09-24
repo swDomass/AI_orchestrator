@@ -1,20 +1,15 @@
 """Security-focused tests: path traversal, CWD validation, policy bypass."""
 
-import sys
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 from queue_manager import extract_cwd
-
 
 # ── Path Traversal ───────────────────────────────────────────────────────────
 
 def test_cwd_rejects_parent_traversal(tmp_path, monkeypatch):
     """cwd:../../../etc/passwd must be rejected."""
     monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [tmp_path])
-    result = extract_cwd(f"Fix bug cwd:../../../etc/passwd")
+    result = extract_cwd("Fix bug cwd:../../../etc/passwd")
     assert result is None
 
 

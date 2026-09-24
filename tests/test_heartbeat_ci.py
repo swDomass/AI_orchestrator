@@ -1,8 +1,6 @@
 """Tests for the CI-Failure-Watcher heartbeat handler (P4)."""
 
-import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

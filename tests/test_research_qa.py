@@ -5,7 +5,6 @@ import pytest
 from providers.base import RunResult
 from tools.research_qa import ResearchQATool
 
-
 # -- Helpers -------------------------------------------------------------------
 
 class _ScriptedProvider:

@@ -1,7 +1,7 @@
 """Tests for the usage_suggester module."""
 
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +21,17 @@ def _reset_singleton():
 def _isolate_suggested_hashes_file(tmp_path):
     """Keep suggestion-history writes inside the test tempdir."""
     with patch.object(us, "_SUGGESTED_HASHES_FILE", tmp_path / "suggested_tasks.json"):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _telegram_enabled():
+    """check_and_suggest() returns "telegram_disabled" before every other guard, and
+    TELEGRAM_ENABLED is read from .env at import time. Without this patch the guard
+    tests below pass only on a machine whose .env carries a bot token and chat id —
+    in a fresh worktree or on CI all 14 of them fail on that first line. Every path
+    that would actually send something patches notifier itself."""
+    with patch.object(us, "TELEGRAM_ENABLED", True):
         yield
 
 
@@ -73,8 +84,9 @@ class TestCheckAndSuggest:
         assert result is None
 
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
     @patch.object(us.UsageSuggester, "_gather_suggestions", return_value=[])
-    def test_returns_none_when_no_suggestions(self, _g, _l):
+    def test_returns_none_when_no_suggestions(self, _g, _pace, _l):
         suggester = _make_suggester()
         result = suggester.check_and_suggest(lambda: [])
         assert result is None

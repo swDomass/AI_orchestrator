@@ -1,11 +1,11 @@
 from pathlib import Path
-from typing import Optional
+
 from skills.discovery import SkillConfig, discover_skills
 
 _cache: dict[str, tuple[float, SkillConfig]] = {}  # key → (mtime, config)
 
 
-def load_skill(name: str, cwd: Path | None = None, vault_path: Path | None = None) -> Optional[SkillConfig]:
+def load_skill(name: str, cwd: Path | None = None, vault_path: Path | None = None) -> SkillConfig | None:
     cache_key = f"{name}::{cwd}::{vault_path}"
     if cache_key in _cache:
         cached_mtime, cached_cfg = _cache[cache_key]

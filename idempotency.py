@@ -9,16 +9,15 @@ Retention: 30 days. Pruning runs lazily, at most once per calendar day.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from pathlib import Path
 import hashlib
 import json
 import logging
 import os
-import sys
 import tempfile
 import threading
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 

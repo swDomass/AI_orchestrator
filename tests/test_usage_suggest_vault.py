@@ -1,8 +1,6 @@
 """Tests for the vault-task suggestion strategy in usage_suggester."""
 
-import re
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest

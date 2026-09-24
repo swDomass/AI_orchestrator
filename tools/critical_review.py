@@ -25,12 +25,12 @@ from datetime import datetime
 from pathlib import Path
 
 from config import (
+    MAX_CONTEXT_FILE_SIZE,
     TOOL_CR_MAX_PLAN_CHARS,
     TOOL_CR_PASS1_MAX_INJECT_CHARS,
     TOOL_CR_PASS1_TIMEOUT_SEC,
     TOOL_CR_PASS2_TIMEOUT_SEC,
     TOOL_CR_PASS3_TIMEOUT_SEC,
-    MAX_CONTEXT_FILE_SIZE,
 )
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
@@ -670,8 +670,8 @@ class CriticalReviewTool(BaseTool):
         # Apply model pin for pass2 provider if task has a matching model tag.
         # (Primary provider already has _forced_model set by orchestrator; pass2
         # may be a different provider and needs its own resolution.)
-        from queue_manager import extract_model_tag
         from config import model_id_for_provider as _model_id_for_provider
+        from queue_manager import extract_model_tag
         pass2_model_id = _model_id_for_provider(
             extract_model_tag(task), pass2_provider.name
         )

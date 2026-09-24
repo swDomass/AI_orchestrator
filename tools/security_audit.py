@@ -236,7 +236,7 @@ class SecurityAuditTool(BaseTool):
             )
 
         notify_tool_progress(self.name, 2, 2, "Phase 2/2: Fixes werden implementiert...")
-        print(f"  [security-audit] Phase 2: Fixes implementieren...")
+        print("  [security-audit] Phase 2: Fixes implementieren...")
 
         if not is_cached_provider_available(provider.name):
             # Save partial result (audit only) and signal retry

@@ -2,7 +2,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 with patch("config._load_dotenv"):
     import queue_healing
     import queue_manager

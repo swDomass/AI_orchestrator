@@ -38,9 +38,9 @@ import re
 import threading
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
 
 import idempotency
+import memory as memory_module
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -54,7 +54,6 @@ from dispatcher import select_provider
 from limits import display_provider_names, get_limits
 from notifier import send_message
 from queue_manager import CWD_RE, append_task, extract_cwd, read_queue
-import memory as memory_module
 
 logger = logging.getLogger("telegram-listener")
 
@@ -295,7 +294,8 @@ class TelegramListener:
 
         # Cancel any pending shutdown on ANY incoming message
         try:
-            from shutdown import cancel_shutdown, shutdown_pending as _sp
+            from shutdown import cancel_shutdown
+            from shutdown import shutdown_pending as _sp
             if _sp.is_set():
                 cancel_shutdown()
                 send_message("✋ Shutdown abgebrochen.")
@@ -516,7 +516,7 @@ class TelegramListener:
             cwd = self._last_cwd_per_chat.get(chat_id)
             if not cwd:
                 raise _SlashCommandError(
-                    f"Kein cwd. Setze einen mit `cwd:<pfad>` oder vorher `/review <pfad>` für last-cwd."
+                    "Kein cwd. Setze einen mit `cwd:<pfad>` oder vorher `/review <pfad>` für last-cwd."
                 )
 
         return cwd, subject
@@ -732,7 +732,8 @@ class TelegramListener:
 
     def _cmd_cancel_shutdown(self) -> None:
         try:
-            from shutdown import cancel_shutdown, shutdown_pending as _sp
+            from shutdown import cancel_shutdown
+            from shutdown import shutdown_pending as _sp
             if not _sp.is_set():
                 send_message("ℹ️ Kein Shutdown ausstehend.")
                 return

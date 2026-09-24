@@ -15,7 +15,6 @@ from tools.scientific_investigation_approvals import (
     get_manager,
     reset_manager_for_tests,
 )
-from tools.scientific_investigation_phase2 import ReviewFinding
 from tools.scientific_investigation_phase5 import (
     Phase5aReport,
     Phase5bReport,
@@ -36,7 +35,6 @@ from tools.scientific_investigation_phase8 import (
     phase_final_approval,
 )
 from tools.scientific_investigation_phases import PreRegResult, Threshold
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

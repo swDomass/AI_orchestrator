@@ -1,0 +1,76 @@
+# CI für Linux. Nur Tests sind ein Gate; ruff und mypy laufen beratend mit,
+# bis die Baseline ein hartes Gate halten kann (docs/lint-baseline-2026-09-02.md,
+# Offene Frage 3). Keine Secrets, kein Deploy.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 ist der verifizierte Floor (pyproject.toml requires-python).
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
+      # -p no:randomly ist ohne pytest-randomly ein No-op, schützt aber, falls es
+      # je in die Umgebung kommt: tests/test_telegram_listener.py ist reihenfolgeabhängig.
+      - name: pytest
+        run: python -m pytest -q -p no:randomly
+
+  # ruff und mypy werten pyproject.toml aus (target-version py312 bzw.
+  # python_version 3.12) — das Ergebnis hängt nicht vom Interpreter ab, daher
+  # nur ein Lauf. continue-on-error sitzt am Schritt, nicht am Job: so endet der
+  # Job grün und der Commit trägt kein rotes Kreuz, die Befunde stehen im Log
+  # und als Annotation im Lauf. Am Job gesetzt, zeigte die Checks-Liste jeden
+  # Commit rot, obwohl Workflow und Badge grün waren.
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
+      - name: ruff check
+        continue-on-error: true
+        run: ruff check . --statistics
+
+  mypy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
+      - name: mypy
+        continue-on-error: true
+        run: python -m mypy .

@@ -9,10 +9,9 @@ Covers the four things that can silently break this feature:
 
 import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
-
-from unittest.mock import patch
 
 import queue_manager
 from config import CLAUDE_EFFORT_LEVELS
@@ -418,8 +417,8 @@ def test_run_single_subtask_applies_forced_effort(monkeypatch):
     import dispatcher
     import orchestrator
     import parallel_runner as parallel_runner_module
-    from parallel_runner import SubTask
     from limits import AllLimits
+    from parallel_runner import SubTask
 
     class DummyProvider:
         name = "claude"
@@ -478,8 +477,8 @@ def test_run_parallel_does_not_inherit_over_an_invalid_child_tag(monkeypatch, ba
     was covered and the other three kept inheriting the parent level.
     """
     import parallel_runner as parallel_runner_module
-    from parallel_runner import SubTask, SubTaskResult, run_parallel
     from limits import AllLimits
+    from parallel_runner import SubTaskResult, run_parallel
 
     monkeypatch.setattr(queue_manager, "ALLOWED_CWD_ROOTS", [])
     # Real _parse_subtask so the raw-tag lookup sees the actual subtask text.
@@ -526,8 +525,8 @@ def test_run_parallel_inherits_parent_effort_for_subtasks_without_effort(monkeyp
     no tag of their own. Without this the tag would silently no-op on the whole
     parallel path. Mirrors test_parallel_runner's model_tag inheritance test."""
     import parallel_runner as parallel_runner_module
-    from parallel_runner import SubTask, SubTaskResult, run_parallel
     from limits import AllLimits
+    from parallel_runner import SubTask, SubTaskResult, run_parallel
 
     monkeypatch.setattr(queue_manager, "ALLOWED_CWD_ROOTS", [])
     monkeypatch.setattr(

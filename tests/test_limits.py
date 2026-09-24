@@ -2,8 +2,9 @@ import threading
 import time
 from types import SimpleNamespace
 
-import limits
 import pytest
+
+import limits
 
 
 def test_refresh_token_claude_returns_true_when_auth_status_shows_valid(monkeypatch):
@@ -1674,6 +1675,7 @@ def test_get_claude_limits_from_local_handles_runtime_exception(monkeypatch):
 def test_get_claude_limits_from_local_returns_full_capacity_when_no_block_is_active(monkeypatch):
     pytest.importorskip("claude_monitor")
     import datetime as dt
+
     import claude_monitor.data.analyzer as analyzer
     import claude_monitor.data.reader as reader
 
@@ -1685,7 +1687,7 @@ def test_get_claude_limits_from_local_returns_full_capacity_when_no_block_is_act
             return [
                 SimpleNamespace(
                     is_active=False,
-                    end_time=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1),
+                    end_time=dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1),
                     token_counts=SimpleNamespace(total_tokens=19_000),
                 )
             ]

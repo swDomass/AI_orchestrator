@@ -978,7 +978,7 @@ def _apply_429_fallback(result: AllLimits, p429: set[str]) -> AllLimits:
 
     # For Claude: try reading local JSONL files before acquiring the state lock.
     # This is IO-bound and must not run while holding _429_estimate_lock.
-    local_claude_pl: "ProviderLimits | None" = (
+    local_claude_pl: ProviderLimits | None = (
         _get_claude_limits_from_local(CLAUDE_PLAN) if "claude" in p429 else None
     )
 

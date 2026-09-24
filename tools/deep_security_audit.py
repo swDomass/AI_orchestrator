@@ -624,7 +624,7 @@ class DeepSecurityAuditTool(BaseTool):
             return _make_capacity_exhausted_result(msg, "", 0, 0, 0)
 
         notify_tool_progress(self.name, 1, 2, "Phase 1/2: 6-Persona Audit + CISO-Synthesis (parallele Subagents)...")
-        print(f"  [deep-security-audit] Subagent-Mode: 1 Master-Subprocess mit 6 parallelen Personas")
+        print("  [deep-security-audit] Subagent-Mode: 1 Master-Subprocess mit 6 parallelen Personas")
 
         system_prompt = _build_system_prompt(
             provider.name,
@@ -800,7 +800,7 @@ class DeepSecurityAuditTool(BaseTool):
             )
 
         notify_tool_progress(self.name, 2, 2, "Phase 2/2: Fixes werden implementiert...")
-        print(f"  [deep-security-audit] Phase 2: Fixes implementieren...")
+        print("  [deep-security-audit] Phase 2: Fixes implementieren...")
 
         fix_prompt = system_prompt + "\n\n" + _FIX_PROMPT.format(
             task=clean_task,

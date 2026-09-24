@@ -45,7 +45,6 @@ import shutil
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from config import (
     MEMORY_ARCHIVE_DELETE_DAYS,
@@ -81,7 +80,7 @@ _RE_DELIMITERS  = re.compile(r"[_\-/\\.]")
 _RE_WORDS       = re.compile(r"[a-zA-ZäöüÄÖÜß0-9]{3,}")
 
 # Throttle: archive_old_memories() läuft maximal 1× pro Kalendertag
-_archive_last_run_date: Optional[date] = None
+_archive_last_run_date: date | None = None
 
 # Simple stopwords for tokenization
 _STOPWORDS = {
@@ -389,7 +388,7 @@ def _temporal_score(sim: float, age_days: float, half_life: float = MEMORY_HALF_
 
 # ── Frontmatter parsing ───────────────────────────────────────────────────────
 
-def _parse_memory_file(path: Path) -> Optional[dict]:
+def _parse_memory_file(path: Path) -> dict | None:
     """Parse a memory .md file. Returns dict with keys: task, provider, cwd,
     duration_sec, timestamp, success, summary, output_tokens, noninformative, path."""
     try:
@@ -457,14 +456,14 @@ def store_result(
     result: str,
     provider: str,
     duration_sec: float,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     *,
     success: bool = True,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
     cache_read_input_tokens: int = 0,
-) -> Optional[Path]:
+) -> Path | None:
     """Write a task result to memory/task_results/.
 
     Token fields are written into the frontmatter for billing analytics
@@ -522,7 +521,7 @@ def store_result(
 
 def search_memory(
     query: str,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     top_k: int = MEMORY_TOP_K,
 ) -> list[dict]:
     """Search memory files for relevant past context.
@@ -577,7 +576,7 @@ def search_memory(
     return [item for _, item in scored[:top_k]]
 
 
-def get_context_for_task(task_text: str, cwd: Optional[str] = None) -> str:
+def get_context_for_task(task_text: str, cwd: str | None = None) -> str:
     """Build an injectable memory context block for a task.
 
     - Searches by keyword similarity + temporal decay.
@@ -643,7 +642,7 @@ def get_context_for_task(task_text: str, cwd: Optional[str] = None) -> str:
     return "\n\n".join(lines)
 
 
-def _get_recent_memories(cwd: Optional[str] = None, n: int = MEMORY_TOP_K) -> list[dict]:
+def _get_recent_memories(cwd: str | None = None, n: int = MEMORY_TOP_K) -> list[dict]:
     """Return the N most recent memory files, filtered by cwd if provided."""
     if not _TASK_RESULTS_DIR.exists():
         return []
@@ -722,7 +721,7 @@ def append_daily_log(
     result: str,
     provider: str,
     duration_sec: float,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     *,
     success: bool = True,
     output_tokens: int = 0,

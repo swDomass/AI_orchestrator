@@ -38,11 +38,20 @@ from config import (
 from limits import is_cached_provider_available
 from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider, error_code_of, is_transient
-from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result, _write_tool_file
+from tools.base_tool import (
+    BaseTool,
+    SessionContext,
+    TokenCounter,
+    ToolResult,
+    ToolTracer,
+    _build_system_prompt,
+    _make_capacity_exhausted_result,
+    _write_tool_file,
+)
 from tools.review_loop import (
-    ROUND_REFLECTION_INSTRUCTION,
-    KNOWN_LIMITS_REVIEW_BLOCK,
     KNOWN_LIMITS_RESOLUTION_BLOCK,
+    KNOWN_LIMITS_REVIEW_BLOCK,
+    ROUND_REFLECTION_INSTRUCTION,
     _is_clean_output,
     _parse_findings,
     format_known_limits,
@@ -1649,7 +1658,7 @@ class DevLoopTool(BaseTool):
                 _lesson_left = deadline - time.monotonic()
                 if (iteration > 1 and memory_module is not None
                         and not final_round and _lesson_left >= _LESSON_CALL_SEC):
-                    print(f"  [dev-loop] Generiere Lesson Learned...")
+                    print("  [dev-loop] Generiere Lesson Learned...")
                     memory_module.create_lesson_from_loop(
                         self.name, task, all_outputs, provider, cwd=cwd
                     )

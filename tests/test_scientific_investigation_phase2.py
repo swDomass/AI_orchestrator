@@ -12,9 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock
-
 import pytest
 
 from providers.base import ProviderCallError, RunResult
@@ -22,7 +19,6 @@ from tools.personas import AUTHOR, DEVILS_ADVOCATE, METHODIKER
 from tools.personas.base import PersonaAllocation
 from tools.scientific_investigation_phase2 import (
     InvestigationPlan,
-    Phase2Result,
     ReviewFinding,
     SubTask,
     _parse_investigation_plan,
@@ -33,7 +29,6 @@ from tools.scientific_investigation_phase2 import (
     write_review_findings_md,
 )
 from tools.scientific_investigation_phases import FramingResult, PreRegResult, Threshold
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

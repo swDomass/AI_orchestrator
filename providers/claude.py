@@ -10,9 +10,10 @@ estimation. The final type=="result" event carries .result + .usage.
 import json
 import shutil
 import subprocess
+
+from config import TASK_IDLE_TIMEOUT_SEC, TASK_TIMEOUT_SEC
 from providers.base import BaseProvider, RunResult
 from providers.process_runner import run_with_watchdog
-from config import TASK_TIMEOUT_SEC, TASK_IDLE_TIMEOUT_SEC
 
 _CLAUDE_CMD = shutil.which("claude") or "claude"
 
@@ -90,7 +91,7 @@ class ClaudeProvider(BaseProvider):
         if model_label:
             print(f"  [claude → {model_label}] Führe Task aus...")
         else:
-            print(f"  [claude] Führe Task aus...")
+            print("  [claude] Führe Task aus...")
         cmd = self._build_command(read_only=read_only, session_id=session_id, resume=resume)
         if self._forced_model:
             cmd.extend(["--model", self._forced_model])

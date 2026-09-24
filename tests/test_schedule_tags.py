@@ -5,13 +5,11 @@ filtering, #every: extends mark_done/finalize_task_with_result rewriting.
 """
 
 import re
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 
 with patch("config._load_dotenv"):
     import queue_manager

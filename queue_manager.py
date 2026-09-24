@@ -4,7 +4,6 @@ Parses open tasks, marks them done, appends results and log entries.
 Supports: file context injection, cwd extraction, file locking, encoding fallback.
 """
 
-from dataclasses import dataclass
 import logging
 import os
 import re
@@ -12,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -25,10 +25,9 @@ from config import (
     QUEUE_EVENTS_LOG_FILE,
     QUEUE_EVENTS_LOG_RETENTION_DAYS,
     QUEUE_FILE,
-    RESULTS_SECTION,
-    LOG_SECTION,
     VAULT_PATH,
 )
+
 # dispatcher._TAG_MAP is the maßgebliche list of every routing tag (provider-only
 # AND model-specific). Imported at module level, not deferred like the local
 # `from dispatcher import _TAG_MAP` in parallel_runner._parse_subtask() — dispatcher's

@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -37,7 +36,6 @@ from tools.scientific_investigation_phases import (
     phase_prereg,
     write_plan_md,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

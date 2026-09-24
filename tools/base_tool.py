@@ -4,15 +4,15 @@ Tools are multi-step workflows that go beyond single CLI calls.
 They run iterative loops (review→fix→recheck) and report progress.
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
 import json
 import logging
 import os
 import tempfile
 import time
 import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from config import MEMORY_HISTORY_HEADING, get_system_prompt
@@ -513,8 +513,8 @@ def _build_system_prompt(
     # Goes right after the static system prompt so the longest stable prefix
     # stays cache-stable across tool runs.
     try:
-        from skills import build_index
         from config import VAULT_PATH as _VAULT_PATH
+        from skills import build_index
         index_block = build_index(vault_path=_VAULT_PATH)
         if index_block:
             prompt += f"\n\n{index_block}"

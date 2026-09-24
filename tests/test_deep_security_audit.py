@@ -7,10 +7,9 @@ import pytest
 # Mock config._load_dotenv before importing modules that depend on config
 with patch("config._load_dotenv"):
     from providers.base import RunResult
-    from tools.base_tool import ToolResult
     from tools.deep_security_audit import (
-        DeepSecurityAuditTool,
         _AGENTS,
+        DeepSecurityAuditTool,
         _clean_tags,
         _wants_fix,
     )

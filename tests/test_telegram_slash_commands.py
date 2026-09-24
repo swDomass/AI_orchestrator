@@ -1,7 +1,7 @@
 """Tests for the slash command catalog in telegram_listener.py (#32)."""
 
-from unittest.mock import patch
 import threading
+from unittest.mock import patch
 
 import pytest
 

@@ -1,6 +1,14 @@
-import pytest
 from pathlib import Path
-from policy import PolicyEngine, TIER_AUTO, TIER_APPROVE, TIER_DENY, PolicyRule, reason_matches_preapproval
+
+from policy import (
+    TIER_APPROVE,
+    TIER_AUTO,
+    TIER_DENY,
+    PolicyEngine,
+    PolicyRule,
+    reason_matches_preapproval,
+)
+
 
 def test_policy_rule_exact_match():
     rule = PolicyRule(pattern="git commit", message="git commit matched", tier=TIER_AUTO)

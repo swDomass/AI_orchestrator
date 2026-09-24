@@ -1,5 +1,6 @@
 """Tests for queue_linter.py — validates queue files without executing tasks."""
 
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -8,7 +9,6 @@ with patch("config._load_dotenv"):
     import queue_linter
     from queue_linter import (
         LEVEL_ERROR,
-        LEVEL_INFO,
         LEVEL_WARN,
         exit_code_for,
         format_findings,
@@ -456,6 +456,11 @@ def test_verify_script_missing_flagged_without_cwd(tmp_path, monkeypatch):
     assert "Prozess-cwd" in msg
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Backslash als Pfadtrenner (#verify:scripts\\check.ps1) — auf POSIX ist '\\' "
+    "ein Dateinamenszeichen, der Pfad löst nie zu scripts/check.ps1 auf",
+)
 def test_verify_script_missing_flagged_with_cwd_tag(tmp_path, monkeypatch):
     """The real incident: cwd: points at a real, existing directory (e.g. the
     haus-repo), but the #verify: script the task actually needs lives elsewhere."""

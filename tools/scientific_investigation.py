@@ -26,13 +26,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
-import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +38,8 @@ from config import (
     TOOL_SI_APPROVAL_TIMEOUT_HOURS,
     TOOL_SI_BYPASS_LIMIT_PER_30_DAYS,
     TOOL_SI_EMBEDDING_MODEL,
-    TOOL_SI_PHASE0_TIMEOUT_SEC,
     TOOL_SI_PHASE0_5_TIMEOUT_SEC,
+    TOOL_SI_PHASE0_TIMEOUT_SEC,
     TOOL_SI_TELEGRAM_APPROVAL_TIMEOUT_SEC,
 )
 from notifier import notify_tool_done
@@ -156,7 +154,7 @@ def parse_tags(task: str) -> _Tags:
 
 def _ts_slug(now: datetime | None = None) -> str:
     """Filesystem-safe timestamp slug (UTC, second resolution)."""
-    return (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
+    return (now or datetime.now(UTC)).strftime("%Y%m%d-%H%M%S")
 
 
 def build_run_dir(root_cwd: Path, ts_slug: str) -> Path:
@@ -219,7 +217,7 @@ def write_manifest(
     """Write the run's audit/manifest.json with provenance metadata."""
     manifest = {
         "run_id": run_id,
-        "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "task": task,
         "provider": provider_name,
         "root_cwd": str(root_cwd),

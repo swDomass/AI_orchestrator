@@ -28,10 +28,10 @@ import re
 import shutil
 import subprocess
 import threading
-from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from config import (
     ALLOWED_CWD_ROOTS,
@@ -57,21 +57,21 @@ class HeartbeatItem:
     label: str
     interval_min: int      # 0 = daily
     daily_after: int = 480 # minute-of-day threshold (for daily items)
-    last_run: Optional[datetime] = None
-    last_run_date: Optional[date] = None   # for daily items
+    last_run: datetime | None = None
+    last_run_date: date | None = None   # for daily items
     handler_key: str = ""
 
 
 # ── Module-level state for queue-idle tracking ─────────────────────────────
 
-_queue_empty_since: Optional[datetime] = None
+_queue_empty_since: datetime | None = None
 _queue_empty_lock = threading.Lock()
-_usage_suggest_thread: Optional[threading.Thread] = None
+_usage_suggest_thread: threading.Thread | None = None
 
 
 # ── Built-in handlers ─────────────────────────────────────────────────────────
 
-def _check_queue_idle(queue_read_fn: Callable) -> Optional[str]:
+def _check_queue_idle(queue_read_fn: Callable) -> str | None:
     """Warn if the queue has been empty for >HEARTBEAT_QUEUE_IDLE_HOURS hours."""
     global _queue_empty_since
 
@@ -99,7 +99,7 @@ def _check_queue_idle(queue_read_fn: Callable) -> Optional[str]:
     return None
 
 
-def _check_git_status() -> Optional[str]:
+def _check_git_status() -> str | None:
     """Run git status --short in each ALLOWED_CWD_ROOTS dir."""
     results: list[str] = []
     roots = ALLOWED_CWD_ROOTS or []
@@ -130,7 +130,7 @@ def _check_git_status() -> Optional[str]:
     return "\n\n".join(results) if results else None
 
 
-def _check_session_cleanup() -> Optional[str]:
+def _check_session_cleanup() -> str | None:
     """Delete orchestrator-created Claude session JSONL files older than
     ``ORCH_SESSION_RETENTION_DAYS`` from ``~/.claude/projects/**``.
 
@@ -141,12 +141,12 @@ def _check_session_cleanup() -> Optional[str]:
     are pruned silently (file may have been manually cleaned).
     """
     try:
-        from session_registry import prune_old
         from config import ORCH_SESSION_RETENTION_DAYS
+        from session_registry import prune_old
     except ImportError:
         return None
 
-    kept, expired = prune_old(ORCH_SESSION_RETENTION_DAYS)
+    _kept, expired = prune_old(ORCH_SESSION_RETENTION_DAYS)
     if not expired:
         return None
 
@@ -175,7 +175,7 @@ def _check_session_cleanup() -> Optional[str]:
     return " | ".join(msg_parts) if msg_parts else None
 
 
-def _check_disk_space() -> Optional[str]:
+def _check_disk_space() -> str | None:
     """Check disk usage for drives in ALLOWED_CWD_ROOTS."""
     checked_drives: set[str] = set()
     warnings: list[str] = []
@@ -270,7 +270,7 @@ def _append_capacity_log(limits) -> None:
 
 
 # Module-level: track last cleanup date to run at most once per day
-_last_capacity_cleanup: Optional[date] = None
+_last_capacity_cleanup: date | None = None
 
 
 def _cleanup_capacity_log() -> None:
@@ -326,7 +326,7 @@ def _cleanup_capacity_log() -> None:
         _last_capacity_cleanup = today
 
 
-def _check_limits(get_limits_fn: Callable) -> Optional[str]:
+def _check_limits(get_limits_fn: Callable) -> str | None:
     """Call get_limits() and return a formatted summary with per-window detail."""
     try:
         limits = get_limits_fn()
@@ -373,7 +373,7 @@ def _log_capacity() -> None:
         logger.debug("log-capacity failed: %s", e)
 
 
-def _check_task_summary(dispatcher: Optional[object] = None) -> Optional[str]:
+def _check_task_summary(dispatcher: object | None = None) -> str | None:
     """Summarize yesterday's completed tasks from memory/task_results/."""
     try:
         from memory import _TASK_RESULTS_DIR, _parse_memory_file
@@ -398,7 +398,7 @@ def _check_task_summary(dispatcher: Optional[object] = None) -> Optional[str]:
         return None
 
 
-def _check_usage_suggest(queue_read_fn: Callable) -> Optional[str]:
+def _check_usage_suggest(queue_read_fn: Callable) -> str | None:
     """Check if Claude limits are about to reset with unused capacity and suggest tasks."""
     global _usage_suggest_thread
     try:
@@ -511,6 +511,7 @@ def _llm_check_for_newer_models() -> str:
     """
     try:
         from datetime import date
+
         from config import (
             CLAUDE_MODEL_ALIASES,
             CODEX_MODEL_ALIASES,
@@ -583,7 +584,7 @@ def _llm_check_for_newer_models() -> str:
         return f"⚠️ LLM-Check failed: {exc}"
 
 
-def _check_model_updates() -> Optional[str]:
+def _check_model_updates() -> str | None:
     """Verify all configured model aliases are still alive (CLI probe) and ask
     an LLM whether newer IDs are available. Designed for monthly heartbeat.
 
@@ -631,7 +632,7 @@ def _check_model_updates() -> Optional[str]:
     return "\n\n".join(parts) if parts else None
 
 
-def _check_stale_branches() -> Optional[str]:
+def _check_stale_branches() -> str | None:
     """Warn about branches with last commit >HEARTBEAT_GIT_STALE_DAYS days old."""
     results: list[str] = []
     roots = ALLOWED_CWD_ROOTS or []
@@ -677,12 +678,12 @@ def _check_stale_branches() -> Optional[str]:
     return "\n\n".join(results) if results else None
 
 
-def _check_queue_healing(queue_read_fn: Callable) -> Optional[str]:
+def _check_queue_healing(queue_read_fn: Callable) -> str | None:
     """Queue-healing (#38): scan blocked tasks and surface unblock proposals."""
     try:
         import queue_healing
-        from queue_manager import _read_queue_content, read_queue_items
         from notifier import send_message as _notify
+        from queue_manager import _read_queue_content, read_queue_items
 
         candidates = queue_healing.heal_once(
             read_queue_items,
@@ -740,7 +741,7 @@ def _format_recap(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def _check_status_recap() -> Optional[str]:
+def _check_status_recap() -> str | None:
     """Daily 24h recap handler (P6).
 
     Pulls aggregated data from analytics.last_24h_summary() and formats it
@@ -757,7 +758,7 @@ def _check_status_recap() -> Optional[str]:
         return None
 
 
-def _check_ci_failures() -> Optional[str]:
+def _check_ci_failures() -> str | None:
     """CI-Watcher (P4) heartbeat handler.
 
     Calls ci_watcher.sweep_once(), returning a Telegram-formatted summary
@@ -791,7 +792,7 @@ def _check_ci_failures() -> Optional[str]:
     return "\n".join(parts)
 
 
-def _check_skill_suggest(queue_read_fn: Callable) -> Optional[str]:
+def _check_skill_suggest(queue_read_fn: Callable) -> str | None:
     """Skill-suggester (#36): scan replay records for repeated patterns and
     write SKILL.md drafts. Manual activation only — drafts land in a separate
     directory.
@@ -1060,7 +1061,7 @@ class HeartbeatRunner:
     def run_due(
         self,
         queue_read_fn: Callable,
-        dispatcher: Optional[object] = None,
+        dispatcher: object | None = None,
     ) -> None:
         """Run all due items, send Telegram notifications for non-empty results.
 
@@ -1077,7 +1078,7 @@ class HeartbeatRunner:
     def _run_due_locked(
         self,
         queue_read_fn: Callable,
-        dispatcher: Optional[object] = None,
+        dispatcher: object | None = None,
     ) -> None:
         """Inner implementation of run_due — must be called with _lock held."""
         self._reload_if_changed()
@@ -1119,8 +1120,8 @@ class HeartbeatRunner:
         self,
         item: HeartbeatItem,
         queue_read_fn: Callable,
-        dispatcher: Optional[object],
-    ) -> Optional[str]:
+        dispatcher: object | None,
+    ) -> str | None:
         """Dispatch to the correct handler."""
         key = item.handler_key
 
@@ -1167,7 +1168,7 @@ def start_heartbeat_thread(
     queue_read_fn: Callable,
     stop_event: threading.Event,
     poll_sec: int = 60,
-    pause_event: Optional[threading.Event] = None,
+    pause_event: threading.Event | None = None,
 ) -> threading.Thread:
     """Start a daemon thread that calls heartbeat.run_due() every *poll_sec* seconds.
 

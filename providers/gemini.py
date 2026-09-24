@@ -24,9 +24,9 @@ import urllib.error
 import urllib.request
 
 import config
+from config import CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC, TASK_TIMEOUT_SEC
 from providers.base import BaseProvider, RunResult
 from providers.process_runner import run_with_watchdog
-from config import TASK_TIMEOUT_SEC, CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class GeminiProvider(BaseProvider):
         if model_label:
             print(f"  [gemini → {model_label}] Führe Task aus...")
         else:
-            print(f"  [gemini] Führe Task aus...")
+            print("  [gemini] Führe Task aus...")
         try:
             cmd = [
                 _GEMINI_CMD,

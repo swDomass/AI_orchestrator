@@ -1,4 +1,4 @@
-from skills.discovery import discover_skills, SkillConfig, parse_skill_md
+from skills.discovery import SkillConfig, discover_skills, parse_skill_md
 from skills.gating import check_requirements
 from skills.index import (
     build_index,
@@ -7,7 +7,7 @@ from skills.index import (
     list_sections,
     progressive_body,
 )
-from skills.loader import load_skill, invalidate_cache
+from skills.loader import invalidate_cache, load_skill
 
 __all__ = [
     "discover_skills", "SkillConfig", "parse_skill_md",

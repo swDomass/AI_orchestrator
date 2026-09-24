@@ -60,7 +60,7 @@ from config import (
 )
 from providers.base import BaseProvider, ProviderCallError
 from tools.crosschecks import audit_trail, similarity_index
-from tools.personas import ALL_PHASE2_PERSONAS, Persona, PersonaAllocation
+from tools.personas import ALL_PHASE2_PERSONAS, PersonaAllocation
 from tools.scientific_investigation_approvals import get_manager
 
 logger = logging.getLogger(__name__)

@@ -13,12 +13,11 @@ import os
 import shutil
 import subprocess
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-from config import VAULT_PATH, QUEUE_FILE
-
+from config import QUEUE_FILE, VAULT_PATH
 
 # ── ANSI colours (stripped on non-TTY) ────────────────────────────────────────
 
@@ -70,7 +69,7 @@ def _check_cli(label: str, cmd: str, install_hint: str = "") -> CheckResult:
         return CheckResult(PASS, label, version)
     return CheckResult(
         FAIL, label,
-        f"not found in PATH",
+        "not found in PATH",
         fix_hint=install_hint,
     )
 
@@ -356,7 +355,7 @@ def check_env_file() -> CheckResult:
         if example.exists():
             import shutil as _shutil
             _shutil.copy(example, env_file)
-            print(f"    Created .env from .env.example — edit it to set your credentials.")
+            print("    Created .env from .env.example — edit it to set your credentials.")
         else:
             env_file.write_text(
                 "TELEGRAM_BOT_TOKEN=\nTELEGRAM_CHAT_ID=\nORCH_VAULT_PATH=\n",
@@ -632,6 +631,7 @@ def check_model_aliases() -> CheckResult:
     """
     try:
         from concurrent.futures import ThreadPoolExecutor
+
         from config import (
             CLAUDE_MODEL_ALIASES,
             CODEX_MODEL_ALIASES,

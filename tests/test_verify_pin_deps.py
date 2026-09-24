@@ -9,6 +9,7 @@ review pass; the internal round had rated the same observation as marginal.
 The tests produce the violation instead of asserting the guard exists.
 """
 
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -76,9 +77,9 @@ def test_deleted_dependency_is_refused(scripts):
 
 
 @pytest.mark.skipif(
-    sys.platform != "win32",
-    reason="führt wrapper.ps1 wirklich aus (pwsh -NoProfile -File) — PowerShell ist "
-    "außerhalb von Windows nicht vorausgesetzt",
+    shutil.which("pwsh") is None,
+    reason="führt wrapper.ps1 wirklich aus (pwsh -NoProfile -File) — ohne pwsh im PATH "
+    "nicht ausführbar; die GitHub-ubuntu-Runner bringen pwsh mit, dort läuft der Test",
 )
 def test_untouched_dependency_passes(scripts):
     """Counter-probe — without it the matrix only proves the check can say no."""

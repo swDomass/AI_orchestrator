@@ -37,12 +37,13 @@ jobs:
 
   # ruff und mypy werten pyproject.toml aus (target-version py312 bzw.
   # python_version 3.12) — das Ergebnis hängt nicht vom Interpreter ab, daher
-  # nur ein Lauf. continue-on-error: der Job darf rot werden, ohne den
-  # Workflow rot zu machen.
+  # nur ein Lauf. continue-on-error sitzt am Schritt, nicht am Job: so endet der
+  # Job grün und der Commit trägt kein rotes Kreuz, die Befunde stehen im Log
+  # und als Annotation im Lauf. Am Job gesetzt, zeigte die Checks-Liste jeden
+  # Commit rot, obwohl Workflow und Badge grün waren.
   ruff:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -54,12 +55,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
       - name: ruff check
+        continue-on-error: true
         run: ruff check . --statistics
 
   mypy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -71,4 +72,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest "ruff==0.16.1" "mypy==2.3.1" types-PyYAML
       - name: mypy
+        continue-on-error: true
         run: python -m mypy .

@@ -84,8 +84,9 @@ class TestCheckAndSuggest:
         assert result is None
 
     @patch.object(us.UsageSuggester, "_get_claude_limits", return_value=(50.0, 600))
+    @patch.object(us.UsageSuggester, "_get_seven_day_pace", return_value=None)
     @patch.object(us.UsageSuggester, "_gather_suggestions", return_value=[])
-    def test_returns_none_when_no_suggestions(self, _g, _l):
+    def test_returns_none_when_no_suggestions(self, _g, _pace, _l):
         suggester = _make_suggester()
         result = suggester.check_and_suggest(lambda: [])
         assert result is None

@@ -17,9 +17,11 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ```bash
 # Linux, Cloud (2026-09-24, CPython 3.12.3 und 3.13.12, nach Lint-Paket 3+4):
 # 2837 passed / 0 failed / 7 skipped in 62-72 s — 2844 gesammelt wie unten.
-# CI (.github/workflows/ci.yml) laeuft auf 3.12 + 3.13. Die 7 Skips: 6 an Windows
-# gebunden (4 schon vorher; 2026-09-24 dazu der Backslash-Pfad in test_queue_linter
-# und pwsh in test_verify_pin_deps), 1 fehlendes optionales claude_monitor. Die 14
+# CI (.github/workflows/ci.yml) laeuft auf 3.12 + 3.13. Die 7 Skips: 5 an Windows
+# gebunden (4 schon vorher; 2026-09-24 dazu der Backslash-Pfad in test_queue_linter),
+# 1 an pwsh (test_verify_pin_deps, skippt nur ohne pwsh im PATH — die Cloud-Umgebung
+# hatte keins, die GitHub-ubuntu-Runner haben es), 1 fehlendes optionales
+# claude_monitor. Die 14
 # test_usage_suggester-Faelle, die unten als umgebungsabhaengig rot stehen, patchen
 # TELEGRAM_ENABLED seit 2026-09-24 selbst.
 # Run all tests (2844 passed / 0 failed in 180 s — measured 2026-09-17 in the main

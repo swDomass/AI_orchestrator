@@ -86,15 +86,15 @@ cp .env.example .env
 # Edit .env with your vault path and optional Telegram credentials
 ```
 
-`requirements.txt` includes:
-- `pyyaml>=6.0`
-- `claude-monitor>=3.0.0` *(optional — enables local JSONL fallback for Claude HTTP 429; requires `CLAUDE_PLAN` in `.env`)*
+`requirements.txt` holds the only hard dependency, `pyyaml>=6.0`.
+`requirements-optional.txt` adds `claude-monitor>=3.0.0` *(enables local JSONL fallback for Claude HTTP 429; requires `CLAUDE_PLAN` in `.env`)* — install it separately with `pip install -r requirements-optional.txt`. CI does not install it, which is why one test in `tests/test_limits.py` skips there.
 
 ## Linting & Typing
 
 Ruff and mypy are configured in `pyproject.toml` (tooling sections only — the
 repo is a flat script collection, not an installable package). Neither is
-required to run the orchestrator and neither is wired into a CI gate yet.
+required to run the orchestrator. CI runs both on every push, advisory only —
+the tests are the sole gate (`.github/workflows/ci.yml`).
 
 ```bash
 pip install ruff mypy types-PyYAML

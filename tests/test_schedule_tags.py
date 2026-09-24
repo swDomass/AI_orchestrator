@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 with patch("config._load_dotenv"):
     import queue_manager
 

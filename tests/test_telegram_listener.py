@@ -13,11 +13,10 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-
-from telegram_listener import TelegramListener
-from providers.base import RunResult
-from limits import AllLimits, ProviderLimits
 from config import MIN_CAPACITY_PERCENT
+from limits import AllLimits, ProviderLimits
+from providers.base import RunResult
+from telegram_listener import TelegramListener
 
 # Chat ID used for all tests — patched onto the module so the security check passes
 TEST_CHAT_ID = "99999999"

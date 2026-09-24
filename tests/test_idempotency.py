@@ -1,9 +1,9 @@
 """Tests for idempotency.py — duplicate-trigger deduplication via JSONL store."""
 
+import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-import json
 import pytest
 
 with patch("config._load_dotenv"):

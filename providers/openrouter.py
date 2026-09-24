@@ -21,7 +21,6 @@ import urllib.request
 import config
 from providers.base import BaseProvider, RunResult
 
-
 _AUTH_STATUS_CODES = (401, 403)
 _RATE_LIMIT_STATUS = 429
 

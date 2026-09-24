@@ -1,7 +1,15 @@
-import time
 import threading
+import time
 from types import SimpleNamespace
-from shutdown import request_shutdown, cancel_shutdown, shutdown_pending, shutdown_cancel, execute_shutdown
+
+from shutdown import (
+    cancel_shutdown,
+    execute_shutdown,
+    request_shutdown,
+    shutdown_cancel,
+    shutdown_pending,
+)
+
 
 def test_shutdown_state_management():
     # Reset states

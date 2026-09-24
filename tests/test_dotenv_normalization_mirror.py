@@ -11,6 +11,7 @@ so importing it does not disturb the vault-path redirect timing).
 from __future__ import annotations
 
 import conftest
+
 import config
 
 EXAMPLE_VALUES = [

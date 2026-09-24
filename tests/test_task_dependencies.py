@@ -3,16 +3,15 @@ from unittest.mock import patch
 
 import pytest
 
-
 with patch("config._load_dotenv"):
     import queue_manager
     from queue_manager import (
+        QueueTask,
+        _collect_completed_ids,
         extract_id_tag,
         extract_needs_tags,
-        strip_metadata_tags,
-        _collect_completed_ids,
         read_queue_items,
-        QueueTask,
+        strip_metadata_tags,
     )
 
 

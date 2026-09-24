@@ -9,8 +9,8 @@ Usage in queue:
 import re
 import time
 
-from config import TOOL_MAX_ITERATIONS, TOOL_FIX_TIMEOUT_SEC, TOOL_INTER_STEP_SLEEP_SEC
-from notifier import notify_tool_progress, notify_tool_done
+from config import TOOL_FIX_TIMEOUT_SEC, TOOL_INTER_STEP_SLEEP_SEC, TOOL_MAX_ITERATIONS
+from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider, error_code_of, is_transient
 from tools.base_tool import BaseTool, ToolResult, _build_system_prompt
 from tools.review_loop import format_known_limits, parse_known_limits

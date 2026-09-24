@@ -7,9 +7,10 @@ Uses ChatGPT subscription auth - no API key needed.
 import shutil
 import subprocess
 import sys
+
+from config import CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC, TASK_TIMEOUT_SEC
 from providers.base import BaseProvider, RunResult
 from providers.process_runner import run_with_watchdog
-from config import TASK_TIMEOUT_SEC, CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC
 
 _CODEX_CMD = shutil.which("codex") or "codex"
 

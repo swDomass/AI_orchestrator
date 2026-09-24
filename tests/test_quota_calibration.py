@@ -12,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import quota_calibration  # noqa: E402
 from limits import AllLimits, ProviderLimits, WindowData  # noqa: E402
 
-
 # ───────────────────────────── Helpers ────────────────────────────────────────
 
 
@@ -21,7 +20,7 @@ class _FakeEntry:
                  message_id="msg", request_id="req"):
         self.message_id = message_id
         self.request_id = request_id
-        self.timestamp = ts if ts is not None else dt.datetime.now(dt.timezone.utc)
+        self.timestamp = ts if ts is not None else dt.datetime.now(dt.UTC)
         self.input_tokens = in_t
         self.output_tokens = out_t
         self.cache_creation_tokens = cc
@@ -281,7 +280,7 @@ def test_aggregate_tokens_does_not_re_dedupe(monkeypatch):
 
 def test_aggregate_tokens_filters_entries_before_window_start(monkeypatch):
     """Entries older than window_start are dropped — not part of the current Anthropic window."""
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     window_start = now - dt.timedelta(hours=2)   # block started 2h ago
 
     _patch_load_entries(monkeypatch, [
@@ -302,7 +301,7 @@ def test_aggregate_tokens_filters_entries_before_window_start(monkeypatch):
 
 def test_aggregate_tokens_treats_naive_timestamps_as_utc(monkeypatch):
     """If claude-monitor returns naive datetimes, treat them as UTC for the window filter."""
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     window_start = now - dt.timedelta(hours=1)
     naive_inside = (now - dt.timedelta(minutes=30)).replace(tzinfo=None)
     naive_outside = (now - dt.timedelta(hours=3)).replace(tzinfo=None)
@@ -334,7 +333,7 @@ def test_aggregate_tokens_without_window_start_falls_back_to_rolling(monkeypatch
 
 def test_aggregate_tokens_loads_buffered_history_when_window_is_old(monkeypatch):
     """For an aging block (e.g. 4h into a 5h window) we load enough history."""
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     window_start = now - dt.timedelta(hours=4)
     captured = {}
 
@@ -350,7 +349,7 @@ def test_aggregate_tokens_loads_buffered_history_when_window_is_old(monkeypatch)
 
 def test_aggregate_tokens_buffer_scales_with_factor_and_absolute_terms(monkeypatch):
     """Verify the buffer formula: ceil(elapsed * 1.1) + 6."""
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     window_start = now - dt.timedelta(hours=160)  # 7d-style aging
     captured = {}
 

@@ -22,7 +22,6 @@ from tools.scientific_investigation import ScientificInvestigationTool
 from tools.scientific_investigation_approvals import reset_manager_for_tests
 from tools.scientific_investigation_phases import phase_persona_allocation
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 

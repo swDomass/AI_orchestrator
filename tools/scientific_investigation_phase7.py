@@ -62,7 +62,7 @@ class EngineeringFinding:
     suggestion: str
 
     @classmethod
-    def from_p_severity(cls, p_finding) -> "EngineeringFinding":
+    def from_p_severity(cls, p_finding) -> EngineeringFinding:
         sev: Literal["BLOCKER", "HINT"] = (
             "BLOCKER" if p_finding.severity == "P1" else "HINT"
         )

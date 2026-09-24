@@ -21,8 +21,8 @@ from pathlib import Path
 
 from config import (
     TOOL_INTER_STEP_SLEEP_SEC,
-    TOOL_RQA_DISCOVERY_TIMEOUT_SEC,
     TOOL_RQA_ANALYSIS_TIMEOUT_SEC,
+    TOOL_RQA_DISCOVERY_TIMEOUT_SEC,
     TOOL_RQA_QUESTIONS_TIMEOUT_SEC,
 )
 from notifier import notify_tool_done, notify_tool_progress

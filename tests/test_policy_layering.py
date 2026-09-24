@@ -3,7 +3,7 @@
 Layering hierarchy (highest → lowest priority):
     task #approve: tags  →  profile.policy  →  global policy.yaml
 """
-from policy import PolicyEngine, TIER_AUTO, TIER_APPROVE, TIER_DENY
+from policy import TIER_APPROVE, TIER_AUTO, TIER_DENY, PolicyEngine
 
 
 def _make_engine(tmp_path, global_yaml: str) -> PolicyEngine:
@@ -76,6 +76,7 @@ def test_none_profile_policy_uses_global(tmp_path):
 def test_profile_policy_field_parsed_from_yaml(tmp_path):
     """ProfileConfig.policy is populated when the profile YAML has a policy section."""
     import yaml
+
     from profiles import _build_profile_config
 
     data = yaml.safe_load(

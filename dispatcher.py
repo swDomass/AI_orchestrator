@@ -23,7 +23,6 @@ from typing import Callable
 
 import config
 from limits import AllLimits, ProviderLimits, is_transient_token_refresh
-from providers.base import BaseProvider
 from providers import (
     ClaudeProvider,
     CodexProvider,
@@ -32,6 +31,7 @@ from providers import (
     OpenRouterProvider,
     VibeProvider,
 )
+from providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 

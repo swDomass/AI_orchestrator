@@ -5,7 +5,6 @@ from unittest.mock import patch
 import heartbeat
 from heartbeat import _cleanup_capacity_log
 
-
 HEADER = (
     "# AI Provider Capacity Log\n"
     "<!-- appended by orchestrator heartbeat -->\n\n"

@@ -203,7 +203,8 @@ def sweep(
 
     All gh and side-effect functions are injected for testability.
     """
-    from gh_helpers import list_open_prs as _list, view_pr as _view
+    from gh_helpers import list_open_prs as _list
+    from gh_helpers import view_pr as _view
     list_open_prs_fn = list_open_prs_fn or _list
     view_pr_fn = view_pr_fn or _view
     if append_task_fn is None:

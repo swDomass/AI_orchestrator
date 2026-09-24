@@ -1034,6 +1034,7 @@ SHUTDOWN_COMMAND = (
 
 # --- SOUL.md (Personality-as-Config) ---
 import threading as _threading
+
 _soul_lock = _threading.Lock()
 _soul_cache: dict[str, str] | None = None
 _soul_mtime: float = 0.0

@@ -400,9 +400,10 @@ def test_check_model_updates_reports_flaky_ids(monkeypatch):
 def test_persistent_state_round_trip(tmp_path, monkeypatch):
     """Save/load symmetry: long-interval items keep their last_run across restarts."""
     from datetime import datetime as _dt
+
     from heartbeat import (
-        _save_heartbeat_state,
         _load_heartbeat_state,
+        _save_heartbeat_state,
     )
 
     state_file = tmp_path / "heartbeat-state.json"
@@ -423,6 +424,7 @@ def test_runner_restores_last_run_for_long_interval_items(tmp_path, monkeypatch)
     """Items with interval >= 1 day must hydrate from disk on init."""
     from datetime import datetime as _dt
     from unittest.mock import patch
+
     from heartbeat import HeartbeatItem, HeartbeatRunner
 
     state_file = tmp_path / "heartbeat-state.json"
@@ -452,6 +454,7 @@ def test_runner_does_not_persist_short_interval_items(tmp_path, monkeypatch):
     """5-minute items must NOT clutter the state file."""
     from datetime import datetime as _dt
     from unittest.mock import patch
+
     from heartbeat import HeartbeatItem, HeartbeatRunner
 
     state_file = tmp_path / "heartbeat-state.json"

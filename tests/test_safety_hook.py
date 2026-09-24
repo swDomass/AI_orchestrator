@@ -17,7 +17,6 @@ from config import SAFETY_DENY_PATTERNS, SAFETY_RULES
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from safety_hook import check_command
 
-
 # ---------------------------------------------------------------------------
 # config.py: SAFETY_DENY_PATTERNS + SAFETY_RULES
 # ---------------------------------------------------------------------------

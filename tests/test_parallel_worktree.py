@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 import parallel_runner as parallel_runner_module
+from limits import AllLimits
 from parallel_runner import (
     SubTask,
     SubTaskResult,
@@ -20,7 +21,6 @@ from parallel_runner import (
     _worktree_id,
     run_parallel,
 )
-from limits import AllLimits
 
 
 @pytest.fixture(autouse=True)

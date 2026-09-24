@@ -51,7 +51,7 @@ SCHEMA_VERSION = 1
 _PROVIDER_NAMES = ("claude", "gemini", "codex")
 
 
-def _provider_to_dict(pl: "ProviderLimits", now: float) -> dict:
+def _provider_to_dict(pl: ProviderLimits, now: float) -> dict:
     """Serialise one ProviderLimits, adding reader-friendly ``used_pct`` and
     absolute window reset epochs (computed from ``resets_in_sec`` at write
     time, since WindowData only carries the relative offset)."""
@@ -78,10 +78,10 @@ def _provider_to_dict(pl: "ProviderLimits", now: float) -> dict:
 
 
 def build_state(
-    all_limits: "AllLimits",
-    now: "float | None" = None,
+    all_limits: AllLimits,
+    now: float | None = None,
     *,
-    claude_factors: "dict[str, int] | None" = None,
+    claude_factors: dict[str, int] | None = None,
 ) -> dict:
     """Build the SoTH state dict (pure, testable without disk I/O).
 
@@ -96,7 +96,7 @@ def build_state(
         "schema_version": SCHEMA_VERSION,
         "fetched_at_unix": round(now, 3),
         "fetched_at_utc": dt.datetime.fromtimestamp(
-            now, dt.timezone.utc,
+            now, dt.UTC,
         ).isoformat(timespec="seconds"),
         "providers": {
             name: _provider_to_dict(getattr(all_limits, name), now)
@@ -114,7 +114,7 @@ def build_state(
 
 
 def write_quota_state(
-    all_limits: "AllLimits", path, *, claude_factors: "dict[str, int] | None" = None,
+    all_limits: AllLimits, path, *, claude_factors: dict[str, int] | None = None,
 ) -> bool:
     """Atomically write the SoTH quota state. Never raises.
 
@@ -130,7 +130,7 @@ def write_quota_state(
             ensure_ascii=False, indent=2,
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path: "Path | None" = None
+        tmp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", delete=False, dir=path.parent,
@@ -153,7 +153,7 @@ def write_quota_state(
         return False
 
 
-def read_quota_state(path) -> "dict | None":
+def read_quota_state(path) -> dict | None:
     """Read the SoTH quota state. Returns None if missing, empty, or corrupt.
 
     Read-only consumers (statusline, --check-limits) call this; it must be
@@ -172,7 +172,7 @@ def read_quota_state(path) -> "dict | None":
         return None
 
 
-def state_age_sec(state: dict, now: "float | None" = None) -> "float | None":
+def state_age_sec(state: dict, now: float | None = None) -> float | None:
     """Seconds since the snapshot was fetched, or None if unparseable.
 
     Lets a reader decide whether to trust the file or fall back to its own

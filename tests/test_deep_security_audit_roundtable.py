@@ -13,9 +13,9 @@ import pytest
 with patch("config._load_dotenv"):
     from providers.base import RunResult
     from tools.deep_security_audit import (
-        DeepSecurityAuditTool,
         _AGENTS,
         _ROUNDTABLE_PROMPT,
+        DeepSecurityAuditTool,
         _clean_tags,
         _wants_roundtable,
     )

@@ -10,9 +10,10 @@ estimation. The final type=="result" event carries .result + .usage.
 import json
 import shutil
 import subprocess
+
+from config import TASK_IDLE_TIMEOUT_SEC, TASK_TIMEOUT_SEC
 from providers.base import BaseProvider, RunResult
 from providers.process_runner import run_with_watchdog
-from config import TASK_TIMEOUT_SEC, TASK_IDLE_TIMEOUT_SEC
 
 _CLAUDE_CMD = shutil.which("claude") or "claude"
 

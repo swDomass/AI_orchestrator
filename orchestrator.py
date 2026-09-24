@@ -20,28 +20,30 @@ Task format in agent-queue.md:
 """
 
 import argparse
-from dataclasses import dataclass
 import hashlib
+
 # Module level on purpose, against this file's habit of lazy `import logging as
 # _logging` inside functions: main()'s BaseException handler and
 # _charge_process_crash() run while the process is already dying, and a crash
 # handler should not be performing imports. The five lazy ones elsewhere stay.
 import logging
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 # Ensure UTF-8 output on Windows (avoids cp1252 UnicodeEncodeError for →, ✅, ❌, etc.)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime, timedelta
 
-from logging_setup import install_thread_excepthook, setup_logging
-
+import git_commit
+import memory as memory_module
+import replay
 from config import (
     GIT_AUTO_STASH,
     GIT_COMMIT_MAX_FILES,
@@ -50,12 +52,10 @@ from config import (
     GIT_SNAPSHOT_PROTECT_DAYS,
     GIT_SNAPSHOT_REF_MAX_ATTEMPTS,
     GIT_SNAPSHOT_REF_PREFIX,
-    MAX_HANG_RETRIES,
     HANG_RETRY_BACKOFF_SEC,
+    MAX_HANG_RETRIES,
     MAX_RETRIES_PER_PROVIDER,
     MEMORY_HISTORY_HEADING,
-    is_known_model_tag,
-    model_id_for_provider,
     PROMPT_CURATED_MEMORY_TOKENS,
     PROMPT_DAILY_LOG_TOKENS,
     PROMPT_MEMORY_TOKENS,
@@ -65,18 +65,29 @@ from config import (
     STARTUP_DELAY_SEC,
     TASK_TIMEOUT_SEC,
     TRACK_FILE_CHANGES,
+    VAULT_PATH,
     get_system_prompt,
+    is_known_model_tag,
+    model_id_for_provider,
 )
 from dispatcher import (
-    select_provider,
     earliest_cooldown_reset,
-    has_explicit_provider_tag,
     force_refresh_can_unblock,
     forced_provider_policy_violation,
+    has_explicit_provider_tag,
     policy_dead_end,
     profile_dead_end_reason,
+    select_provider,
 )
-from limits import get_limits, set_queue_idle, set_paused, AllLimits, report_estimated_usage, estimate_task_usage_pct
+from limits import (
+    AllLimits,
+    estimate_task_usage_pct,
+    get_limits,
+    report_estimated_usage,
+    set_paused,
+    set_queue_idle,
+)
+from logging_setup import install_thread_excepthook, setup_logging
 from notifier import (
     notify_auth_expired,
     notify_error,
@@ -87,33 +98,31 @@ from notifier import (
     start_session,
 )
 from providers.base import TRANSIENT_ERRORS, RunResult, contains_auth_expired, error_code_of
-from skills import load_skill, check_requirements
-from config import VAULT_PATH
-import memory as memory_module
+from providers.process_runner import run_with_watchdog
 from queue_manager import (
     append_log,
     cleanup_done_tasks,
+    collect_file_context,
     ensure_queue_file,
     extract_cwd,
     extract_effort_tag,
-    extract_every_tag,
     extract_effort_tag_raw,
-    has_effort_tag_attempt,
+    extract_every_tag,
+    extract_hang_count,
     extract_id_tag,
     extract_model_tag,
     extract_needs_tags,
     extract_pass_providers,
     extract_preapproved_actions,
-    collect_file_context,
     extract_profile_tag,
     extract_second_opinion_alias,
     extract_shutdown_tag,
     extract_timeout,
-    extract_hang_count,
     extract_verify_tag,
     finalize_task_with_result,
     has_allow_dirty_tag,
     has_cwd_tag,
+    has_effort_tag_attempt,
     has_no_commit_tag,
     has_verify_tag,
     mark_done,
@@ -124,12 +133,9 @@ from queue_manager import (
     restamp_done_as_failed,
     strip_metadata_tags,
 )
-from providers.process_runner import run_with_watchdog
-import git_commit
-import replay
+from skills import check_requirements, load_skill
 from telegram_listener import TelegramListener
 from tools import extract_tool_tag, get_tool, list_tools
-
 
 # ---------------------------------------------------------------------------
 # Process-crash circuit breaker
@@ -2238,7 +2244,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         # --- Feature 6: Load execution profile ---
         profile_name: str | None = None
         try:
-            from profiles import load_profile, get_default_profile
+            from profiles import get_default_profile, load_profile
             profile_name = extract_profile_tag(task)
             if profile_name:
                 profile = load_profile(profile_name, VAULT_PATH)
@@ -2395,7 +2401,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
 
         # --- Feature 9: Policy check ---
         try:
-            from policy import get_engine, TIER_DENY, TIER_APPROVE, _TIER_ORDER, reason_matches_preapproval
+            from policy import (
+                _TIER_ORDER,
+                TIER_APPROVE,
+                TIER_DENY,
+                get_engine,
+                reason_matches_preapproval,
+            )
             engine = get_engine()
 
             # Build profile policy once; used for both parent task and subtasks
@@ -2532,7 +2544,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             notify_task_started(task, "parallel")
             _span.provider = "parallel"
             try:
-                from parallel_runner import run_parallel, format_parallel_result
+                from parallel_runner import format_parallel_result, run_parallel
                 # Snapshot before the subtasks (which write in their cwds) run.
                 verify_pin = _pin_verify_script(task, cwd)
                 results = run_parallel(
@@ -3379,7 +3391,8 @@ def run_watch(dry_run: bool = False) -> None:
             if not tasks:
                 # Feature 10: if shutdown pending and queue drained, start countdown
                 try:
-                    from shutdown import execute_shutdown, shutdown_pending as _sp
+                    from shutdown import execute_shutdown
+                    from shutdown import shutdown_pending as _sp
                     if _sp.is_set() and not pause_event.is_set():
                         print("\n[shutdown] Queue leer + #shutdown gesetzt → Countdown startet")
                         execute_shutdown(cleanup_cb=_cleanup)
@@ -3412,7 +3425,8 @@ def run_watch(dry_run: bool = False) -> None:
 
             # Feature 10: check shutdown after each run_once cycle
             try:
-                from shutdown import execute_shutdown, shutdown_pending as _sp
+                from shutdown import execute_shutdown
+                from shutdown import shutdown_pending as _sp
                 if _sp.is_set() and not pause_event.is_set():
                     print("\n[shutdown] #shutdown gesetzt → Countdown startet")
                     execute_shutdown(cleanup_cb=_cleanup)

@@ -1,7 +1,9 @@
-import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+import yaml
+
 
 @dataclass
 class SkillConfig:
@@ -14,7 +16,7 @@ class SkillConfig:
     config: Dict[str, Any] = field(default_factory=dict)
     prompt: str = ""
 
-def parse_skill_md(file_path: Path) -> Optional[SkillConfig]:
+def parse_skill_md(file_path: Path) -> SkillConfig | None:
     """Parse SKILL.md file and return SkillConfig."""
     if not file_path.exists():
         return None
@@ -57,7 +59,7 @@ def parse_skill_md(file_path: Path) -> Optional[SkillConfig]:
         print(f"Error parsing {file_path}: {e}")
         return None
 
-def discover_skills(cwd: Optional[Path] = None, vault_path: Optional[Path] = None) -> Dict[str, SkillConfig]:
+def discover_skills(cwd: Path | None = None, vault_path: Path | None = None) -> Dict[str, SkillConfig]:
     """
     Discover skills in all 4 locations with precedence:
     1. Task CWD: <cwd>/.orchestrator/skills/<name>/SKILL.md

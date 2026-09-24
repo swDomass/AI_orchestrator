@@ -17,20 +17,28 @@ from config import (
     CLAUDE_MODEL_ALIASES,
     CODEX_MODEL_ALIASES,
     OPENROUTER_MODEL_ALIASES,
-    VIBE_MODEL_ALIASES,
-    TOOL_MAX_ITERATIONS,
-    TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_FIX_TIMEOUT_SEC,
     TOOL_INTER_STEP_SLEEP_SEC,
+    TOOL_MAX_ITERATIONS,
+    TOOL_REVIEW_TIMEOUT_SEC,
     TOOL_RL_DRIFT_CHECK_TIMEOUT_SEC,
     TOOL_RL_SECOND_OPINION_MAX_DIFF_CHARS,
     TOOL_RL_SECOND_OPINION_TIMEOUT_SEC,
     TOOL_VERIFICATION_TIMEOUT_SEC,
+    VIBE_MODEL_ALIASES,
 )
 from limits import is_cached_provider_available
-from notifier import notify_tool_progress, notify_tool_done
+from notifier import notify_tool_done, notify_tool_progress
 from providers.base import BaseProvider, error_code_of, is_transient
-from tools.base_tool import BaseTool, SessionContext, TokenCounter, ToolResult, ToolTracer, _build_system_prompt, _make_capacity_exhausted_result
+from tools.base_tool import (
+    BaseTool,
+    SessionContext,
+    TokenCounter,
+    ToolResult,
+    ToolTracer,
+    _build_system_prompt,
+    _make_capacity_exhausted_result,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -12,10 +12,8 @@ Covers:
 import threading
 import time
 
-
 from providers.base import BaseProvider, RunResult
 from providers.claude import ClaudeProvider
-
 
 # ---------------------------------------------------------------------------
 # Minimal concrete provider (BaseProvider is abstract)

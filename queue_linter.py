@@ -45,22 +45,23 @@ Exit codes: 0 = clean, 1 = warnings, 2 = errors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import re
 import shutil
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 from config import (
+    _MODEL_ALIASES_BY_PROVIDER,
     CLAUDE_EFFORT_LEVELS,
     OPENROUTER_API_KEY,
     QUEUE_FILE,
-    _MODEL_ALIASES_BY_PROVIDER,
     is_known_model_tag,
 )
 from orchestrator import _resolve_verify_path
 from providers.opencode import OpencodeProvider
 from queue_manager import (
+    _MODEL_ALIAS_PREFIXES,
     AT_TAG_RE,
     EFFORT_ATTEMPT_RE,
     EFFORT_TAG_RE,
@@ -74,19 +75,18 @@ from queue_manager import (
     VERIFY_TAG_RE,
     _collect_completed_ids,
     _decode_queue_bytes,
-    _MODEL_ALIAS_PREFIXES,
+    _is_whole_day_interval,
     _parse_subtask_line,
     extract_cwd,
     extract_every_tag,
     extract_id_tag,
-    extract_needs_tags,
     extract_model_tag,
+    extract_needs_tags,
     extract_pass_providers,
     extract_profile_tag,
     extract_second_opinion_alias,
     extract_verify_tag,
     has_cwd_tag,
-    _is_whole_day_interval,
 )
 
 # Regex for any open task line (subset of OPEN_TASK_RE — without retry-stripping)

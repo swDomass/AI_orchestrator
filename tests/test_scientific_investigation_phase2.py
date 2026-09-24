@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-
 import pytest
 
 from providers.base import ProviderCallError, RunResult
@@ -30,7 +29,6 @@ from tools.scientific_investigation_phase2 import (
     write_review_findings_md,
 )
 from tools.scientific_investigation_phases import FramingResult, PreRegResult, Threshold
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

@@ -11,7 +11,7 @@ Covers the deterministic safeguards:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -36,7 +36,6 @@ from tools.scientific_investigation import (
     parse_tags,
 )
 from tools.sub_tool_context import build_sub_env
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -440,8 +439,8 @@ def test_cross_provider_bypass_counter_rate_limits_after_3_in_30_days(tmp_path):
 def test_cross_provider_bypass_counter_drops_old_entries(tmp_path):
     """Entries older than 30 days fall out of the rolling window."""
     counter_path = bypass_counter._counter_path(tmp_path)
-    old_ts = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
-    recent_ts = datetime.now(timezone.utc).isoformat()
+    old_ts = (datetime.now(UTC) - timedelta(days=40)).isoformat()
+    recent_ts = datetime.now(UTC).isoformat()
     counter_path.write_text(json.dumps({
         "bypasses": [
             {"at": old_ts, "run_id": "ancient"},

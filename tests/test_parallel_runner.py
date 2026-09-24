@@ -1,9 +1,17 @@
 from pathlib import Path
 from types import SimpleNamespace
-import queue_manager
+
 import parallel_runner as parallel_runner_module
-from parallel_runner import _parse_subtask, SubTask, run_parallel, format_parallel_result, SubTaskResult
+import queue_manager
 from limits import AllLimits
+from parallel_runner import (
+    SubTask,
+    SubTaskResult,
+    _parse_subtask,
+    format_parallel_result,
+    run_parallel,
+)
+
 
 def test_parse_subtask(tmp_path, monkeypatch):
     # Disable ALLOWED_CWD_ROOTS check for the test

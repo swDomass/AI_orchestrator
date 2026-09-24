@@ -1,4 +1,5 @@
-from profiles import load_profile, _build_profile_config
+from profiles import _build_profile_config, load_profile
+
 
 def test_build_profile_config_defaults():
     data = {}

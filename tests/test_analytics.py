@@ -178,7 +178,7 @@ class TestAggregation:
         assert _success_rate([]) == 0.0
 
     def test_provider_distribution(self):
-        from analytics import _provider_distribution, TaskRecord
+        from analytics import TaskRecord, _provider_distribution
         recs = [
             TaskRecord("t", "claude+review-loop", "", 1, datetime.now(), True, "x"),
             TaskRecord("t", "claude", "", 1, datetime.now(), True, "x"),
@@ -190,7 +190,7 @@ class TestAggregation:
         assert values[idx] == 2  # normalized: claude+review-loop → claude
 
     def test_avg_duration_only_success(self):
-        from analytics import _avg_duration, TaskRecord
+        from analytics import TaskRecord, _avg_duration
         recs = [
             TaskRecord("t", "c", "", 100, datetime.now(), True, "x"),
             TaskRecord("t", "c", "", 200, datetime.now(), True, "x"),
@@ -199,7 +199,7 @@ class TestAggregation:
         assert _avg_duration(recs) == 150.0
 
     def test_limits_timeline_filters_old(self):
-        from analytics import _limits_timeline, LimitSnapshot
+        from analytics import LimitSnapshot, _limits_timeline
         old = datetime.now() - timedelta(hours=100)
         recent = datetime.now() - timedelta(hours=1)
         snaps = [
@@ -277,7 +277,7 @@ class TestParseLogSuggestEvents:
 
     def test_suggest_events_in_recent_events(self, tmp_path):
         """suggest events appear in recent_events with type='suggest' from get_dashboard_data()."""
-        from analytics import get_dashboard_data, _cache
+        from analytics import _cache, get_dashboard_data
         _cache["data"] = None
         _cache["ts"] = 0.0
         log_dir = tmp_path / "logs"
@@ -440,7 +440,7 @@ class TestBillingAnalytics:
 
 class TestCache:
     def test_cache_returns_same_object(self, tmp_path):
-        from analytics import get_dashboard_data, _cache
+        from analytics import _cache, get_dashboard_data
         # Reset cache
         _cache["data"] = None
         _cache["ts"] = 0.0

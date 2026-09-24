@@ -1,8 +1,7 @@
 """Tests for notifier._escape_markdown() and _truncate() utilities."""
 
 
-from notifier import _escape_markdown, _truncate, _strip_backticks
-
+from notifier import _escape_markdown, _strip_backticks, _truncate
 
 # ── _escape_markdown ─────────────────────────────────────────────────────────
 

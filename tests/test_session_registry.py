@@ -21,7 +21,7 @@ def registry_path(tmp_path, monkeypatch):
 
 
 def test_register_session_appends_jsonl(registry_path):
-    from session_registry import register_session, list_sessions
+    from session_registry import list_sessions, register_session
     register_session("uuid-1", "dev-loop", "/d/proj")
     register_session("uuid-2", "review-loop", "/d/proj2")
 
@@ -38,7 +38,7 @@ def test_list_sessions_empty_when_no_file(registry_path):
 
 
 def test_is_orchestrator_session(registry_path):
-    from session_registry import register_session, is_orchestrator_session
+    from session_registry import is_orchestrator_session, register_session
     register_session("known-uuid", "dev-loop", "/d/proj")
 
     assert is_orchestrator_session("known-uuid") is True

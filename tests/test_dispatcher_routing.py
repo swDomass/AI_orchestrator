@@ -6,11 +6,11 @@ import pytest
 
 import limits
 from dispatcher import (
-    select_provider,
+    _selection_order,
+    force_refresh_can_unblock,
     has_explicit_provider_tag,
     resolve_forced_provider,
-    force_refresh_can_unblock,
-    _selection_order,
+    select_provider,
 )
 
 

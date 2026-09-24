@@ -14,10 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from providers.process_runner import run_with_watchdog
 from providers.claude import ClaudeProvider
-from providers.gemini import GeminiProvider
 from providers.codex import CodexProvider
+from providers.gemini import GeminiProvider
+from providers.process_runner import run_with_watchdog
 
 
 def _py(code: str) -> list[str]:
@@ -108,7 +108,8 @@ def test_tree_kill_reaps_grandchild(tmp_path):
             )
     else:
         try:
-            import os, signal  # noqa: F401
+            import os
+            import signal  # noqa: F401
             os.getpgid  # noqa: B018
         except (ImportError, AttributeError):
             pytest.skip("POSIX process-group primitives unavailable")

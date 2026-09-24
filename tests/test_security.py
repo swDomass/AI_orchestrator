@@ -2,9 +2,7 @@
 
 from pathlib import Path
 
-
 from queue_manager import extract_cwd
-
 
 # ── Path Traversal ───────────────────────────────────────────────────────────
 

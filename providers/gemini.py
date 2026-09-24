@@ -24,9 +24,9 @@ import urllib.error
 import urllib.request
 
 import config
+from config import CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC, TASK_TIMEOUT_SEC
 from providers.base import BaseProvider, RunResult
 from providers.process_runner import run_with_watchdog
-from config import TASK_TIMEOUT_SEC, CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC
 
 logger = logging.getLogger(__name__)
 

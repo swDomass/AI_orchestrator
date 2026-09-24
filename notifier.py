@@ -4,19 +4,19 @@ Sends messages on task completion, errors, provider exhaustion, and queue summar
 """
 
 import threading
-import urllib.request
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 from config import (
+    NOTIFY_ON_ALL_PROVIDERS_EXHAUSTED,
+    NOTIFY_ON_ERROR,
+    NOTIFY_ON_QUEUE_COMPLETE,
+    NOTIFY_ON_TASK_DONE,
+    NOTIFY_ON_TASK_STARTED,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TELEGRAM_ENABLED,
-    NOTIFY_ON_TASK_STARTED,
-    NOTIFY_ON_TASK_DONE,
-    NOTIFY_ON_ERROR,
-    NOTIFY_ON_QUEUE_COMPLETE,
-    NOTIFY_ON_ALL_PROVIDERS_EXHAUSTED,
 )
 
 _API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"

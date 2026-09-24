@@ -13,12 +13,11 @@ import os
 import shutil
 import subprocess
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-from config import VAULT_PATH, QUEUE_FILE
-
+from config import QUEUE_FILE, VAULT_PATH
 
 # ── ANSI colours (stripped on non-TTY) ────────────────────────────────────────
 
@@ -632,6 +631,7 @@ def check_model_aliases() -> CheckResult:
     """
     try:
         from concurrent.futures import ThreadPoolExecutor
+
         from config import (
             CLAUDE_MODEL_ALIASES,
             CODEX_MODEL_ALIASES,

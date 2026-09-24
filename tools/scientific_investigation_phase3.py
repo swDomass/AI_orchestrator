@@ -33,7 +33,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from config import TOOL_SI_SUBTASK_TIMEOUT_SEC
 from providers.base import BaseProvider
@@ -201,8 +201,8 @@ def phase_execution_loop(
     root_cwd: Path,
     run_id: str,
     sub_task_executor: SubTaskExecutor | None = None,
-    adversarial_query_generator: Optional[Callable[[SubTask], list[SearchQuery]]] = None,
-    adversarial_search_executor: Optional[SearchExecutor] = None,
+    adversarial_query_generator: Callable[[SubTask], list[SearchQuery]] | None = None,
+    adversarial_search_executor: SearchExecutor | None = None,
     timeout_per_sub_task: int | None = None,
 ) -> Phase3Result:
     """Run all Sub-Tasks. Each Sub-Task is independent — we DON'T abort the

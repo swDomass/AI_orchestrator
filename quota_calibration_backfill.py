@@ -62,7 +62,7 @@ class RawEntry:
         self.cc_5m = cc_5m
 
 
-def _parse_ts(raw: str) -> "dt.datetime | None":
+def _parse_ts(raw: str) -> dt.datetime | None:
     """Parse an ISO-8601 timestamp; treat naive as UTC, normalise to UTC."""
     if not raw:
         return None
@@ -71,11 +71,11 @@ def _parse_ts(raw: str) -> "dt.datetime | None":
     except ValueError:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=dt.timezone.utc)
-    return ts.astimezone(dt.timezone.utc)
+        ts = ts.replace(tzinfo=dt.UTC)
+    return ts.astimezone(dt.UTC)
 
 
-def load_raw_entries() -> "list[RawEntry]":
+def load_raw_entries() -> list[RawEntry]:
     """Load + dedup all assistant usage records from every project JSONL.
 
     Dedup key is ``(message.id, requestId)`` — the same key claude-monitor

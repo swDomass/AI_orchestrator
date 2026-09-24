@@ -19,7 +19,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 # QUEUE_FILE is unused here but patched as `analytics.QUEUE_FILE` by two tests in
 # tests/test_analytics.py; dropping it (ruff F401 --fix) turns both red. Those patches
@@ -90,7 +89,7 @@ class ToolTraceEvent:
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
-def _parse_task_file(path: Path, source: str = "task_results") -> Optional[TaskRecord]:
+def _parse_task_file(path: Path, source: str = "task_results") -> TaskRecord | None:
     """Parse a single memory MD file with YAML-ish frontmatter."""
     try:
         content = path.read_text(encoding="utf-8")

@@ -22,14 +22,14 @@ import pytest
 with patch("config._load_dotenv"):
     from providers.base import RunResult
     from tools.brainstorm import (
-        BrainstormTool,
-        _clean_tags,
-        _parse_int_tag,
-        _wants_cross_provider,
         _MAX_ITER_RE,
         _MAX_PERSONAS_RE,
         _MIN_PERSONAS_RE,
         _TOP_N_RE,
+        BrainstormTool,
+        _clean_tags,
+        _parse_int_tag,
+        _wants_cross_provider,
     )
     from tools.brainstorm_phases import (
         BrainstormAllocation,

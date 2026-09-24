@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 
-
 from providers.base import RunResult
 from tools.crosschecks import audit_trail
 from tools.crosschecks.adversarial_search import (
@@ -34,7 +33,6 @@ from tools.scientific_investigation_phase3 import (
     phase_execution_loop,
     write_execution_report_md,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -373,7 +371,7 @@ def test_phase_execution_writes_audit_entry_per_sub_task(tmp_path):
 
 
 def test_write_execution_report_md_renders_status(tmp_path):
-    from tools.scientific_investigation_phase3 import Phase3Result, CrosscheckFile
+    from tools.scientific_investigation_phase3 import CrosscheckFile, Phase3Result
     results = [
         SubTaskResult(
             sub_task=_make_sub_task("S1"),

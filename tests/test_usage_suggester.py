@@ -24,6 +24,17 @@ def _isolate_suggested_hashes_file(tmp_path):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _telegram_enabled():
+    """check_and_suggest() returns "telegram_disabled" before every other guard, and
+    TELEGRAM_ENABLED is read from .env at import time. Without this patch the guard
+    tests below pass only on a machine whose .env carries a bot token and chat id —
+    in a fresh worktree or on CI all 14 of them fail on that first line. Every path
+    that would actually send something patches notifier itself."""
+    with patch.object(us, "TELEGRAM_ENABLED", True):
+        yield
+
+
 def _make_suggester():
     return us.get_suggester()
 

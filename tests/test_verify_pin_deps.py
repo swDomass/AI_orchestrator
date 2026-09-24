@@ -75,6 +75,11 @@ def test_deleted_dependency_is_refused(scripts):
     assert not passed
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="führt wrapper.ps1 wirklich aus (pwsh -NoProfile -File) — PowerShell ist "
+    "außerhalb von Windows nicht vorausgesetzt",
+)
 def test_untouched_dependency_passes(scripts):
     """Counter-probe — without it the matrix only proves the check can say no."""
     pin = _pin(scripts)

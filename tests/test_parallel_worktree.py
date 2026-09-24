@@ -6,7 +6,7 @@ Mocks `subprocess.run` so tests never spawn real `git worktree` commands.
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 

@@ -11,9 +11,8 @@ Covers:
 
 import threading
 import time
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from telegram_listener import TelegramListener
 from providers.base import RunResult

@@ -478,7 +478,7 @@ def test_run_parallel_does_not_inherit_over_an_invalid_child_tag(monkeypatch, ba
     was covered and the other three kept inheriting the parent level.
     """
     import parallel_runner as parallel_runner_module
-    from parallel_runner import SubTask, SubTaskResult, run_parallel
+    from parallel_runner import SubTaskResult, run_parallel
     from limits import AllLimits
 
     monkeypatch.setattr(queue_manager, "ALLOWED_CWD_ROOTS", [])

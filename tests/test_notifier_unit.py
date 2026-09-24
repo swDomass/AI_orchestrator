@@ -1,6 +1,5 @@
 """Tests for notifier._escape_markdown() and _truncate() utilities."""
 
-import pytest
 
 from notifier import _escape_markdown, _truncate, _strip_backticks
 

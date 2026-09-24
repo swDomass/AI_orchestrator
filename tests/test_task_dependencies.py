@@ -1,6 +1,5 @@
 """Tests for #id: / #needs: task dependency system in queue_manager."""
-from unittest.mock import patch, MagicMock
-from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 

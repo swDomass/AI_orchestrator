@@ -12,7 +12,6 @@ from tools.scientific_investigation_phase2 import (
 )
 from tools.scientific_investigation_phase3 import Phase3Result, SubTaskResult
 from tools.scientific_investigation_phase4 import (
-    StatusTuple,
     SynthesisResult,
     _count_sentences,
     _parse_limitation_subsections,

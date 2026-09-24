@@ -100,7 +100,6 @@ def test_price_cap_and_workdir_passed(monkeypatch):
 
 def test_price_cap_is_a_validated_positive_number(monkeypatch):
     """A bad env value must not travel to the CLI as a cost argument."""
-    import importlib
     import config as config_mod
 
     monkeypatch.setenv("VIBE_MAX_PRICE_USD", "not-a-number")

@@ -12,12 +12,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
 from providers.base import RunResult
-from tools.crosschecks import audit_trail, bypass_counter
+from tools.crosschecks import bypass_counter
 from tools.crosschecks.audit_trail import (
     append_audit_entry,
     approvals_path,

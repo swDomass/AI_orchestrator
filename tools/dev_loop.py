@@ -1649,7 +1649,7 @@ class DevLoopTool(BaseTool):
                 _lesson_left = deadline - time.monotonic()
                 if (iteration > 1 and memory_module is not None
                         and not final_round and _lesson_left >= _LESSON_CALL_SEC):
-                    print(f"  [dev-loop] Generiere Lesson Learned...")
+                    print("  [dev-loop] Generiere Lesson Learned...")
                     memory_module.create_lesson_from_loop(
                         self.name, task, all_outputs, provider, cwd=cwd
                     )

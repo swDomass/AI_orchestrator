@@ -22,7 +22,7 @@ import logging
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from limits import AllLimits, estimate_task_usage_pct, report_estimated_usage
@@ -167,7 +167,6 @@ def _run_single_subtask(
     try:
         # Tool-based subtask
         if subtask.tool_name:
-            from orchestrator import ToolTaskExecutionOutcome
             outcome = _execute_tool_task(
                 subtask.text,
                 subtask.tool_name,

@@ -1,5 +1,5 @@
 """Tests for the monthly model-update heartbeat check."""
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -134,7 +134,7 @@ def test_probe_model_does_not_flag_unsupported_encoding_as_dead(monkeypatch):
     p = _fake_provider(success=False, error="unsupported encoding in input file")
     monkeypatch.setattr("dispatcher.get_provider_by_name", lambda _: p)
 
-    alive, detail = _probe_model("claude", "claude-opus-4-7")
+    alive, _detail = _probe_model("claude", "claude-opus-4-7")
 
     # Should NOT be flagged as dead — narrower keywords avoid this false positive
     assert alive is True
@@ -399,12 +399,8 @@ def test_check_model_updates_reports_flaky_ids(monkeypatch):
 
 def test_persistent_state_round_trip(tmp_path, monkeypatch):
     """Save/load symmetry: long-interval items keep their last_run across restarts."""
-    import json
     from datetime import datetime as _dt
     from heartbeat import (
-        HeartbeatItem,
-        HeartbeatRunner,
-        _PERSIST_INTERVAL_THRESHOLD_MIN,
         _save_heartbeat_state,
         _load_heartbeat_state,
     )

@@ -9,7 +9,6 @@ with patch("config._load_dotenv"):
     import queue_linter
     from queue_linter import (
         LEVEL_ERROR,
-        LEVEL_INFO,
         LEVEL_WARN,
         exit_code_for,
         format_findings,

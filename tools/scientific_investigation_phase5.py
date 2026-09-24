@@ -40,10 +40,9 @@ from typing import Literal
 
 from config import TOOL_SI_PHASE5B_TIMEOUT_SEC
 from providers.base import BaseProvider, ProviderCallError
-from tools.crosschecks import audit_trail
 from tools.scientific_investigation_phase2 import _parse_review_findings
 from tools.scientific_investigation_phase4 import CriteriaStatus
-from tools.scientific_investigation_phases import PreRegResult, Threshold
+from tools.scientific_investigation_phases import PreRegResult
 
 logger = logging.getLogger(__name__)
 

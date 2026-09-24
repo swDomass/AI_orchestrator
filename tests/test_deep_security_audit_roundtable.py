@@ -17,7 +17,6 @@ with patch("config._load_dotenv"):
         _AGENTS,
         _ROUNDTABLE_PROMPT,
         _clean_tags,
-        _wants_fix,
         _wants_roundtable,
     )
 

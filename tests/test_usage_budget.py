@@ -1,6 +1,5 @@
 """Tests for usage_budget module."""
 
-import pytest
 
 import usage_budget as ub
 

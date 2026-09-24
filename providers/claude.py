@@ -90,7 +90,7 @@ class ClaudeProvider(BaseProvider):
         if model_label:
             print(f"  [claude → {model_label}] Führe Task aus...")
         else:
-            print(f"  [claude] Führe Task aus...")
+            print("  [claude] Führe Task aus...")
         cmd = self._build_command(read_only=read_only, session_id=session_id, resume=resume)
         if self._forced_model:
             cmd.extend(["--model", self._forced_model])

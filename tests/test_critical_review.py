@@ -9,7 +9,6 @@ import pytest
 with patch("config._load_dotenv"):
     from providers.base import RunResult
     from queue_manager import extract_pass_providers, strip_metadata_tags
-    from tools.base_tool import ToolResult
     from tools.critical_review import (
         CriticalReviewTool,
         _plan_v2_path,
@@ -217,7 +216,7 @@ class TestResolvePlanFile:
         docs = tmp_path / "docs"
         docs.mkdir()
         (docs / "design.md").write_text("# Design", encoding="utf-8")
-        path, ref = _resolve_plan_file("Prüfe docs/design.md", tmp_path)
+        path, _ref = _resolve_plan_file("Prüfe docs/design.md", tmp_path)
         assert path is not None
         assert path.name == "design.md"
 
@@ -227,12 +226,12 @@ class TestResolvePlanFile:
         assert ref == ""
 
     def test_nonexistent_file_returns_none(self, tmp_path):
-        path, ref = _resolve_plan_file("Prüfe nonexistent.md", tmp_path)
+        path, _ref = _resolve_plan_file("Prüfe nonexistent.md", tmp_path)
         assert path is None
 
     def test_wikilink_in_cwd(self, tmp_path):
         (tmp_path / "MyPlan.md").write_text("# Plan", encoding="utf-8")
-        path, ref = _resolve_plan_file("Prüfe [[MyPlan]]", tmp_path)
+        path, _ref = _resolve_plan_file("Prüfe [[MyPlan]]", tmp_path)
         assert path is not None
         assert path.name == "MyPlan.md"
 

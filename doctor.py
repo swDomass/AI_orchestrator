@@ -70,7 +70,7 @@ def _check_cli(label: str, cmd: str, install_hint: str = "") -> CheckResult:
         return CheckResult(PASS, label, version)
     return CheckResult(
         FAIL, label,
-        f"not found in PATH",
+        "not found in PATH",
         fix_hint=install_hint,
     )
 
@@ -356,7 +356,7 @@ def check_env_file() -> CheckResult:
         if example.exists():
             import shutil as _shutil
             _shutil.copy(example, env_file)
-            print(f"    Created .env from .env.example — edit it to set your credentials.")
+            print("    Created .env from .env.example — edit it to set your credentials.")
         else:
             env_file.write_text(
                 "TELEGRAM_BOT_TOKEN=\nTELEGRAM_CHAT_ID=\nORCH_VAULT_PATH=\n",

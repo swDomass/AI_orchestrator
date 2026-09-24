@@ -1,4 +1,3 @@
-import pytest
 import time
 import threading
 from types import SimpleNamespace

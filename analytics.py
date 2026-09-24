@@ -21,7 +21,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from config import ALLOWED_CWD_ROOTS, CAPACITY_LOG_FILE, LOG_FILE, QUEUE_EVENTS_LOG_FILE, QUEUE_FILE, VAULT_PATH
+# QUEUE_FILE is unused here but patched as `analytics.QUEUE_FILE` by two tests in
+# tests/test_analytics.py; dropping it (ruff F401 --fix) turns both red. Those patches
+# are no-ops anyway: get_dashboard_data() reads the queue via queue_manager.
+from config import (
+    ALLOWED_CWD_ROOTS,
+    CAPACITY_LOG_FILE,
+    LOG_FILE,
+    QUEUE_EVENTS_LOG_FILE,
+    QUEUE_FILE,  # noqa: F401
+    VAULT_PATH,
+)
 
 logger = logging.getLogger(__name__)
 

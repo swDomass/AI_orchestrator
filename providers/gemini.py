@@ -212,7 +212,7 @@ class GeminiProvider(BaseProvider):
         if model_label:
             print(f"  [gemini → {model_label}] Führe Task aus...")
         else:
-            print(f"  [gemini] Führe Task aus...")
+            print("  [gemini] Führe Task aus...")
         try:
             cmd = [
                 _GEMINI_CMD,

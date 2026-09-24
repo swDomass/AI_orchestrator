@@ -28,7 +28,7 @@ import re
 import shutil
 import subprocess
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -146,7 +146,7 @@ def _check_session_cleanup() -> Optional[str]:
     except ImportError:
         return None
 
-    kept, expired = prune_old(ORCH_SESSION_RETENTION_DAYS)
+    _kept, expired = prune_old(ORCH_SESSION_RETENTION_DAYS)
     if not expired:
         return None
 

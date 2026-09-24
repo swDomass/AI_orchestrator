@@ -22,7 +22,7 @@ import socketserver
 import threading
 import urllib.parse
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 from analytics import get_dashboard_data
 from config import DASHBOARD_PORT

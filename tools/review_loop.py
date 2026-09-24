@@ -914,13 +914,13 @@ class ReviewLoopTool(BaseTool):
                                 )
                             elif so_no_findings:
                                 print(
-                                    f"  [review-loop] Second-Opinion bestätigt: "
-                                    f"keine zusätzlichen Findings"
+                                    "  [review-loop] Second-Opinion bestätigt: "
+                                    "keine zusätzlichen Findings"
                                 )
                             else:
                                 print(
-                                    f"  [review-loop] Second-Opinion-Output "
-                                    f"ohne parsbare Findings — ignoriert"
+                                    "  [review-loop] Second-Opinion-Output "
+                                    "ohne parsbare Findings — ignoriert"
                                 )
 
             # A known limit's lifecycle ends here if the reviewer (primary or second
@@ -953,7 +953,7 @@ class ReviewLoopTool(BaseTool):
             if no_findings or not blocking_findings:
                 # Verification phase (configurable via policy.yaml)
                 if self._should_verify():
-                    print(f"  [review-loop] === VERIFICATION PHASE ===")
+                    print("  [review-loop] === VERIFICATION PHASE ===")
                     verify_prompt = (
                         f"{system_prompt}\n\n{task}\n\n{_VERIFICATION_PROMPT_BODY}"
                     )
@@ -981,7 +981,7 @@ class ReviewLoopTool(BaseTool):
                         )
                         verified = "VERIFIED" in verify_result.output.upper().replace("NOT VERIFIED", "")
                         if not verified:
-                            print(f"  [review-loop] Verification nicht bestanden, Concerns gefunden.")
+                            print("  [review-loop] Verification nicht bestanden, Concerns gefunden.")
                             # Not a hard failure — log but still succeed
                             # (concerns are informational, findings were already clean)
 
@@ -1009,7 +1009,7 @@ class ReviewLoopTool(BaseTool):
 
                 # Auto-lesson: generate LLM summary if it took more than 1 iteration
                 if iteration > 1 and memory_module is not None:
-                    print(f"  [review-loop] Generiere Lesson Learned...")
+                    print("  [review-loop] Generiere Lesson Learned...")
                     memory_module.create_lesson_from_loop(
                         self.name, task, all_outputs, provider, cwd=cwd
                     )
@@ -1185,7 +1185,7 @@ class ReviewLoopTool(BaseTool):
                     known_limits.update(
                         validate_known_limits(candidates, blocking_findings, tool_name=self.name)
                     )
-            print(f"  [review-loop] Fix durchgeführt. Starte Re-Review...")
+            print("  [review-loop] Fix durchgeführt. Starte Re-Review...")
             previous_findings_count = len(blocking_findings)
 
             # Phase B: rollover session every cap iterations to bound conversation

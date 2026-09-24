@@ -52,7 +52,7 @@ class CodexProvider(BaseProvider):
         if model_label:
             print(f"  [codex → {model_label}] Führe Task aus...")
         else:
-            print(f"  [codex] Führe Task aus...")
+            print("  [codex] Führe Task aus...")
         try:
             cmd = self._build_command(read_only=read_only, model=model_label)
             result = run_with_watchdog(

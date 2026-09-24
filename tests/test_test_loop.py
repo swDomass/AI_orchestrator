@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 
 from providers.base import RunResult
 from tools.test_loop import _tests_passed, TestLoopTool

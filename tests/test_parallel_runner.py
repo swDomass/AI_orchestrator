@@ -1,5 +1,3 @@
-import pytest
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 import queue_manager

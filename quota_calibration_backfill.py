@@ -252,7 +252,7 @@ def grid_search_5h(recomputed) -> None:
                 best = (cv, w1, w5)
     print("=== 5h grid search: io + w1*cc_1h + w5*cc_5m ===")
     print(f"  best CV {best[0]:.1%} at w_1h={best[1]:.2f}, w_5m={best[2]:.2f}")
-    print(f"  (baseline with_cc = w1=w5=1.0; decision gate = CV < 15%)")
+    print("  (baseline with_cc = w1=w5=1.0; decision gate = CV < 15%)")
     print(f"  VERDICT: {'tier reweighting HELPS' if best[0] < 0.15 else 'tier reweighting does NOT reach <15% — 5h noise is not a weighting problem'}")
 
 

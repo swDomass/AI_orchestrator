@@ -181,7 +181,7 @@ def test_suggest_once_writes_draft_and_notifies(tmp_path):
         notify_fn=notified.append,
     )
     assert len(written) == 1
-    cand, path = written[0]
+    _cand, path = written[0]
     assert path.exists()
     assert len(notified) == 1
     assert "Skill-Vorschlag" in notified[0]

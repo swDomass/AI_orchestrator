@@ -1,6 +1,5 @@
 """Tests for dispatcher.select_provider() routing logic."""
 
-from unittest.mock import patch, PropertyMock
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +10,6 @@ from dispatcher import (
     has_explicit_provider_tag,
     resolve_forced_provider,
     force_refresh_can_unblock,
-    _providers,
     _selection_order,
 )
 

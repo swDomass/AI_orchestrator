@@ -1,5 +1,5 @@
 """Tests for _cleanup_capacity_log() in heartbeat.py."""
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import heartbeat

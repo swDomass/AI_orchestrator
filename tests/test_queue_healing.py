@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -214,7 +212,7 @@ def test_apply_drop_marks_task_failed(monkeypatch):
         return True
 
     monkeypatch.setattr("queue_manager._apply_update", fake_apply)
-    ok, msg = apply_drop("task-b")
+    ok, _msg = apply_drop("task-b")
     assert ok
     assert "- [-] Run B #id:task-b" in written["out"]
     assert "drop via queue-healing" in written["out"]
@@ -243,7 +241,7 @@ def test_apply_retry_dep_resets_failed_to_open(monkeypatch):
 
 
 def test_apply_retry_dep_rejects_empty_input():
-    ok, msg = apply_retry_dep([])
+    ok, _msg = apply_retry_dep([])
     assert not ok
 
 

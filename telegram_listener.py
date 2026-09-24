@@ -38,7 +38,6 @@ import re
 import threading
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
 
 import idempotency
 from config import (
@@ -516,7 +515,7 @@ class TelegramListener:
             cwd = self._last_cwd_per_chat.get(chat_id)
             if not cwd:
                 raise _SlashCommandError(
-                    f"Kein cwd. Setze einen mit `cwd:<pfad>` oder vorher `/review <pfad>` für last-cwd."
+                    "Kein cwd. Setze einen mit `cwd:<pfad>` oder vorher `/review <pfad>` für last-cwd."
                 )
 
         return cwd, subject

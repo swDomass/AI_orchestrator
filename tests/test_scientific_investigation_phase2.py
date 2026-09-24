@@ -12,8 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,7 +20,6 @@ from tools.personas import AUTHOR, DEVILS_ADVOCATE, METHODIKER
 from tools.personas.base import PersonaAllocation
 from tools.scientific_investigation_phase2 import (
     InvestigationPlan,
-    Phase2Result,
     ReviewFinding,
     SubTask,
     _parse_investigation_plan,

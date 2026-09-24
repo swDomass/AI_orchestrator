@@ -70,7 +70,7 @@ def test_deleted_dependency_is_refused(scripts):
     pin = _pin(scripts)
     (scripts / "logic.ps1").unlink()
 
-    passed, detail = orchestrator._run_verify_script("wrapper.ps1", str(scripts), pin=pin)
+    passed, _detail = orchestrator._run_verify_script("wrapper.ps1", str(scripts), pin=pin)
 
     assert not passed
 

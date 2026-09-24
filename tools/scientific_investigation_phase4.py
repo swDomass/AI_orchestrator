@@ -37,7 +37,6 @@ from config import (
 from providers.base import BaseProvider, ProviderCallError
 from tools.personas import AUTHOR
 from tools.scientific_investigation_phase2 import (
-    InvestigationPlan,
     Phase2Result,
 )
 from tools.scientific_investigation_phase3 import Phase3Result

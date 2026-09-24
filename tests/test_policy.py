@@ -1,4 +1,3 @@
-import pytest
 from pathlib import Path
 from policy import PolicyEngine, TIER_AUTO, TIER_APPROVE, TIER_DENY, PolicyRule, reason_matches_preapproval
 

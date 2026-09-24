@@ -6,7 +6,6 @@ Sends messages on task completion, errors, provider exhaustion, and queue summar
 import threading
 import urllib.request
 import urllib.parse
-import json
 from datetime import datetime
 
 from config import (

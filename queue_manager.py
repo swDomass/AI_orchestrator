@@ -25,8 +25,6 @@ from config import (
     QUEUE_EVENTS_LOG_FILE,
     QUEUE_EVENTS_LOG_RETENTION_DAYS,
     QUEUE_FILE,
-    RESULTS_SECTION,
-    LOG_SECTION,
     VAULT_PATH,
 )
 # dispatcher._TAG_MAP is the maßgebliche list of every routing tag (provider-only

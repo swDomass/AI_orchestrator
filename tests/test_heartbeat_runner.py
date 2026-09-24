@@ -1,9 +1,8 @@
 """Tests for HeartbeatRunner lock safety and start_heartbeat_thread."""
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import heartbeat
 from heartbeat import HeartbeatRunner, start_heartbeat_thread
 
 

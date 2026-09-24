@@ -1,13 +1,11 @@
 
-import os
 import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Mock config to avoid loading real .env
 with patch("config._load_dotenv"):
     import queue_manager
-    from queue_manager import read_queue, mark_done, ensure_queue_file
+    from queue_manager import read_queue, mark_done
 
 @pytest.fixture
 def mock_queue_file(tmp_path):

@@ -6,7 +6,6 @@ Layer 3: TF-IDF search (existing, tested indirectly)
 """
 
 import logging
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta

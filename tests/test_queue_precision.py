@@ -1,5 +1,3 @@
-from unittest.mock import patch
-import pytest
 from queue_manager import _replace_open_task_line
 
 def test_replace_open_task_line_with_identical_tasks_and_subtasks(capsys):

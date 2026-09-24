@@ -1,8 +1,7 @@
 import pytest
-from pathlib import Path
 from limits import AllLimits, ProviderLimits
 from dispatcher import select_provider
-from policy import PolicyEngine, get_engine
+from policy import PolicyEngine
 import policy as policy_module
 
 @pytest.fixture

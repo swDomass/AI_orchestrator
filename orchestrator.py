@@ -2383,7 +2383,7 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             print(f"  [DRY-RUN] Memory: {len(memory_context)} Zeichen ({memory_context.count(chr(10)+chr(10))+1 if memory_context else 0} Einträge)")
             print(f"  [DRY-RUN] Prompt-Länge: {len(prompt)} Zeichen (~{len(prompt.split())} Tokens)")
             if task_has_shutdown:
-                print(f"  [DRY-RUN] #shutdown erkannt → Shutdown nach diesem Task")
+                print("  [DRY-RUN] #shutdown erkannt → Shutdown nach diesem Task")
             continue
 
         # Get current limits
@@ -3335,7 +3335,7 @@ def run_watch(dry_run: bool = False) -> None:
             remaining = STARTUP_DELAY_SEC - slept
             if remaining > 0:
                 print(f"  [startup] noch {fmt_time(int(remaining))}...", end="\r")
-        print(f"[startup] Delay abgeschlossen, starte Queue-Verarbeitung.")
+        print("[startup] Delay abgeschlossen, starte Queue-Verarbeitung.")
 
     pause_event = threading.Event()
     listener = TelegramListener(pause_event)

@@ -62,14 +62,12 @@ from orchestrator import _resolve_verify_path
 from providers.opencode import OpencodeProvider
 from queue_manager import (
     AT_TAG_RE,
-    CWD_RE,
     EFFORT_ATTEMPT_RE,
     EFFORT_TAG_RE,
     EVERY_TAG_RE,
     FRESHONLY_TAG_RE,
     GRACE_TAG_RE,
     HANG_COUNT_RE,
-    NEEDS_TAG_RE,
     PARALLEL_TAG_RE,
     PROVIDER_TAG_RE,
     RETRY_TAG_RE,

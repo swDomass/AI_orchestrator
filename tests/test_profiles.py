@@ -1,6 +1,4 @@
-import pytest
-from pathlib import Path
-from profiles import ProfileConfig, load_profile, _build_profile_config
+from profiles import load_profile, _build_profile_config
 
 def test_build_profile_config_defaults():
     data = {}

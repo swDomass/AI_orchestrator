@@ -13,10 +13,16 @@ TEST_CHAT_ID = "99999999"
 
 @pytest.fixture(autouse=True)
 def isolated_idempotency_store(tmp_path):
+    # Restore the previous path afterwards, so the swap does not leak into later
+    # test files. Order matters: reset_for_tests() deletes the store at the
+    # CURRENT path, so it must run while that path is still the tmp one — never
+    # after the restore, where it would hit logs/idempotency.jsonl.
+    saved_path = idempotency.get_store_path()
     idempotency.set_store_path(tmp_path / "idempotency.jsonl")
     idempotency.reset_for_tests()
     yield
     idempotency.reset_for_tests()
+    idempotency.set_store_path(saved_path)
 
 
 def _make_listener() -> TelegramListener:

@@ -38,7 +38,7 @@ import queue_linter
 import queue_manager
 
 # ---------------------------------------------------------------------------
-# Isolation — the suite is order-sensitive (`-p no:randomly` is load-bearing)
+# Isolation — process-wide state is restored per test, so order does not matter
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)

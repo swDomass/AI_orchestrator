@@ -8,8 +8,8 @@ no trace anywhere. These two tests pin the replacement hook: it logs the
 traceback, and it keeps the stdlib's one exemption for `SystemExit`.
 
 The hook is a process-wide mutation, so both tests restore
-`threading.excepthook` in a fixture — this suite is order-sensitive
-(`-p no:randomly` is load-bearing).
+`threading.excepthook` in a fixture — that restore is what keeps them
+independent of test order.
 """
 import logging
 import threading

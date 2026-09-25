@@ -312,12 +312,27 @@ workaround. Tests per error class (transient, terminal/unclassifiable,
 auth_expired) across two call sites (Phase 0 and Phase 4/0.5/2/7), plus a
 unit test per raise site — all mutation-proven.
 
+An eighth was closed on 2026-09-25: **the suite's known order leak.**
+`tests/test_telegram_listener.py` was not order-dependent itself — it
+was the victim. `tests/test_shutdown.py::test_shutdown_state_management` left
+the process-wide `shutdown.shutdown_pending` Event set, and
+`TelegramListener._handle_message` answers a pending shutdown with "✋ Shutdown
+abgebrochen." and swallows plain text. Found by bisection at test level under
+`pytest-randomly` seed 22222 (952 predecessors → 1 in ten steps); a fixed order
+hid it because the last test in that file happens to clear the Event again.
+Fixed test-side with an autouse fixture in `tests/test_shutdown.py`, no
+production change; mutation-proven on seeds 22222, 114 and 120 (red without the
+fix, green with it). The row that tracked it also carried
+`tests/test_usage_suggester.py`'s environment dependence, closed 2026-09-24, so
+the row is gone. `-p no:randomly` stays as the reproducible order, no longer as
+a workaround. Random order is verified by sampling (eight seeds, Linux, Cloud),
+not proven for every order, and CI still runs only the fixed one.
+
 | Defect | Impact |
 |---|---|
 | `stdin_incomplete` requeues without bound | `<!-- hang: N -->` is the only persistent per-task counter and only `hang` + `format_error` *increment* it. Every other error code requeues without raising it. Count unbounded, rate still throttled by the 5-min cooldown. Pre-existing. Narrowed 2026-08-15: those parks no longer *reset* the counter either, so a task alternating between real failures and parks does reach the cap. |
 | An unregistered value in `#pass1:`/`#pass2:` is still dropped silently | Narrowed 2026-09-02: `vibe` and `openrouter` are accepted now, but a typo or an unknown provider still fails twice over — `extract_pass_providers()` drops the pass, and `strip_metadata_tags()` leaves the tag in place, so it reaches the model as prompt text. Measured: `#pass1:claude #pass2:mistral` yields `{1: 'claude'}` and a prompt still ending in `#pass2:mistral`. `queue_linter.py` has no counterpart check. |
 | Safety-hook residuals | `find . -exec git push`, `docker exec c git push`, `xargs git push` are not recognised (needs real argv parsing, not a regex). A heredoc body line starting with a git write command matches — a deliberate false positive in the safe direction. Hook covers Claude only; Codex relies on its own sandbox flag. |
-| `tests/test_telegram_listener.py` order-dependent; `tests/test_usage_suggester.py` environment-dependent | Run with `-p no:randomly`. A red suite in a fresh worktree is more likely one of these two than a real regression. |
 | `orchestrator.py:3379` (`--check-limits`) still hand-counts the providers | Added 2026-09-09, while fixing the four status sites. This one enumerates `("claude", "gemini", "codex", "opencode")` and is therefore **complete today** — it is the same drift pattern, not a live defect. Deliberately left alone: switching it to `limits.display_provider_names()` would also drop gemini from `--check-limits` output, a visible behaviour change nobody asked for. Fix it together with a decision about whether that command reports *capacity* (all fields) or *reachability* (policy-filtered) — the same question the capacity log answered later that day, in the direction of `all_provider_names()`, on the grounds that a report about quota is about what exists, not about what routing currently permits. `--check-limits` is the closer analogue of the two, so the likely answer is `all_provider_names()` and the gemini row simply stays. |
 | `.dev-loop/<task-hash>/` accumulates one subdirectory per distinct task text | Added 2026-09-09, created by the fix on the same day. Nothing prunes them, and nothing prunes the pre-2026-09-09 files still lying in `.dev-loop/` either. Deleting run artefacts is exactly the kind of destructive housekeeping that should not appear silently in an unattended tool — so it is named here instead of built. |
 | `logs/capacity-log.md` and `logs/queue-events.log` rotation, `idempotency`/`session_registry.prune_old` | No structural test-isolation guard (KERN 2, 2026-09-16). Both log rotations and the two `prune_old` functions can in principle still write/prune inside a test run without a test noticing, the same class of gap the vault/`docs/` guard closes for `memory.py`. Deliberately left alone: `logs/` belongs to whichever tree the orchestrator runs from (worktree or live), not to the vault or this repo's `docs/`, which is where KERN 2 draws the line. Named here rather than built. |

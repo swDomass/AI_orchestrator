@@ -795,10 +795,15 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
     "claude_sonnet": "claude-sonnet-5",    # Sonnet 5 = current Sonnet tier (2026-07)
-    "claude_opus":   "claude-opus-5",      # Opus 5 = current Opus tier (2026-07); 4.8 is
-                                           # previous-gen. Drop-in: same price as 4.8
-                                           # ($5/$25 per Mtok), same CLI surface.
+    "claude_opus":   "claude-opus-5-5",    # Opus 5.5 = current Opus tier (2026-09);
+                                           # cheaper than Opus 5 ($4/$20 vs $5/$25 per
+                                           # Mtok), same CLI surface.
 }
+# Claude drift-check 2026-09-25 (monthly maintenance, claude-api skill + CLI 2.1.282 binary
+# + live probe): `claude-opus-5-5` supersedes `claude-opus-5`. One behavioural difference
+# the alias swap carries: on the API, Opus 5.5 defaults to effort `medium` (Opus 5: `high`),
+# and a queue line without `#effort:` passes no --effort flag — tag `#effort:high` where
+# depth matters. `claude-fable-5-1` deliberately NOT adopted, same reason as Fable 5 below.
 # Claude drift-check 2026-07-30 against the canonical model table (claude-api skill):
 # `claude-opus-5` supersedes `claude-opus-4-8`; `claude-fable-5` deliberately NOT adopted
 # ($10/$50 per Mtok is above Opus tier — no fallback executor is worth that). Note the

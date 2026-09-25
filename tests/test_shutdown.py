@@ -2,6 +2,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from shutdown import (
     cancel_shutdown,
     execute_shutdown,
@@ -9,6 +11,24 @@ from shutdown import (
     shutdown_cancel,
     shutdown_pending,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_shutdown_events():
+    """Leave shutdown.py's module-level Events as found at import: both cleared.
+
+    They are process-wide. test_shutdown_state_management ends with both SET,
+    and a leaked shutdown_pending makes TelegramListener._handle_message treat
+    every later message as "cancel the pending shutdown" (reply + early return
+    for plain text) — 4 red tests in test_telegram_listener.py under
+    pytest-randomly seed 22222, found by bisection on 2026-09-25.
+    _countdown_running needs no reset: execute_shutdown clears it in `finally`.
+    """
+    shutdown_pending.clear()
+    shutdown_cancel.clear()
+    yield
+    shutdown_pending.clear()
+    shutdown_cancel.clear()
 
 
 def test_shutdown_state_management():

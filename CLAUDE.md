@@ -76,8 +76,15 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 # is likewise unchanged in count: one test switched its provider error from
 # rate_limit to timeout, because a capacity error is now deliberately re-routed
 # to capacity_exhausted instead of rotating to the next provider.
-# -p no:randomly is load-bearing: tests/test_telegram_listener.py is
-# order-dependent, so a random seed can turn the suite red with no code change.
+# -p no:randomly ist seit 2026-09-25 nicht mehr tragend. Die Reihenfolgeabhaengigkeit
+# von tests/test_telegram_listener.py war ein Leck aus tests/test_shutdown.py:
+# test_shutdown_state_management liess shutdown.shutdown_pending GESETZT, und der
+# Listener behandelt dann jede Nachricht als "Shutdown abbrechen" (Zusatzantwort,
+# Klartext wird verschluckt). Eine autouse-Fixture dort raeumt jetzt beide
+# shutdown-Events. Linux, Cloud (CPython 3.12.3, pytest-randomly 4.1.0): Seeds
+# 22222, 1, 42, 1234, 31415, 99999, 114, 120 je 2837 passed / 7 skipped; ohne Fix
+# waren 22222, 114 und 120 rot. Das Flag bleibt als reproduzierbare Standard-
+# reihenfolge stehen (auch in ci.yml).
 python -m pytest tests/ -q -p no:randomly
 
 # Run a single test file / single test

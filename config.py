@@ -794,11 +794,14 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 # Tags are provider-bound: #claude_opus only applies to claude, not to gemini on fallback.
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "claude_haiku": "claude-haiku-4-5-20251001",
-    "claude_sonnet": "claude-sonnet-5",    # Sonnet 5 = current Sonnet tier (2026-07)
+    "claude_sonnet": "claude-sonnet-5-5",  # Sonnet 5.5 = current Sonnet tier (2026-09);
+                                           # same price as Sonnet 5 ($2/$10); effort
+                                           # levels recalibrated, default stays `high`.
     "claude_opus":   "claude-opus-5-5",    # Opus 5.5 = current Opus tier (2026-09);
                                            # cheaper than Opus 5 ($4/$20 vs $5/$25 per
                                            # Mtok), same CLI surface.
 }
+# Claude drift-check 2026-10 (quarterly): claude-sonnet-5-5 supersedes claude-sonnet-5 (Claude Code 2.1.284).
 # Claude drift-check 2026-09-25 (monthly maintenance, claude-api skill + CLI 2.1.282 binary
 # + live probe): `claude-opus-5-5` supersedes `claude-opus-5`. One behavioural difference
 # the alias swap carries: on the API, Opus 5.5 defaults to effort `medium` (Opus 5: `high`),

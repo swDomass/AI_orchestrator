@@ -986,13 +986,6 @@ def test_review_loop_classifies_provider_error_instead_of_passing_it_through(mon
 
 # ─── Rundenreflexion / BEKANNTE GRENZE ─────────────────────────────────────
 
-def _patch_review_loop(monkeypatch):
-    monkeypatch.setattr("tools.review_loop.notify_tool_done", lambda *a, **kw: None)
-    monkeypatch.setattr("tools.review_loop.notify_tool_progress", lambda *a, **kw: None)
-    monkeypatch.setattr("tools.review_loop.time.sleep", lambda _s: None)
-    monkeypatch.setattr("tools.review_loop.is_cached_provider_available", lambda _n: True)
-
-
 def test_review_loop_iteration1_review_prompt_is_byte_identical_to_before(monkeypatch, tmp_path):
     """Moving review_prompt construction into the loop (for the known-limits block)
     must not change iteration 1 at all — known_limits is always empty then."""

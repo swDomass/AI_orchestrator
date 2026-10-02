@@ -853,10 +853,14 @@ GEMINI_MODEL_ALIASES: dict[str, str] = {
 # migrated its own bundled selections to Terra/Luna. Tier mapping: sol = flagship,
 # terra = balanced default, luna = cheap variant for subagents/lighter tasks.
 # All three verified live via `codex exec -m <id>` on 2026-07-23.
-# NOTE: the version-shaped keys `codex_5`/`codex_5_4` now point at 5.6 IDs — kept
-# stable so existing queue lines keep working; rename is a separate cleanup.
+# 2026-10-02: `codex_5` -> gpt-6.1-sol (Codex catalog priority 1, "Latest workhorse";
+# 5.6 is listed as "Older generation"). Probe on the 29.09. Astra package: 64,696 tokens
+# vs 70,298 for gpt-6-astra, 3 real P2 each. `codex_5_4`/`codex_mini` stay on 5.6 for
+# now — Terra has no GPT-6 counterpart in the catalog, Luna is unprobed.
+# NOTE: the version-shaped keys `codex_5`/`codex_5_4` are kept stable so existing
+# queue lines keep working; rename is a separate cleanup.
 CODEX_MODEL_ALIASES: dict[str, str] = {
-    "codex_5":    "gpt-5.6-sol",
+    "codex_5":    "gpt-6.1-sol",
     "codex_5_4":  "gpt-5.6-terra",
     "codex_mini": "gpt-5.6-luna",
 }

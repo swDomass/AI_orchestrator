@@ -53,6 +53,7 @@ from config import (
 from dispatcher import select_provider
 from limits import display_provider_names, get_limits
 from notifier import send_message
+from providers.base import BaseProvider
 from queue_manager import CWD_RE, append_task, extract_cwd, read_queue
 
 logger = logging.getLogger("telegram-listener")
@@ -947,11 +948,16 @@ class TelegramListener:
                 # and avoids orphaned provider worker threads on timeout/hangs.
                 provider_done = threading.Event()
 
-                def _send_thinking_if_pending() -> None:
-                    if provider_done.is_set():
+                # Bound as defaults, not closed over: cancel() cannot stop a callback
+                # that has already started, and a closure would then read the event
+                # and provider of the NEXT round (B023, lint-baseline D2).
+                def _send_thinking_if_pending(
+                    _done: threading.Event = provider_done, _p: BaseProvider = provider,
+                ) -> None:
+                    if _done.is_set():
                         return
-                    logger.info("%s denkt noch nach (>%ss)", provider.name, TELEGRAM_CHAT_THINKING_SEC)
-                    send_message(f"⏳ {provider.name} denkt noch nach...")
+                    logger.info("%s denkt noch nach (>%ss)", _p.name, TELEGRAM_CHAT_THINKING_SEC)
+                    send_message(f"⏳ {_p.name} denkt noch nach...")
 
                 thinking_timer = threading.Timer(max(0, TELEGRAM_CHAT_THINKING_SEC), _send_thinking_if_pending)
                 thinking_timer.daemon = True

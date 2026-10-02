@@ -135,13 +135,13 @@ class TokenCounter:
     cache_read_input_tokens: int = 0
 
     def add(self, result: object) -> None:
-        for field in (
+        for attr in (
             "input_tokens",
             "output_tokens",
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
         ):
-            setattr(self, field, getattr(self, field) + getattr(result, field, 0))
+            setattr(self, attr, getattr(self, attr) + getattr(result, attr, 0))
 
     def as_kwargs(self) -> dict[str, int]:
         return {

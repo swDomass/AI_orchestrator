@@ -112,7 +112,6 @@ def _run_single_subtask(
         _run_with_retry,
     )
     from providers.base import error_code_of
-    from queue_manager import strip_metadata_tags
 
     if pause_event and pause_event.is_set():
         return SubTaskResult(
@@ -122,8 +121,6 @@ def _run_single_subtask(
             output="",
             error="paused",
         )
-
-    clean_text = strip_metadata_tags(subtask.text)
 
     # Same clean-worktree precondition as the single-task path. run_once() exempts
     # the `#parallel` PARENT (its tool tag is not what runs), so without this the

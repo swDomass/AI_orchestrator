@@ -377,7 +377,7 @@ class ScientificInvestigationTool(BaseTool):
 
         run_dir = build_run_dir(root_cwd, ts_slug_value)
         state_dir = build_state_dir(root_cwd, run_id)
-        manifest_path = write_manifest(
+        write_manifest(
             run_dir,
             run_id=run_id,
             task=task,

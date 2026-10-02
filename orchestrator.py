@@ -2954,7 +2954,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
             _git_snapshot(cwd, is_git=is_git)
 
         # Standard single-shot task with provider fallback in the same run
-        tried_providers: set[str] = set()
+        # Ohne Annotation: der Typ steht schon im #tool:-Pfad oben, und für mypy ist
+        # das derselbe Funktionsrumpf (zweite Annotation = no-redef).
+        tried_providers = set()
         single_shot_success = False
         single_shot_retry_count = 0
         single_shot_token_refreshed = False

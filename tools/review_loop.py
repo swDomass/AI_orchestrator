@@ -699,7 +699,6 @@ class ReviewLoopTool(BaseTool):
 
         system_prompt = _build_system_prompt(provider.name, memory_context, tool_name=self.name, cwd=cwd)
         seen_signatures: set[tuple[str, ...]] = set()
-        last_findings_tuple: tuple[str, ...] = ()
         all_outputs: list[str] = []
         # Ordered set of every P3 seen in any iteration — emitted once as an offer when
         # the loop succeeds. Must outlive a single round; see the accumulation below.
@@ -1054,7 +1053,6 @@ class ReviewLoopTool(BaseTool):
                     **tokens.as_kwargs(),
                 )
             seen_signatures.add(signature)
-            last_findings_tuple = signature
 
             # Drift check: gate the next fix prompt with a refocus hint when the
             # reviewer has wandered off the original task. Non-fatal — failures

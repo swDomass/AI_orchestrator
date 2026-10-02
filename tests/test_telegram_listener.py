@@ -11,6 +11,7 @@ Covers:
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from config import MIN_CAPACITY_PERCENT
@@ -505,6 +506,87 @@ def test_chat_generic_failure_sets_short_provider_cooldown_before_retry(mock_sel
 
     failing.set_cooldown.assert_called_once_with(5 * 60)
     succeeding.set_cooldown.assert_not_called()
+
+
+def _chat_with_late_round1_timer(mock_select, mock_limits, mock_send, event_cls) -> list[str]:
+    """
+    Two chat rounds (claude fails, codex answers) where round 1's thinking callback
+    fires late, from inside round 2's provider.run — i.e. after the loop has
+    rebound provider and provider_done. Timer.cancel() cannot stop a callback
+    that has already started, so this is a reachable ordering, made deterministic
+    by a recording Timer. Round 2's own callback is fired too, as the
+    counter-probe that the capture works. Returns the "thinking" messages sent.
+
+    Only telegram_listener's `threading` reference is swapped, not the global
+    module, so no other thread in the process sees the fakes.
+    """
+    callbacks = []
+
+    class _RecordingTimer:
+        def __init__(self, _interval, function):
+            self.daemon = False
+            callbacks.append(function)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    def _second_round_run(*_args, **_kwargs):
+        callbacks[0]()  # round 1, late
+        callbacks[1]()  # round 2, still running — must speak
+        return RunResult(success=True, output="ok")
+
+    failing = _fake_provider(name="claude", success=False, output="boom")
+    succeeding = _fake_provider(name="codex", output="ok")
+    succeeding.run.side_effect = _second_round_run
+    mock_select.side_effect = [failing, succeeding]
+    mock_limits.return_value = _fake_limits()
+
+    listener, _ = _make_listener()
+    fake_threading = SimpleNamespace(Event=event_cls, Timer=_RecordingTimer)
+    with patch("telegram_listener.threading", fake_threading):
+        listener._handle_chat("test")
+
+    assert len(callbacks) == 2
+    texts = [c[0][0] for c in mock_send.call_args_list]
+    return [t for t in texts if "denkt noch nach" in t]
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.get_limits")
+@patch("telegram_listener.select_provider")
+def test_chat_late_thinking_timer_reads_its_own_done_event(mock_select, mock_limits, mock_send):
+    """
+    B023 (docs/lint-baseline-2026-09-02.md, D2), provider_done half: round 1's
+    event is set before the loop rebinds, so its late callback must stay silent.
+    Closed over, it read round 2's still-unset event and sent a second
+    "codex denkt noch nach" while codex had only just started.
+    """
+    thinking = _chat_with_late_round1_timer(mock_select, mock_limits, mock_send, threading.Event)
+    assert thinking == ["⏳ codex denkt noch nach..."]
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.get_limits")
+@patch("telegram_listener.select_provider")
+def test_chat_late_thinking_timer_names_its_own_provider(mock_select, mock_limits, mock_send):
+    """
+    D2, provider half: the narrower interleaving where round 1's callback read
+    is_set() as False just before the finally set it, and reaches provider.name
+    only after the loop rebound provider. Modelled by an event whose is_set()
+    keeps reporting False. The late message must name round 1's provider —
+    closed over, it named codex for a wait that was claude's.
+    """
+    class _CheckedJustBeforeSet(threading.Event):
+        def is_set(self):
+            return False
+
+    thinking = _chat_with_late_round1_timer(mock_select, mock_limits, mock_send, _CheckedJustBeforeSet)
+    assert thinking == ["⏳ claude denkt noch nach...", "⏳ codex denkt noch nach..."]
 
 
 @patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)

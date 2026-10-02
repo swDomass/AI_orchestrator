@@ -10,6 +10,67 @@ dem Zeitpunkt noch uncommitteten Aenderungen an `queue_manager.py` und
 (rund 24 Befunde in `queue_manager.py`), aber die Zahlen unten sind damit keine
 reine HEAD-Baseline.
 
+## Status-Nachtrag 2026-10-02 — Pakete 5 und 6 erledigt
+
+Gemessen auf **Linux (Cloud), CPython 3.12.3**, ruff `0.16.1`, mypy `2.3.1` —
+dieselben Versionen wie in `ci.yml`. Ausgangspunkt ist `master` = `28f0dcc`.
+Die Zeilennummern der Ausgangsmessung decken sich mit der win32-Messung vom
+selben Tag. Ein Befund, ein Commit.
+
+| | vorher | nach Paket 5 | nach Paket 6 |
+|---|---:|---:|---:|
+| ruff-Befunde | 1131 | 1127 | **1122** |
+| mypy-Fehler | 132 in 39 Dateien | 130 in 38 | **130 in 38** |
+| Tests (`-p no:randomly`) | 2837 passed / 7 skipped | 2839 / 7 | **2839 / 7** |
+
+- **Paket 5:**
+  - [D2](#d2--b023-telegram_listenerpy942944945) `B023` (heute
+    `telegram_listener.py:951/953/954`): `provider_done` und `provider` sind jetzt
+    als Default-Argumente gebunden. Zwei Regressionstests in
+    `tests/test_telegram_listener.py`, je einer pro Name. Ein aufzeichnender
+    Timer feuert den Callback aus Runde 1 erst in Runde 2. Mutationsmatrix: ohne
+    Fix beide rot, nur `_done` gebunden → der `_p`-Test rot, nur `_p` gebunden →
+    der `_done`-Test rot, voller Fix beide gruen.
+  - [D3](#d3--f402-toolsbase_toolpy138) `F402`: Schleifenvariable in
+    `TokenCounter.add()` heisst `attr`.
+  - `no-redef`: mypy meldet **zwei**, nicht einen. `orchestrator.py:2957` ist
+    die Baseline-Stelle `:1789`, nur gewandert: `run_once()` annotiert
+    `tried_providers: set[str]` im `#tool:`-Pfad und im Single-Shot-Pfad. Die
+    Zweige schliessen sich zur Laufzeit aus, fuer mypy ist es ein
+    Funktionsrumpf. Keine bewusste Doppeldefinition, also kein
+    `type: ignore`: die zweite Stelle weist nur noch zu. Der zweite
+    `no-redef` (`tests/test_review_loop.py:989`) kam erst nach der Baseline,
+    mit `5cdd5bd` (2026-09-12). Das war eine byte-identische zweite Kopie des
+    Helfers `_patch_review_loop`; sie ist entfernt.
+- **Paket 6** ([D5](#d5--f841-tote-werte-in-dev_loop-und-review_loop), die vier
+  Produktivcode-Stellen):
+  - `last_quality_tuple` / `last_findings_tuple` sind **kein** halb verdrahtetes
+    Feature, sondern der Rest eines abgeschlossenen Umbaus. `829c949`
+    (2026-03-18) fuehrt sie als Quelle der Auto-Lesson ein, einziger Leser ist
+    `last_findings = last_*_tuple`. `2325ce3` (2026-03-19) deaktiviert diese
+    Auto-Lesson bewusst und entfernt den Leser („letzte Findings speichern
+    nicht sinnvoll … TODO: LLM-Summary aus all_outputs“). `c03eeed`
+    (2026-03-21) setzt das TODO mit `create_lesson_from_loop(…, all_outputs, …)`
+    um. Seitdem werden die Variablen nur noch geschrieben, deshalb sind sie
+    jetzt entfernt.
+    **Falle dabei:** die Cloud-Umgebung klont *shallow*. `git log -S` endete
+    dort zuerst bei `692e7d4` (2026-08-15), der Shallow-Grenze, und sah aus wie
+    „keine aeltere Historie“. Erst nach `git fetch --unshallow` erschienen die
+    Maerz-Commits. Vor Historien-Archaeologie also
+    `git rev-parse --is-shallow-repository` pruefen.
+  - `parallel_runner.py` `clean_text`: entfernt, ebenso der Lazy-Import, der
+    nur dafuer da war (`PLC0415` 632 → 631). `strip_metadata_tags` ist eine
+    reine Regex-Kette, und `_build_prompt()` entfernt die Tags ohnehin selbst.
+    Die sieben `monkeypatch`es von `queue_manager.strip_metadata_tags` in
+    `tests/test_parallel_runner.py` greifen damit ins Leere. Sie sind harmlos
+    und unangetastet.
+  - `tools/scientific_investigation.py` `manifest_path`: nur die Bindung
+    entfaellt. Der Aufruf `write_manifest(…)` schreibt `audit/manifest.json`
+    und bleibt als Ausdruck stehen. Gegenprobe: ohne den Aufruf ist
+    `test_tool_run_creates_layout` rot.
+- **Offen:** die `F841` unter `tests/`, bewusst nicht Teil von D5 — in der
+  Baseline 8, heute 12.
+
 ## Status-Nachtrag 2026-09-24 — Pakete 3 und 4 erledigt, CI auf Linux
 
 Gemessen auf **Linux (Cloud), CPython 3.12.3**, ruff `0.16.1`, mypy `2.3.1` —
@@ -222,7 +283,7 @@ Spalte *Kat.*: **D** = Defekt · **M** = mechanisch (echt, aber risikolos) ·
 | 2 | `dict-item` | S | |
 | 2 | `call-overload` | S | `notifier.py:176`, `analytics.py:339` |
 | 1 | `truthy-function` | **M** | `heartbeat.py:1082` — **kein** toter Guard; nur zusammen mit `assignment` `:1067` lesbar → [E6](#e6--optionale-imports-ohne-annotation-heartbeatpy10671082-und-3-weitere) |
-| 1 | `no-redef` | **M** | `orchestrator.py:1789` |
+| 1 | `no-redef` | **M** | `orchestrator.py:1789` — **behoben 2026-10-02** (inzwischen `:2957`, dazu ein zweiter in `tests/`), siehe Status-Nachtrag oben |
 
 Top-Dateien: `tools/dev_loop.py` 15, `providers/process_runner.py` 15,
 `tools/review_loop.py` 11, `tools/pr_babysitter.py` 8, `orchestrator.py` 7,
@@ -288,6 +349,7 @@ Closure das *neue*, noch nicht gesetzte Event und den *neuen* Provider-Namen.
 **Folge:** eine ueberfluessige oder falsch beschriftete „denkt noch nach"-
 Meldung per Telegram, kein Steuerfluss-Schaden. Fix ist ein Default-Argument
 (`def _send_thinking_if_pending(_done=provider_done, _p=provider)`).
+**Behoben 2026-10-02** mit zwei Regressionstests, siehe Status-Nachtrag oben.
 
 ### D3 — `F402` `tools/base_tool.py:138`
 
@@ -295,6 +357,7 @@ Meldung per Telegram, kein Steuerfluss-Schaden. Fix ist ein Default-Argument
 ist **lokal zur Methode `add()`**, und `field()` wird dort nicht aufgerufen —
 **heute also kein Laufzeitfehler**, sondern eine Mine: wer spaeter in dieser
 Methode `field(...)` benutzt, bekommt einen String. Umbenennen in `attr`.
+**Behoben 2026-10-02.**
 
 ### D4 — `B905` `zip()` ohne `strict=` (7×)
 
@@ -315,6 +378,10 @@ stehen direkt neben `seen_*_signatures.add(sig)` und werden nie gelesen — das
 sieht nach einem halb verdrahteten „vergleiche mit letzter Runde"-Feature aus.
 Vor dem Loeschen kurz pruefen, ob da eine Absicht begraben liegt; die anderen
 beiden sind schlicht tot.
+**Geklaert und behoben 2026-10-02:** keine begrabene Absicht. Die `last_*` sind
+der Rest einer bewusst abgeschalteten Auto-Lesson (`829c949` → `2325ce3` →
+`c03eeed`), alle vier Stellen sind entfernt. Die `F841` unter `tests/` sind
+offen, siehe Status-Nachtrag oben.
 
 ### D6 — `union-attr` auf `Optional` (11×)
 
@@ -519,8 +586,8 @@ Nichts davon wurde in diesem Task ausgefuehrt.
 | 2 | Entscheidung [E1](#e1--plc0415-524) `PLC0415` — vor allem anderen, weil sie 39 % der Baseline bewegt | 1 Konfigzeile | keins |
 | **3** | ~~`F401` + `F541` + `RUF059` autofixen~~ — **erledigt 2026-09-24**, siehe Status-Nachtrag oben. Urspruenglicher Vorschlag: (`ruff check --fix --select F401,F541,RUF059`), Diff durchsehen. **Die 5 `unused-ignore` gehoeren ausdruecklich NICHT dazu** — mypy-Diagnose, von ruff gar nicht erreichbar, und laut [E7](#e7--unused-ignore-5--artefakte-der-lenient-konfiguration) stehen zu lassen | 154 Stellen (134 davon safe-autofixbar, die 20 `RUF059` brauchen `--unsafe-fixes`) | sehr gering |
 | **4** | ~~`I001` + `UP045` + `UP037` + `UP017` autofixen — reine Modernisierung~~ — **erledigt 2026-09-24**, siehe Status-Nachtrag oben | ~230 Stellen | gering |
-| 5 | [D2](#d2--b023-telegram_listenerpy942944945) `B023`, [D3](#d3--f402-toolsbase_toolpy138) `F402`, `no-redef` — Einzeiler mit Verstaendnis-Bedarf | 3 Stellen | gering, je einzeln pruefen |
-| 6 | [D5](#d5--f841-tote-werte-in-dev_loop-und-review_loop) `F841` — vorher klaeren, ob `last_*_tuple` ein unfertiges Feature ist | 12 Stellen | gering |
+| **5** | ~~[D2](#d2--b023-telegram_listenerpy942944945) `B023`, [D3](#d3--f402-toolsbase_toolpy138) `F402`, `no-redef` — Einzeiler mit Verstaendnis-Bedarf~~ — **erledigt 2026-10-02**, siehe Status-Nachtrag oben (`no-redef` waren inzwischen zwei) | 3 Stellen | gering, je einzeln pruefen |
+| **6** | ~~[D5](#d5--f841-tote-werte-in-dev_loop-und-review_loop) `F841` — vorher klaeren, ob `last_*_tuple` ein unfertiges Feature ist~~ — **Produktivcode erledigt 2026-10-02** (4 Stellen; `last_*_tuple` war kein unfertiges Feature), siehe Status-Nachtrag oben. **Offen:** die `F841` unter `tests/` (Baseline 8, heute 12) | 12 Stellen | gering |
 | 7 | [D4](#d4--b905-zip-ohne-strict-7) `B905` + [D6](#d6--union-attr-auf-optional-11) `union-attr` + `PLW1510` — pro Stelle bewerten, meist bewusst | ~52 Stellen | Kopfarbeit, kein Automat |
 | 8 | [E6](#e6--optionale-imports-ohne-annotation-heartbeatpy10671082-und-3-weitere) annotieren (`heartbeat.py` + 3 gleichartige Stellen) — **Guard stehen lassen**, nur den Typ nachtragen | 4 Stellen | gering; Loeschen des Guards waere ein Absturz |
 | 9 | Die 3 toten `# noqa: E402` entfernen ([E3](#e3--ruf100-8)) — die 5 `BLE001`-noqa dabei **nicht** anfassen, also von Hand statt per `--fix` | 3 Stellen | keins |

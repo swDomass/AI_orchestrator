@@ -15,8 +15,10 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Linux, Cloud (2026-09-24, CPython 3.12.3 und 3.13.12, nach Lint-Paket 3+4):
-# 2837 passed / 0 failed / 7 skipped in 62-72 s — 2844 gesammelt wie unten.
+# Linux, Cloud (2026-10-02, CPython 3.12.3 und 3.13.14, nach Lint-Paket 5+6):
+# 2839 passed / 0 failed / 7 skipped in 70-74 s — +2 Regressionstests fuer B023 in
+# test_telegram_listener. Davor (2026-09-24, nach Paket 3+4): 2837 / 7, 2844 gesammelt
+# wie unten.
 # CI (.github/workflows/ci.yml) laeuft auf 3.12 + 3.13. Die 7 Skips: 5 an Windows
 # gebunden (4 schon vorher; 2026-09-24 dazu der Backslash-Pfad in test_queue_linter),
 # 1 an pwsh (test_verify_pin_deps, skippt nur ohne pwsh im PATH — die Cloud-Umgebung
@@ -108,9 +110,10 @@ python orchestrator.py --dashboard    # analytics web dashboard
 python orchestrator.py --lint-queue   # validate agent-queue.md
 
 # Lint / typecheck (config in pyproject.toml; CI runs both, advisory only — continue-on-error)
-# Linux, Cloud 2026-09-24 nach Lint-Paket 3+4: ruff 1131 Befunde (vorher 1510),
-# mypy 132 Fehler in 39 Dateien (unveraendert) → docs/lint-baseline-2026-09-02.md,
-# Status-Nachtrag. Die Zahlen darunter sind aeltere Messungen der Entwicklungsmaschine.
+# Linux, Cloud 2026-10-02 nach Lint-Paket 5+6: ruff 1122 Befunde, mypy 130 Fehler in
+# 38 Dateien (2026-09-24 nach Paket 3+4: 1131 bzw. 132 in 39; davor ruff 1510)
+# → docs/lint-baseline-2026-09-02.md, Status-Nachtraege. Die Zahlen darunter sind
+# aeltere Messungen der Entwicklungsmaschine.
 ruff check .            # 1465 findings, re-measured 2026-09-10 as the LAST step, after
                         # the per-task auto-commit package: +13 over the 1452 below.
                         # git_commit.py + its two test files carry 14 of them and every

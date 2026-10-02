@@ -868,7 +868,6 @@ class DevLoopTool(BaseTool):
         # survive contract as deferred_p3 — round-tripped through the checkpoint below.
         known_limits: dict[str, str] = {}
         seen_quality_signatures: set[tuple[str, ...]] = set()
-        last_quality_tuple: tuple[str, ...] = ()
         seen_review_signatures: set[tuple[tuple[str, ...], str, str]] = set()
 
         # ── Resume: pick up an iteration checkpoint left by an earlier, parked run ──
@@ -1699,7 +1698,6 @@ class DevLoopTool(BaseTool):
                         **tokens.as_kwargs(),
                     )
                 seen_quality_signatures.add(sig)
-                last_quality_tuple = sig
 
             review_sig = (tuple(sorted(blocking_findings)), resolution_status, resolution_output)
             if review_sig in seen_review_signatures:

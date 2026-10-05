@@ -288,14 +288,18 @@ def _query_git_repo_state(cwd: str) -> tuple[str, int, int | None] | None:
 
     Each call keeps its own 5 s timeout, and GIT_OPTIONAL_LOCKS=0 keeps ``git
     status`` from taking index.lock while a task in another thread may be working
-    in that repo. ``orchestrator._git_diff_summary`` is not reused: 10 s per call, a
+    in that repo. The cwd is a repo this process does not own, so nothing its config
+    names may run: ``-c core.fsmonitor=false`` on every call (an fsmonitor hook is an
+    arbitrary command) and ``--ignore-submodules`` on ``git status`` (no recursion
+    into submodules and their configs). ``orchestrator._git_diff_summary`` is not reused: 10 s per call, a
     diffstat rather than counts, and importing orchestrator here would be a cycle.
     """
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
 
     def git(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["git", *args], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+            ["git", "-c", "core.fsmonitor=false", *args], cwd=cwd, env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=_APPROVAL_GIT_TIMEOUT_SEC, check=False,
         )
@@ -304,7 +308,7 @@ def _query_git_repo_state(cwd: str) -> tuple[str, int, int | None] | None:
         branch = git("branch", "--show-current")
         if branch.returncode != 0:
             return None  # not a repository (or a git older than 2.22)
-        status = git("status", "--short")
+        status = git("status", "--short", "--ignore-submodules")
         if status.returncode != 0:
             return None
         dirty = sum(1 for line in status.stdout.splitlines() if line.strip())

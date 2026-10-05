@@ -75,6 +75,14 @@ def _legacy_markdown_problems(text: str) -> list[str]:
     return problems
 
 
+def _subcommand(cmd):
+    """The git subcommand of an argv, past any leading `-c key=value` pairs."""
+    i = 1
+    while cmd[i] == "-c":
+        i += 2
+    return cmd[i]
+
+
 def _git(cwd, *args):
     subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
@@ -233,8 +241,8 @@ def test_every_git_call_is_capped_at_five_seconds(sent, monkeypatch, tmp_path):
     seen = []
 
     def fake_git(cmd, **kwargs):
-        seen.append((cmd[1], kwargs.get("timeout")))
-        out = {"branch": "main\n", "status": " M a.txt\n", "rev-list": "2\n"}[cmd[1]]
+        seen.append((_subcommand(cmd), kwargs.get("timeout")))
+        out = {"branch": "main\n", "status": " M a.txt\n", "rev-list": "2\n"}[_subcommand(cmd)]
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(notifier.subprocess, "run", fake_git)
@@ -274,6 +282,27 @@ def test_hanging_git_cannot_hold_the_request_past_the_overall_deadline(
     assert "Repo:" not in msg
     assert f"cwd: `{tmp_path}`" in msg
     assert msg.endswith(_LAST_LINE)
+
+
+def test_git_calls_cannot_run_commands_from_the_repo_config(sent, monkeypatch, tmp_path):
+    """The cwd is someone's repo: an fsmonitor hook or a submodule's config must not
+    get to run anything while we only ask for its state."""
+    calls = []
+
+    def fake_git(cmd, **kwargs):
+        calls.append(list(cmd))
+        out = {"branch": "main\n", "status": "", "rev-list": "0\n"}[_subcommand(cmd)]
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(notifier.subprocess, "run", fake_git)
+
+    notifier.notify_approval_required("Task", ["git push to remote"], 1800, cwd=str(tmp_path))
+
+    assert [_subcommand(c) for c in calls] == ["branch", "status", "rev-list"]
+    for cmd in calls:
+        assert cmd[:3] == ["git", "-c", "core.fsmonitor=false"], cmd
+    (status,) = [c for c in calls if _subcommand(c) == "status"]
+    assert "--ignore-submodules" in status, status
 
 
 def test_any_git_exception_never_blocks_the_request(sent, monkeypatch, tmp_path):

@@ -1514,7 +1514,10 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
         def is_preapproved(self, _category):
             return False
 
-        def request_approval(self, _task_text, _reasons):
+        def request_approval(self, _task_text, _reasons, _timeout_sec=0, **_context):
+            # **_context: cwd/checked_texts/profile_rules since 2026-10-05. A fake
+            # without it raises TypeError, which run_once books as "policy check
+            # failed" and then runs the task unapproved — this test caught exactly that.
             return "skipped"
 
     monkeypatch.setattr(policy_module, "get_engine", lambda: FakeEngine())
@@ -1538,6 +1541,48 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
     assert result is False
     mark_retry.assert_called_once()
     select_provider.assert_not_called()
+
+
+def test_run_once_approval_request_carries_cwd_and_the_checked_texts(monkeypatch):
+    """The approval message can only show cwd and trigger excerpts if run_once hands
+    them over: cwd as resolved, and the texts check_task classified (tags stripped,
+    subtasks included) — not the raw queue line."""
+    task = "Deploy and git push the release #claude_sonnet #parallel"
+    queue_item = SimpleNamespace(task_text=task, line_no=11, subtasks=("Tag setzen #codex",))
+    engine = Mock()
+    engine.check_task.side_effect = lambda text, profile_rules=None: (
+        policy_module.TIER_APPROVE, ["git push to remote"],
+    )
+    engine.is_preapproved.return_value = False
+    engine.request_approval.return_value = "skipped"
+
+    monkeypatch.setattr(policy_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [queue_item])
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [task])
+    monkeypatch.setattr(orchestrator, "has_cwd_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: "/srv/proj_x")
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
+    monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_a, **_kw: "")
+    monkeypatch.setattr(orchestrator, "mark_retry", Mock(return_value=True))
+    monkeypatch.setattr(orchestrator, "select_provider", Mock(side_effect=AssertionError("ran")))
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_a, **_kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_a, **_kw: None)
+
+    assert orchestrator.run_once() is False
+
+    engine.request_approval.assert_called_once()
+    args, kwargs = engine.request_approval.call_args
+    assert args == (task, ["git push to remote"])
+    assert kwargs["cwd"] == "/srv/proj_x"
+    assert kwargs["checked_texts"] == [
+        orchestrator.strip_metadata_tags(task), orchestrator.strip_metadata_tags("Tag setzen #codex"),
+    ]
+    assert "#claude_sonnet" not in kwargs["checked_texts"][0]
+    assert kwargs["profile_rules"] is None
 
 
 def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):

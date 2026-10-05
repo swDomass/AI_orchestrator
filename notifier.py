@@ -3,6 +3,8 @@ Telegram notification support for the AI Orchestrator.
 Sends messages on task completion, errors, provider exhaustion, and queue summary.
 """
 
+import os
+import subprocess
 import threading
 import urllib.parse
 import urllib.request
@@ -227,22 +229,141 @@ def notify_shutdown_executing() -> None:
     _send("⏾ Shutting down now.")
 
 
-def notify_approval_required(task_text: str, reasons: list[str], timeout_sec: int) -> None:
-    """Send a Telegram approval request for a risky action."""
-    task_safe = _strip_backticks(_truncate(task_text, 100))
-    reasons_safe = _escape_markdown("; ".join(reasons[:5]))
-    timeout_min = timeout_sec // 60
+# ── Approval request ──────────────────────────────────────────────────────────
+#
+# Sent BEFORE the provider runs, so no diff of the coming change exists yet. What the
+# message can carry is what the decision rests on: the task text itself (until
+# 2026-10-05 cut to 100 characters — a night approval was a guess), where it runs,
+# what that repo looks like right now, and which words tripped which rule.
 
-    _send(
-        f"🔒 *Approval required*\n\n"
-        f"Task: `{task_safe}`\n"
-        f"Action: {reasons_safe}\n\n"
-        f"Reply within {timeout_min} min:\n"
-        f"/approve — allow this action\n"
-        f"/approve\\-all \\<category\\> — allow all in session\n"
-        f"/deny — block, pause task\n"
-        f"/skip — skip for now, task retries later"
+_APPROVAL_MAX_BYTES = 3500        # _truncate's default; Telegram's hard cap is 4096
+_APPROVAL_TASK_MAX_BYTES = 1500
+_APPROVAL_MAX_REASONS = 5
+_APPROVAL_GIT_TIMEOUT_SEC = 5
+# Last resort when even the short form cannot be built (e.g. a caller passing odd
+# types): an approval without details still beats an exception, which run_once()
+# would turn into "policy check failed" and an UNAPPROVED run.
+_APPROVAL_BARE_TEXT = (
+    "🔒 *Approval required*\n\n"
+    "Details nicht formatierbar — siehe Orchestrator-Log.\n\n"
+    "/approve — allow this action\n"
+    "/deny — block, pause task\n"
+    "/skip — skip for now, task retries later"
+)
+
+
+def _git_repo_state(cwd: str) -> tuple[str, int, int | None] | None:
+    """(branch, uncommitted entries, commits ahead of upstream) — or None.
+
+    None on anything that goes wrong — no repo, no git, a timeout, an exception of
+    any kind: the repo block is context, the approval request must go out without
+    it. ``ahead`` is None when the branch has no upstream. Uncommitted entries are
+    ``git status --short`` lines, so an untracked directory counts once.
+
+    Every call is capped at 5 s, and GIT_OPTIONAL_LOCKS=0 keeps ``git status`` from
+    taking index.lock while a task in another thread may be working in that repo.
+    ``orchestrator._git_diff_summary`` is not reused: 10 s per call, a diffstat
+    rather than counts, and importing orchestrator here would be a cycle.
+    """
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_APPROVAL_GIT_TIMEOUT_SEC, check=False,
+        )
+
+    try:
+        branch = git("branch", "--show-current")
+        if branch.returncode != 0:
+            return None  # not a repository (or a git older than 2.22)
+        status = git("status", "--short")
+        if status.returncode != 0:
+            return None
+        dirty = sum(1 for line in status.stdout.splitlines() if line.strip())
+        upstream = git("rev-list", "--count", "@{u}..HEAD")
+        ahead = int(upstream.stdout.strip()) if upstream.returncode == 0 else None
+        return branch.stdout.strip() or "(detached HEAD)", dirty, ahead
+    except Exception:
+        return None
+
+
+def _approval_message(
+    task_text: str,
+    reasons: list[str],
+    timeout_sec: int,
+    cwd: str | None,
+    triggers: dict[str, str] | None,
+) -> str:
+    """Assemble the approval text within _APPROVAL_MAX_BYTES.
+
+    Every part has its own cap, and the task takes what is left (at most 1500
+    bytes) — the assembled Markdown is never cut afterwards, because a cut inside a
+    backtick span makes Telegram reject the whole message, and a request that never
+    arrives is a timeout, i.e. a paused task. Paths, branch and excerpts sit inside
+    backticks (no escaping there, so underscores in paths are safe); free text
+    outside goes through _escape_markdown.
+    """
+    lines = ["`"]  # closes the task's code span, opened at the end of `head`
+    if cwd:
+        lines.append(f"cwd: `{_strip_backticks(_truncate(str(cwd), 300))}`")
+        state = _git_repo_state(cwd)
+        if state is not None:
+            branch, dirty, ahead = state
+            repo = f"Repo: `{_strip_backticks(_truncate(branch, 100))}`, {dirty} uncommitted"
+            if ahead is not None:
+                repo += f", {ahead} ahead of upstream"
+            lines.append(repo)
+
+    lines.append("Action:")
+    for reason in list(reasons)[:_APPROVAL_MAX_REASONS]:
+        lines.append(f"• {_escape_markdown(_truncate(str(reason), 100))}")
+        excerpt = (triggers or {}).get(reason)
+        if excerpt:
+            lines.append(f"  ↳ `{_strip_backticks(_truncate(excerpt, 150))}`")
+
+    lines += [
+        "",
+        f"Reply within {timeout_sec // 60} min:",
+        "/approve — allow this action",
+        "/approve\\-all \\<category\\> — allow all in session",
+        "/deny — block, pause task",
+        "/skip — skip for now, task retries later",
+    ]
+    head = "🔒 *Approval required*\n\nTask: `"
+    body = "\n".join(lines)
+    room = _APPROVAL_MAX_BYTES - len((head + body).encode("utf-8")) - len(b"...")
+    task_safe = _strip_backticks(
+        _truncate(str(task_text), max(0, min(_APPROVAL_TASK_MAX_BYTES, room)))
     )
+    return head + task_safe + body
+
+
+def notify_approval_required(
+    task_text: str,
+    reasons: list[str],
+    timeout_sec: int,
+    *,
+    cwd: str | None = None,
+    triggers: dict[str, str] | None = None,
+) -> None:
+    """Send a Telegram approval request for a risky action.
+
+    Never raises: orchestrator.py treats any exception in the approval path as
+    "policy check failed" and then runs the task UNAPPROVED. If the detailed text
+    cannot be built, the short form (task, reasons, commands) goes out; if not even
+    that, a bare request with the commands only.
+    """
+    try:
+        text = _approval_message(task_text, reasons, timeout_sec, cwd, triggers)
+    except Exception as exc:
+        print(f"  [telegram] Freigabe-Details nicht formatierbar, sende Kurzform: {exc}")
+        try:
+            text = _approval_message(task_text, reasons, timeout_sec, None, None)
+        except Exception:
+            text = _APPROVAL_BARE_TEXT
+    _send(text)
 
 
 def notify_approval_timeout(task_text: str) -> None:

@@ -112,12 +112,16 @@ class PolicyRule:
     _compiled: re.Pattern | None = field(default=None, repr=False, compare=False)
 
     def matches(self, text: str) -> bool:
+        return self.search(text) is not None
+
+    def search(self, text: str) -> re.Match | None:
+        """The match itself — the approval message quotes the text that triggered it."""
         if self._compiled is None:
             try:
                 object.__setattr__(self, "_compiled", re.compile(self.pattern, re.IGNORECASE))
             except re.error:
                 object.__setattr__(self, "_compiled", re.compile(re.escape(self.pattern), re.IGNORECASE))
-        return bool(self._compiled.search(text))
+        return self._compiled.search(text)
 
 
 def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
@@ -138,6 +142,22 @@ def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
         if isinstance(pattern, str):
             rules.append(PolicyRule(pattern=pattern, message=pattern, tier=TIER_DENY))
     return rules
+
+
+_EXCERPT_CONTEXT_CHARS = 30
+_EXCERPT_MAX_CHARS = 120
+
+
+def _excerpt(text: str, m: re.Match) -> str:
+    """The match plus a little context, whitespace collapsed, capped in length."""
+    start = max(0, m.start() - _EXCERPT_CONTEXT_CHARS)
+    end = min(len(text), m.end() + _EXCERPT_CONTEXT_CHARS)
+    snippet = " ".join(text[start:end].split())
+    clipped_tail = end < len(text)
+    if len(snippet) > _EXCERPT_MAX_CHARS:
+        snippet = snippet[:_EXCERPT_MAX_CHARS - 1].rstrip()
+        clipped_tail = True
+    return ("…" if start > 0 else "") + snippet + ("…" if clipped_tail else "")
 
 
 def _coerce_provider_list(raw) -> list[str] | None:
@@ -451,24 +471,75 @@ class PolicyEngine:
     # Approval request (blocking)
     # ------------------------------------------------------------------
 
+    def match_excerpts(
+        self,
+        texts: list[str],
+        reasons: list[str],
+        profile_rules: dict | None = None,
+    ) -> dict[str, str]:
+        """Map each reason to an excerpt of the text that triggered it.
+
+        A reason is a rule's ``message``; the excerpt is the first match of a rule
+        carrying that message in *texts* (the same texts ``check_task`` saw), with
+        ~30 characters of context on each side. Reasons without a matching rule —
+        e.g. the scientific-investigation bypass, which passes free-form reasons —
+        are simply absent from the result.
+
+        Never raises: it runs inside the approval path, and orchestrator.py treats
+        any exception there as "policy check failed" and runs the task UNAPPROVED.
+        """
+        try:
+            wanted = {str(r) for r in reasons}
+            rules: list[PolicyRule] = (
+                _parse_rules_from_dict(profile_rules) if profile_rules else []
+            )
+            with self._lock:
+                rules.extend(self._rules)
+            out: dict[str, str] = {}
+            for rule in rules:
+                if rule.message not in wanted or rule.message in out:
+                    continue
+                for text in texts:
+                    m = rule.search(text)
+                    if m is not None and m.group(0).strip():
+                        out[rule.message] = _excerpt(text, m)
+                        break
+            return out
+        except Exception as exc:
+            logger.debug("policy: match_excerpts failed: %s", exc)
+            return {}
+
     def request_approval(
         self,
         task_text: str,
         reasons: list[str],
         timeout_sec: int = POLICY_APPROVAL_TIMEOUT_SEC,
+        *,
+        cwd: str | None = None,
+        checked_texts: list[str] | None = None,
+        profile_rules: dict | None = None,
     ) -> str:
         """Send Telegram approval request and block until responded.
+
+        The keyword arguments only enrich the message (cwd, repo state, the text
+        that triggered each reason). ``checked_texts`` are the texts ``check_task``
+        classified — tags stripped, subtasks included — and default to the raw
+        *task_text*. None of it can make the request fail.
 
         Returns: "approved" | "denied" | "skipped" | "timeout"
         """
         from notifier import notify_approval_required
+
+        triggers = self.match_excerpts(
+            checked_texts if checked_texts else [task_text], reasons, profile_rules,
+        )
 
         event = threading.Event()
         with self._lock:
             self._approval_response = ""
             self._approval_event = event
 
-        notify_approval_required(task_text, reasons, timeout_sec)
+        notify_approval_required(task_text, reasons, timeout_sec, cwd=cwd, triggers=triggers)
         logger.info("policy: approval requested for: %s", task_text[:80])
 
         responded = event.wait(timeout=timeout_sec)

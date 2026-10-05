@@ -18,7 +18,7 @@ paths:
 
 Ausgelagert aus CLAUDE.md am 2026-09-21; laedt automatisch bei Zugriff auf notifier.py, telegram_listener.py, idempotency.py, session_registry.py, replay.py, taxonomy.py, preflight.py, skill_suggester.py, skills/index.py, gh_helpers.py, ci_watcher.py, parallel_runner.py, run_orchestrator.ps1.
 
-- **`notifier.py`** — Telegram notifications, 3500-char truncation
+- **`notifier.py`** — Telegram notifications, 3500-char truncation. **Freigabe mit Inhalt (2026-10-05):** `notify_approval_required` zeigt Task (≤ 1500 Bytes statt 100 Zeichen), `cwd`, Repo-Zustand (Branch, `status --short`-Zeilen, Commits vor `@{u}`; je Git-Aufruf ≤ 5 s, jeder Fehler → Block entfällt still) und je Grund den Auslöser-Ausschnitt; die Gesamtnachricht bleibt ≤ 3500 Bytes, weil der Task als Einziges nachgibt — nie hinterher kürzen, ein Schnitt in einem Code-Span lässt Telegram die ganze Nachricht ablehnen. Darf nie werfen: `run_once()` verbucht jede Exception im Freigabepfad als `policy check failed` und lässt den Task **ohne** Freigabe laufen (fail-open, vorbestehend)
 - **`telegram_listener.py`** — Bot listener, `/chat` AI mode, slash tool-commands (`/review` `/security` `/audit` `/dev` `/critique` `/brainstorm`), `/approve` SI-Manager routing; P5 `/pr-fix <owner/repo#N>` + `/pr-ignore <owner/repo#N>` for PR-Babysitter report-only mode
 - **`idempotency.py`** — Duplicate-trigger dedup (JSONL store, sha256 keys, 30-day retention)
 - **`session_registry.py`** — Append-only JSONL whitelist of orchestrator-created Claude session UUIDs

@@ -2439,12 +2439,16 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 profile_rules=profile_policy or None,
             )
             reasons = set(reasons_list)
+            # The exact texts classified above — the approval message quotes from them.
+            policy_texts = [clean_task_for_policy]
 
             # Check subtasks (if any)
             if getattr(queue_task, "subtasks", None):
                 for st in task_subtasks:
+                    clean_st = strip_metadata_tags(st)
+                    policy_texts.append(clean_st)
                     st_verdict, st_reasons = engine.check_task(
-                        strip_metadata_tags(st),
+                        clean_st,
                         profile_rules=profile_policy or None,
                     )
                     # Lower index means higher priority (DENY < APPROVE < AUTO)
@@ -2477,7 +2481,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                     and not engine.is_preapproved(r)
                 ]
                 if unapproved:
-                    response = engine.request_approval(task, unapproved)
+                    response = engine.request_approval(
+                        task, unapproved, cwd=cwd, checked_texts=policy_texts,
+                        profile_rules=profile_policy or None,
+                    )
                     if response == "denied":
                         print("  ❌ Genehmigung abgelehnt — Task bleibt in Queue.")
                         append_log(f"Genehmigung abgelehnt für Task: {task[:60]}")

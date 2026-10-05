@@ -146,6 +146,18 @@ def test_underscore_path_yields_valid_markdown(sent, no_outer_repo):
     assert "rm\\_rf on build\\_output" in msg            # reason escaped outside code
 
 
+def test_command_help_lines_carry_no_visible_backslashes(sent):
+    """Legacy Markdown escapes only _ * ` [ — "\\-" and "\\<" are displayed as typed."""
+    notifier.notify_approval_required("Task", ["git push to remote"], 1800)
+
+    (msg,) = sent
+    help_lines = [line for line in msg.splitlines() if line.startswith("/")]
+    assert "/approve-all <category> — allow all in session" in help_lines
+    assert len(help_lines) == 4
+    for line in help_lines:
+        assert "\\" not in line, line
+
+
 def test_markdown_checker_catches_what_it_should():
     """Gegenprobe for the helper above — otherwise its silence would prove nothing."""
     assert _legacy_markdown_problems("cwd: /a/my_dir")

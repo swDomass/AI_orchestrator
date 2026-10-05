@@ -357,7 +357,9 @@ def _approval_message(
         "",
         f"Reply within {timeout_sec // 60} min:",
         "/approve — allow this action",
-        "/approve\\-all \\<category\\> — allow all in session",
+        # No backslashes: legacy Markdown escapes only _ * ` [ — a "\-" or "\<" is
+        # shown literally (it was, on master too).
+        "/approve-all <category> — allow all in session",
         "/deny — block, pause task",
         "/skip — skip for now, task retries later",
     ]

@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from policy import (
@@ -52,6 +53,33 @@ deny:
     tier, reasons = engine.check_task("ls -la")
     assert tier == TIER_AUTO
     assert reasons == []
+
+def test_policy_engine_matches_case_insensitively(tmp_path):
+    """Pins the IGNORECASE semantics PolicyRule.search() inherited from matches()."""
+    policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True)
+    policy_file.write_text(
+        """approve:
+  - pattern: "git push"
+    message: "pushing to remote"
+""",
+        encoding="utf-8"
+    )
+    engine = PolicyEngine(vault_path=tmp_path)
+
+    tier, reasons = engine.check_task("GIT PUSH origin x")
+    assert tier == TIER_APPROVE
+    assert reasons == ["pushing to remote"]
+
+def test_policy_rule_invalid_regex_falls_back_to_literal_match():
+    """An unparseable pattern is matched as escaped literal text, not dropped."""
+    rule = PolicyRule(pattern="a(b", message="literal a(b", tier=TIER_APPROVE)
+    try:
+        matched = rule.matches("a(b")
+    except re.error as exc:  # no fallback at all: the pattern error escapes
+        matched = exc
+    assert matched is True, f"escape fallback did not match the literal text: {matched!r}"
+    assert rule.matches("ab") is False
 
 def test_preapprovals():
     engine = PolicyEngine(vault_path=Path("/tmp"))

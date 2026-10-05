@@ -15,6 +15,10 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Linux, Cloud (2026-10-05, CPython 3.12.3 und 3.13.14, nach den Korrekturen aus dem
+# lokalen Review zu PR #4): 2874 passed / 0 failed / 7 skipped in 76-80 s — +5 über die
+# 2869 darunter (1 Git-Gesamtfrist — dauert selbst 5 s, 2 Policy-Semantik, 1 fsmonitor/
+# Submodule, 1 Hilfezeile). ruff 1122 und mypy 130/38 unverändert.
 # Linux, Cloud (2026-10-05, CPython 3.12.3 und 3.13.14, nach Abschlussregel/verify_absent
 # + Freigabe mit Inhalt): 2869 passed / 0 failed / 7 skipped in 73-75 s — +30 über die
 # 2839 vom 2026-10-02 (Teil A +8: 1 Prompt, 5 Linter, 2 End-to-End-Verify; Teil B +22:

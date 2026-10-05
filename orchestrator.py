@@ -1077,6 +1077,19 @@ PROMPT_TASK_DELIMITER_EMPTY = (
     "════════════════════════════════════════════════════════════════════"
 )
 
+# Completion rule, placed directly in front of the delimiter (see _build_prompt). Lives
+# here, not in SOUL.md, because SOUL.md is a vault file outside this repo and would leave
+# the rule unversioned and untestable. Anlassfall `njtaxr` (2026-09-03): exit ok, the
+# three reel-*.md files missing, the target folder only named in the task's prose. The
+# rule is the soft half; `#verify:` is the hard one (queue_linter warns as
+# `verify_absent` when a line carries none).
+PROMPT_COMPLETION_RULE = (
+    "Abschlussregel: Melde eine Aufgabe nur als erledigt, wenn die in der Aufgabe "
+    "genannten Ergebnisse (Dateien, Ausgaben) existieren und du sie nach dem Schreiben "
+    "selbst geprüft hast. Ein fast erschöpftes Budget rechtfertigt kein verfrühtes "
+    "Fertigmelden — melde dann den Teilstand ausdrücklich als unvollständig."
+)
+
 
 def _build_prompt(
     task: str,
@@ -1111,6 +1124,11 @@ def _build_prompt(
     Hence PROMPT_TASK_DELIMITER below: the boundary has to be stated, not just implied by
     ordering. Nothing may be appended after the task — that would re-bury it and undo the
     2026-07-25 fix.
+
+    PROMPT_COMPLETION_RULE sits directly in front of the delimiter, under its own
+    "## Systemregel" heading: before the delimiter so the task stays last, and with a
+    heading so it cannot read as the tail of the last referenced file in step 6. It rides
+    with the delimiter — a prompt that is nothing but the instruction carries neither.
     """
     from skills import build_index, load_skill, progressive_body
 
@@ -1171,6 +1189,7 @@ def _build_prompt(
     # Only when something precedes the task — a prompt that is nothing but the instruction
     # has no context to delimit, and the announcement would refer to nothing.
     if parts:
+        parts.append(f"## Systemregel\n{PROMPT_COMPLETION_RULE}")
         parts.append(PROMPT_TASK_DELIMITER if clean_task else PROMPT_TASK_DELIMITER_EMPTY)
     # 7. The task LAST — see the docstring for why this position is load-bearing.
     # A queue line consisting only of routing tags strips down to nothing; emitting a

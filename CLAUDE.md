@@ -249,7 +249,7 @@ Wer an einem dieser Themen arbeitet, ohne eine passende Datei anzufassen (Antwor
 | Thema (Stichworte) | Regeldatei | Auslösende Pfade |
 |---|---|---|
 | Provider-Fallback-Kette, Policy-Gates, uncapped Provider, Modell-/Tag-Regex, Reasoning-Effort, HTTP-429-Resilienz, Token-Schätzung, Test-Fixtures für Provider-Registrierung | `core-dispatch-policy.md` | `dispatcher.py`, `policy.py`, `profiles.py`, `limits.py`, `tests/conftest.py` |
-| Queue-Parser, `#needs:`/`#id:`, HTML-Kommentar-Falle, Prompt-Reihenfolge, `#verify:`, Format-Fehler-Zähler, ❌/✅-Stempel, queue-healing | `queue-and-tasks.md` | `queue_manager.py`, `queue_linter.py`, `queue_healing.py` |
+| Queue-Parser, `#needs:`/`#id:`, HTML-Kommentar-Falle, Prompt-Reihenfolge + Abschlussregel, `#verify:` + `verify_absent`, Format-Fehler-Zähler, ❌/✅-Stempel, queue-healing | `queue-and-tasks.md` | `queue_manager.py`, `queue_linter.py`, `queue_healing.py` |
 | Hauptschleife, `main()`-Crash-Breaker, `_snapshot_dir`-`nul`-Bug, Shutdown-State-Machine, Logging | `orchestrator-runtime.md` | `orchestrator.py`, `shutdown.py`, `logging_setup.py` |
 | Claude/Codex/Gemini/OpenRouter/Vibe/opencode-Provider, Liveness-Watchdog, stdin-Zustellung, Fehlerklassifikation, `auth_expired`-Saga | `providers.md` | `providers/*.py` |
 | dev-loop/review-loop/critical-review/scientific-investigation/brainstorm/security-audit/pr-babysitter, Budget-Landung, Arbeitsbaum-Gate | `tools-catalog.md` | `tools/*.py` |

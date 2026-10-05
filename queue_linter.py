@@ -38,6 +38,8 @@ Catches bad queue entries before they reach a provider:
     is certain to fail every single time). Skipped when `cwd:` itself is invalid —
     `invalid_cwd` already covers that line, and the task dies before the verify step
     either way.
+  - an open task line without any #verify: (`verify_absent`, warning) — nothing checks
+    the outcome, so an ok is the provider's word only (Anlassfall `njtaxr`, 2026-09-03)
 
 CLI: ``python orchestrator.py --lint-queue``
 Exit codes: 0 = clean, 1 = warnings, 2 = errors.
@@ -375,6 +377,7 @@ def _check_task(
     out.extend(_check_freshonly_tag(line_no, task_text))
     out.extend(_check_verify_tag(line_no, task_text))
     out.extend(_check_verify_script_missing(line_no, task_text))
+    out.extend(_check_verify_absent(line_no, task_text))
     out.extend(_check_effort_tag(line_no, task_text))
     # #effort: is also honoured on subtasks (parallel_runner.SubTask.effort), so the
     # check has to see them too — otherwise `  - [ ] Teil A #effort:ultra` runs at the
@@ -585,6 +588,35 @@ def _check_verify_script_missing(line_no: int, task_text: str) -> list[LintFindi
         f"Der Task würde laufen und trotzdem als 'verify_missing' (Konfigurationsfehler) "
         f"statt geprüft enden — Pfad oder cwd: korrigieren",
         code="verify_script_missing",
+    )]
+
+
+def _check_verify_absent(line_no: int, task_text: str) -> list[LintFinding]:
+    """Warn about an open task that carries no ``#verify:`` at all.
+
+    Without the tag the orchestrator books whatever the provider reports. Anlassfall
+    `njtaxr` (2026-09-03, run_id c0ab5bf8): exit ok, the three expected reel-*.md files
+    missing, and nothing noticed — the target folder only stood in the task's prose.
+    ``#verify:`` is the one deterministic floor for "did the work happen"; the prompt's
+    completion rule (``orchestrator.PROMPT_COMPLETION_RULE``) is only the soft half.
+
+    WARNING, not ERROR: the line is valid and runs exactly as written, and a task
+    already scheduled or running must not start failing because of this check —
+    ``--lint-queue`` is no execution gate. It does move the CLI exit code from 0 to 1.
+
+    Absent means no ``#verify:`` text anywhere on the line. A tag that is present but
+    unusable (no path, glued to the previous word) is ``verify_without_path``'s job, so
+    the presence test is the same substring test that check starts with — one defect,
+    one finding. Parent line only, like ``_check_verify_script_missing``: the runtime
+    never reads a subtask's own tag either. Done lines (``- [x]``) never get here,
+    ``_iter_open_tasks`` yields open lines only.
+    """
+    if "#verify:" in task_text.lower():
+        return []
+    return [LintFinding(
+        LEVEL_WARN, line_no, task_text,
+        "kein Beleg-Check (#verify:) — ein ok wäre ungeprüft",
+        code="verify_absent",
     )]
 
 

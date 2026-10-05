@@ -868,7 +868,7 @@ Telegram approval commands: `/approve`, `/approve-all <category>`, `/deny`, `/sk
 **What the approval request shows** (since 2026-10-05; before, the task was cut to 100 characters and nothing else was there to decide on). The request goes out *before* the provider runs, so there is no diff of the coming change — instead:
 
 - the task text, up to ~1500 bytes (the whole message stays within 3500 bytes; the task gives way first, the commands are never cut)
-- `cwd:` and, if it is a git repo, its state: branch, number of `git status --short` entries, commits ahead of the upstream (omitted without one). Each git call has a 5 s timeout; on any error or timeout the repo line is dropped silently
+- `cwd:` and, if it is a git repo, its state: branch, number of `git status --short` entries, commits ahead of the upstream (omitted without one). The repo state has an overall deadline of 5 s (Repo-Zustand mit Gesamtfrist 5 s, sonst ohne Repo-Block): all git calls run together in a background thread, because a per-call timeout is not a hard bound on Windows (the `git.exe` wrapper is killed, its child is waited for without limit). Past the deadline, or on any error, the request goes out without the repo line
 - per reason, the excerpt of the task text that matched the rule (`↳ …`), when the reason comes from a `policy.yaml` rule — the scientific-investigation bypass passes free-form reasons and shows those alone
 
 Paths, branch and excerpts sit in code spans, so underscores in paths cannot break Telegram's Markdown. Nothing in this enrichment can make the request fail — if the detailed text cannot be built, the short form goes out.

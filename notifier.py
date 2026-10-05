@@ -239,7 +239,8 @@ def notify_shutdown_executing() -> None:
 _APPROVAL_MAX_BYTES = 3500        # _truncate's default; Telegram's hard cap is 4096
 _APPROVAL_TASK_MAX_BYTES = 1500
 _APPROVAL_MAX_REASONS = 5
-_APPROVAL_GIT_TIMEOUT_SEC = 5
+_APPROVAL_GIT_TIMEOUT_SEC = 5     # per git call
+_APPROVAL_GIT_DEADLINE_SEC = 5    # all git calls together — see _git_repo_state
 # Last resort when even the short form cannot be built (e.g. a caller passing odd
 # types): an approval without details still beats an exception, which run_once()
 # would turn into "policy check failed" and an UNAPPROVED run.
@@ -255,15 +256,40 @@ _APPROVAL_BARE_TEXT = (
 def _git_repo_state(cwd: str) -> tuple[str, int, int | None] | None:
     """(branch, uncommitted entries, commits ahead of upstream) — or None.
 
+    Hard overall deadline: the queries run in a daemon thread that is joined for at
+    most _APPROVAL_GIT_DEADLINE_SEC. The per-call timeout alone is no bound on
+    Windows — `git` resolves to the cmd\\git.exe wrapper, subprocess.run's timeout
+    kills only that wrapper and then waits without limit for the real git child to
+    close the pipes (measured 2026-10-05 with timeout=1: 6.0 s through the wrapper,
+    1.0 s direct) — and three calls would add up to ~15 s nominally anyway. A thread
+    still busy at the deadline is abandoned (daemon, never holds up shutdown), the
+    repo block is dropped and the request goes out now.
+    """
+    found: list = []
+    try:
+        worker = threading.Thread(
+            target=lambda: found.append(_query_git_repo_state(cwd)),
+            name="approval-git-state", daemon=True,
+        )
+        worker.start()
+        worker.join(_APPROVAL_GIT_DEADLINE_SEC)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def _query_git_repo_state(cwd: str) -> tuple[str, int, int | None] | None:
+    """The git queries behind _git_repo_state — no overall deadline of their own.
+
     None on anything that goes wrong — no repo, no git, a timeout, an exception of
     any kind: the repo block is context, the approval request must go out without
     it. ``ahead`` is None when the branch has no upstream. Uncommitted entries are
     ``git status --short`` lines, so an untracked directory counts once.
 
-    Every call is capped at 5 s, and GIT_OPTIONAL_LOCKS=0 keeps ``git status`` from
-    taking index.lock while a task in another thread may be working in that repo.
-    ``orchestrator._git_diff_summary`` is not reused: 10 s per call, a diffstat
-    rather than counts, and importing orchestrator here would be a cycle.
+    Each call keeps its own 5 s timeout, and GIT_OPTIONAL_LOCKS=0 keeps ``git
+    status`` from taking index.lock while a task in another thread may be working
+    in that repo. ``orchestrator._git_diff_summary`` is not reused: 10 s per call, a
+    diffstat rather than counts, and importing orchestrator here would be a cycle.
     """
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
 

@@ -11,6 +11,8 @@ book that as "policy check failed" and run the task unapproved).
 
 import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -242,6 +244,36 @@ def test_every_git_call_is_capped_at_five_seconds(sent, monkeypatch, tmp_path):
     assert [c for c, _ in seen] == ["branch", "status", "rev-list"]
     assert all(t is not None and t <= 5 for _, t in seen), seen
     assert "Repo: `main`, 1 uncommitted, 2 ahead of upstream" in sent[0]
+
+
+def test_hanging_git_cannot_hold_the_request_past_the_overall_deadline(
+    sent, monkeypatch, tmp_path,
+):
+    """Windows: subprocess.run's timeout kills only the git.exe wrapper, then waits
+    without limit for the real git child (measured with timeout=1: 6.0 s). Simulated
+    as a run() that ignores its timeout and hangs 30 s — the request must still go
+    out within the 5 s overall deadline, without the repo block."""
+    release = threading.Event()
+
+    def stuck_git(cmd, **kwargs):
+        release.wait(30)
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="")
+
+    monkeypatch.setattr(notifier.subprocess, "run", stuck_git)
+    try:
+        start = time.monotonic()
+        notifier.notify_approval_required(
+            "Task", ["git push to remote"], 1800, cwd=str(tmp_path),
+        )
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()  # let the abandoned worker thread finish
+
+    (msg,) = sent
+    assert elapsed < 6.0, f"request held for {elapsed:.1f} s"
+    assert "Repo:" not in msg
+    assert f"cwd: `{tmp_path}`" in msg
+    assert msg.endswith(_LAST_LINE)
 
 
 def test_any_git_exception_never_blocks_the_request(sent, monkeypatch, tmp_path):

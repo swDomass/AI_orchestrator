@@ -15,6 +15,11 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Linux, Cloud (2026-10-06, CPython 3.12.3 und 3.13.16, nach Korrekturrunde 2 zu PR #5):
+# 2960 passed / 0 failed / 7 skipped in 81-85 s — +6 über die 2954 darunter (K6: 4 in
+# test_dev_loop_plan_approval — Ladefehler im Abschnittsparser, Reparatur, frische Engine;
+# K7: 2 in test_parallel_runner — Frist über alle Fragen des Aufrufs, Verdrahtung).
+# ruff 1122, mypy 125/38 unverändert.
 # Linux, Cloud (2026-10-06, CPython 3.12.3 und 3.13.16, nach Korrekturrunde 1 zu PR #5):
 # 2954 passed / 0 failed / 7 skipped in 88-90 s — +23 über die 2931 darunter (K1: 15
 # parametrisierte Störfälle in test_orchestrator_policy_fail_closed, K4: 5 Nicht-Freigabe-

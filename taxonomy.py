@@ -20,6 +20,8 @@ Categories
 * ``policy_denied``        — PolicyEngine rejected the task
 * ``profile_denied``       — Profile allowed/denied skill blocked execution
 * ``approval_denied``      — Telegram approval rejected / timed-out / skipped
+                             or not obtainable at all (``approval_unavailable``:
+                             the approval path itself failed — fail-closed, nothing ran)
 * ``capacity_exhausted``   — usage budget consumed mid-tool
 * ``dep_unsatisfied``      — #needs: dependency never resolved
 * ``test_failure``         — dev-loop terminal state with failing tests
@@ -162,6 +164,7 @@ _ERROR_CODE_MAP: dict[str, str] = {
     "approval_denied":        CAT_APPROVAL,
     "approval_timeout":       CAT_APPROVAL,
     "approval_skipped":       CAT_APPROVAL,
+    "approval_unavailable":   CAT_APPROVAL,
     "capacity_exhausted":     CAT_CAPACITY,
     "dep_unsatisfied":        CAT_DEP,
     "test_failure":           CAT_TEST,

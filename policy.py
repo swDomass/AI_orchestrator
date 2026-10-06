@@ -249,6 +249,15 @@ class PolicyEngine:
         self._rules: list[PolicyRule] = []
         self._tool_providers: dict[str, list[str]] = {}
         self._tool_contracts: dict[str, ToolContract] = {}
+        # `tool_phases:` — per-tool phase switches (dev-loop plan_approval, …).
+        # Raw per-tool entries; the shape of one entry is judged on read, see
+        # get_tool_phase().
+        self._tool_phases: dict[str, object] = {}
+        # Why the last attempt to parse an EXISTING policy.yaml failed, or None.
+        # Rules and the other sections keep their last good state on such a
+        # failure (unchanged behaviour); get_tool_phase() refuses to answer from
+        # it instead, because a safety switch nobody can read is not "off".
+        self._load_error: str | None = None
         self._mtime: float = 0.0
         self._lock = threading.Lock()
 
@@ -305,10 +314,17 @@ class PolicyEngine:
                 data = yaml.safe_load(f)
         except Exception as e:
             logger.warning("policy: could not load %s: %s", path, e)
+            self._load_error = f"{type(e).__name__}: {e}"
             return
 
-        if not isinstance(data, dict):
+        if data is None:
+            # Empty file: deliberately nothing configured, not a read failure.
+            self._load_error = None
             return
+        if not isinstance(data, dict):
+            self._load_error = f"top level is {type(data).__name__}, not a mapping"
+            return
+        self._load_error = None
 
         self._rules = _parse_rules_from_dict(data)
 
@@ -333,6 +349,15 @@ class PolicyEngine:
                         tool_name, type(entry).__name__,
                     )
         self._tool_contracts = contracts
+
+        phases_raw = data.get("tool_phases") or {}
+        if not isinstance(phases_raw, dict):
+            logger.warning(
+                "policy: tool_phases is not a mapping (got %s) — ignored",
+                type(phases_raw).__name__,
+            )
+            phases_raw = {}
+        self._tool_phases = {str(k): v for k, v in phases_raw.items()}
 
         logger.debug(
             "policy: loaded %d rules, %d tool policies, %d tool contracts from %s",
@@ -379,6 +404,47 @@ class PolicyEngine:
         self._reload_if_changed()
         with self._lock:
             return dict(self._tool_contracts)
+
+    def get_tool_phase(self, tool: str, key: str, default: str) -> str:
+        """One switch from policy.yaml's ``tool_phases:`` section, as a string.
+
+        Example yaml::
+
+            tool_phases:
+              dev-loop:
+                plan_approval: approve
+
+        Returns *default* when the file is missing, has no ``tool_phases:``
+        section, no entry for *tool*, or no *key* in it. A value that is there is
+        returned as ``str(value)`` WITHOUT validation — the caller knows the
+        allowed set (``yes`` parses to ``True`` and comes back as ``"True"``).
+
+        Raises ValueError when the answer cannot be known: the file exists but
+        could not be parsed into a mapping, or the entry for *tool* is not a
+        mapping. Deliberately not *default*: for a safety switch, "unreadable"
+        and "not configured" must stay distinguishable, and only the caller can
+        decide which way to fail.
+
+        Only dev-loop reads this so far. tools/review_loop.py still imports a
+        ``load_policy`` that does not exist, so its ``tool_phases`` keys
+        (``verification``, ``drift_check_mode``) stay inert until that reader is
+        rewired on purpose.
+        """
+        self._reload_if_changed()
+        with self._lock:
+            load_error = self._load_error
+            entry = self._tool_phases.get(tool)
+        if load_error is not None:
+            raise ValueError(f"policy.yaml unreadable ({load_error})")
+        if entry is None:
+            return default
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"tool_phases['{tool}'] is not a mapping (got {type(entry).__name__})"
+            )
+        if key not in entry:
+            return default
+        return str(entry[key])
 
     def get_allowed_providers(self, tool_name: str | None = None) -> list[str] | None:
         """Return the list of allowed providers for a tool, or None if no restriction.
@@ -512,8 +578,9 @@ class PolicyEngine:
         e.g. the scientific-investigation bypass, which passes free-form reasons —
         are absent from the result.
 
-        Never raises: it runs inside the approval path, and orchestrator.py treats
-        any exception there as "policy check failed" and runs the task UNAPPROVED.
+        Never raises: it runs inside the approval path, where an exception holds the
+        task in the queue instead of sending the request (fail-closed since
+        2026-10-06; until then orchestrator.py ran the task UNAPPROVED).
         """
         try:
             wanted = {str(r) for r in reasons}

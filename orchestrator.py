@@ -2519,10 +2519,42 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _span.emit()
                         return False
                     # "approved" → continue
-        except ImportError:
-            pass
         except Exception as e:
-            _log.warning("policy check failed: %s", e)
+            # Fail-closed since 2026-10-06, ImportError included. Both branches used
+            # to fall through into execution (`except ImportError: pass`, and a
+            # warning for everything else): the task then ran without the approval
+            # AND without the DENY check — also when the user had answered /deny and
+            # only the re-stamp after it raised. Now any fault in classification or
+            # approval holds the task like the `timeout` branch above: it stays open,
+            # is retried in 10 minutes and never runs in this pass. Every report is
+            # best effort, so none of them can keep the requeue from being tried;
+            # if the requeue fails too, the line is still open and the next cycle
+            # checks it again.
+            msg = f"Policy-Prüfung gestört — Task bleibt in Queue: {type(e).__name__}: {e}"
+            _log.warning("%s (task: %.60s)", msg, task, exc_info=True)
+            try:
+                append_log(msg)
+                print(f"  ⛔ {msg}")
+            except Exception as report_exc:
+                _log.debug("policy hold: report failed: %s", report_exc)
+            try:
+                notify_error(task, "policy", msg)
+            except Exception as notify_exc:
+                _log.debug("policy hold: notify_error failed: %s", notify_exc)
+            reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+            try:
+                requeued = _mark_retry_checked(
+                    task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                )
+            except Exception as mark_exc:
+                _log.warning("policy hold: requeue failed, task stays open: %s", mark_exc)
+                requeued = False
+            if requeued:
+                _span.retry("approval_unavailable")
+            else:
+                _span.error("approval_unavailable")
+            _span.emit()
+            return False
 
         # --- Clean-worktree precondition (2026-09-04) ---
         # The last gate before anything runs. A tool that produces the diff its own

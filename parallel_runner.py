@@ -334,21 +334,33 @@ def _remove_worktree(parent_cwd: Path, worktree_path: Path) -> bool:
         return False
 
 
-def _group_join_timeout_sec(group: list[tuple[int, SubTask]]) -> int:
+def _approval_questions(group: list[tuple[int, SubTask]]) -> int:
+    """How many subtasks of *group* may stop to ask a human (dev-loop's plan approval)."""
+    return sum(1 for _, st in group if st.tool_name in _APPROVAL_GATED_TOOLS)
+
+
+def _group_join_timeout_sec(group: list[tuple[int, SubTask]], questions_in_call: int = 0) -> int:
     """Join timeout for one CWD group (runs sequentially within a single thread).
 
     A dev-loop subtask can wait for a human on top of its own timeout (2026-10-06):
     with `plan_approval: approve` it blocks up to POLICY_APPROVAL_TIMEOUT_SEC for the
-    Telegram answer, and once more as long for `_PLAN_APPROVAL_LOCK` while a dev-loop
-    of another group is asking. Without that slack the parent gave up the join while
-    the subtask still waited, booked it as failed — and a late /approve then ran the
-    plan in the abandoned daemon thread, unaccounted. Added regardless of the live
+    Telegram answer, and `_PLAN_APPROVAL_LOCK` serialises those questions across ALL
+    groups of the call. Without that slack the parent gave up the join while the
+    subtask still waited, booked it as failed — and a late /approve then ran the plan
+    in the abandoned daemon thread, unaccounted.
+
+    The wait therefore counts every question in the call, not just this group's
+    (K7): a group can queue behind every other group's question before and between
+    its own, so its worst case is `questions_in_call` answers, plus one as slack (the
+    "+1" the first version gave every group, which covered one foreign question only:
+    with five groups of one dev-loop each, the last group in lock order can wait
+    5 x 600 s, the old cap covered 2 x 600 s). A group with
+    no such subtask waits for nobody and gets nothing. Added regardless of the live
     mode: a longer cap only delays giving up on a thread that really hangs.
     """
     total = sum(max(0, st.timeout) for _, st in group)
-    approval_waits = sum(1 for _, st in group if st.tool_name in _APPROVAL_GATED_TOOLS)
-    if approval_waits:
-        approval_waits += 1  # once per group: waiting on the lock for another group's question
+    own = _approval_questions(group)
+    approval_waits = max(own, questions_in_call) + 1 if own else 0
     return total + 120 + approval_waits * POLICY_APPROVAL_TIMEOUT_SEC  # 120: provider/tool overhead
 
 
@@ -490,6 +502,11 @@ def run_parallel(
             with lock:
                 all_results[idx] = result
 
+    # Every question the started groups can ask; one group may wait behind all of them.
+    questions_in_call = sum(
+        _approval_questions(group)
+        for key, group in cwd_groups.items() if key not in worktree_errors
+    )
     for _cwd, group in cwd_groups.items():
         if _cwd in worktree_errors:
             continue   # already short-circuited above
@@ -500,7 +517,7 @@ def run_parallel(
             name=f"parallel-{_cwd or 'default'}",
         )
         threads.append(t)
-        thread_timeouts[t] = _group_join_timeout_sec(group)
+        thread_timeouts[t] = _group_join_timeout_sec(group, questions_in_call)
         t.start()
 
     for t in threads:

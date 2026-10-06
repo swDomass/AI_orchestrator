@@ -148,6 +148,64 @@ def test_get_engine_raising_holds_the_task(world, monkeypatch, caplog):
     _requeued_in_ten_minutes(world)
 
 
+class _PolicyBoomError(Exception):
+    """A project-specific exception class no narrowed `except` tuple would list."""
+
+
+def _raise(exc_type):
+    def raiser(*_a, **_kw):
+        raise exc_type("injected policy fault")
+    return raiser
+
+
+@pytest.mark.parametrize("site", ["get_engine", "check_task", "request_approval"])
+@pytest.mark.parametrize("exc_type", [
+    AttributeError,   # get_engine() handing back None, a fake missing a method
+    TypeError,        # an engine with a different signature (the **kwargs case)
+    KeyError,
+    ValueError,
+    _PolicyBoomError,
+])
+def test_any_exception_class_at_any_fault_site_holds_the_task(
+    world, monkeypatch, caplog, site, exc_type,
+):
+    """The three tests above use RuntimeError, OSError and ImportError. A hold
+    narrowed to exactly those (`except (ImportError, OSError, RuntimeError)`) passed
+    all of them while a task with any other fault ran unapproved and unchecked
+    again. The hold has to be `except Exception`, and this pins it."""
+    if site == "get_engine":
+        monkeypatch.setattr(policy_module, "get_engine", _raise(exc_type))
+    else:
+        engine = _Engine()
+        monkeypatch.setattr(engine, site, _raise(exc_type))
+        monkeypatch.setattr(policy_module, "get_engine", lambda: engine)
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator"):
+        assert orchestrator.run_once() is False
+
+    _held(world, caplog)
+    _requeued_in_ten_minutes(world)
+    assert exc_type.__name__ in world.notify_error.call_args.args[2]
+
+
+@pytest.mark.parametrize("answer", ["", None, "bogus", "Approved", "approved "],
+                         ids=["empty", "none", "bogus", "capitalised", "trailing_space"])
+def test_an_answer_that_is_not_an_approval_holds_the_task(world, monkeypatch, caplog, answer):
+    """Only the exact word "approved" runs. "" is reachable, not hypothetical: the
+    engine's one pending slot can be reset to "" by a second request between
+    `_respond()` setting the event and the waiter reading the answer — and before
+    2026-10-06 such an answer fell through into execution as if approved."""
+    engine = _Engine(answer=answer)
+    monkeypatch.setattr(policy_module, "get_engine", lambda: engine)
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator"):
+        assert orchestrator.run_once() is False
+
+    assert engine.approval_calls == 1
+    _held(world, caplog)
+    _requeued_in_ten_minutes(world)
+
+
 def test_denied_with_a_failing_restamp_still_never_runs(world, monkeypatch, caplog):
     """The user answered /deny; the re-stamp raises (queue file locked). The old
     handler logged a warning and ran the task anyway."""

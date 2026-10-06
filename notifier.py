@@ -3,6 +3,7 @@ Telegram notification support for the AI Orchestrator.
 Sends messages on task completion, errors, provider exhaustion, and queue summary.
 """
 
+import contextlib
 import os
 import subprocess
 import threading
@@ -385,12 +386,15 @@ def notify_approval_required(
     Never raises: orchestrator.py treats any exception in the approval path as
     "policy check failed" and then runs the task UNAPPROVED. If the detailed text
     cannot be built, the short form (task, reasons, commands) goes out; if not even
-    that, a bare request with the commands only.
+    that, a bare request with the commands only. The diagnostic line on that path is
+    best effort: a dead stdout (OSError) or a cp1252 console that cannot encode the
+    exception text (UnicodeEncodeError) must not cost the request itself.
     """
     try:
         text = _approval_message(task_text, reasons, timeout_sec, cwd, triggers)
     except Exception as exc:
-        print(f"  [telegram] Freigabe-Details nicht formatierbar, sende Kurzform: {exc}")
+        with contextlib.suppress(Exception):
+            print(f"  [telegram] Freigabe-Details nicht formatierbar, sende Kurzform: {exc}")
         try:
             text = _approval_message(task_text, reasons, timeout_sec, None, None)
         except Exception:

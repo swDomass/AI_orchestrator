@@ -356,6 +356,43 @@ def test_formatting_failure_falls_back_to_the_short_request(sent):
     assert msg.endswith(_LAST_LINE)
 
 
+class _BrokenStdout:
+    """A stdout whose write() fails — closed pipe, or a cp1252 console."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def write(self, _text):
+        raise self._exc
+
+    def flush(self):
+        pass
+
+
+@pytest.mark.parametrize("stdout_error", [
+    OSError("stdout is gone"),
+    UnicodeEncodeError("charmap", "Ä", 0, 1, "character maps to <undefined>"),
+], ids=["oserror", "unicode-encode-error"])
+def test_failing_diagnostic_print_still_sends_the_short_form(sent, monkeypatch, stdout_error):
+    """The fallback announces itself with a print; if that print fails, the request
+    must still go out — otherwise run_once() books "policy check failed" and the task
+    runs unapproved."""
+    monkeypatch.setattr("sys.stdout", _BrokenStdout(stdout_error))
+
+    try:
+        notifier.notify_approval_required(
+            "Task", ["git push to remote"], 1800, triggers=object(),  # no .get
+        )
+        raised = None
+    except Exception as exc:
+        raised = exc
+
+    assert raised is None, f"approval request raised {raised!r}, {len(sent)} message(s) sent"
+    assert len(sent) == 1
+    assert "• git push to remote" in sent[0]
+    assert sent[0].endswith(_LAST_LINE)
+
+
 def test_reasons_as_a_set_are_accepted(sent):
     """reasons[:5] on a set raised TypeError — in the approval path that means an
     unapproved run, so any iterable has to do."""

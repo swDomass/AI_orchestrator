@@ -177,6 +177,11 @@ def test_approve_sends_one_request_carrying_the_plan(monkeypatch, tmp_path, tele
     assert "PLAN-MARKER-7f3" in msg, "the request must show the plan it asks about"
     assert "Fix login bug" in msg
     assert "plan" in msg.lower() and "approval" in msg.lower()
+    # /deny and /skip end a dev-loop plan ❌ with retryable=False — the shared request
+    # text must not promise a retry or a pause that never comes.
+    assert "retries later" not in msg
+    assert "pause task" not in msg
+    assert "/skip — skip this request" in msg and "/deny — block this action" in msg
     # The engine consumed the answer: nothing pending any more.
     assert engine.has_pending_approval() is False
 

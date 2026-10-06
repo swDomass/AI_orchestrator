@@ -21,7 +21,7 @@ import notifier
 import policy as policy_module
 
 _LIMIT = 3500
-_LAST_LINE = "/skip — skip for now, task retries later"
+_LAST_LINE = "/skip — skip this request"
 _has_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
 
 

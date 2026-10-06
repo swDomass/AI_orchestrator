@@ -250,8 +250,8 @@ _APPROVAL_BARE_TEXT = (
     "🔒 *Approval required*\n\n"
     "Details nicht formatierbar — siehe Orchestrator-Log.\n\n"
     "/approve — allow this action\n"
-    "/deny — block, pause task\n"
-    "/skip — skip for now, task retries later"
+    "/deny — block this action\n"
+    "/skip — skip this request"
 )
 
 
@@ -362,8 +362,12 @@ def _approval_message(
         # No backslashes: legacy Markdown escapes only _ * ` [ — a "\-" or "\<" is
         # shown literally (it was, on master too).
         "/approve-all <category> — allow all in session",
-        "/deny — block, pause task",
-        "/skip — skip for now, task retries later",
+        # Neutral on purpose (2026-10-06): the same request serves the single-shot
+        # policy check (/deny and /skip requeue the task in 10 min) AND dev-loop's
+        # plan approval (both end the run ❌, no retry). "task retries later" was
+        # false for the second, and "pause task" for both.
+        "/deny — block this action",
+        "/skip — skip this request",
     ]
     head = "🔒 *Approval required*\n\nTask: `"
     body = "\n".join(lines)

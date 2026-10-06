@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import parallel_runner as parallel_runner_module
 import queue_manager
+from config import POLICY_APPROVAL_TIMEOUT_SEC
 from limits import AllLimits
 from parallel_runner import (
     SubTask,
@@ -587,3 +588,35 @@ def test_run_single_subtask_does_not_notify_on_other_errors(monkeypatch):
 
     assert result.success is False
     assert notified == []
+
+
+# ── Join cap vs. dev-loop's plan approval wait (2026-10-06) ──────────────────
+
+def _st(tool_name, timeout):
+    return SubTask(text="t", provider_forced=None, cwd=None, tool_name=tool_name, timeout=timeout)
+
+
+def test_join_cap_covers_a_dev_loop_plan_approval_wait():
+    """A dev-loop subtask can wait POLICY_APPROVAL_TIMEOUT_SEC for the Telegram answer
+    plus as long again for the plan-approval lock — on top of its own timeout. A cap
+    without that slack abandoned the subtask mid-wait, and a late /approve then ran the
+    plan in the orphaned daemon thread."""
+    cap = parallel_runner_module._group_join_timeout_sec([(0, _st("dev-loop", 900))])
+
+    assert cap >= 900 + 120 + POLICY_APPROVAL_TIMEOUT_SEC
+    assert cap == 900 + 120 + 2 * POLICY_APPROVAL_TIMEOUT_SEC   # own question + lock wait
+
+
+def test_join_cap_counts_every_dev_loop_question_but_the_lock_wait_once():
+    group = [(0, _st("dev-loop", 900)), (1, _st("review-loop", 300)), (2, _st("dev-loop", 600))]
+
+    cap = parallel_runner_module._group_join_timeout_sec(group)
+
+    assert cap == 900 + 300 + 600 + 120 + 3 * POLICY_APPROVAL_TIMEOUT_SEC
+
+
+def test_join_cap_without_dev_loop_is_unchanged():
+    """Control: nothing in the group waits for a human, so timeout + 120 as before."""
+    group = [(0, _st("review-loop", 900)), (1, _st(None, 300))]
+
+    assert parallel_runner_module._group_join_timeout_sec(group) == 900 + 300 + 120

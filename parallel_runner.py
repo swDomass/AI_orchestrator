@@ -25,9 +25,14 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from config import POLICY_APPROVAL_TIMEOUT_SEC
 from limits import AllLimits, estimate_task_usage_pct, report_estimated_usage
 
 logger = logging.getLogger(__name__)
+
+# Tools that may block on a human approval inside their run (dev-loop's plan
+# approval, tools/dev_loop.py). Their wait is not part of the subtask's timeout.
+_APPROVAL_GATED_TOOLS = frozenset({"dev-loop"})
 
 
 @dataclass
@@ -330,9 +335,21 @@ def _remove_worktree(parent_cwd: Path, worktree_path: Path) -> bool:
 
 
 def _group_join_timeout_sec(group: list[tuple[int, SubTask]]) -> int:
-    """Join timeout for one CWD group (runs sequentially within a single thread)."""
+    """Join timeout for one CWD group (runs sequentially within a single thread).
+
+    A dev-loop subtask can wait for a human on top of its own timeout (2026-10-06):
+    with `plan_approval: approve` it blocks up to POLICY_APPROVAL_TIMEOUT_SEC for the
+    Telegram answer, and once more as long for `_PLAN_APPROVAL_LOCK` while a dev-loop
+    of another group is asking. Without that slack the parent gave up the join while
+    the subtask still waited, booked it as failed — and a late /approve then ran the
+    plan in the abandoned daemon thread, unaccounted. Added regardless of the live
+    mode: a longer cap only delays giving up on a thread that really hangs.
+    """
     total = sum(max(0, st.timeout) for _, st in group)
-    return total + 120  # extra buffer for provider/tool overhead
+    approval_waits = sum(1 for _, st in group if st.tool_name in _APPROVAL_GATED_TOOLS)
+    if approval_waits:
+        approval_waits += 1  # once per group: waiting on the lock for another group's question
+    return total + 120 + approval_waits * POLICY_APPROVAL_TIMEOUT_SEC  # 120: provider/tool overhead
 
 
 def run_parallel(

@@ -1516,8 +1516,9 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
 
         def request_approval(self, _task_text, _reasons, _timeout_sec=0, **_context):
             # **_context: cwd/checked_texts/profile_rules since 2026-10-05. A fake
-            # without it raises TypeError, which run_once books as "policy check
-            # failed" and then runs the task unapproved — this test caught exactly that.
+            # without it raises TypeError, which run_once used to book as "policy
+            # check failed" and then run the task unapproved — this test caught
+            # exactly that. Since 2026-10-06 that fault holds the task instead.
             return "skipped"
 
     monkeypatch.setattr(policy_module, "get_engine", lambda: FakeEngine())

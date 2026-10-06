@@ -243,8 +243,9 @@ _APPROVAL_MAX_REASONS = 5
 _APPROVAL_GIT_TIMEOUT_SEC = 5     # per git call
 _APPROVAL_GIT_DEADLINE_SEC = 5    # all git calls together — see _git_repo_state
 # Last resort when even the short form cannot be built (e.g. a caller passing odd
-# types): an approval without details still beats an exception, which run_once()
-# would turn into "policy check failed" and an UNAPPROVED run.
+# types): an approval without details still beats an exception. Since 2026-10-06
+# run_once() holds the task on one (fail-closed, retried in 10 min) — then nobody
+# is asked at all, and the task waits instead of being decided.
 _APPROVAL_BARE_TEXT = (
     "🔒 *Approval required*\n\n"
     "Details nicht formatierbar — siehe Orchestrator-Log.\n\n"
@@ -383,8 +384,9 @@ def notify_approval_required(
 ) -> None:
     """Send a Telegram approval request for a risky action.
 
-    Never raises: orchestrator.py treats any exception in the approval path as
-    "policy check failed" and then runs the task UNAPPROVED. If the detailed text
+    Never raises: an exception in the approval path makes run_once() hold the task
+    in the queue (fail-closed since 2026-10-06; until then it ran UNAPPROVED), so a
+    raising request is a request that never arrives. If the detailed text
     cannot be built, the short form (task, reasons, commands) goes out; if not even
     that, a bare request with the commands only. The diagnostic line on that path is
     best effort: a dead stdout (OSError) or a cp1252 console that cannot encode the

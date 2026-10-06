@@ -873,6 +873,8 @@ Telegram approval commands: `/approve`, `/approve-all <category>`, `/deny`, `/sk
 
 Paths, branch and excerpts sit in code spans, so underscores in paths cannot break Telegram's Markdown. Nothing in this enrichment can make the request fail — if the detailed text cannot be built, the short form goes out.
 
+**A disturbed policy check holds the task** (since 2026-10-06). Any error while classifying or asking — the policy engine not loadable, a rule check that raises, a request that cannot be sent, a re-stamp that fails after `/deny` — keeps the task in the queue and retries it in 10 minutes; it never runs unchecked. (Until then such an error let the task run without approval and without the `DENY` check.) A missing or unparseable `policy.yaml` is *not* such an error: the engine then classifies with no rules (or, in a running process, the last good ones), as before.
+
 Tasks can also carry preapprovals: `#approve:push,publish`
 
 ## Telegram Control

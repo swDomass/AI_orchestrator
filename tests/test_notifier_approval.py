@@ -5,8 +5,9 @@ the commands, nothing else. It is sent BEFORE the provider runs, so there is no 
 to show; what it can show is the full task, the cwd, the repo state and the text that
 tripped each rule. Two properties matter more than any of that: the message must stay
 within Telegram's limits and parse as legacy Markdown (otherwise it never arrives and
-the request times out), and nothing in the enrichment may raise (orchestrator.py would
-book that as "policy check failed" and run the task unapproved).
+the request times out), and nothing in the enrichment may raise (orchestrator.py holds
+the task on that since 2026-10-06 — fail-closed, but then nobody is asked at all; until
+then it ran the task unapproved).
 """
 
 import shutil
@@ -375,8 +376,8 @@ class _BrokenStdout:
 ], ids=["oserror", "unicode-encode-error"])
 def test_failing_diagnostic_print_still_sends_the_short_form(sent, monkeypatch, stdout_error):
     """The fallback announces itself with a print; if that print fails, the request
-    must still go out — otherwise run_once() books "policy check failed" and the task
-    runs unapproved."""
+    must still go out — otherwise run_once() holds the task as a disturbed policy
+    check and nobody is ever asked (until 2026-10-06 the task ran unapproved)."""
     monkeypatch.setattr("sys.stdout", _BrokenStdout(stdout_error))
 
     try:
@@ -394,8 +395,9 @@ def test_failing_diagnostic_print_still_sends_the_short_form(sent, monkeypatch, 
 
 
 def test_reasons_as_a_set_are_accepted(sent):
-    """reasons[:5] on a set raised TypeError — in the approval path that means an
-    unapproved run, so any iterable has to do."""
+    """reasons[:5] on a set raised TypeError — in the approval path that means a
+    held task nobody is asked about (an unapproved run until 2026-10-06), so any
+    iterable has to do."""
     notifier.notify_approval_required("Task", {"git push to remote"}, 1800)
 
     (msg,) = sent

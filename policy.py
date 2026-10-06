@@ -403,14 +403,30 @@ class PolicyEngine:
 
     def _classify(self, task_text: str, rules: list[PolicyRule]) -> tuple[str, list[str], bool]:
         """Returns (tier, messages, had_any_match)."""
-        matches_by_tier: dict[str, list[str]] = {TIER_DENY: [], TIER_APPROVE: [], TIER_AUTO: []}
+        tier, hits = self._classify_matches(task_text, rules)
+        return tier, [rule.message for rule, _ in hits], bool(hits)
+
+    @staticmethod
+    def _classify_matches(
+        task_text: str, rules: list[PolicyRule],
+    ) -> tuple[str, list[tuple[PolicyRule, re.Match]]]:
+        """(winning tier, [(rule, match)] of that tier) — the hits that decide.
+
+        The one place that says which rule matches count: ``_classify`` (and so
+        ``check_task``) reports their messages, ``match_excerpts`` quotes their
+        text. An empty list means nothing matched (tier AUTO).
+        """
+        hits_by_tier: dict[str, list[tuple[PolicyRule, re.Match]]] = {
+            TIER_DENY: [], TIER_APPROVE: [], TIER_AUTO: [],
+        }
         for rule in rules:
-            if rule.matches(task_text):
-                matches_by_tier[rule.tier].append(rule.message)
+            m = rule.search(task_text)
+            if m is not None:
+                hits_by_tier[rule.tier].append((rule, m))
         for tier in _TIER_ORDER:
-            if matches_by_tier[tier]:
-                return tier, matches_by_tier[tier], True
-        return TIER_AUTO, [], False
+            if hits_by_tier[tier]:
+                return tier, hits_by_tier[tier]
+        return TIER_AUTO, []
 
     def check_task(self, task_text: str, profile_rules: dict | None = None) -> tuple[str, list[str]]:
         """Scan task text for all rule patterns.
@@ -479,31 +495,42 @@ class PolicyEngine:
     ) -> dict[str, str]:
         """Map each reason to an excerpt of the text that triggered it.
 
-        A reason is a rule's ``message``; the excerpt is the first match of a rule
-        carrying that message in *texts* (the same texts ``check_task`` saw), with
-        ~30 characters of context on each side. Reasons without a matching rule —
+        Quotes only the hits that decided the classification, per text and with the
+        same layering as ``check_task``: profile rules first, and where they match a
+        text, global rules are not even searched on it. Searching every rule on every
+        text instead (the first version) had two faults (Codex review r1): a global
+        rule sharing a message with a profile rule could quote a text the profile had
+        classified AUTO, and a pathological global regex ran on texts classification
+        never gave it — measured `(a+)+$` on "a"*24+"!": 1.6 s here, 0.000 s in
+        check_task. The classification pass is repeated once, but no rule runs on a
+        text that classification did not also run it on.
+
+        Among the deciding hits, APPROVE outranks AUTO (``_TIER_ORDER``): the
+        approval is about the hits that made it necessary, and a message shared by
+        an AUTO and an APPROVE hit is quoted from the APPROVE one. Excerpt: first
+        such match, ~30 characters of context on each side. Reasons no rule decided —
         e.g. the scientific-investigation bypass, which passes free-form reasons —
-        are simply absent from the result.
+        are absent from the result.
 
         Never raises: it runs inside the approval path, and orchestrator.py treats
         any exception there as "policy check failed" and runs the task UNAPPROVED.
         """
         try:
             wanted = {str(r) for r in reasons}
-            rules: list[PolicyRule] = (
-                _parse_rules_from_dict(profile_rules) if profile_rules else []
-            )
+            p_rules = _parse_rules_from_dict(profile_rules) if profile_rules else []
             with self._lock:
-                rules.extend(self._rules)
+                g_rules = list(self._rules)
+            decisive: list[tuple[PolicyRule, str, re.Match]] = []
+            for text in texts:
+                hits = self._classify_matches(text, p_rules)[1] if p_rules else []
+                if not hits:
+                    hits = self._classify_matches(text, g_rules)[1]
+                decisive.extend((rule, text, m) for rule, m in hits)
+            decisive.sort(key=lambda hit: _TIER_ORDER.index(hit[0].tier))  # stable
             out: dict[str, str] = {}
-            for rule in rules:
-                if rule.message not in wanted or rule.message in out:
-                    continue
-                for text in texts:
-                    m = rule.search(text)
-                    if m is not None and m.group(0).strip():
-                        out[rule.message] = _excerpt(text, m)
-                        break
+            for rule, text, m in decisive:
+                if rule.message in wanted and rule.message not in out and m.group(0).strip():
+                    out[rule.message] = _excerpt(text, m)
             return out
         except Exception as exc:
             logger.debug("policy: match_excerpts failed: %s", exc)

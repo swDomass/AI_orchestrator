@@ -111,3 +111,60 @@ def test_policy_engine_multi_match(tmp_path):
     tier, reasons = engine.check_task("git push and npm publish")
     assert tier == TIER_APPROVE
     assert set(reasons) == {"push", "publish"}
+
+
+# --- match_excerpts follows check_task's profile-before-global layering (Codex r1) ---
+
+def _engine_with(tmp_path, policy_yaml):
+    policy_file = tmp_path / "99_System" / "AI" / "policy.yaml"
+    policy_file.parent.mkdir(parents=True)
+    policy_file.write_text(policy_yaml, encoding="utf-8")
+    return PolicyEngine(vault_path=tmp_path)
+
+
+def test_match_excerpts_quotes_the_text_that_made_the_approval_necessary(tmp_path):
+    """Profile AUTO rule and global APPROVE rule share the message "harmless". The
+    excerpt must come from the text the global rule decided, not from the one the
+    profile classified AUTO."""
+    engine = _engine_with(
+        tmp_path,
+        'approve:\n  - pattern: "git push"\n    message: "harmless"\n',
+    )
+    profile = {"auto": ["harmless"]}
+    texts = ["harmless: fetch documentation", "git push origin main"]
+    assert [engine.check_task(t, profile_rules=profile) for t in texts] == [
+        (TIER_AUTO, ["harmless"]), (TIER_APPROVE, ["harmless"]),
+    ]
+
+    excerpts = engine.match_excerpts(texts, ["harmless"], profile_rules=profile)
+
+    assert excerpts == {"harmless": "git push origin main"}
+
+
+def test_match_excerpts_skips_global_rules_on_texts_the_profile_decided(tmp_path, monkeypatch):
+    """A pathological global regex must not run on a text whose classification the
+    profile settled (measured before the fix: 1.6 s for n=24, check_task 0.000 s).
+    Counted rather than timed: every PolicyRule.search call is recorded."""
+    engine = _engine_with(
+        tmp_path,
+        'approve:\n  - pattern: "(a+)+$"\n    message: "nested quantifier"\n',
+    )
+    profile = {"auto": ["^a+!$"]}
+    long_text = "a" * 24 + "!"
+    texts = [long_text, "a"]
+    calls = []
+    original_search = PolicyRule.search
+
+    def recording_search(rule, text):
+        calls.append((rule.pattern, text))
+        if (rule.pattern, text) == ("(a+)+$", long_text):
+            return None  # never pay the backtracking, even under the reverted code
+        return original_search(rule, text)
+
+    monkeypatch.setattr(PolicyRule, "search", recording_search)
+
+    excerpts = engine.match_excerpts(texts, ["nested quantifier"], profile_rules=profile)
+
+    assert ("(a+)+$", long_text) not in calls, calls
+    assert ("(a+)+$", "a") in calls
+    assert excerpts == {"nested quantifier": "a"}

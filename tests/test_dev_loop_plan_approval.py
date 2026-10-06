@@ -377,6 +377,67 @@ def test_mode_reader_follows_a_policy_edit(monkeypatch, tmp_path):
     assert DevLoopTool()._get_plan_approval_mode() == "approve"
 
 
+_BROKEN_CONTRACT_YAML = (
+    "tool_phases: {dev-loop: {plan_approval: approve}}\n"
+    "tool_contracts: {dev-loop: {stop_conditions: 1}}\n"   # _parse_tool_contract raises
+)
+
+
+def _rewrite(path, text):
+    """Write and move the mtime on, so the engine's mtime cache sees the edit."""
+    path.write_text(text, encoding="utf-8")
+    later = path.stat().st_mtime + 5
+    os.utime(path, (later, later))
+
+
+@pytest.mark.parametrize("before", [None, _mode_yaml("auto")], ids=["no_file_yet", "was_auto"])
+def test_a_failing_section_parser_keeps_the_switch_unreadable_on_every_call(
+    monkeypatch, tmp_path, before,
+):
+    """K6: the reload stores the new mtime BEFORE parsing. While `_load_error` was
+    cleared ahead of the section parsers, a parser raising after that point (here
+    tool_contracts, `stop_conditions: 1` → TypeError) made only the FIRST call fail;
+    every later one read the stale phases as "auto" — and dev-loop ran its plan
+    without asking, although the edit asked for approval."""
+    engine = _install_engine(tmp_path, monkeypatch, before)
+    path = engine.config_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _rewrite(path, _BROKEN_CONTRACT_YAML)
+
+    with pytest.raises(TypeError):        # the triggering reload fails as it always did
+        engine.get_tool_phase("dev-loop", "plan_approval", "auto")
+    for _ in range(2):                     # ...and the switch stays unreadable after it
+        with pytest.raises(ValueError, match="TypeError"):
+            engine.get_tool_phase("dev-loop", "plan_approval", "auto")
+    assert [DevLoopTool()._get_plan_approval_mode() for _ in range(3)] == ["approve"] * 3
+
+
+def test_a_repaired_policy_reloads_and_clears_the_error(monkeypatch, tmp_path):
+    engine = _install_engine(tmp_path, monkeypatch, None)
+    path = engine.config_path
+    _rewrite(path, _BROKEN_CONTRACT_YAML)
+    with pytest.raises(TypeError):
+        engine.get_tool_phase("dev-loop", "plan_approval", "auto")
+
+    _rewrite(path, _mode_yaml("approve") + "tool_contracts: {dev-loop: {stop_conditions: [x]}}\n")
+
+    assert engine.get_tool_phase("dev-loop", "plan_approval", "auto") == "approve"
+    assert engine.get_tool_phase("dev-loop", "plan_approval", "auto") == "approve"
+    assert engine._load_error is None
+
+
+def test_a_fresh_engine_on_a_failing_section_parser_still_cannot_be_built(tmp_path):
+    """Control for the other path, unchanged: built on that file, the engine's
+    constructor raises, so get_engine() raises on every call — the mode reader
+    answers "approve" and the gate halts with approval_unavailable."""
+    ai = tmp_path / "vault" / "99_System" / "AI"
+    ai.mkdir(parents=True)
+    (ai / "policy.yaml").write_text(_BROKEN_CONTRACT_YAML, encoding="utf-8")
+
+    with pytest.raises(TypeError):
+        policy_module.PolicyEngine(vault_path=tmp_path / "vault")
+
+
 def test_unreadable_policy_halts_unless_approved(monkeypatch, tmp_path, telegram, cwd):
     """End to end: a policy.yaml that exists but cannot be parsed asks for approval."""
     _patch(monkeypatch, tmp_path)

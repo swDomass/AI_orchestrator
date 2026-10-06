@@ -307,7 +307,18 @@ class PolicyEngine:
             self._load_rules_locked(path)
 
     def _load_rules_locked(self, path: Path) -> None:
-        """Parse policy.yaml into PolicyRule list. Caller must hold self._lock."""
+        """Parse policy.yaml into PolicyRule list. Caller must hold self._lock.
+
+        `_load_error` is cleared only once EVERY section has parsed (2026-10-06, K6).
+        A section parser that raises — `stop_conditions: 1` makes
+        `_parse_tool_contract` raise TypeError — records the error and re-raises, so
+        the triggering call fails exactly as before. The caller has already stored the
+        new mtime, so no later call re-parses; with the error cleared up front, every
+        call after the first read the stale `_tool_phases` as "auto" and dev-loop
+        executed without its plan approval. Sections parsed before the failing one are
+        applied as before (unchanged on purpose: an all-or-nothing rewrite would drop
+        rules the same edit added).
+        """
         try:
             import yaml
             with open(path, encoding="utf-8") as f:
@@ -324,8 +335,24 @@ class PolicyEngine:
         if not isinstance(data, dict):
             self._load_error = f"top level is {type(data).__name__}, not a mapping"
             return
+        try:
+            self._apply_sections_locked(data)
+        except Exception as e:
+            logger.warning("policy: could not parse %s: %s", path, e)
+            self._load_error = f"{type(e).__name__}: {e}"
+            raise
         self._load_error = None
 
+        logger.debug(
+            "policy: loaded %d rules, %d tool policies, %d tool contracts from %s",
+            len(self._rules), len(self._tool_providers), len(self._tool_contracts), path,
+        )
+
+    def _apply_sections_locked(self, data: dict) -> None:
+        """Parse and apply the sections of one policy.yaml mapping, in this order:
+        rules, tool_providers, tool_contracts, tool_phases. Each is applied as soon as
+        it has parsed. Caller holds the lock and owns `_load_error` (see
+        _load_rules_locked)."""
         self._rules = _parse_rules_from_dict(data)
 
         providers_raw = data.get("tool_providers") or {}
@@ -358,11 +385,6 @@ class PolicyEngine:
             )
             phases_raw = {}
         self._tool_phases = {str(k): v for k, v in phases_raw.items()}
-
-        logger.debug(
-            "policy: loaded %d rules, %d tool policies, %d tool contracts from %s",
-            len(self._rules), len(self._tool_providers), len(self._tool_contracts), path,
-        )
 
     # ------------------------------------------------------------------
     # Classification

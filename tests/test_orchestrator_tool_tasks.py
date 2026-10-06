@@ -1514,7 +1514,10 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
         def is_preapproved(self, _category):
             return False
 
-        def request_approval(self, _task_text, _reasons):
+        def request_approval(self, _task_text, _reasons, _timeout_sec=0, **_context):
+            # **_context: cwd/checked_texts/profile_rules since 2026-10-05. A fake
+            # without it raises TypeError, which run_once books as "policy check
+            # failed" and then runs the task unapproved — this test caught exactly that.
             return "skipped"
 
     monkeypatch.setattr(policy_module, "get_engine", lambda: FakeEngine())
@@ -1538,6 +1541,48 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
     assert result is False
     mark_retry.assert_called_once()
     select_provider.assert_not_called()
+
+
+def test_run_once_approval_request_carries_cwd_and_the_checked_texts(monkeypatch):
+    """The approval message can only show cwd and trigger excerpts if run_once hands
+    them over: cwd as resolved, and the texts check_task classified (tags stripped,
+    subtasks included) — not the raw queue line."""
+    task = "Deploy and git push the release #claude_sonnet #parallel"
+    queue_item = SimpleNamespace(task_text=task, line_no=11, subtasks=("Tag setzen #codex",))
+    engine = Mock()
+    engine.check_task.side_effect = lambda text, profile_rules=None: (
+        policy_module.TIER_APPROVE, ["git push to remote"],
+    )
+    engine.is_preapproved.return_value = False
+    engine.request_approval.return_value = "skipped"
+
+    monkeypatch.setattr(policy_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [queue_item])
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [task])
+    monkeypatch.setattr(orchestrator, "has_cwd_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: "/srv/proj_x")
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_shutdown_tag", lambda _task: False)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator.memory_module, "archive_old_memories", lambda: 0)
+    monkeypatch.setattr(orchestrator.memory_module, "get_context_for_task", lambda *_a, **_kw: "")
+    monkeypatch.setattr(orchestrator, "mark_retry", Mock(return_value=True))
+    monkeypatch.setattr(orchestrator, "select_provider", Mock(side_effect=AssertionError("ran")))
+    monkeypatch.setattr(orchestrator, "append_log", lambda *_a, **_kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *_a, **_kw: None)
+
+    assert orchestrator.run_once() is False
+
+    engine.request_approval.assert_called_once()
+    args, kwargs = engine.request_approval.call_args
+    assert args == (task, ["git push to remote"])
+    assert kwargs["cwd"] == "/srv/proj_x"
+    assert kwargs["checked_texts"] == [
+        orchestrator.strip_metadata_tags(task), orchestrator.strip_metadata_tags("Tag setzen #codex"),
+    ]
+    assert "#claude_sonnet" not in kwargs["checked_texts"][0]
+    assert kwargs["profile_rules"] is None
 
 
 def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
@@ -2237,6 +2282,103 @@ def test_every_verify_site_restamps_on_failure():
     assert calls.count("_restamp_after_failed_verify") == 3, (
         calls.count("_restamp_after_failed_verify")
     )
+
+
+# The neighbours above stub _verify_task_result itself. This one runs the REAL pin, the
+# real verify dispatch and a real .py check against a real queue file: the provider
+# reports success, the artefacts it was asked for do not exist (njtaxr, 2026-09-03).
+
+_REELS = ("reel-k01-instagram.md", "reel-k01-tiktok.md", "reel-k01-youtube.md")
+
+_REEL_CHECK = (
+    "import pathlib, sys\n"
+    "here = pathlib.Path(__file__).resolve().parent\n"
+    f"missing = [n for n in {_REELS!r} if not (here / n).is_file()]\n"
+    "print('fehlt: ' + ', '.join(missing) if missing else 'alle drei da')\n"
+    "sys.exit(1 if missing else 0)\n"
+)
+
+
+def _real_verify_run(tmp_path, monkeypatch, *, writes_reels: bool):
+    project = tmp_path / "WL-SocialMedia"
+    project.mkdir()
+    (project / "check_reels.py").write_text(_REEL_CHECK, encoding="utf-8")
+    q_file = tmp_path / "agent-queue.md"
+    q_file.write_text(
+        "## Queue\n"
+        "- [ ] Rendere die Reel-Assets für Kleid K-01 #id:reel #verify:check_reels.py\n"
+        "\n"
+        "- [ ] Poste die Reels #needs:reel\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("queue_manager.QUEUE_FILE", q_file)
+
+    def provider_run(*_a, **_kw):
+        if writes_reels:
+            for name in _REELS:
+                (project / name).write_text("ok", encoding="utf-8")
+        return (
+            SimpleNamespace(
+                success=True, output="Alle drei Reels gerendert.", error=None,
+                input_tokens=0, output_tokens=0, cache_creation_input_tokens=0,
+                cache_read_input_tokens=0, session_id=None,
+            ),
+            False,
+        )
+
+    spans: list = []
+
+    def record_span(span):
+        spans.append(span)
+
+    notify_done = Mock()
+    _no_worktree_gate(monkeypatch)
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: str(project))
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: SimpleNamespace(
+        name="claude", set_cooldown=Mock()))
+    monkeypatch.setattr(orchestrator, "_run_with_retry", provider_run)
+    monkeypatch.setattr(orchestrator, "_git_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "TRACK_FILE_CHANGES", False)
+    monkeypatch.setattr(orchestrator, "cleanup_done_tasks", lambda *a, **kw: 0)
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_started", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_task_done", notify_done)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator._RunSpan, "emit", record_span)
+    return q_file, spans, notify_done
+
+
+def _reel_line(q_file):
+    return next(ln for ln in q_file.read_text(encoding="utf-8").splitlines() if "#id:reel" in ln)
+
+
+def test_provider_success_with_failing_verify_script_ends_red(tmp_path, monkeypatch):
+    q_file, spans, notify_done = _real_verify_run(tmp_path, monkeypatch, writes_reels=False)
+    orchestrator.run_once()
+
+    line = _reel_line(q_file)
+    assert line.startswith("- [x]"), line
+    assert "❌" in line and "✅" not in line, line
+    assert spans and spans[0].error_code == "verify_failed", [s.error_code for s in spans]
+    notify_done.assert_not_called()
+    # orchestrator's binding of queue_manager.read_queue_items — reads the patched file.
+    dependent = next(t for t in orchestrator.read_queue_items() if "Poste" in t.task_text)
+    assert dependent.blocked_reason != "", q_file.read_text(encoding="utf-8")
+
+
+def test_provider_success_with_passing_verify_script_ends_green(tmp_path, monkeypatch):
+    """Gegenprobe: same setup, the run really writes the files — the check passes."""
+    q_file, spans, notify_done = _real_verify_run(tmp_path, monkeypatch, writes_reels=True)
+    orchestrator.run_once()
+
+    line = _reel_line(q_file)
+    assert "✅" in line and "❌" not in line, line
+    assert spans and spans[0].error_code is None, [s.error_code for s in spans]
+    notify_done.assert_called_once()
 
 
 def test_run_once_bare_vibe_tag_under_missing_policy_is_terminal_provider_not_allowed(

@@ -332,7 +332,7 @@ Codex and Gemini providers also have CLI-level resume capabilities, but `support
 - **Blocked categories**: `rm -rf`, `git push --force/-f`, `git reset --hard`, `git clean -f`, `git checkout -- .`, `DROP/TRUNCATE TABLE`, `DELETE FROM` without WHERE, `format`/`mkfs`/`diskpart`, fork bombs, raw disk writes, credential exfiltration via curl/wget, Windows `del /s`, `rd /s /q`, `Remove-Item -Recurse -Force`.
 - CWD validation against `ALLOWED_CWD_ROOTS` — rejects relative paths and parent escapes.
 - Skill gating checks requirements (bins, env vars, OS, provider) before execution.
-- Policy layer can block tasks pending Telegram approval.
+- Policy layer can block tasks pending Telegram approval. **The request shows content since 2026-10-05**: task text up to ~1500 bytes (was 100 characters), `cwd`, the repo state of a git `cwd` (branch, `git status --short` count, commits ahead of `@{u}` — Repo-Zustand mit Gesamtfrist 5 s, sonst ohne Repo-Block — all git calls together in a daemon thread, because a per-call timeout is not hard on Windows) and, per reason, the text that tripped the rule (`PolicyEngine.match_excerpts()`). It is sent BEFORE the provider runs, so there is no diff to show. **Caution, measured on the way:** `run_once()` books ANY exception in the approval path as `policy check failed` and runs the task **unapproved** (fail-open, pre-existing, not changed here) — code there must never raise, which is why the notifier falls back to the short form instead.
 
 
 ## Per-task auto-commit — HEAD never moves

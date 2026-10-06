@@ -170,6 +170,41 @@ def test_no_delimiter_without_any_context_above_it():
     assert prompt == "## Aufgabe\nSchreibe den Morgenbrief"
 
 
+# --- Completion rule (Anlassfall njtaxr, 2026-09-03: exit ok, artefacts missing) ---
+#
+# The rule rides directly in front of the delimiter. Before it, because the task has to
+# stay last; directly before, so it is the last thing read before the instruction and
+# not the tail of whatever file context happens to precede it.
+
+_CANONICAL_COMPLETION_RULE = (
+    "Abschlussregel: Melde eine Aufgabe nur als erledigt, wenn die in der Aufgabe "
+    "genannten Ergebnisse (Dateien, Ausgaben) existieren und du sie nach dem Schreiben "
+    "selbst geprüft hast. Ein fast erschöpftes Budget rechtfertigt kein verfrühtes "
+    "Fertigmelden — melde dann den Teilstand ausdrücklich als unvollständig."
+)
+
+
+def test_completion_rule_appears_once_directly_before_the_delimiter():
+    prompt = _make_prompt(
+        task="Schreibe den Morgenbrief",
+        memory_context="alte Läufe",
+        file_context="--- Inhalt von 'x.md' ---\nbody",
+    )
+
+    # Counting the canonical text also pins the wording: any drift makes this 0.
+    assert prompt.count(_CANONICAL_COMPLETION_RULE) == 1
+    rule_end = prompt.index(_CANONICAL_COMPLETION_RULE) + len(_CANONICAL_COMPLETION_RULE)
+    # Order first: with the rule BEHIND the delimiter the slice below is empty and the
+    # "nothing in between" check passes vacuously (caught by the mutation probe).
+    assert rule_end <= prompt.index(_delimiter())
+    # Directly before: nothing but the paragraph break between rule and delimiter.
+    assert prompt[rule_end:prompt.index(_delimiter())].strip() == ""
+    # After the file context, under its own heading — not read as the file's last line.
+    assert prompt.index("## Systemregel\n" + _CANONICAL_COMPLETION_RULE) > prompt.index("body")
+    # And the 2026-07-25 invariant survives: the task is still the very end.
+    assert prompt.rstrip().endswith("## Aufgabe\nSchreibe den Morgenbrief")
+
+
 def test_build_prompt_strips_routing_tags_from_task():
     """Scoped to the task section — the skill index legitimately documents these tags."""
     prompt = _make_prompt(task="Mach was #claude_sonnet #every:24h")

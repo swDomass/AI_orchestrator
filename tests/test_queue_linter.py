@@ -40,8 +40,11 @@ def test_queue_with_no_open_tasks_returns_no_findings():
 def test_clean_simple_task_passes(tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
+    # Clean includes a #verify: since verify_absent (2026-10-05) — without one the line
+    # draws a warning, see the verify_absent tests below.
+    (project / "check.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
     monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
-    content = f"## Queue\n- [ ] Review code cwd:{project} #tool:review-loop\n"
+    content = f"## Queue\n- [ ] Review code cwd:{project} #tool:review-loop #verify:check.py\n"
     findings = lint_queue(content)
     assert findings == []
     assert exit_code_for(findings) == 0
@@ -523,6 +526,81 @@ def test_verify_script_missing_absent_without_any_verify_tag(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# No #verify: at all (verify_absent) — Anlassfall njtaxr, 2026-09-03: the run was
+# booked ok while the three reel-*.md files were missing. The target folder stood only
+# in the task's prose, outside the cwd, and no #verify: was there to notice.
+# ---------------------------------------------------------------------------
+
+def _njtaxr_line(project, target, verify=""):
+    """The incident line, anonymised: target folder named only in the prose."""
+    tail = f" {verify}" if verify else ""
+    return (
+        f"Rendere die Reel-Assets für Kleid K-01 — in {target} müssen drei Dateien "
+        f"reel-k01-instagram.md, reel-k01-tiktok.md und reel-k01-youtube.md liegen "
+        f"cwd:{project}{tail}"
+    )
+
+
+@pytest.fixture
+def njtaxr_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
+    project = tmp_path / "WL-SocialMedia"
+    project.mkdir()
+    (project / "check_reels.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    return project, tmp_path / "Reels-Ziel"
+
+
+def test_verify_absent_flags_the_njtaxr_line(njtaxr_dirs):
+    project, target = njtaxr_dirs
+    findings = lint_queue(f"## Queue\n- [ ] {_njtaxr_line(project, target)}\n")
+
+    hits = [f for f in findings if f.code == "verify_absent"]
+    assert len(hits) == 1
+    assert hits[0].level == LEVEL_WARN
+    assert hits[0].line_no == 2
+    assert "kein Beleg-Check (#verify:)" in hits[0].message
+    assert "ein ok wäre ungeprüft" in hits[0].message
+
+
+def test_verify_absent_is_a_warning_not_an_error(njtaxr_dirs):
+    """Non-blocking: a line already scheduled (retry marker) still lints at exit 1, not 2."""
+    project, target = njtaxr_dirs
+    line = f"{_njtaxr_line(project, target)} <!-- retry: 2026-10-06 03:00 -->"
+    findings = lint_queue(f"## Queue\n- [ ] {line}\n")
+
+    assert _codes(findings) == {"verify_absent"}
+    assert _levels(findings) == {LEVEL_WARN}
+    assert exit_code_for(findings) == 1
+
+
+def test_verify_absent_silent_with_verify_tag(njtaxr_dirs):
+    """Gegenprobe: the same line with a #verify: is clean."""
+    project, target = njtaxr_dirs
+    line = _njtaxr_line(project, target, verify="#verify:check_reels.py")
+    findings = lint_queue(f"## Queue\n- [ ] {line}\n")
+
+    assert findings == []
+
+
+def test_verify_absent_ignores_done_lines(njtaxr_dirs):
+    # An open, verified line next to it: a queue of done lines only would return []
+    # from lint_queue's early exit and prove nothing about the check itself.
+    project, target = njtaxr_dirs
+    done = _njtaxr_line(project, target)
+    open_ = _njtaxr_line(project, target, verify="#verify:check_reels.py")
+    content = f"## Queue\n- [x] {done} ✅ 2026-09-03 22:45 (claude)\n- [ ] {open_}\n"
+
+    assert lint_queue(content) == []
+
+
+def test_verify_absent_leaves_a_pathless_tag_to_verify_without_path():
+    """One defect, one finding: a broken tag is not also reported as a missing one."""
+    codes = _codes(lint_queue("## Queue\n- [ ] Brief #verify:\n"))
+    assert "verify_without_path" in codes
+    assert "verify_absent" not in codes
+
+
+# ---------------------------------------------------------------------------
 # HTML comments in the task body
 # ---------------------------------------------------------------------------
 
@@ -703,7 +781,11 @@ def test_format_findings_includes_summary_counts():
 
 def test_run_lint_returns_zero_on_clean_file(tmp_path, monkeypatch, capsys):
     queue = tmp_path / "agent-queue.md"
-    queue.write_text("## Queue\n- [ ] Plain task\n", encoding="utf-8")
+    check = tmp_path / "check.py"
+    check.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    # Absolute and quoted: without cwd: a relative path resolves against the process
+    # cwd, and a Windows temp dir may contain spaces.
+    queue.write_text(f'## Queue\n- [ ] Plain task #verify:"{check}"\n', encoding="utf-8")
     monkeypatch.setattr(queue_linter, "QUEUE_FILE", queue)
     rc = queue_linter.run_lint()
     assert rc == 0

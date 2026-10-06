@@ -58,11 +58,21 @@ tool_providers:
 
 @pytest.fixture
 def open_cwd(tmp_path, monkeypatch):
-    """A cwd the linter accepts, so cwd findings never mask the policy ones."""
+    """A cwd the linter accepts, so cwd findings never mask the policy ones.
+
+    Carries the check script _VERIFIED points at, so the lines asserted to be
+    finding-free below are not flagged as verify_absent either.
+    """
     monkeypatch.setattr("queue_manager.ALLOWED_CWD_ROOTS", [])
     project = tmp_path / "proj"
     project.mkdir()
+    (project / "check.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
     return project
+
+
+# A #verify: that resolves (against open_cwd) — keeps verify_absent out of the tests
+# that assert an otherwise empty finding list.
+_VERIFIED = "#verify:check.py"
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +148,7 @@ def test_model_alias_counts_as_a_forced_provider(
 
 def test_allowed_provider_produces_no_finding(monkeypatch, tmp_path, open_cwd):
     _install_policy(monkeypatch, tmp_path, _BARRING)
-    content = f"## Queue\n- [ ] Baue X cwd:{open_cwd} #tool:dev-loop #codex\n"
+    content = f"## Queue\n- [ ] Baue X cwd:{open_cwd} #tool:dev-loop #codex {_VERIFIED}\n"
 
     assert lint_queue(content) == []
 
@@ -148,7 +158,7 @@ def test_untagged_task_produces_no_finding(monkeypatch, tmp_path, open_cwd):
     # unroutable) is deliberately NOT reported here — the task asked for
     # "requests a provider the policy bars".
     _install_policy(monkeypatch, tmp_path, _BARRING)
-    content = f"## Queue\n- [ ] Baue X cwd:{open_cwd}\n"
+    content = f"## Queue\n- [ ] Baue X cwd:{open_cwd} {_VERIFIED}\n"
 
     assert lint_queue(content) == []
 
@@ -298,7 +308,7 @@ def test_second_opinion_bare_provider_names_resolve():
 
 def test_missing_policy_file_is_a_single_warning(monkeypatch, tmp_path, open_cwd):
     _install_policy(monkeypatch, tmp_path, None)
-    content = f"## Queue\n- [ ] Baue X cwd:{open_cwd}\n"
+    content = f"## Queue\n- [ ] Baue X cwd:{open_cwd} {_VERIFIED}\n"
 
     findings = lint_queue(content)
 

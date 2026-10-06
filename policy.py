@@ -112,12 +112,16 @@ class PolicyRule:
     _compiled: re.Pattern | None = field(default=None, repr=False, compare=False)
 
     def matches(self, text: str) -> bool:
+        return self.search(text) is not None
+
+    def search(self, text: str) -> re.Match | None:
+        """The match itself — the approval message quotes the text that triggered it."""
         if self._compiled is None:
             try:
                 object.__setattr__(self, "_compiled", re.compile(self.pattern, re.IGNORECASE))
             except re.error:
                 object.__setattr__(self, "_compiled", re.compile(re.escape(self.pattern), re.IGNORECASE))
-        return bool(self._compiled.search(text))
+        return self._compiled.search(text)
 
 
 def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
@@ -138,6 +142,22 @@ def _parse_rules_from_dict(data: dict) -> list[PolicyRule]:
         if isinstance(pattern, str):
             rules.append(PolicyRule(pattern=pattern, message=pattern, tier=TIER_DENY))
     return rules
+
+
+_EXCERPT_CONTEXT_CHARS = 30
+_EXCERPT_MAX_CHARS = 120
+
+
+def _excerpt(text: str, m: re.Match) -> str:
+    """The match plus a little context, whitespace collapsed, capped in length."""
+    start = max(0, m.start() - _EXCERPT_CONTEXT_CHARS)
+    end = min(len(text), m.end() + _EXCERPT_CONTEXT_CHARS)
+    snippet = " ".join(text[start:end].split())
+    clipped_tail = end < len(text)
+    if len(snippet) > _EXCERPT_MAX_CHARS:
+        snippet = snippet[:_EXCERPT_MAX_CHARS - 1].rstrip()
+        clipped_tail = True
+    return ("…" if start > 0 else "") + snippet + ("…" if clipped_tail else "")
 
 
 def _coerce_provider_list(raw) -> list[str] | None:
@@ -383,14 +403,30 @@ class PolicyEngine:
 
     def _classify(self, task_text: str, rules: list[PolicyRule]) -> tuple[str, list[str], bool]:
         """Returns (tier, messages, had_any_match)."""
-        matches_by_tier: dict[str, list[str]] = {TIER_DENY: [], TIER_APPROVE: [], TIER_AUTO: []}
+        tier, hits = self._classify_matches(task_text, rules)
+        return tier, [rule.message for rule, _ in hits], bool(hits)
+
+    @staticmethod
+    def _classify_matches(
+        task_text: str, rules: list[PolicyRule],
+    ) -> tuple[str, list[tuple[PolicyRule, re.Match]]]:
+        """(winning tier, [(rule, match)] of that tier) — the hits that decide.
+
+        The one place that says which rule matches count: ``_classify`` (and so
+        ``check_task``) reports their messages, ``match_excerpts`` quotes their
+        text. An empty list means nothing matched (tier AUTO).
+        """
+        hits_by_tier: dict[str, list[tuple[PolicyRule, re.Match]]] = {
+            TIER_DENY: [], TIER_APPROVE: [], TIER_AUTO: [],
+        }
         for rule in rules:
-            if rule.matches(task_text):
-                matches_by_tier[rule.tier].append(rule.message)
+            m = rule.search(task_text)
+            if m is not None:
+                hits_by_tier[rule.tier].append((rule, m))
         for tier in _TIER_ORDER:
-            if matches_by_tier[tier]:
-                return tier, matches_by_tier[tier], True
-        return TIER_AUTO, [], False
+            if hits_by_tier[tier]:
+                return tier, hits_by_tier[tier]
+        return TIER_AUTO, []
 
     def check_task(self, task_text: str, profile_rules: dict | None = None) -> tuple[str, list[str]]:
         """Scan task text for all rule patterns.
@@ -451,24 +487,86 @@ class PolicyEngine:
     # Approval request (blocking)
     # ------------------------------------------------------------------
 
+    def match_excerpts(
+        self,
+        texts: list[str],
+        reasons: list[str],
+        profile_rules: dict | None = None,
+    ) -> dict[str, str]:
+        """Map each reason to an excerpt of the text that triggered it.
+
+        Quotes only the hits that decided the classification, per text and with the
+        same layering as ``check_task``: profile rules first, and where they match a
+        text, global rules are not even searched on it. Searching every rule on every
+        text instead (the first version) had two faults (Codex review r1): a global
+        rule sharing a message with a profile rule could quote a text the profile had
+        classified AUTO, and a pathological global regex ran on texts classification
+        never gave it — measured `(a+)+$` on "a"*24+"!": 1.6 s here, 0.000 s in
+        check_task. The classification pass is repeated once, but no rule runs on a
+        text that classification did not also run it on.
+
+        Among the deciding hits, APPROVE outranks AUTO (``_TIER_ORDER``): the
+        approval is about the hits that made it necessary, and a message shared by
+        an AUTO and an APPROVE hit is quoted from the APPROVE one. Excerpt: first
+        such match, ~30 characters of context on each side. Reasons no rule decided —
+        e.g. the scientific-investigation bypass, which passes free-form reasons —
+        are absent from the result.
+
+        Never raises: it runs inside the approval path, and orchestrator.py treats
+        any exception there as "policy check failed" and runs the task UNAPPROVED.
+        """
+        try:
+            wanted = {str(r) for r in reasons}
+            p_rules = _parse_rules_from_dict(profile_rules) if profile_rules else []
+            with self._lock:
+                g_rules = list(self._rules)
+            decisive: list[tuple[PolicyRule, str, re.Match]] = []
+            for text in texts:
+                hits = self._classify_matches(text, p_rules)[1] if p_rules else []
+                if not hits:
+                    hits = self._classify_matches(text, g_rules)[1]
+                decisive.extend((rule, text, m) for rule, m in hits)
+            decisive.sort(key=lambda hit: _TIER_ORDER.index(hit[0].tier))  # stable
+            out: dict[str, str] = {}
+            for rule, text, m in decisive:
+                if rule.message in wanted and rule.message not in out and m.group(0).strip():
+                    out[rule.message] = _excerpt(text, m)
+            return out
+        except Exception as exc:
+            logger.debug("policy: match_excerpts failed: %s", exc)
+            return {}
+
     def request_approval(
         self,
         task_text: str,
         reasons: list[str],
         timeout_sec: int = POLICY_APPROVAL_TIMEOUT_SEC,
+        *,
+        cwd: str | None = None,
+        checked_texts: list[str] | None = None,
+        profile_rules: dict | None = None,
     ) -> str:
         """Send Telegram approval request and block until responded.
+
+        The keyword arguments only enrich the message (cwd, repo state, the text
+        that triggered each reason). ``checked_texts`` are the texts ``check_task``
+        classified — tags stripped, subtasks included — and default to the raw
+        *task_text*. None of it can make the request fail.
 
         Returns: "approved" | "denied" | "skipped" | "timeout"
         """
         from notifier import notify_approval_required
+
+        triggers = self.match_excerpts(
+            checked_texts if checked_texts else [task_text], reasons, profile_rules,
+        )
 
         event = threading.Event()
         with self._lock:
             self._approval_response = ""
             self._approval_event = event
 
-        notify_approval_required(task_text, reasons, timeout_sec)
+        notify_approval_required(task_text, reasons, timeout_sec, cwd=cwd, triggers=triggers)
         logger.info("policy: approval requested for: %s", task_text[:80])
 
         responded = event.wait(timeout=timeout_sec)

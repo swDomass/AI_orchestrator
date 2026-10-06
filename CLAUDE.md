@@ -15,6 +15,19 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Linux, Cloud (2026-10-06, CPython 3.12.3 und 3.13.14, nach Codex-Review r1 zu PR #4):
+# 2878 passed / 0 failed / 7 skipped in 75-78 s — +4 über die 2874 darunter (K1: 2
+# parametrisierte Fälle Diagnose-print, K2: 2 match_excerpts-Schichtung). ruff 1122 und
+# mypy 130/38 unverändert.
+# Linux, Cloud (2026-10-05, CPython 3.12.3 und 3.13.14, nach den Korrekturen aus dem
+# lokalen Review zu PR #4): 2874 passed / 0 failed / 7 skipped in 76-80 s — +5 über die
+# 2869 darunter (1 Git-Gesamtfrist — dauert selbst 5 s, 2 Policy-Semantik, 1 fsmonitor/
+# Submodule, 1 Hilfezeile). ruff 1122 und mypy 130/38 unverändert.
+# Linux, Cloud (2026-10-05, CPython 3.12.3 und 3.13.14, nach Abschlussregel/verify_absent
+# + Freigabe mit Inhalt): 2869 passed / 0 failed / 7 skipped in 73-75 s — +30 über die
+# 2839 vom 2026-10-02 (Teil A +8: 1 Prompt, 5 Linter, 2 End-to-End-Verify; Teil B +22:
+# 21 in tests/test_notifier_approval.py, 1 in test_orchestrator_tool_tasks). ruff 1122
+# und mypy 130/38 unverändert.
 # Linux, Cloud (2026-10-02, CPython 3.12.3 und 3.13.14, nach Lint-Paket 5+6):
 # 2839 passed / 0 failed / 7 skipped in 70-74 s — +2 Regressionstests fuer B023 in
 # test_telegram_listener. Davor (2026-09-24, nach Paket 3+4): 2837 / 7, 2844 gesammelt
@@ -238,7 +251,7 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **Pre-task git snapshot lives in its own ref namespace (2026-09-03)**: `_git_snapshot()` writes the `git stash create` commit to `refs/orchestrator-backup/<timestamp>` via `git update-ref` (empty `oldvalue` = create-only, `_2` suffix on a same-second collision) — **never to `refs/stash`**, which is the user's own list and where the old `git stash store` piled up 11 unreclaimed entries because nothing in the repo ever ran `stash drop`/`clear`/`pop`. `_prune_snapshot_refs()` caps the namespace on each write: `age >= GIT_SNAPSHOT_PROTECT_DAYS (14) AND (age > GIT_SNAPSHOT_MAX_AGE_DAYS (30) OR outside the newest GIT_SNAPSHOT_MAX_COUNT (50))`. The protect window is a **veto** over both caps, not a third equal test. **Begründung neu gefasst 2026-09-11**, als der Per-Task-Auto-Commit landete: die alte Fassung („night tasks deliberately do not commit, so the snapshot is the only undo") war damit an beiden Hälften falsch. Die Schlussfolgerung überlebt, der Grund ist ein anderer — Snapshot und `orch/*`-Branch decken **Verschiedenes** ab. Der Branch trägt das **Ergebnis** des Laufs für die Pfade, die der Commit genommen hat; der Snapshot trägt den Zustand **davor**, Index eingeschlossen, für alles, was der Commit bewusst liegen ließ (fremd gestaged, beim Start schon schmutzig, Konflikt, Rename) — plus jeden fehlgeschlagenen Lauf und jeden übersprungenen Commit, wo überhaupt kein Branch existiert. Das sind genau die Fälle, in denen fremde Arbeit im Spiel ist, das Undo ist dort also weiterhin einmalig. Umgekehrt deckt der Branch etwas ab, das der Snapshot nie konnte: `git stash create` erfasst **keine** untracked Dateien, der Commit schon. Deshalb wird auf Task-Erfolg weiterhin nichts gelöscht; der count cap kann in einem Repo mit hoher Änderungsrate ausgehungert werden (bewusst). Scoped by a `startswith(GIT_SNAPSHOT_REF_PREFIX)` re-check per ref, so branches, tags, `refs/stash` and the adjacent `refs/orchestrator-backup-sibling/` are out of reach; never raises. Ref name + `git stash apply <ref>` go to **both** `print` and `logger` — `git stash list` no longer shows the snapshot, and `run_orchestrator.ps1` starts `--watch` without stdout redirection. **Alterung laeuft ueber `committerdate`, nicht ueber den Eintritt in den Namensraum** — ein von Hand hereingeschobener Ref (die 11 Maerz-Archive) behaelt das alte Commit-Datum und faellt beim allerersten Prune; die Ref-*Namen* tragen dieselben alten Timestamps, Namens-Alterung hilft also nicht. Deshalb: jede Loeschung mit Name **und** Sha ins Log (bis `git gc` ueber `git stash apply <sha>` erreichbar), und **mehr als ein Ref in einem Durchgang** geht auf `WARNING` statt `INFO` — ein *routinemaessiger* Prune raeumt hoechstens einen Ref ab, mehrere auf einmal sind die Massenverlust-Form und duerfen im unbeaufsichtigten 03:00-Lauf nicht wie Housekeeping aussehen
 - CWD validation against `ALLOWED_CWD_ROOTS`
 - Skill gating (bins, env vars, OS, provider) before execution
-- Policy layer can block tasks pending Telegram approval
+- Policy layer can block tasks pending Telegram approval. **The request shows content since 2026-10-05**: task text up to ~1500 bytes (was 100 characters), `cwd`, the repo state of a git `cwd` (branch, `git status --short` count, commits ahead of `@{u}` — Repo-Zustand mit Gesamtfrist 5 s, sonst ohne Repo-Block — all git calls together in a daemon thread, because a per-call timeout is not hard on Windows) and, per reason, the text that tripped the rule (`PolicyEngine.match_excerpts()`). It is sent BEFORE the provider runs, so there is no diff to show. **Caution, measured on the way:** `run_once()` books ANY exception in the approval path as `policy check failed` and runs the task **unapproved** (fail-open, pre-existing, not changed here) — code there must never raise, which is why the notifier falls back to the short form instead
 
 Full pattern catalog → [`docs/architecture/patterns.md#safety-rules-enforced-in-code--details`](docs/architecture/patterns.md#safety-rules-enforced-in-code--details).
 
@@ -249,7 +262,7 @@ Wer an einem dieser Themen arbeitet, ohne eine passende Datei anzufassen (Antwor
 | Thema (Stichworte) | Regeldatei | Auslösende Pfade |
 |---|---|---|
 | Provider-Fallback-Kette, Policy-Gates, uncapped Provider, Modell-/Tag-Regex, Reasoning-Effort, HTTP-429-Resilienz, Token-Schätzung, Test-Fixtures für Provider-Registrierung | `core-dispatch-policy.md` | `dispatcher.py`, `policy.py`, `profiles.py`, `limits.py`, `tests/conftest.py` |
-| Queue-Parser, `#needs:`/`#id:`, HTML-Kommentar-Falle, Prompt-Reihenfolge, `#verify:`, Format-Fehler-Zähler, ❌/✅-Stempel, queue-healing | `queue-and-tasks.md` | `queue_manager.py`, `queue_linter.py`, `queue_healing.py` |
+| Queue-Parser, `#needs:`/`#id:`, HTML-Kommentar-Falle, Prompt-Reihenfolge + Abschlussregel, `#verify:` + `verify_absent`, Format-Fehler-Zähler, ❌/✅-Stempel, queue-healing | `queue-and-tasks.md` | `queue_manager.py`, `queue_linter.py`, `queue_healing.py` |
 | Hauptschleife, `main()`-Crash-Breaker, `_snapshot_dir`-`nul`-Bug, Shutdown-State-Machine, Logging | `orchestrator-runtime.md` | `orchestrator.py`, `shutdown.py`, `logging_setup.py` |
 | Claude/Codex/Gemini/OpenRouter/Vibe/opencode-Provider, Liveness-Watchdog, stdin-Zustellung, Fehlerklassifikation, `auth_expired`-Saga | `providers.md` | `providers/*.py` |
 | dev-loop/review-loop/critical-review/scientific-investigation/brainstorm/security-audit/pr-babysitter, Budget-Landung, Arbeitsbaum-Gate | `tools-catalog.md` | `tools/*.py` |

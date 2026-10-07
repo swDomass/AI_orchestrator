@@ -6,6 +6,7 @@ import pytest
 import limits
 import orchestrator
 import policy as policy_module
+import replay
 from tools.base_tool import ToolResult
 
 
@@ -1516,8 +1517,9 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
 
         def request_approval(self, _task_text, _reasons, _timeout_sec=0, **_context):
             # **_context: cwd/checked_texts/profile_rules since 2026-10-05. A fake
-            # without it raises TypeError, which run_once books as "policy check
-            # failed" and then runs the task unapproved — this test caught exactly that.
+            # without it raises TypeError, which run_once used to book as "policy
+            # check failed" and then run the task unapproved — this test caught
+            # exactly that. Since 2026-10-06 that fault holds the task instead.
             return "skipped"
 
     monkeypatch.setattr(policy_module, "get_engine", lambda: FakeEngine())
@@ -1541,6 +1543,10 @@ def test_run_once_policy_skip_marks_retry_and_does_not_execute(monkeypatch):
     assert result is False
     mark_retry.assert_called_once()
     select_provider.assert_not_called()
+    # Since 2026-10-06 a fault in the skipped branch is caught by the fail-closed hold,
+    # which looks the same from outside (no run, requeued). Only the recorded code
+    # tells a real /skip from that: approval_skipped, not approval_unavailable.
+    assert [r["error_code"] for r in replay.read_runs()] == ["approval_skipped"]
 
 
 def test_run_once_approval_request_carries_cwd_and_the_checked_texts(monkeypatch):
@@ -1583,6 +1589,7 @@ def test_run_once_approval_request_carries_cwd_and_the_checked_texts(monkeypatch
     ]
     assert "#claude_sonnet" not in kwargs["checked_texts"][0]
     assert kwargs["profile_rules"] is None
+    assert [r["error_code"] for r in replay.read_runs()] == ["approval_skipped"]
 
 
 def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
@@ -1616,6 +1623,8 @@ def test_run_once_inline_preapproval_tag_matches_policy_reason(monkeypatch):
     assert result is False
     engine.request_approval.assert_not_called()
     mark_retry.assert_called_once()
+    # Reached execution (no provider free), not a held policy check.
+    assert [r["error_code"] for r in replay.read_runs()] == ["provider_unreachable"]
 
 
 def test_run_once_parallel_exception_marks_retry_instead_of_done(monkeypatch):
@@ -1656,6 +1665,7 @@ def test_run_once_parallel_exception_marks_retry_instead_of_done(monkeypatch):
     assert result is False
     mark_retry.assert_called_once()
     mark_done.assert_not_called()
+    assert [r["error_code"] for r in replay.read_runs()] == ["tool_internal_error"]
 
 
 # ---------------------------------------------------------------------------

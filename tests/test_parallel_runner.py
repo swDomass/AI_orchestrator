@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import parallel_runner as parallel_runner_module
 import queue_manager
+from config import POLICY_APPROVAL_TIMEOUT_SEC
 from limits import AllLimits
 from parallel_runner import (
     SubTask,
@@ -587,3 +588,93 @@ def test_run_single_subtask_does_not_notify_on_other_errors(monkeypatch):
 
     assert result.success is False
     assert notified == []
+
+
+# ── Join cap vs. dev-loop's plan approval wait (2026-10-06) ──────────────────
+
+def _st(tool_name, timeout):
+    return SubTask(text="t", provider_forced=None, cwd=None, tool_name=tool_name, timeout=timeout)
+
+
+def test_join_cap_covers_a_dev_loop_plan_approval_wait():
+    """A dev-loop subtask can wait POLICY_APPROVAL_TIMEOUT_SEC for the Telegram answer
+    plus as long again for the plan-approval lock — on top of its own timeout. A cap
+    without that slack abandoned the subtask mid-wait, and a late /approve then ran the
+    plan in the orphaned daemon thread."""
+    cap = parallel_runner_module._group_join_timeout_sec([(0, _st("dev-loop", 900))])
+
+    assert cap >= 900 + 120 + POLICY_APPROVAL_TIMEOUT_SEC
+    assert cap == 900 + 120 + 2 * POLICY_APPROVAL_TIMEOUT_SEC   # own question + lock wait
+
+
+def test_join_cap_counts_every_dev_loop_question_but_the_lock_wait_once():
+    group = [(0, _st("dev-loop", 900)), (1, _st("review-loop", 300)), (2, _st("dev-loop", 600))]
+
+    cap = parallel_runner_module._group_join_timeout_sec(group)
+
+    assert cap == 900 + 300 + 600 + 120 + 3 * POLICY_APPROVAL_TIMEOUT_SEC
+
+
+def test_join_cap_without_dev_loop_is_unchanged():
+    """Control: nothing in the group waits for a human, so timeout + 120 as before."""
+    group = [(0, _st("review-loop", 900)), (1, _st(None, 300))]
+
+    assert parallel_runner_module._group_join_timeout_sec(group) == 900 + 300 + 120
+
+
+def test_join_cap_counts_every_question_of_the_whole_call():
+    """K7: the plan-approval lock serialises questions across ALL groups, so one group
+    can wait behind every other group's question — not just one. Three groups with one
+    dev-loop each: worst case for the last in lock order is 3 answers; + 1 slack."""
+    one_dev_loop = [(0, _st("dev-loop", 60))]
+
+    cap = parallel_runner_module._group_join_timeout_sec(one_dev_loop, questions_in_call=3)
+
+    assert cap >= 60 + 120 + (1 + 3) * POLICY_APPROVAL_TIMEOUT_SEC
+    # Control: a group that never asks waits for nobody, however many others do.
+    assert parallel_runner_module._group_join_timeout_sec(
+        [(1, _st("review-loop", 60))], questions_in_call=3,
+    ) == 60 + 120
+
+
+def test_run_parallel_hands_every_group_the_questions_of_the_whole_call(monkeypatch):
+    """The wiring half of K7: run_parallel must count across groups, or the cap above
+    is only ever computed per group."""
+    parsed = {
+        "a": SubTask(text="a", provider_forced=None, cwd="C:/a", tool_name="dev-loop", timeout=60),
+        "b": SubTask(text="b", provider_forced=None, cwd="C:/b", tool_name="dev-loop", timeout=60),
+        "c": SubTask(text="c", provider_forced=None, cwd="C:/c", tool_name="dev-loop", timeout=60),
+        "d": SubTask(text="d", provider_forced=None, cwd="C:/d", tool_name="review-loop", timeout=60),
+    }
+    monkeypatch.setattr(parallel_runner_module, "_parse_subtask", lambda text: parsed[text])
+    monkeypatch.setattr(
+        parallel_runner_module, "_run_single_subtask",
+        lambda subtask, idx, limits, memory_context, pause_event, profile=None: SubTaskResult(
+            text=subtask.text, provider_name="mock", success=True, output="ok",
+        ),
+    )
+    created = []
+
+    class FakeThread:
+        def __init__(self, target, args, daemon, name):
+            self._target, self._args, self.name = target, args, name
+            self.join_timeout = None
+            created.append(self)
+
+        def start(self):
+            self._target(*self._args)
+
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(parallel_runner_module.threading, "Thread", FakeThread)
+
+    run_parallel("parent", ("a", "b", "c", "d"), AllLimits())
+
+    caps = {t.name: t.join_timeout for t in created}
+    for group in ("parallel-C:/a", "parallel-C:/b", "parallel-C:/c"):
+        assert caps[group] == 60 + 120 + (3 + 1) * POLICY_APPROVAL_TIMEOUT_SEC, group
+    assert caps["parallel-C:/d"] == 60 + 120

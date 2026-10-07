@@ -19,12 +19,15 @@ Usage in queue:
 
 import hashlib
 import json
+import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
 from config import (
+    POLICY_APPROVAL_TIMEOUT_SEC,
     TOOL_DEV_EXEC_TIMEOUT_SEC,
     TOOL_DEV_PLAN_TIMEOUT_SEC,
     TOOL_DEV_QUALITY_REVIEW_TIMEOUT_SEC,
@@ -107,6 +110,74 @@ _MAX_CAPACITY_PARKS = 5
 # another module and therefore outside `_landing_cap`; the loop skips it when less
 # than this is left, so it cannot silently extend the documented overrun bound.
 _LESSON_CALL_SEC = 120
+
+logger = logging.getLogger(__name__)
+
+# ── Plan approval (policy.yaml `tool_phases.dev-loop.plan_approval`) ─────────
+# A module constant rather than the config value at the call site, so tests can
+# set it to 0 and get a real "timeout" answer from the real engine.
+_PLAN_APPROVAL_TIMEOUT_SEC = POLICY_APPROVAL_TIMEOUT_SEC
+_PLAN_APPROVAL_MODES = ("auto", "approve", "skip")
+_PLAN_APPROVAL_REASON = "dev-loop plan_approval: approve — Plan-Freigabe vor der Ausführung"
+# PolicyEngine.request_approval() answers that are NOT an approval → error_code.
+# Anything else that is not "approved" (an exception, no engine, an answer this
+# table does not know) becomes `approval_unavailable` — and halts just the same.
+_PLAN_REFUSAL_CODES = {
+    "denied": "approval_denied",
+    "skipped": "approval_skipped",
+    "timeout": "approval_timeout",
+}
+# One plan question at a time. `#parallel` runs CWD groups in parallel threads, so
+# two dev-loops can reach the gate together — and the engine has ONE pending slot
+# that /approve answers blindly: the second request would replace the first, the
+# answer the user typed for message 1 would release plan 2, and plan 1 would sit
+# out its timeout. Held only around the request itself, never around provider work.
+_PLAN_APPROVAL_LOCK = threading.Lock()
+
+
+def _ask_plan_approval(task: str, research_and_plan: str, cwd: str | None) -> "tuple[str, str] | None":
+    """Ask for the plan approval and BLOCK. None means approved; otherwise
+    ``(error_code, message)`` for a run that must stop here.
+
+    Goes through the process-wide ``policy.get_engine()`` — dev-loop runs inside
+    the orchestrator process, so this is the same engine whose pending slot the
+    TelegramListener answers with /approve, /deny and /skip. No engine of its own.
+
+    Fail-closed by construction: only the exact answer ``"approved"`` returns
+    None. Until 2026-10-06 this imported a ``notifier.request_approval`` that does
+    not exist; the ImportError was caught as "Plan-Approval uebersprungen" and the
+    run went on without anyone having been asked.
+    """
+    text = f"Dev-Loop Plan fuer: {task[:200]}\n\n{research_and_plan[:1000]}"
+    detail = ""
+    try:
+        from policy import get_engine
+        with _PLAN_APPROVAL_LOCK:
+            response = get_engine().request_approval(
+                text, [_PLAN_APPROVAL_REASON],
+                timeout_sec=_PLAN_APPROVAL_TIMEOUT_SEC, cwd=cwd,
+            )
+    except Exception as exc:
+        response = "error"
+        detail = f"{type(exc).__name__}: {exc}"
+
+    if response == "approved":
+        return None
+    code = _PLAN_REFUSAL_CODES.get(response) if isinstance(response, str) else None
+    if code == "approval_denied":
+        msg = "Plan-Freigabe abgelehnt (Antwort: denied)"
+    elif code == "approval_skipped":
+        msg = "Plan-Freigabe übersprungen (Antwort: skipped)"
+    elif code == "approval_timeout":
+        msg = (f"Plan-Freigabe nicht beantwortet (Antwort: timeout nach "
+               f"{_PLAN_APPROVAL_TIMEOUT_SEC}s)")
+    elif detail:
+        code = "approval_unavailable"
+        msg = f"Plan-Freigabe nicht einholbar ({detail})"
+    else:
+        code = "approval_unavailable"
+        msg = f"Plan-Freigabe ohne verwertbare Antwort (Antwort: {response!r})"
+    return code, f"{msg} — Lauf angehalten, nichts ausgeführt."
 
 
 def _task_hash(task: str) -> str:
@@ -367,12 +438,18 @@ def _write_checkpoint(
     park_reason: str | None = None,
     park_count: int = 0,
     known_limits: dict | None = None,
+    plan_approved: bool = False,
 ) -> bool:
     """Write the version-2 state. Returns True only if it is durably on disk.
 
     `known_limits` defaults to None/{} rather than being required like
     `deferred_p3` — it round-trips identically once passed, the default just
     keeps every pre-existing direct caller (tests included) working unchanged.
+
+    `plan_approved` records that THIS plan passed the Telegram plan approval
+    (`plan_approval: approve`). Under that mode a cached plan without it is asked
+    for again before anything executes — see `_record_plan_approval`. A missing
+    key (every file written before 2026-10-06) reads as "not approved".
 
     `park_reason` decides whether the record may ever be RESUMED from:
     `_PARK_CAPACITY` for a run parked by an exhausted quota, None for a plain
@@ -411,6 +488,7 @@ def _write_checkpoint(
             "tokens": tokens.as_kwargs(),
             "dirty_paths": dirty,
             "dirty_snapshot_ok": dirty_ok,
+            "plan_approved": plan_approved,
         })
         return True
     except Exception as exc:
@@ -442,6 +520,33 @@ def _consume_park_licence(cwd: str | None, task_hash: str) -> None:
             _save_state(cwd, task_hash, state)
     except Exception as exc:
         print(f"  [dev-loop] ⚠️ Fortsetzungs-Lizenz konnte nicht entwertet werden: {exc}")
+
+
+def _record_plan_approval(cwd: str | None, task_hash: str, research_and_plan: str) -> None:
+    """Mark the cached plan as approved, in place — only if it is THIS plan.
+
+    Why the cache needs the mark at all: the plan checkpoint is written BEFORE
+    the approval is asked, and a run that never gets an answer is not always a
+    run that returns. Ctrl+C or a crash during the up-to-600 s wait leaves the
+    checkpoint behind, and the next attempt at the same task would take the cache
+    branch and execute a plan nobody approved. The same holds for a plan cached
+    while the mode was still `auto` — or while the approval import was dead, i.e.
+    every plan cached before 2026-10-06 — and for a `_clear_state` that swallowed
+    an OSError. With the mark, the cache branch asks for an unmarked plan, and a
+    resumed, already-approved run (capacity park) is not asked twice.
+
+    Same in-place shape as `_consume_park_licence`. Never raises: failing to
+    record costs one extra question on the next attempt, never a run without one.
+    """
+    if not cwd:
+        return
+    try:
+        state = _load_state(cwd, task_hash)
+        if isinstance(state, dict) and state.get("research_and_plan") == research_and_plan:
+            state["plan_approved"] = True
+            _save_state(cwd, task_hash, state)
+    except Exception as exc:
+        print(f"  [dev-loop] ⚠️ Plan-Freigabe konnte nicht im Cache vermerkt werden: {exc}")
 
 
 def _is_capacity_error(error: str) -> bool:
@@ -829,14 +934,30 @@ class DevLoopTool(BaseTool):
                       f"{len(current)} eigene Pfade unverändert")
 
     def _get_plan_approval_mode(self) -> str:
-        """Check policy.yaml for plan approval mode: auto | approve | skip."""
+        """policy.yaml ``tool_phases.dev-loop.plan_approval``: auto | approve | skip.
+
+        File, section or key missing → ``"auto"`` (the default stays the default).
+        A value that is there but not one of the three (a typo like ``aprove``),
+        or ANY failure to read it → ``"approve"`` with a warning: a safety switch
+        that cannot be read is not treated as off.
+
+        Until 2026-10-06 this imported a ``policy.load_policy`` that never existed;
+        the ImportError was caught, so ``approve`` and ``skip`` both read as
+        ``"auto"`` and neither ever took effect.
+        """
         try:
-            from policy import load_policy
-            policy = load_policy()
-            phases = policy.get("tool_phases", {}).get("dev-loop", {})
-            return phases.get("plan_approval", "auto")
-        except (ImportError, OSError, ValueError):
-            return "auto"
+            from policy import get_engine
+            mode = get_engine().get_tool_phase("dev-loop", "plan_approval", "auto")
+        except Exception as exc:
+            problem = f"nicht lesbar ({type(exc).__name__}: {exc})"
+        else:
+            if mode in _PLAN_APPROVAL_MODES:
+                return mode
+            problem = f"ungültig ({mode!r}, erlaubt: {'|'.join(_PLAN_APPROVAL_MODES)})"
+        msg = f"policy.yaml tool_phases.dev-loop.plan_approval {problem} → approve"
+        logger.warning("dev-loop: %s", msg)
+        print(f"  [dev-loop] ⚠️ {msg}")
+        return "approve"
 
     def run(
         self,
@@ -1087,6 +1208,10 @@ class DevLoopTool(BaseTool):
 
         cached_state = _load_state(cwd, t_hash) if cwd else None
         cache_phase = "research_and_plan_done" if merged_phase else "research_done"
+        # True once THIS plan passed the plan approval — from the cache, or from the
+        # gate below. Carried into every later checkpoint so a capacity-parked,
+        # approved run resumes without being asked a second time.
+        plan_approved = False
 
         # `.get(...)` and not `[...]`: a state file carrying the right tool, task_hash
         # and phase but no plan used to raise KeyError straight out of the tool. That
@@ -1098,6 +1223,7 @@ class DevLoopTool(BaseTool):
                 and cached_state.get("research_and_plan"):
             print(f"  [dev-loop] Research+Plan aus Cache geladen (task_hash={t_hash})")
             research_and_plan = cached_state["research_and_plan"]
+            plan_approved = cached_state.get("plan_approved") is True
             all_outputs.append(f"--- Research+Plan (cached) ---\n{research_and_plan}")
         else:
             if not is_cached_provider_available(provider.name):
@@ -1196,29 +1322,39 @@ class DevLoopTool(BaseTool):
                 park_count=park_count,
             )
 
-            # Telegram approval if configured (only if plan is part of output)
-            if merged_phase and plan_approval_mode == "approve":
-                try:
-                    from notifier import request_approval
-                    approved = request_approval(
-                        f"Dev-Loop Plan fuer: {task[:100]}\n\n{research_and_plan[:500]}",
-                        timeout=600,
-                    )
-                    if not approved:
-                        msg = "Plan wurde via Telegram abgelehnt."
-                        print(f"  [dev-loop] {msg}")
-                        notify_tool_done(self.name, 0, False, msg)
-                        return ToolResult(
-                            success=False,
-                            output="\n\n".join(all_outputs),
-                            iterations=0,
-                            error=msg,
-                            **tokens.as_kwargs(),
-                        )
-                except (ImportError, OSError, ValueError) as exc:
-                    print(f"  [dev-loop] Plan-Approval uebersprungen (Fehler: {exc})")
-
             time.sleep(TOOL_INTER_STEP_SLEEP_SEC)
+
+        # ── Plan approval (policy.yaml tool_phases.dev-loop.plan_approval: approve) ──
+        # After BOTH branches, not only after a fresh plan: a cached plan is asked for
+        # too unless it carries the approval mark (see _record_plan_approval for the
+        # bypasses that closes). A resumed run whose plan WAS approved is not asked
+        # again. Only "approved" continues; every other outcome — denied, skipped,
+        # timeout, any exception on the way — halts the run here, before the first
+        # execution call, and drops the cached plan so the next attempt plans and
+        # asks afresh. Not retryable: a retry would re-run Research+Plan and wait
+        # another _PLAN_APPROVAL_TIMEOUT_SEC, every time, while Telegram is down.
+        if merged_phase and plan_approval_mode == "approve" and not plan_approved:
+            print("  [dev-loop] Plan-Freigabe angefragt (Telegram) — warte auf Antwort ...")
+            refusal = _ask_plan_approval(task, research_and_plan, cwd)
+            if refusal is not None:
+                refusal_code, msg = refusal
+                if cwd:
+                    _clear_state(cwd, t_hash)
+                logger.warning("dev-loop: %s (task_hash=%s)", msg, t_hash)
+                print(f"  [dev-loop] ⛔ {msg}")
+                notify_tool_done(self.name, 0, False, msg)
+                return ToolResult(
+                    success=False,
+                    output="\n\n".join(all_outputs),
+                    iterations=0,
+                    error=msg,
+                    error_code=refusal_code,
+                    retryable=False,
+                    **tokens.as_kwargs(),
+                )
+            plan_approved = True
+            _record_plan_approval(cwd, t_hash, research_and_plan)
+            print("  [dev-loop] ✅ Plan freigegeben")
 
         # ── Phase 2+3: Execute → Dual-Review → Iterate ───────────────────────
         previous_quality_findings: list[str] = list(previous_quality_findings_seed)
@@ -1263,6 +1399,7 @@ class DevLoopTool(BaseTool):
                 tokens=tokens,
                 park_reason=_PARK_CAPACITY,
                 park_count=park_count + 1,
+                plan_approved=plan_approved,
             )
             if saved:
                 msg = (f"Kontingent erschöpft in {phase_label} (Iteration {iteration}) "

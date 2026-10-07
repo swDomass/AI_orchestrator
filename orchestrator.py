@@ -2136,6 +2136,18 @@ def _execute_tool_task(
         )
 
 
+class _UnusableApprovalAnswerError(Exception):
+    """request_approval() answered something other than approved/denied/timeout/skipped.
+
+    Raised inside run_once()'s policy block so that such an answer takes the SAME
+    hold as every other fault there — one hold path, not a copy of it. Reachable,
+    not only defensive: the engine has one pending slot, `_respond()` releases its
+    lock before `event.set()`, and a second `request_approval()` in that window
+    resets the answer to "" — the first waiter then wakes with "" and, before
+    2026-10-06, fell through into execution as if approved.
+    """
+
+
 def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) -> bool | None:
     """
     Process all open tasks in the queue once.
@@ -2518,11 +2530,50 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         _span.retry("approval_skipped")
                         _span.emit()
                         return False
+                    elif response != "approved":
+                        # Only the exact answer "approved" runs the task. "", None or
+                        # an unknown word is not an approval: hand it to the hold below.
+                        raise _UnusableApprovalAnswerError(
+                            f"Freigabe-Antwort {response!r} ist keine Freigabe"
+                        )
                     # "approved" → continue
-        except ImportError:
-            pass
         except Exception as e:
-            _log.warning("policy check failed: %s", e)
+            # Fail-closed since 2026-10-06, ImportError included. Both branches used
+            # to fall through into execution (`except ImportError: pass`, and a
+            # warning for everything else): the task then ran without the approval
+            # AND without the DENY check — also when the user had answered /deny and
+            # only the re-stamp after it raised. Now any fault in classification or
+            # approval — including an answer that is not an approval at all
+            # (_UnusableApprovalAnswerError) — holds the task like the `timeout` branch:
+            # it stays open, is retried in 10 minutes and never runs in this pass. Every report is
+            # best effort, so none of them can keep the requeue from being tried;
+            # if the requeue fails too, the line is still open and the next cycle
+            # checks it again.
+            msg = f"Policy-Prüfung gestört — Task bleibt in Queue: {type(e).__name__}: {e}"
+            _log.warning("%s (task: %.60s)", msg, task, exc_info=True)
+            try:
+                append_log(msg)
+                print(f"  ⛔ {msg}")
+            except Exception as report_exc:
+                _log.debug("policy hold: report failed: %s", report_exc)
+            try:
+                notify_error(task, "policy", msg)
+            except Exception as notify_exc:
+                _log.debug("policy hold: notify_error failed: %s", notify_exc)
+            reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+            try:
+                requeued = _mark_retry_checked(
+                    task, reset_at, queue_line_no=queue_task.line_no, subtasks=task_subtasks,
+                )
+            except Exception as mark_exc:
+                _log.warning("policy hold: requeue failed, task stays open: %s", mark_exc)
+                requeued = False
+            if requeued:
+                _span.retry("approval_unavailable")
+            else:
+                _span.error("approval_unavailable")
+            _span.emit()
+            return False
 
         # --- Clean-worktree precondition (2026-09-04) ---
         # The last gate before anything runs. A tool that produces the diff its own

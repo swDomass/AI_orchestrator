@@ -22,7 +22,12 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 # test_orchestrator_policy_fail_closed +21, test_orchestrator_tool_tasks +4,
 # test_telegram_listener +3, test_orchestrator_prompt +2, test_queue_linter_policy +2
 # (test_notifier_approval und test_parallel_runner schärfen bestehende Tests).
-# ruff 1122, mypy 125/38 unverändert.
+# ruff 1122 unverändert, mypy 122/38 — −3 gegen master, die toten load_policy-Importe in
+# tools/review_loop.py (Punkt 3); die Erstfassung dieser Zeile sagte "125/38 unverändert",
+# gemessen war das nur nach Punkt 2.
+# Korrekturrunde 1 zu PR #6 (2026-10-08, CPython 3.12.3 und 3.13.16): 3054 passed /
+# 0 failed / 7 skipped in 87-97 s — +14 (K1: 4 in test_orchestrator_policy_fail_closed,
+# 5 in test_notifier_unit; K2: 5 in test_queue_linter_policy). ruff 1122, mypy 122/38.
 # Linux, Cloud (2026-10-06, CPython 3.12.3 und 3.13.16, nach Korrekturrunde 2 zu PR #5):
 # 2960 passed / 0 failed / 7 skipped in 81-85 s — +6 über die 2954 darunter (K6: 4 in
 # test_dev_loop_plan_approval — Ladefehler im Abschnittsparser, Reparatur, frische Engine;

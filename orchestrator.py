@@ -276,11 +276,12 @@ def _clear_auth_expired_notice(provider_name: str) -> None:
 # 1): notifier._send swallows network errors, Telegram 5xx/429 and timeouts and returns
 # False, and recording such an alert silenced the cause for the whole window although
 # nothing had arrived. An undelivered alert is tried again on the next hold, every 10
-# minutes as before the throttle; a Telegram that keeps failing (or is switched off,
-# NOTIFY_ON_ERROR) produces attempts, not a flood, because none of them arrives. The
-# all-clear likewise forgets the causes only once send_message() returned True.
-# Remaining risk, named not built: a send that arrives but still reports False (a
-# timeout after delivery) repeats the alert every 10 minutes until one reports True.
+# minutes per held task as before the throttle; a Telegram that keeps failing (or is
+# switched off, NOTIFY_ON_ERROR) produces attempts, not a flood, because none of them
+# arrives. The all-clear likewise forgets the causes only once send_message() returned
+# True. Remaining risk, named not built: a send that arrives but still reports False
+# (a timeout after delivery) repeats the alert on every hold — as on master, every 10
+# minutes per held task — until one send reports True.
 _POLICY_HOLD_NOTICES: dict[str, tuple[float, bool]] = {}
 # Bound for causes whose text keeps changing; the oldest alert is dropped first.
 _POLICY_HOLD_MAX_CAUSES = 20

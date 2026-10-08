@@ -639,9 +639,12 @@ def test_join_cap_counts_every_question_of_the_whole_call():
 
 def test_run_parallel_hands_every_group_the_questions_of_the_whole_call(monkeypatch):
     """The wiring half of K7: run_parallel must count across groups, or the cap above
-    is only ever computed per group."""
+    is only ever computed per group. Group C:/a carries TWO dev-loop subtasks, so the
+    call holds four questions in three groups: a sum over groups (`min(1, …)` per
+    group) would give three and is told apart from the sum over questions."""
     parsed = {
         "a": SubTask(text="a", provider_forced=None, cwd="C:/a", tool_name="dev-loop", timeout=60),
+        "a2": SubTask(text="a2", provider_forced=None, cwd="C:/a", tool_name="dev-loop", timeout=60),
         "b": SubTask(text="b", provider_forced=None, cwd="C:/b", tool_name="dev-loop", timeout=60),
         "c": SubTask(text="c", provider_forced=None, cwd="C:/c", tool_name="dev-loop", timeout=60),
         "d": SubTask(text="d", provider_forced=None, cwd="C:/d", tool_name="review-loop", timeout=60),
@@ -672,9 +675,10 @@ def test_run_parallel_hands_every_group_the_questions_of_the_whole_call(monkeypa
 
     monkeypatch.setattr(parallel_runner_module.threading, "Thread", FakeThread)
 
-    run_parallel("parent", ("a", "b", "c", "d"), AllLimits())
+    run_parallel("parent", ("a", "a2", "b", "c", "d"), AllLimits())
 
     caps = {t.name: t.join_timeout for t in created}
-    for group in ("parallel-C:/a", "parallel-C:/b", "parallel-C:/c"):
-        assert caps[group] == 60 + 120 + (3 + 1) * POLICY_APPROVAL_TIMEOUT_SEC, group
+    for group in ("parallel-C:/b", "parallel-C:/c"):
+        assert caps[group] == 60 + 120 + (4 + 1) * POLICY_APPROVAL_TIMEOUT_SEC, group
+    assert caps["parallel-C:/a"] == 2 * 60 + 120 + (4 + 1) * POLICY_APPROVAL_TIMEOUT_SEC
     assert caps["parallel-C:/d"] == 60 + 120

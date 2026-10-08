@@ -647,25 +647,44 @@ class ReviewLoopTool(BaseTool):
         return f"Review/Fix-Loop auf uncommitted Changes (max {TOOL_MAX_ITERATIONS}, P1+P2 fixen, P3 als Angebot)"
 
     def _should_verify(self) -> bool:
-        """Check policy.yaml whether verification phase is enabled."""
+        """policy.yaml ``tool_phases.review-loop.verification``: False only for ``skip``.
+
+        File, section or key missing → ``auto`` (verify). ANY failure to read it — an
+        unreadable policy.yaml included — → verify, with a warning: verifying is the
+        safe direction. Read like dev-loop's plan_approval (``get_tool_phase``).
+
+        Until 2026-10-08 this imported a ``policy.load_policy`` that never existed;
+        the ImportError was caught, so ``verification: skip`` never took effect.
+        """
         try:
-            from policy import load_policy
-            policy = load_policy()
-            phases = policy.get("tool_phases", {}).get("review-loop", {})
-            return phases.get("verification", "auto") != "skip"
-        except (ImportError, OSError, ValueError):
-            return True  # default: verify
+            from policy import get_engine
+            value = get_engine().get_tool_phase("review-loop", "verification", "auto")
+        except Exception as exc:
+            msg = (f"policy.yaml tool_phases.review-loop.verification nicht lesbar "
+                   f"({type(exc).__name__}: {exc}) → verifizieren")
+            logger.warning("review-loop: %s", msg)
+            print(f"  [review-loop] ⚠️ {msg}")
+            return True
+        return value != "skip"
 
     def _drift_check_mode(self) -> str:
-        """Return 'auto' | 'always' | 'skip' (default: 'auto')."""
+        """policy.yaml ``tool_phases.review-loop.drift_check_mode``: auto | always | skip.
+
+        Missing or not one of the three → ``auto``; any failure to read it → ``auto``
+        with a warning. ``get_tool_phase`` hands back ``str(value)``, so a yaml bool
+        arrives as ``"True"`` and falls to ``auto`` like any other unknown word.
+        Dead until 2026-10-08 for the same reason as _should_verify.
+        """
         try:
-            from policy import load_policy
-            policy = load_policy()
-            phases = policy.get("tool_phases", {}).get("review-loop", {})
-            mode = phases.get("drift_check_mode", "auto")
-            return mode if mode in ("auto", "always", "skip") else "auto"
-        except (ImportError, OSError, ValueError):
+            from policy import get_engine
+            mode = get_engine().get_tool_phase("review-loop", "drift_check_mode", "auto")
+        except Exception as exc:
+            msg = (f"policy.yaml tool_phases.review-loop.drift_check_mode nicht lesbar "
+                   f"({type(exc).__name__}: {exc}) → auto")
+            logger.warning("review-loop: %s", msg)
+            print(f"  [review-loop] ⚠️ {msg}")
             return "auto"
+        return mode if mode in ("auto", "always", "skip") else "auto"
 
     def run(
         self,

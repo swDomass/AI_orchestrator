@@ -492,10 +492,9 @@ class PolicyEngine:
         and "not configured" must stay distinguishable, and only the caller can
         decide which way to fail.
 
-        Only dev-loop reads this so far. tools/review_loop.py still imports a
-        ``load_policy`` that does not exist, so its ``tool_phases`` keys
-        (``verification``, ``drift_check_mode``) stay inert until that reader is
-        rewired on purpose.
+        Readers: dev-loop (``plan_approval``, since 2026-10-06) and review-loop
+        (``verification``, ``drift_check_mode``, since 2026-10-08 — until then it
+        imported a ``load_policy`` that never existed, and both keys were inert).
         """
         self._reload_if_changed()
         with self._lock:

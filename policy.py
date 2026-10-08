@@ -503,11 +503,18 @@ class PolicyEngine:
         returned as ``str(value)`` WITHOUT validation — the caller knows the
         allowed set (``yes`` parses to ``True`` and comes back as ``"True"``).
 
-        Raises ValueError when the answer cannot be known: the file exists but
-        could not be parsed into a mapping, or the entry for *tool* is not a
-        mapping. Deliberately not *default*: for a safety switch, "unreadable"
-        and "not configured" must stay distinguishable, and only the caller can
-        decide which way to fail.
+        Raises when the answer cannot be known — deliberately not *default*: for a
+        safety switch, "unreadable" and "not configured" must stay distinguishable,
+        and only the caller can decide which way to fail:
+
+        * PolicyUnreadableError (a ValueError) while `_load_error` stands: the file
+          exists but did not parse into a mapping, or a section parser raised on it.
+        * On the one call whose reload hits a failing section parser, that parser's
+          raw exception instead (e.g. TypeError for ``stop_conditions: 1``); every
+          later call raises PolicyUnreadableError until the file loads again.
+        * ValueError when the entry for *tool* is present but not a mapping (a
+          scalar or a list). An entry that is YAML null (``dev-loop:`` with nothing
+          after it) is treated as absent and returns *default*.
 
         Readers: dev-loop (``plan_approval``, since 2026-10-06) and review-loop
         (``verification``, ``drift_check_mode``, since 2026-10-08 — until then it

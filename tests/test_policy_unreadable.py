@@ -253,3 +253,29 @@ def test_deleting_the_file_keeps_the_last_good_phases_and_rules(tmp_path, mode):
 
     assert _get_phase(engine) == mode
     assert engine.check_task(_TASK) == (TIER_APPROVE, ["git push to remote"])
+
+
+# ── Punkt 6.4: rules before a failing section are kept ──────────────────────
+
+def test_rules_parsed_before_a_failing_section_are_applied(tmp_path):
+    """_apply_sections_locked applies each section as soon as it has parsed: the
+    rules (first section) of an edit whose tool_contracts then fail are kept — an
+    all-or-nothing rewrite would drop the APPROVE rule the same edit added.
+
+    Read from `_rules` directly, not through check_task: since Punkt 1 check_task
+    raises while `_load_error` stands, so these rules classify nothing until the
+    file is repaired (then they are re-parsed anyway) — or deleted (Punkt 4): then
+    exactly these rules, from the broken file's first section, are what classifies.
+    """
+    engine = _engine(tmp_path, "tool_providers:\n  default: [claude]\n")   # no rules yet
+    assert engine._rules == []
+    _rewrite(engine.config_path, _BROKEN_SECTION)
+
+    with pytest.raises(TypeError):                 # the triggering reload raises raw
+        engine.get_allowed_providers()
+
+    assert [(r.tier, r.message) for r in engine._rules] == [(TIER_APPROVE, "git push to remote")]
+    _raises_unreadable(engine)                     # ...and classification still holds
+
+    engine.config_path.unlink()
+    assert engine.check_task(_TASK) == (TIER_APPROVE, ["git push to remote"])

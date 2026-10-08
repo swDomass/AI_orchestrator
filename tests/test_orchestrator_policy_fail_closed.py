@@ -24,6 +24,7 @@ from unittest.mock import Mock
 import pytest
 
 import limits
+import notifier
 import orchestrator
 import policy as policy_module
 import replay
@@ -339,3 +340,267 @@ def test_control_a_readable_policy_yaml_reaches_execution(world, monkeypatch, tm
 
     world.select_provider.assert_called_once()
     assert not any("Policy-Prüfung gestört" in line for line in world.log_lines)
+
+
+# ── Alert throttle on the hold (2026-10-08) ──────────────────────────────────
+#
+# Only the Telegram alert is throttled — one per cause and
+# POLICY_HOLD_NOTIFY_WINDOW_SEC. Log, append_log and the requeue run on every hold.
+# The real notify_error runs; the fake is the outermost boundary, notifier._send.
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = _Clock()
+    monkeypatch.setattr(orchestrator.time, "monotonic", fake)
+    return fake
+
+
+@pytest.fixture
+def telegram(world, monkeypatch):
+    sent: list[str] = []
+
+    def _send(text):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(orchestrator, "notify_error", notifier.notify_error)
+    monkeypatch.setattr(notifier, "NOTIFY_ON_ERROR", True)
+    monkeypatch.setattr(notifier, "_send", _send)
+    return sent
+
+
+def _alerts(sent):
+    return [m for m in sent if "Policy-Prüfung gestört" in m]
+
+
+def _all_clears(sent):
+    return [m for m in sent if "wieder in Ordnung" in m]
+
+
+_WINDOW = orchestrator.POLICY_HOLD_NOTIFY_WINDOW_SEC
+
+
+def test_same_cause_alerts_once_while_every_hold_still_logs_and_requeues(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+
+    for _ in range(4):                           # four cycles, 10 minutes apart
+        assert orchestrator.run_once() is False
+        clock.now += 600
+
+    assert len(_alerts(telegram)) == 1, telegram
+    assert "policy.yaml unreadable" in _alerts(telegram)[0]
+    assert "frühestens in 6 h" in _alerts(telegram)[0]
+    # ...and nothing else is throttled:
+    assert world.mark_retry.call_count == 4
+    assert sum("Policy-Prüfung gestört" in line for line in world.log_lines) == 4
+    world.select_provider.assert_not_called()
+
+
+def test_the_log_warning_is_not_throttled(world, monkeypatch, tmp_path, caplog, telegram):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator"):
+        for _ in range(3):
+            orchestrator.run_once()
+
+    assert len(_alerts(telegram)) == 1
+    assert sum("Policy-Prüfung gestört" in r.getMessage() for r in caplog.records) == 3
+
+
+def test_the_same_cause_alerts_again_once_the_window_is_over(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+
+    orchestrator.run_once()
+    clock.now += _WINDOW - 1
+    orchestrator.run_once()
+    assert len(_alerts(telegram)) == 1, "inside the window: throttled"
+    clock.now += 1
+    orchestrator.run_once()
+
+    assert len(_alerts(telegram)) == 2
+
+
+def test_a_different_cause_alerts_at_once(world, monkeypatch, tmp_path, clock, telegram):
+    engine = _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    orchestrator.run_once()
+
+    _rewrite(engine.config_path, _UNPARSEABLE_OTHER)
+    orchestrator.run_once()
+
+    assert len(_alerts(telegram)) == 2
+
+
+def test_different_tasks_held_for_the_same_cause_alert_once(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    other = "Release notes schreiben und git push"
+    for text, line_no in ((_TASK, 7), (other, 8)):
+        item = SimpleNamespace(task_text=text, line_no=line_no)
+        monkeypatch.setattr(orchestrator, "read_queue_items", lambda item=item: [item])
+        monkeypatch.setattr(orchestrator, "read_queue", lambda text=text: [text])
+        orchestrator.run_once()
+
+    assert [c.args[0] for c in world.mark_retry.call_args_list] == [_TASK, other]
+    assert len(_alerts(telegram)) == 1, telegram
+
+
+def test_a_failing_section_parser_is_one_cause_from_the_first_cycle_on(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    """Prüffrage 1: the reload that hits the parser used to surface its raw TypeError,
+    every later one the stored error — two texts, two alerts for one fault."""
+    engine = _install_real_engine(monkeypatch, tmp_path, _GOOD_AUTO)
+    _rewrite(engine.config_path, _BROKEN_SECTION)
+
+    for _ in range(3):
+        assert orchestrator.run_once() is False
+
+    assert len(_alerts(telegram)) == 1, telegram
+    held = [line for line in world.log_lines if "Policy-Prüfung gestört" in line]
+    assert len(held) == 3 and len(set(held)) == 1, held
+
+
+def test_recovery_sends_one_all_clear_and_rearms_the_alert(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    engine = _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    orchestrator.run_once()
+    orchestrator.run_once()
+    assert (len(_alerts(telegram)), len(_all_clears(telegram))) == (1, 0)
+
+    _rewrite(engine.config_path, _GOOD_AUTO)
+    orchestrator.run_once()
+    orchestrator.run_once()
+    assert len(_all_clears(telegram)) == 1, "exactly one all-clear"
+    assert world.select_provider.call_count == 2, "the repaired policy lets tasks run"
+
+    # Broken again, same text, well inside the window: alerted at once, because the
+    # all-clear has forgotten the cause.
+    _rewrite(engine.config_path, _UNPARSEABLE)
+    orchestrator.run_once()
+    assert len(_alerts(telegram)) == 2
+
+
+def test_no_all_clear_without_an_alert_before(world, monkeypatch, tmp_path, clock, telegram):
+    _install_real_engine(monkeypatch, tmp_path, _GOOD_AUTO)
+
+    orchestrator.run_once()
+
+    assert telegram == []
+
+
+def test_a_raising_notify_error_still_requeues_and_is_retried_on_the_next_hold(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    attempts: list[str] = []
+
+    def _send_raises(text):
+        attempts.append(text)
+        raise OSError("telegram socket gone")
+
+    monkeypatch.setattr(notifier, "_send", _send_raises)
+
+    orchestrator.run_once()
+    orchestrator.run_once()
+
+    assert world.mark_retry.call_count == 2, "the requeue never depends on the alert"
+    assert len(_alerts(attempts)) == 2, "an alert that raised is not recorded as sent"
+
+
+def test_a_broken_throttle_state_alerts_anyway_and_requeues(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    """Prüffrage 4: the bookkeeping itself raising must neither swallow the alert nor
+    stop the requeue."""
+    class _Broken(dict):
+        def get(self, *_a, **_kw):
+            raise RuntimeError("state gone")
+
+        def __setitem__(self, *_a):
+            raise RuntimeError("state gone")
+
+    monkeypatch.setattr(orchestrator, "_POLICY_HOLD_NOTICES", _Broken())
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+
+    orchestrator.run_once()
+
+    world.mark_retry.assert_called_once()
+    assert len(_alerts(telegram)) == 1
+
+
+def test_an_approval_path_fault_gets_no_all_clear_and_stays_throttled(
+    world, monkeypatch, clock, telegram,
+):
+    """A passing check_task says nothing about the approval path behind it. Treating it
+    as a recovery would mean an all-clear plus a fresh alert on every cycle of a
+    lasting approval fault — the flood the throttle exists to stop."""
+    engine = _Engine(approval_raises=OSError("approval path down"))
+    monkeypatch.setattr(policy_module, "get_engine", lambda: engine)
+
+    for _ in range(3):
+        orchestrator.run_once()
+        clock.now += 600
+
+    assert engine.approval_calls == 3
+    assert len(_alerts(telegram)) == 1, telegram
+    assert _all_clears(telegram) == []
+
+
+def test_a_clock_running_backwards_alerts_rather_than_staying_silent(clock, telegram):
+    """Prüffrage 2: suppression needs 0 <= elapsed < window, nothing else."""
+    exc = RuntimeError("policy fault")
+    orchestrator._notify_policy_hold(_TASK, exc, "Policy-Prüfung gestört — x", classifying=True)
+    clock.now -= 10
+    orchestrator._notify_policy_hold(_TASK, exc, "Policy-Prüfung gestört — x", classifying=True)
+
+    assert len(_alerts(telegram)) == 2
+
+
+def test_the_throttle_keeps_at_most_twenty_causes(clock, telegram):
+    for n in range(25):
+        clock.now += 1
+        orchestrator._notify_policy_hold(
+            _TASK, RuntimeError(f"fault {n}"), "Policy-Prüfung gestört — x", classifying=True,
+        )
+
+    notices = orchestrator._POLICY_HOLD_NOTICES
+    assert len(notices) == orchestrator._POLICY_HOLD_MAX_CAUSES == 20
+    assert "RuntimeError: fault 0" not in notices, "the oldest is dropped first"
+    assert "RuntimeError: fault 24" in notices
+
+
+def _boom(*_a, **_kw):
+    raise RuntimeError("all-clear broken")
+
+
+@pytest.mark.parametrize("site", ["send_message", "_notify_policy_recovered"])
+def test_a_failing_all_clear_never_holds_the_task(world, monkeypatch, tmp_path, clock, site):
+    """The all-clear runs INSIDE the policy block, whose except holds the task. Its
+    first version logged through a name that does not exist at module level, so its
+    own error handler raised — and every task after a recovery was held."""
+    _install_real_engine(monkeypatch, tmp_path, _GOOD_AUTO)
+    orchestrator._POLICY_HOLD_NOTICES["PolicyUnreadableError: x"] = (clock.now, True)
+    monkeypatch.setattr(orchestrator, site, _boom)
+
+    orchestrator.run_once()
+
+    world.select_provider.assert_called_once()
+    assert not any("Policy-Prüfung gestört" in line for line in world.log_lines)
+    if site == "send_message":
+        assert "PolicyUnreadableError: x" in orchestrator._POLICY_HOLD_NOTICES, (
+            "an all-clear that raised is tried again by the next task that passes"
+        )

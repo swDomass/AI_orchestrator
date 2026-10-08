@@ -156,18 +156,27 @@ def test_empty_task_gets_the_delimiter_without_the_imperative():
     assert prompt.rstrip().endswith("(LEER — die Queue-Zeile enthielt nur Metadaten-Tags)")
 
 
-def test_no_delimiter_without_any_context_above_it():
-    """A prompt that is nothing but the instruction has no boundary to draw."""
+def _prompt_without_context(task: str) -> str:
+    """No SOUL base, no skill index, no memory, no file context — only the task."""
     mock_memory = SimpleNamespace(get_curated_memory=lambda: "", get_daily_context=lambda: "")
     with patch("orchestrator.memory_module", mock_memory), \
          patch("orchestrator.collect_file_context", return_value=""), \
          patch("orchestrator.get_system_prompt", return_value=""), \
          patch("skills.build_index", return_value=""):
         from orchestrator import _build_prompt
-        prompt = _build_prompt("Schreibe den Morgenbrief", "claude")
+        return _build_prompt(task, "claude")
+
+
+def test_no_delimiter_without_any_context_above_it():
+    """A prompt with no context has no boundary to draw — but since 2026-10-08 it
+    still carries the completion rule, which is about the task, not the context.
+    Until then this test pinned `prompt == "## Aufgabe\\n…"`: no rule at all."""
+    prompt = _prompt_without_context("Schreibe den Morgenbrief")
 
     assert _delimiter() not in prompt
-    assert prompt == "## Aufgabe\nSchreibe den Morgenbrief"
+    assert prompt == (
+        "## Systemregel\n" + _CANONICAL_COMPLETION_RULE + "\n\n## Aufgabe\nSchreibe den Morgenbrief"
+    )
 
 
 # --- Completion rule (Anlassfall njtaxr, 2026-09-03: exit ok, artefacts missing) ---
@@ -203,6 +212,25 @@ def test_completion_rule_appears_once_directly_before_the_delimiter():
     assert prompt.index("## Systemregel\n" + _CANONICAL_COMPLETION_RULE) > prompt.index("body")
     # And the 2026-07-25 invariant survives: the task is still the very end.
     assert prompt.rstrip().endswith("## Aufgabe\nSchreibe den Morgenbrief")
+
+
+def test_completion_rule_is_there_without_context_once_and_before_the_task():
+    """Punkt 5 (2026-10-08): the rule no longer rides only with the delimiter."""
+    prompt = _prompt_without_context("Schreibe den Morgenbrief")
+
+    assert prompt.count(_CANONICAL_COMPLETION_RULE) == 1
+    assert prompt.index(_CANONICAL_COMPLETION_RULE) < prompt.index("## Aufgabe")
+    assert prompt.rstrip().endswith("## Aufgabe\nSchreibe den Morgenbrief")
+
+
+def test_completion_rule_without_context_also_for_an_empty_task():
+    """Exact, so neither delimiter variant (normal or PROMPT_TASK_DELIMITER_EMPTY) fits."""
+    prompt = _prompt_without_context("#claude_sonnet #every:24h")
+
+    assert prompt == (
+        "## Systemregel\n" + _CANONICAL_COMPLETION_RULE
+        + "\n\n## Aufgabe\n(LEER — die Queue-Zeile enthielt nur Metadaten-Tags)"
+    )
 
 
 def test_build_prompt_strips_routing_tags_from_task():

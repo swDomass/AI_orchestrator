@@ -2446,3 +2446,77 @@ def test_run_once_bare_vibe_tag_under_missing_policy_is_terminal_provider_not_al
     assert "#tool_providers:vibe" in msg
     mark_retry_mock.assert_not_called()
     assert [s.error_code for s in spans] == ["provider_not_allowed"]
+
+
+# ── Punkt 5 (2026-10-08): `#tool:` tasks never reach _build_prompt ──────────
+#
+# The completion rule now goes into EVERY prompt _build_prompt builds, also one with
+# no context above the task. `#tool:` tasks must not change with it: their prompts are
+# built inside the tools. run_once() calls _build_prompt in two places — the dry-run
+# preview (prints a length, runs nothing) and the single-shot loop. The `if tool_name:`
+# branch ends in `continue`/`return` on every path, so it never falls through into the
+# single-shot loop; this pins that for the three ways a tool run can end.
+
+def _recording_build_prompt(monkeypatch) -> list:
+    built: list = []
+
+    def record(*args, **kwargs):
+        built.append(args)
+        return "prompt"
+
+    monkeypatch.setattr(orchestrator, "_build_prompt", record)
+    return built
+
+
+@pytest.mark.parametrize("outcome", [
+    orchestrator.ToolTaskExecutionOutcome(success=True, finalized=False),
+    orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=False, retryable=True, error="timeout", error_code="timeout",
+    ),
+    orchestrator.ToolTaskExecutionOutcome(
+        success=False, finalized=True, error="boom", error_code="tool_internal_error",
+    ),
+], ids=["success", "retryable", "terminal"])
+def test_a_tool_task_never_reaches_build_prompt(monkeypatch, outcome):
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    exec_mock = Mock(return_value=outcome)
+    built = _recording_build_prompt(monkeypatch)
+    monkeypatch.setattr(
+        orchestrator, "read_queue_items",
+        lambda: [SimpleNamespace(task_text="Task #tool:test-loop", line_no=1)],
+    )
+    monkeypatch.setattr(orchestrator, "read_queue", lambda: [])
+    monkeypatch.setattr(orchestrator, "extract_cwd", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "extract_timeout", lambda _task, default=0: default)
+    monkeypatch.setattr(orchestrator, "extract_tool_tag", lambda _task: "test-loop")
+    monkeypatch.setattr(orchestrator, "get_limits", lambda force_refresh=False: limits.AllLimits())
+    monkeypatch.setattr(orchestrator, "_get_next_retry_sec", lambda _limits: 1)
+    monkeypatch.setattr(orchestrator, "select_provider", lambda *a, **kw: p1)
+    monkeypatch.setattr(orchestrator, "_execute_tool_task", exec_mock)
+    monkeypatch.setattr(orchestrator, "mark_retry", Mock(return_value=True))
+    monkeypatch.setattr(orchestrator, "mark_done", Mock(return_value=True))
+    monkeypatch.setattr(orchestrator, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_error", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_providers_exhausted", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "notify_queue_complete", lambda *a, **kw: None)
+
+    orchestrator.run_once()
+
+    exec_mock.assert_called_once()
+    assert built == [], "a #tool: task must not get a _build_prompt prompt"
+
+
+def test_control_a_single_shot_task_does_reach_build_prompt(monkeypatch):
+    """The recorder sits on the real call path: a plain task goes through it."""
+    p1 = SimpleNamespace(name="claude", set_cooldown=Mock())
+    _stub_single_shot_env(monkeypatch, raw_line="- [ ] Plain claude task", provider=p1)
+    built = _recording_build_prompt(monkeypatch)
+    monkeypatch.setattr(
+        orchestrator, "_run_with_retry",
+        lambda *a, **kw: (orchestrator.RunResult(success=False, error="hang"), False),
+    )
+    monkeypatch.setattr(orchestrator, "mark_retry", Mock(return_value=True))
+
+    orchestrator.run_once()
+
+    assert len(built) == 1

@@ -1225,8 +1225,12 @@ def _build_prompt(
 
     PROMPT_COMPLETION_RULE sits directly in front of the delimiter, under its own
     "## Systemregel" heading: before the delimiter so the task stays last, and with a
-    heading so it cannot read as the tail of the last referenced file in step 6. It rides
-    with the delimiter — a prompt that is nothing but the instruction carries neither.
+    heading so it cannot read as the tail of the last referenced file in step 6. Since
+    2026-10-08 it is there in EVERY prompt built here, also one with no context above the
+    task (no SOUL base, a provider without an entry): the rule is about the task, not
+    about the context. The delimiter still needs context — there is nothing to delimit.
+    `#tool:` tasks never reach this function on their run path; their prompts are built
+    in the tools.
     """
     from skills import build_index, load_skill, progressive_body
 
@@ -1284,10 +1288,12 @@ def _build_prompt(
         parts.append(f"{MEMORY_HISTORY_HEADING}\n{mem_block}")
     if wiki_ctx:
         parts.append(f"## Referenzierte Dateien\n{wiki_ctx}")
-    # Only when something precedes the task — a prompt that is nothing but the instruction
-    # has no context to delimit, and the announcement would refer to nothing.
-    if parts:
-        parts.append(f"## Systemregel\n{PROMPT_COMPLETION_RULE}")
+    # The completion rule always; the delimiter only when something precedes the rule — a
+    # prompt that is nothing but rule and instruction has no context to delimit, and the
+    # announcement would refer to nothing.
+    has_context = bool(parts)
+    parts.append(f"## Systemregel\n{PROMPT_COMPLETION_RULE}")
+    if has_context:
         parts.append(PROMPT_TASK_DELIMITER if clean_task else PROMPT_TASK_DELIMITER_EMPTY)
     # 7. The task LAST — see the docstring for why this position is load-bearing.
     # A queue line consisting only of routing tags strips down to nothing; emitting a

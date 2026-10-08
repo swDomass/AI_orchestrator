@@ -30,8 +30,10 @@ from limits import AllLimits, estimate_task_usage_pct, report_estimated_usage
 
 logger = logging.getLogger(__name__)
 
-# Tools that may block on a human approval inside their run (dev-loop's plan
-# approval, tools/dev_loop.py). Their wait is not part of the subtask's timeout.
+# Tools that may block on a human approval inside their run and whose wait is
+# counted here. Currently only dev-loop (plan approval, tools/dev_loop.py); its wait
+# is not part of the subtask's timeout. tools/scientific_investigation.py:320
+# (`engine.request_approval`) can also wait on a human and is NOT included.
 _APPROVAL_GATED_TOOLS = frozenset({"dev-loop"})
 
 

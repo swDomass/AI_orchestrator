@@ -189,3 +189,67 @@ def test_the_singleton_raises_too(monkeypatch, tmp_path):
 def test_unreadable_is_still_a_value_error():
     """get_tool_phase() raised ValueError before; callers catching that keep working."""
     assert issubclass(PolicyUnreadableError, ValueError)
+
+
+# ── Punkt 4: a broken file that is then deleted (2026-10-08) ────────────────
+#
+# _reload_if_changed returned early on a missing file and never cleared
+# `_load_error`, so get_tool_phase kept raising after "broken, then deleted" — and
+# with check_task raising on it too, every task would have been held until a
+# restart, although a missing file means "runs".
+
+_PHASE_GOOD = _GOOD + "tool_phases:\n  dev-loop:\n    plan_approval: approve\n"
+
+
+def _get_phase(engine: PolicyEngine) -> str:
+    return engine.get_tool_phase("dev-loop", "plan_approval", "auto")
+
+
+def test_a_broken_file_that_is_deleted_reads_as_missing_again(tmp_path):
+    engine = _engine(tmp_path, _UNPARSEABLE)
+    _raises_unreadable(engine)
+    with pytest.raises(ValueError):
+        _get_phase(engine)
+
+    engine.config_path.unlink()
+
+    assert engine.check_task(_TASK) == (TIER_AUTO, [])
+    assert _get_phase(engine) == "auto"
+    assert engine._load_error is None
+
+
+@pytest.mark.parametrize("same_mtime", [False, True], ids=["new_mtime", "same_mtime"])
+def test_a_file_created_after_the_deletion_is_loaded(tmp_path, same_mtime):
+    """mtime is reset on the deletion, so even a new file that carries the deleted
+    one's mtime (a sync restoring it) is read."""
+    engine = _engine(tmp_path, _UNPARSEABLE)
+    path = engine.config_path
+    old = path.stat()
+    _raises_unreadable(engine)
+    path.unlink()
+    engine.check_task(_TASK)                       # sees the file missing
+
+    path.write_text(_PHASE_GOOD, encoding="utf-8")
+    if same_mtime:
+        os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    else:
+        later = old.st_mtime + 5
+        os.utime(path, (later, later))
+
+    assert engine.check_task(_TASK) == (TIER_APPROVE, ["git push to remote"])
+    assert _get_phase(engine) == "approve"
+
+
+@pytest.mark.parametrize("mode", ["approve", "skip"])
+def test_deleting_the_file_keeps_the_last_good_phases_and_rules(tmp_path, mode):
+    """Decided, not built (Punkt 4): a missing file is "nothing new configured", the
+    rule rules and the other sections have always followed. A switch read from the
+    last good file stays — `approve` (the safe side) and `skip` alike."""
+    engine = _engine(tmp_path, _GOOD + f"tool_phases:\n  dev-loop:\n    plan_approval: {mode}\n")
+    _rewrite(engine.config_path, _UNPARSEABLE)
+    _raises_unreadable(engine)
+
+    engine.config_path.unlink()
+
+    assert _get_phase(engine) == mode
+    assert engine.check_task(_TASK) == (TIER_APPROVE, ["git push to remote"])

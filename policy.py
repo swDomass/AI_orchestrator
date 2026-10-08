@@ -310,6 +310,18 @@ class PolicyEngine:
         """Reload policy.yaml if the file has changed since last load."""
         path = self.config_path
         if not path.exists():
+            # A missing file is "nothing configured" — also when the file that was
+            # there before it did not load (2026-10-08). Without clearing the error
+            # here, a broken policy.yaml that is then deleted kept get_tool_phase()
+            # raising and, since check_task() raises on it too, held every task until
+            # a restart. The rules and sections of the last good load stay as they
+            # are (unchanged). mtime 0 makes a file created later load even if it
+            # carries the mtime of the one that was deleted.
+            with self._lock:
+                if self._load_error is not None:
+                    logger.info("policy: %s is gone — its load error no longer applies", path)
+                self._load_error = None
+                self._mtime = 0.0
             return
 
         try:
@@ -481,8 +493,13 @@ class PolicyEngine:
               dev-loop:
                 plan_approval: approve
 
-        Returns *default* when the file is missing, has no ``tool_phases:``
-        section, no entry for *tool*, or no *key* in it. A value that is there is
+        Returns *default* when the file has no ``tool_phases:`` section, no
+        entry for *tool*, or no *key* in it, and when it is missing and never
+        loaded. A file that goes missing AFTER a load keeps answering from the
+        phases of that last good load (2026-10-08: a missing file is "nothing new
+        configured", the same rule rules, providers and contracts follow — so
+        deleting the file lifts neither an ``approve`` nor a ``skip``; a restart
+        or a file without the key does). A value that is there is
         returned as ``str(value)`` WITHOUT validation — the caller knows the
         allowed set (``yes`` parses to ``True`` and comes back as ``"True"``).
 

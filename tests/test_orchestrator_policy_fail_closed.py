@@ -604,3 +604,17 @@ def test_a_failing_all_clear_never_holds_the_task(world, monkeypatch, tmp_path, 
         assert "PolicyUnreadableError: x" in orchestrator._POLICY_HOLD_NOTICES, (
             "an all-clear that raised is tried again by the next task that passes"
         )
+
+
+def test_deleting_a_broken_policy_yaml_lets_tasks_run_again(world, monkeypatch, tmp_path, clock, telegram):
+    """Punkt 4 at run_once level: "broken, then deleted" must not hold until a
+    restart — a missing file means the task runs (and the alert gets its all-clear)."""
+    engine = _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    assert orchestrator.run_once() is False
+    world.select_provider.assert_not_called()
+
+    engine.config_path.unlink()
+    orchestrator.run_once()
+
+    world.select_provider.assert_called_once()
+    assert (len(_alerts(telegram)), len(_all_clears(telegram))) == (1, 1)

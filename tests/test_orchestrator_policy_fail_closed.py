@@ -364,13 +364,23 @@ def clock(monkeypatch):
     return fake
 
 
+class _SendLog(list):
+    """Every text handed to the fake `_send`. `results` scripts its return values
+    (consumed one per send; True once empty) — False is what the real `_send` returns
+    for a network error, Telegram 5xx/429 or a timeout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[bool] = []
+
+
 @pytest.fixture
 def telegram(world, monkeypatch):
-    sent: list[str] = []
+    sent = _SendLog()
 
     def _send(text):
         sent.append(text)
-        return True
+        return sent.results.pop(0) if sent.results else True
 
     monkeypatch.setattr(orchestrator, "notify_error", notifier.notify_error)
     monkeypatch.setattr(notifier, "NOTIFY_ON_ERROR", True)
@@ -654,3 +664,87 @@ def test_a_policy_that_breaks_between_parent_and_subtask_check_holds_the_whole_t
     assert world.mark_retry.call_args.kwargs["subtasks"] == ("sub one", "sub two")
     assert len(_alerts(telegram)) == 1
     assert "Entwarnung" in _alerts(telegram)[0], "a classification fault gets an all-clear"
+
+
+# ── Korrekturrunde 1, K1: only a DELIVERED alert silences its cause ─────────
+#
+# notifier._send swallows network errors, Telegram 5xx/429 and timeouts and returns
+# False. Until this round the hold recorded its cause after notify_error() whatever
+# that returned — one lost first alert meant 6 h of silence while every task was
+# held (review probe: 35 holds over 5 h 50 min, 0 further attempts). Now notify_error
+# reports delivery as a bool and only True is recorded; the all-clear forgets its
+# causes only once send_message() returned True.
+
+def test_an_undelivered_alert_is_tried_again_on_the_next_hold(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    telegram.results = [False, True]
+
+    for _ in range(4):
+        orchestrator.run_once()
+        clock.now += 600
+
+    # 1st: sent, lost → not recorded; 2nd: sent, delivered → recorded; 3rd/4th: throttled.
+    assert len(_alerts(telegram)) == 2, telegram
+    assert world.mark_retry.call_count == 4
+
+
+def test_a_permanently_undelivered_alert_is_tried_on_every_hold(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    """Attempts, not a flood: none of them arrives."""
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    telegram.results = [False] * 4
+
+    for _ in range(4):
+        assert orchestrator.run_once() is False
+        clock.now += 600
+
+    assert len(_alerts(telegram)) == 4
+    assert world.mark_retry.call_count == 4, "the requeue never depends on the alert"
+    assert orchestrator._POLICY_HOLD_NOTICES == {}
+    world.select_provider.assert_not_called()
+
+
+def test_an_undelivered_all_clear_keeps_the_state_and_is_tried_again(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    engine = _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    orchestrator.run_once()                       # alert delivered → recorded
+    assert len(orchestrator._POLICY_HOLD_NOTICES) == 1
+
+    _rewrite(engine.config_path, _GOOD_AUTO)
+    telegram.results = [False]                    # the first all-clear is lost
+    orchestrator.run_once()
+    assert len(_all_clears(telegram)) == 1
+    assert len(orchestrator._POLICY_HOLD_NOTICES) == 1, "kept for the next try"
+
+    orchestrator.run_once()                       # the next passing task tries again
+    assert len(_all_clears(telegram)) == 2
+    assert orchestrator._POLICY_HOLD_NOTICES == {}
+    assert world.select_provider.call_count == 2, "the all-clear never holds a task"
+
+    # Cleared, so a new fault alerts at once although the window is still running.
+    _rewrite(engine.config_path, _UNPARSEABLE)
+    orchestrator.run_once()
+    assert len(_alerts(telegram)) == 2
+
+
+def test_no_all_clear_when_error_notifications_are_off(
+    world, monkeypatch, tmp_path, clock, telegram,
+):
+    """R1-03: with NOTIFY_ON_ERROR off nothing is sent, so nothing is recorded — and
+    without a recorded alert there is no all-clear to send."""
+    engine = _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+    monkeypatch.setattr(notifier, "NOTIFY_ON_ERROR", False)
+
+    orchestrator.run_once()
+    orchestrator.run_once()
+    _rewrite(engine.config_path, _GOOD_AUTO)
+    orchestrator.run_once()
+
+    assert telegram == []
+    assert orchestrator._POLICY_HOLD_NOTICES == {}
+    assert world.mark_retry.call_count >= 2
+    world.select_provider.assert_called_once()

@@ -266,9 +266,21 @@ def _clear_auth_expired_notice(provider_name: str) -> None:
 # cause -> (time.monotonic() of its last alert, raised while classifying). The cause is
 # the exception's class and text WITHOUT the task, so every task held for one fault
 # shares one entry and a different fault alerts at once. time.monotonic() does not
-# move with the wall clock. Main thread only (run_once() is, see the crash register
+# move with the wall clock; across a Windows sleep/hibernate it keeps counting or
+# stands still depending on the platform clock, so at worst a reminder comes earlier
+# or later — never not at all. Main thread only (run_once() is, see the crash register
 # above), so no lock. In-process only: after a restart the first hold alerts again —
 # at most one extra alert per process start, which is wanted.
+#
+# Only a DELIVERED alert is recorded (notify_error() -> True, 2026-10-08, Korrekturrunde
+# 1): notifier._send swallows network errors, Telegram 5xx/429 and timeouts and returns
+# False, and recording such an alert silenced the cause for the whole window although
+# nothing had arrived. An undelivered alert is tried again on the next hold, every 10
+# minutes as before the throttle; a Telegram that keeps failing (or is switched off,
+# NOTIFY_ON_ERROR) produces attempts, not a flood, because none of them arrives. The
+# all-clear likewise forgets the causes only once send_message() returned True.
+# Remaining risk, named not built: a send that arrives but still reports False (a
+# timeout after delivery) repeats the alert every 10 minutes until one reports True.
 _POLICY_HOLD_NOTICES: dict[str, tuple[float, bool]] = {}
 # Bound for causes whose text keeps changing; the oldest alert is dropped first.
 _POLICY_HOLD_MAX_CAUSES = 20
@@ -287,9 +299,10 @@ def _policy_hold_cause(exc: BaseException) -> str:
 def _notify_policy_hold(task: str, exc: BaseException, msg: str, *, classifying: bool) -> None:
     """Send the hold alert unless this cause was alerted within the window. Never raises.
 
-    Decide, send, THEN record. A fault in the bookkeeping before the send errs
-    towards sending; a fault after it costs a duplicate on the next hold, never the
-    alert. A send that raises is not recorded, so the next hold tries again. A
+    Decide, send, THEN record — and record only an alert notify_error() reports as
+    delivered. A fault in the bookkeeping before the send errs towards sending; a
+    fault after it costs a duplicate on the next hold, never the alert. A send that
+    raises or returns False is not recorded, so the next hold tries again. A
     negative elapsed time (impossible for a monotonic clock) alerts as well, so no
     clock jump can keep the throttle silent for good.
 
@@ -315,9 +328,13 @@ def _notify_policy_hold(task: str, exc: BaseException, msg: str, *, classifying:
     if classifying:
         tail += " Sobald die Policy-Prüfung wieder durchläuft, kommt eine Entwarnung."
     try:
-        notify_error(task, "policy", f"{msg}\n\n{tail}")
+        delivered = notify_error(task, "policy", f"{msg}\n\n{tail}")
     except Exception as notify_exc:
         _policy_log.debug("policy hold: notify_error failed: %s", notify_exc)
+        return
+    if delivered is not True:
+        # Not recorded: the next hold tries again (see the block comment above).
+        _policy_log.debug("policy hold: alert not delivered, retried on the next hold: %s", cause)
         return
     if cause is None:
         return
@@ -333,16 +350,19 @@ def _notify_policy_hold(task: str, exc: BaseException, msg: str, *, classifying:
 def _notify_policy_recovered() -> None:
     """Called once every check_task() of a task has returned. Never raises.
 
-    If a classification fault was alerted, send ONE all-clear and forget those causes,
-    so the next fault alerts at once. Kept while the send raises (the next task that
-    passes tries again); a send that merely returns False is not retried. Causes from
-    the approval path stay until they age out (see _notify_policy_hold).
+    If a classification fault was alerted (and that alert delivered — nothing else is
+    recorded), send ONE all-clear and forget those causes, so the next fault alerts at
+    once. The causes are forgotten only once send_message() returns True; while it
+    raises or returns False they stay, and the next task that passes tries again.
+    Causes from the approval path stay until they age out (see _notify_policy_hold).
     """
     try:
         recovered = [c for c, (_, classifying) in _POLICY_HOLD_NOTICES.items() if classifying]
         if not recovered:
             return
-        send_message(_POLICY_RECOVERED_TEXT)
+        if send_message(_POLICY_RECOVERED_TEXT) is not True:
+            _policy_log.debug("policy hold: all-clear not delivered, retried by the next task")
+            return
         for cause in recovered:
             _POLICY_HOLD_NOTICES.pop(cause, None)
         _policy_log.info("policy check recovered: %s", "; ".join(recovered))

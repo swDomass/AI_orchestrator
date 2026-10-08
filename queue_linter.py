@@ -24,8 +24,10 @@ Catches bad queue entries before they reach a provider:
     fallback — orchestrator.py calls forced_provider_policy_violation()), plus the
     two silently-degrading variants #pass2: and #second_opinion:. Registration
     and policy are different questions: the checks above only ask whether a CLI exists
-  - policy.yaml missing (warning) or present-but-unparseable (error) — PolicyEngine
-    reports both as "no restriction configured", so the linter reads the file itself
+  - policy.yaml missing (warning) or present-but-unparseable (error). On the provider
+    side PolicyEngine reports both as "no restriction configured"; on the rule side
+    an unparseable file holds every queue task since 2026-10-08 (check_task raises)
+    while a missing one classifies AUTO. The linter reads the file itself
   - #parallel with no/single subtask, or subtasks sharing CWD
   - HTML comments inside the task body (silently truncate the task text), or at the
     line end without being a valid retry/hang marker (silently dropped on rewrite)
@@ -847,14 +849,31 @@ _NO_ALLOWLIST_CONSEQUENCE = (
 )
 
 
+# What a policy.yaml that exists but does not load means for the RULES since
+# 2026-10-08: PolicyEngine.check_task raises PolicyUnreadableError, and run_once()
+# holds the task instead of classifying it AUTO with no (or stale) rules.
+_UNREADABLE_RULES_CONSEQUENCE = (
+    "der Orchestrator haelt jeden Queue-Task an (Policy-Pruefung gestoert, neuer "
+    "Versuch alle 10 min), bis die Datei wieder parst"
+)
+_UNREADABLE_PROVIDER_SCOPE = (
+    "Provider-Policy (nur noch auf Wegen ohne Policy-Pruefung, z. B. /chat und --dry-run)"
+)
+
+
 def _policy_status() -> LintFinding | None:
     """One file-level finding about policy.yaml itself, or None when it is usable.
 
     The linter reads and parses the file directly instead of asking PolicyEngine,
-    because the engine cannot tell the states apart: a missing file
-    (``_reload_if_changed`` returns early), an unparseable one
-    (``_load_rules_locked`` logs and returns) and a deliberately empty one all
-    surface as ``get_allowed_providers() -> None`` = "no restriction configured".
+    because the engine's provider side cannot tell the states apart: a missing
+    file (``_reload_if_changed`` returns early), an unparseable one
+    (``_load_rules_locked`` records ``_load_error`` and returns) and a deliberately
+    empty one all surface as ``get_allowed_providers() -> None`` = "no restriction
+    configured". The rule side differs since 2026-10-08: for an unparseable file or
+    a non-mapping root ``check_task`` raises ``PolicyUnreadableError`` and
+    run_once() holds every queue task until the file parses again — those findings
+    say so first (``_UNREADABLE_RULES_CONSEQUENCE``). Missing and empty files still
+    classify AUTO.
 
     Three outcomes, deliberately different levels:
 
@@ -872,9 +891,12 @@ def _policy_status() -> LintFinding | None:
 
     All four findings below (missing/unreadable x3/empty) land on the exact same
     ``get_allowed_providers() -> None`` outcome, so they must describe the exact
-    same runtime consequence via ``_NO_ALLOWLIST_CONSEQUENCE`` - "no restriction"
+    same PROVIDER consequence via ``_NO_ALLOWLIST_CONSEQUENCE`` - "no restriction"
     is only true for claude/codex/opencode; ``dispatcher._allows()`` stays
     fail-closed for vibe/openrouter regardless of *why* no allow-list resolved.
+    For the two unreadable variants that the rule side holds on, that provider
+    consequence only reaches paths without a policy check (``/chat``,
+    ``--dry-run``), and the finding says so.
     Saying "jede Provider-Sperre ist weg" for the unreadable/empty cases while
     ``policy_missing`` next to it correctly says the opposite would be the exact
     self-contradiction the 2026-09-17 forced-branch fix removed from the
@@ -914,8 +936,9 @@ def _policy_status() -> LintFinding | None:
     except Exception as exc:  # noqa: BLE001 - yaml/OSError raise a wide family
         return LintFinding(
             LEVEL_ERROR, None, str(path),
-            f"policy.yaml nicht lesbar/parsebar ({exc}) - PolicyEngine meldet das als "
-            f"'keine Einschraenkung'. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
+            f"policy.yaml nicht lesbar/parsebar ({exc}) - Folge fuer die Regeln: "
+            f"{_UNREADABLE_RULES_CONSEQUENCE}. Folge fuer die "
+            f"{_UNREADABLE_PROVIDER_SCOPE}: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
@@ -931,7 +954,8 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml enthaelt kein Mapping (got {type(data).__name__}) - "
-            f"PolicyEngine verwirft das still. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
+            f"Folge fuer die Regeln: {_UNREADABLE_RULES_CONSEQUENCE}. Folge fuer die "
+            f"{_UNREADABLE_PROVIDER_SCOPE}: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 

@@ -16,6 +16,7 @@ AssertionError some outer handler might swallow.
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -257,3 +258,84 @@ def test_control_auto_task_reaches_execution_without_asking(world, monkeypatch):
 
     assert engine.approval_calls == 0
     world.select_provider.assert_called_once()
+
+
+# ── A broken policy.yaml, through a REAL engine (2026-10-08) ─────────────────
+#
+# Until 2026-10-08 such a file reached run_once() as `('auto', [])` (broken at
+# process start) or as the stale last-good rules (broken while running), and the
+# task ran. Now check_task raises PolicyUnreadableError and the hold above applies.
+# Nothing in the policy path is faked here: a real PolicyEngine on a real file in
+# tmp_path, installed as the singleton run_once() asks for.
+
+_GOOD_AUTO = "auto:\n  - \"Deploy release\"\n"          # matches _TASK, decides AUTO
+_UNPARSEABLE = "approve:\n  - pattern: [unclosed\n"
+_UNPARSEABLE_OTHER = "deny: {oops\n"
+_BROKEN_SECTION = _GOOD_AUTO + "tool_contracts: {dev-loop: {stop_conditions: 1}}\n"
+
+
+def _install_real_engine(monkeypatch, tmp_path, text: str) -> policy_module.PolicyEngine:
+    ai = tmp_path / "vault" / "99_System" / "AI"
+    ai.mkdir(parents=True, exist_ok=True)
+    (ai / "policy.yaml").write_text(text, encoding="utf-8")
+    engine = policy_module.PolicyEngine(vault_path=tmp_path / "vault")
+    monkeypatch.setattr(policy_module, "_engine", engine)
+    return engine
+
+
+def _rewrite(path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    later = path.stat().st_mtime + 5
+    os.utime(path, (later, later))
+
+
+def test_broken_policy_yaml_holds_the_task_and_no_provider_runs(world, monkeypatch, tmp_path, caplog):
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator"):
+        assert orchestrator.run_once() is False
+
+    _held(world, caplog)                                  # select_provider never called
+    _requeued_in_ten_minutes(world)
+    (record,) = replay.read_runs()
+    assert record["exit_status"] == replay.EXIT_RETRY
+    assert any("policy.yaml unreadable (" in line for line in world.log_lines), world.log_lines
+
+
+def test_broken_policy_yaml_holds_on_every_cycle(world, monkeypatch, tmp_path, caplog):
+    """The second cycle reads no new mtime — it must hold all the same."""
+    _install_real_engine(monkeypatch, tmp_path, _UNPARSEABLE)
+
+    for _ in range(3):
+        assert orchestrator.run_once() is False
+
+    world.select_provider.assert_not_called()
+    world.mark_done.assert_not_called()
+    assert world.mark_retry.call_count == 3
+    assert [r["error_code"] for r in replay.read_runs()] == ["approval_unavailable"] * 3
+
+
+def test_policy_yaml_broken_while_running_holds_instead_of_using_the_old_rules(
+    world, monkeypatch, tmp_path,
+):
+    engine = _install_real_engine(monkeypatch, tmp_path, _GOOD_AUTO)
+    orchestrator.run_once()
+    assert world.select_provider.call_count == 1     # good file: execution is reached
+    requeues_before = world.mark_retry.call_count     # (the stub has no provider → parked)
+
+    _rewrite(engine.config_path, _UNPARSEABLE)
+    assert orchestrator.run_once() is False
+
+    assert world.select_provider.call_count == 1, "the broken file must not reach execution"
+    assert world.mark_retry.call_count == requeues_before + 1
+    assert any("policy.yaml unreadable (" in line for line in world.log_lines)
+
+
+def test_control_a_readable_policy_yaml_reaches_execution(world, monkeypatch, tmp_path):
+    """Without this the tests above could pass on a set-up that never gets that far."""
+    _install_real_engine(monkeypatch, tmp_path, _GOOD_AUTO)
+
+    orchestrator.run_once()
+
+    world.select_provider.assert_called_once()
+    assert not any("Policy-Prüfung gestört" in line for line in world.log_lines)

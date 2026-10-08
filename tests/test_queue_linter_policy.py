@@ -359,6 +359,22 @@ def test_unreadable_policy_warning_does_not_claim_every_bar_is_gone(
     assert errors and errors[0].level == LEVEL_ERROR
 
 
+@pytest.mark.parametrize("text", ["tool_providers: [unclosed\n", "- just\n- a\n- list\n"],
+                         ids=["unparseable", "top_level_list"])
+def test_unreadable_policy_finding_says_the_queue_is_held(monkeypatch, tmp_path, text):
+    """Since 2026-10-08 such a file holds every queue task (check_task raises).
+    The finding used to say PolicyEngine treats it as 'keine Einschraenkung' —
+    true for the provider side only, and now the opposite of what the rules do."""
+    _install_policy(monkeypatch, tmp_path, text)
+
+    finding = queue_linter._policy_status()
+
+    assert finding is not None and finding.code == "policy_unreadable"
+    assert "haelt jeden Queue-Task an" in finding.message
+    assert "keine Einschraenkung" not in finding.message
+    assert "verwirft das still" not in finding.message
+
+
 def test_non_mapping_policy_root_is_an_error(monkeypatch, tmp_path):
     _install_policy(monkeypatch, tmp_path, "- just\n- a\n- list\n")
     finding = queue_linter._policy_status()

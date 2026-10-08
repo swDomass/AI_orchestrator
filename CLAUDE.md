@@ -15,6 +15,14 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Linux, Cloud (2026-10-08, CPython 3.12.3 und 3.13.16, PR #6: kaputte policy.yaml hält an,
+# Meldungsdrossel, review-loop-Leser, Abschlussregel ohne Kontext, Reste aus PR #5):
+# 3040 passed / 0 failed / 7 skipped — +80 über die 2960 darunter, per --collect-only
+# zugeordnet: test_policy_unreadable 24 (neu), test_review_loop_policy_reader 24 (neu),
+# test_orchestrator_policy_fail_closed +21, test_orchestrator_tool_tasks +4,
+# test_telegram_listener +3, test_orchestrator_prompt +2, test_queue_linter_policy +2
+# (test_notifier_approval und test_parallel_runner schärfen bestehende Tests).
+# ruff 1122, mypy 125/38 unverändert.
 # Linux, Cloud (2026-10-06, CPython 3.12.3 und 3.13.16, nach Korrekturrunde 2 zu PR #5):
 # 2960 passed / 0 failed / 7 skipped in 81-85 s — +6 über die 2954 darunter (K6: 4 in
 # test_dev_loop_plan_approval — Ladefehler im Abschnittsparser, Reparatur, frische Engine;

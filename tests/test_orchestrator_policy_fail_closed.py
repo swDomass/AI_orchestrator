@@ -26,6 +26,7 @@ import pytest
 import limits
 import notifier
 import orchestrator
+import parallel_runner
 import policy as policy_module
 import replay
 
@@ -618,3 +619,38 @@ def test_deleting_a_broken_policy_yaml_lets_tasks_run_again(world, monkeypatch, 
 
     world.select_provider.assert_called_once()
     assert (len(_alerts(telegram)), len(_all_clears(telegram))) == (1, 1)
+
+
+def test_a_policy_that_breaks_between_parent_and_subtask_check_holds_the_whole_task(
+    world, monkeypatch, tmp_path, telegram,
+):
+    """Prüffrage 5: the parent's check_task passes, the file breaks, the subtask's
+    check_task reloads and raises. The task is held as a whole — no partial check,
+    no parallel run — and the cause counts as a classification fault."""
+    engine = _install_real_engine(monkeypatch, tmp_path, _GOOD_AUTO)
+    item = SimpleNamespace(task_text=_TASK, line_no=7, subtasks=("sub one", "sub two"))
+    monkeypatch.setattr(orchestrator, "read_queue_items", lambda: [item])
+    run_parallel = Mock(side_effect=AssertionError("parallel run reached"))
+    monkeypatch.setattr(parallel_runner, "run_parallel", run_parallel)
+    real_check = engine.check_task
+    checked: list[str] = []
+
+    def check_then_break(text, profile_rules=None):
+        # A spy, not a fake: every call goes to the real check_task.
+        checked.append(text)
+        if len(checked) == 2:                  # parent passed; break before the subtask
+            _rewrite(engine.config_path, _UNPARSEABLE)
+        return real_check(text, profile_rules=profile_rules)
+
+    monkeypatch.setattr(engine, "check_task", check_then_break)
+
+    assert orchestrator.run_once() is False
+
+    assert len(checked) == 2, "the second subtask is never checked after the hold"
+    run_parallel.assert_not_called()
+    world.select_provider.assert_not_called()
+    world.mark_done.assert_not_called()
+    world.mark_retry.assert_called_once()
+    assert world.mark_retry.call_args.kwargs["subtasks"] == ("sub one", "sub two")
+    assert len(_alerts(telegram)) == 1
+    assert "Entwarnung" in _alerts(telegram)[0], "a classification fault gets an all-clear"

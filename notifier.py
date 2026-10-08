@@ -135,10 +135,16 @@ def notify_task_done(task: str, provider: str, output: str, change_summary: str 
     _send(header + output_safe + changes_block)
 
 
-def notify_error(task: str, provider: str, error: str) -> None:
-    """Notify about a task error."""
+def notify_error(task: str, provider: str, error: str) -> bool:
+    """Notify about a task error. True only if _send reports the message delivered.
+
+    False when nothing was sent (NOTIFY_ON_ERROR off, Telegram not configured) or the
+    send failed — _send swallows network errors, Telegram 5xx/429 and timeouts. Since
+    2026-10-08 the policy-hold throttle in orchestrator.py records an alert only on
+    True; every other caller ignores the result.
+    """
     if not NOTIFY_ON_ERROR:
-        return
+        return False
 
     with _stats_lock:
         _stats["tasks_failed"] += 1
@@ -147,11 +153,11 @@ def notify_error(task: str, provider: str, error: str) -> None:
     task_safe = _strip_backticks(_truncate(task, 300))
     error_safe = _escape_markdown(_truncate(str(error), 3500))
 
-    _send(
+    return _send(
         f"❌ *Fehler* ({provider_safe})\n"
         f"`{task_safe}`\n\n"
         f"Fehler: {error_safe}"
-    )
+    ) is True
 
 
 def notify_auth_expired(provider_name: str) -> None:

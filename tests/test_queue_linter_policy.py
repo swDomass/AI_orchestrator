@@ -359,6 +359,84 @@ def test_unreadable_policy_warning_does_not_claim_every_bar_is_gone(
     assert errors and errors[0].level == LEVEL_ERROR
 
 
+@pytest.mark.parametrize("text", ["tool_providers: [unclosed\n", "- just\n- a\n- list\n"],
+                         ids=["unparseable", "top_level_list"])
+def test_unreadable_policy_finding_says_the_queue_is_held(monkeypatch, tmp_path, text):
+    """Since 2026-10-08 such a file holds every queue task (check_task raises).
+    The finding used to say PolicyEngine treats it as 'keine Einschraenkung' —
+    true for the provider side only, and now the opposite of what the rules do."""
+    _install_policy(monkeypatch, tmp_path, text)
+
+    finding = queue_linter._policy_status()
+
+    assert finding is not None and finding.code == "policy_unreadable"
+    assert "haelt jeden Queue-Task an" in finding.message
+    assert "keine Einschraenkung" not in finding.message
+    assert "verwirft das still" not in finding.message
+
+
+# Korrekturrunde 1 zu PR #6 (R1-04): a failing SECTION parser holds every queue task
+# just like an unparseable file (_load_error is set, check_task raises), but the
+# linter reported it only as the policy_check_failed warning — or, with an engine
+# already built, not at all.
+_SECTION_BROKEN = {
+    "tool_contracts": _BARRING + "tool_contracts: {dev-loop: {stop_conditions: 1}}\n",
+    "rules": "approve: 5\n" + _BARRING,
+}
+
+
+def _assert_held_finding(finding, path):
+    assert finding is not None
+    assert (finding.code, finding.level) == ("policy_unreadable", LEVEL_ERROR)
+    assert finding.task_text == str(path)
+    assert "ein Abschnitt ist nicht lesbar (TypeError" in finding.message
+    assert "haelt jeden Queue-Task an" in finding.message
+    assert "bis die Datei repariert ist" in finding.message
+    assert "claude/codex/opencode laufen weiter" in finding.message   # provider side kept
+
+
+@pytest.mark.parametrize("section", sorted(_SECTION_BROKEN))
+def test_a_section_error_with_a_running_engine_is_an_error(monkeypatch, tmp_path, section):
+    path = _install_policy(monkeypatch, tmp_path, _BARRING)       # engine built on a good file
+    path.write_text(_SECTION_BROKEN[section], encoding="utf-8")
+
+    _assert_held_finding(queue_linter._policy_status(), path)
+
+
+@pytest.mark.parametrize("section", sorted(_SECTION_BROKEN))
+def test_a_section_error_in_a_fresh_process_is_an_error(monkeypatch, tmp_path, section, open_cwd):
+    """`--lint-queue` builds the engine itself; on such a file get_engine() raises."""
+    vault = tmp_path / "fresh"
+    path = vault / "99_System" / "AI" / "policy.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(_SECTION_BROKEN[section], encoding="utf-8")
+    monkeypatch.setattr(policy_module, "_engine", None)
+    monkeypatch.setattr("config.VAULT_PATH", vault)
+    with pytest.raises(TypeError):
+        policy_module.get_engine()
+
+    findings = lint_queue(f"## Queue\n- [ ] Baue X cwd:{open_cwd} {_VERIFIED}\n")
+
+    (finding,) = [f for f in findings if f.line_no is None]
+    _assert_held_finding(finding, path)
+    assert exit_code_for(findings) == 2
+
+
+def test_an_unrelated_engine_failure_with_a_readable_file_stays_a_warning(monkeypatch, tmp_path):
+    """Control for the narrowed fallback: only a section error is told apart."""
+    vault = tmp_path / "fine"
+    path = vault / "99_System" / "AI" / "policy.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(_BARRING, encoding="utf-8")
+    monkeypatch.setattr("config.VAULT_PATH", vault)
+    monkeypatch.setattr(policy_module, "get_engine", lambda: (_ for _ in ()).throw(OSError("nope")))
+
+    finding = queue_linter._policy_status()
+
+    assert finding is not None
+    assert (finding.code, finding.level) == ("policy_check_failed", LEVEL_WARN)
+
+
 def test_non_mapping_policy_root_is_an_error(monkeypatch, tmp_path):
     _install_policy(monkeypatch, tmp_path, "- just\n- a\n- list\n")
     finding = queue_linter._policy_status()

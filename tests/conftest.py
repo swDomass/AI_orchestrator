@@ -488,6 +488,28 @@ def _isolate_policy_engine(tmp_path: Path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_policy_hold_throttle():
+    """Empty orchestrator's per-cause alert throttle for the policy hold around each test.
+
+    The state is module-level and lives for the process (by design, see
+    orchestrator._POLICY_HOLD_NOTICES). Without this, a test expecting the hold's
+    Telegram alert would pass or fail depending on whether an earlier test was held
+    for the same cause within the window — e.g. the 15 parametrised fault cases in
+    tests/test_orchestrator_policy_fail_closed.py share their exception texts.
+    Only touched when orchestrator is already imported; a later import starts empty.
+    """
+    def _clear():
+        orchestrator_module = sys.modules.get("orchestrator")
+        notices = getattr(orchestrator_module, "_POLICY_HOLD_NOTICES", None)
+        if notices is not None:
+            notices.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
 @pytest.fixture
 def with_opencode():
     """Register opencode in ``dispatcher._providers`` regardless of local CLI/config

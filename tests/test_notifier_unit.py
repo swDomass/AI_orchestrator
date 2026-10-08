@@ -1,6 +1,9 @@
-"""Tests for notifier._escape_markdown() and _truncate() utilities."""
+"""Tests for notifier._escape_markdown() and _truncate() utilities, and notify_error()'s
+delivery result."""
 
+import pytest
 
+import notifier
 from notifier import _escape_markdown, _strip_backticks, _truncate
 
 # ── _escape_markdown ─────────────────────────────────────────────────────────
@@ -87,3 +90,35 @@ def test_send_returns_false_without_token(monkeypatch):
     monkeypatch.setattr("notifier.TELEGRAM_BOT_TOKEN", "")
     from notifier import _send
     assert _send("test message") is False
+
+
+# ── notify_error reports delivery (2026-10-08, Korrekturrunde 1 zu PR #6) ────
+# The policy-hold throttle in orchestrator.py records an alert only when this is
+# True; it used to return None, so a lost alert silenced its cause for 6 h.
+
+
+@pytest.mark.parametrize("enabled, send_result, expected", [
+    (True, True, True),
+    (True, False, False),       # network error / Telegram 5xx/429 / timeout
+    (True, None, False),        # anything but True is not a delivery
+    (False, True, False),       # NOTIFY_ON_ERROR off: nothing sent
+], ids=["delivered", "lost", "non_bool", "notifications_off"])
+def test_notify_error_returns_whether_the_message_was_delivered(
+    monkeypatch, enabled, send_result, expected,
+):
+    sent: list[str] = []
+    monkeypatch.setattr(notifier, "NOTIFY_ON_ERROR", enabled)
+    monkeypatch.setattr(notifier, "_send", lambda text: sent.append(text) or send_result)
+
+    result = notifier.notify_error("Task", "policy", "boom")
+
+    assert result is expected
+    assert len(sent) == (1 if enabled else 0)
+
+
+def test_notify_error_without_telegram_configured_is_false(monkeypatch):
+    """The real _send, Telegram switched off: no network, a plain False."""
+    monkeypatch.setattr(notifier, "NOTIFY_ON_ERROR", True)
+    monkeypatch.setattr(notifier, "TELEGRAM_ENABLED", False)
+
+    assert notifier.notify_error("Task", "policy", "boom") is False

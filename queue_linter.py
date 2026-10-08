@@ -24,8 +24,11 @@ Catches bad queue entries before they reach a provider:
     fallback — orchestrator.py calls forced_provider_policy_violation()), plus the
     two silently-degrading variants #pass2: and #second_opinion:. Registration
     and policy are different questions: the checks above only ask whether a CLI exists
-  - policy.yaml missing (warning) or present-but-unparseable (error) — PolicyEngine
-    reports both as "no restriction configured", so the linter reads the file itself
+  - policy.yaml missing (warning) or present-but-unparseable, or with a section the
+    engine's parser rejects (error). On the provider
+    side PolicyEngine reports both as "no restriction configured"; on the rule side
+    an unparseable file holds every queue task since 2026-10-08 (check_task raises)
+    while a missing one classifies AUTO. The linter reads the file itself
   - #parallel with no/single subtask, or subtasks sharing CWD
   - HTML comments inside the task body (silently truncate the task text), or at the
     line end without being a valid retry/hang marker (silently dropped on rewrite)
@@ -53,14 +56,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import config
 from config import (
     _MODEL_ALIASES_BY_PROVIDER,
     CLAUDE_EFFORT_LEVELS,
     OPENROUTER_API_KEY,
+    POLICY_FILE_RELATIVE,
     QUEUE_FILE,
     is_known_model_tag,
 )
 from orchestrator import _resolve_verify_path
+from policy import PolicyEngine, policy_file_path
 from providers.opencode import OpencodeProvider
 from queue_manager import (
     _MODEL_ALIAS_PREFIXES,
@@ -847,14 +853,31 @@ _NO_ALLOWLIST_CONSEQUENCE = (
 )
 
 
+# What a policy.yaml that exists but does not load means for the RULES since
+# 2026-10-08: PolicyEngine.check_task raises PolicyUnreadableError, and run_once()
+# holds the task instead of classifying it AUTO with no (or stale) rules.
+_UNREADABLE_RULES_CONSEQUENCE = (
+    "der Orchestrator haelt jeden Queue-Task an (Policy-Pruefung gestoert, neuer "
+    "Versuch alle 10 min), bis die Datei repariert ist"
+)
+_UNREADABLE_PROVIDER_SCOPE = (
+    "Provider-Policy (nur noch auf Wegen ohne Policy-Pruefung, z. B. /chat und --dry-run)"
+)
+
+
 def _policy_status() -> LintFinding | None:
     """One file-level finding about policy.yaml itself, or None when it is usable.
 
     The linter reads and parses the file directly instead of asking PolicyEngine,
-    because the engine cannot tell the states apart: a missing file
-    (``_reload_if_changed`` returns early), an unparseable one
-    (``_load_rules_locked`` logs and returns) and a deliberately empty one all
-    surface as ``get_allowed_providers() -> None`` = "no restriction configured".
+    because the engine's provider side cannot tell the states apart: a missing
+    file (``_reload_if_changed`` returns early), an unparseable one
+    (``_load_rules_locked`` records ``_load_error`` and returns) and a deliberately
+    empty one all surface as ``get_allowed_providers() -> None`` = "no restriction
+    configured". The rule side differs since 2026-10-08: for an unparseable file or
+    a non-mapping root ``check_task`` raises ``PolicyUnreadableError`` and
+    run_once() holds every queue task until the file parses again — those findings
+    say so first (``_UNREADABLE_RULES_CONSEQUENCE``). Missing and empty files still
+    classify AUTO.
 
     Three outcomes, deliberately different levels:
 
@@ -866,15 +889,20 @@ def _policy_status() -> LintFinding | None:
       most likely a truncated OneDrive sync, but "deliberately empty" is a
       readable intent too - and an ERROR on an intended state would be noise in
       the one report that has to be trustworthy.
-    * **present but not usable** (parse error, non-mapping root, ``tool_providers``
-      that is not a mapping) -> ERROR. That is corruption, and the OneDrive-sync
-      collision is exactly the case that must not pass quietly.
+    * **present but not usable** (parse error, non-mapping root, a section the
+      engine's own parser rejects, ``tool_providers`` that is not a mapping) ->
+      ERROR. That is corruption, and the OneDrive-sync collision is exactly the
+      case that must not pass quietly. The section case holds every queue task like
+      a parse error (Korrekturrunde 1 zu PR #6, see _policy_section_finding).
 
     All four findings below (missing/unreadable x3/empty) land on the exact same
     ``get_allowed_providers() -> None`` outcome, so they must describe the exact
-    same runtime consequence via ``_NO_ALLOWLIST_CONSEQUENCE`` - "no restriction"
+    same PROVIDER consequence via ``_NO_ALLOWLIST_CONSEQUENCE`` - "no restriction"
     is only true for claude/codex/opencode; ``dispatcher._allows()`` stays
     fail-closed for vibe/openrouter regardless of *why* no allow-list resolved.
+    For the two unreadable variants that the rule side holds on, that provider
+    consequence only reaches paths without a policy check (``/chat``,
+    ``--dry-run``), and the finding says so.
     Saying "jede Provider-Sperre ist weg" for the unreadable/empty cases while
     ``policy_missing`` next to it correctly says the opposite would be the exact
     self-contradiction the 2026-09-17 forced-branch fix removed from the
@@ -888,6 +916,20 @@ def _policy_status() -> LintFinding | None:
         # PolicyEngine.config_path for why the two must not be asked separately.
         path = get_engine().config_path
     except Exception as exc:  # noqa: BLE001 - a config import must not kill the lint run
+        # get_engine() also raises when the file it is built on has a failing section
+        # parser (Korrekturrunde 1, R1-04): the constructor re-raises it. Only that case
+        # is told apart here, on the file get_engine() would have loaded; any other
+        # failure keeps the warning it always got.
+        section_error = None
+        try:
+            # What get_engine() builds on: config.VAULT_PATH, read now.
+            fallback = policy_file_path(config.VAULT_PATH)
+            if fallback.exists():
+                section_error = _policy_section_error(fallback)
+        except Exception:
+            section_error = None
+        if section_error is not None:
+            return _policy_section_finding(fallback, section_error)
         return LintFinding(
             LEVEL_WARN, None, "policy.yaml",
             f"Policy-Pfad nicht aufloesbar ({exc}) - Provider-Policy wird nicht geprueft",
@@ -914,8 +956,9 @@ def _policy_status() -> LintFinding | None:
     except Exception as exc:  # noqa: BLE001 - yaml/OSError raise a wide family
         return LintFinding(
             LEVEL_ERROR, None, str(path),
-            f"policy.yaml nicht lesbar/parsebar ({exc}) - PolicyEngine meldet das als "
-            f"'keine Einschraenkung'. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
+            f"policy.yaml nicht lesbar/parsebar ({exc}) - Folge fuer die Regeln: "
+            f"{_UNREADABLE_RULES_CONSEQUENCE}. Folge fuer die "
+            f"{_UNREADABLE_PROVIDER_SCOPE}: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
 
@@ -931,9 +974,14 @@ def _policy_status() -> LintFinding | None:
         return LintFinding(
             LEVEL_ERROR, None, str(path),
             f"policy.yaml enthaelt kein Mapping (got {type(data).__name__}) - "
-            f"PolicyEngine verwirft das still. Folge: {_NO_ALLOWLIST_CONSEQUENCE}",
+            f"Folge fuer die Regeln: {_UNREADABLE_RULES_CONSEQUENCE}. Folge fuer die "
+            f"{_UNREADABLE_PROVIDER_SCOPE}: {_NO_ALLOWLIST_CONSEQUENCE}",
             code="policy_unreadable",
         )
+
+    section_error = _policy_section_error(path)
+    if section_error is not None:
+        return _policy_section_finding(path, section_error)
 
     providers_raw = data.get("tool_providers")
     if providers_raw is not None and not isinstance(providers_raw, dict):
@@ -945,6 +993,49 @@ def _policy_status() -> LintFinding | None:
             code="policy_unreadable",
         )
 
+    return None
+
+
+def _policy_section_finding(path: Path, section_error: str) -> LintFinding:
+    """Valid YAML, but one of the engine's section parsers raises on it (e.g.
+    ``tool_contracts: {dev-loop: {stop_conditions: 1}}``). ``_load_error`` is set, so
+    check_task raises and every queue task is held — the same consequence as an
+    unparseable file, hence the same code and level (Korrekturrunde 1, R1-04). Until
+    then it surfaced only as the policy_check_failed warning (fresh process) or not at
+    all (engine already built). The provider side differs from an unparseable file:
+    a fresh process has no engine (no allow-list), a running one has applied the
+    sections before the failing one."""
+    return LintFinding(
+        LEVEL_ERROR, None, str(path),
+        f"policy.yaml: ein Abschnitt ist nicht lesbar ({section_error}) - Folge fuer "
+        f"die Regeln: {_UNREADABLE_RULES_CONSEQUENCE}. Folge fuer die "
+        f"{_UNREADABLE_PROVIDER_SCOPE}: in einem frisch gestarteten Prozess "
+        f"{_NO_ALLOWLIST_CONSEQUENCE}; ein schon laufender nimmt tool_providers aus "
+        f"dieser Datei, wenn der Fehler erst dahinter liegt (tool_contracts), sonst "
+        f"den zuletzt geladenen Stand",
+        code="policy_unreadable",
+    )
+
+
+def _policy_section_error(path: Path) -> str | None:
+    """The error the engine's own section parsers raise on *path*, or None.
+
+    Asks the real parser instead of repeating it: a throwaway PolicyEngine on the
+    same vault, whose constructor re-raises a section error (_load_rules_locked).
+    None also when the vault cannot be derived from *path* or the probe does not
+    get that far — the checks before this one already cover a missing/unparseable
+    file.
+    """
+    try:
+        vault = path.parents[len(POLICY_FILE_RELATIVE.parts) - 1]
+        if policy_file_path(vault) != path:
+            return None
+    except Exception:   # no probe possible, nothing to report
+        return None
+    try:
+        PolicyEngine(vault_path=vault)
+    except Exception as exc:   # whatever a section parser raises
+        return f"{type(exc).__name__}: {exc}"
     return None
 
 

@@ -647,7 +647,7 @@ class TelegramListener:
                 send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
                 return
             engine._respond("denied")
-            send_message("❌ Abgelehnt. Task bleibt in Queue.")
+            send_message("❌ Abgelehnt.")
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 
@@ -715,7 +715,7 @@ class TelegramListener:
                 send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
                 return
             engine._respond("denied")
-            send_message("❌ Abgelehnt. Task bleibt in Queue.")
+            send_message("❌ Abgelehnt.")
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 
@@ -727,7 +727,7 @@ class TelegramListener:
                 send_message("ℹ️ Keine ausstehende Genehmigungsanfrage.")
                 return
             engine._respond("skipped")
-            send_message("⏭️ Übersprungen. Riskante Aktion blockiert; Task bleibt in Queue.")
+            send_message("⏭️ Übersprungen. Riskante Aktion blockiert.")
         except Exception as e:
             send_message(f"❌ Fehler: {_escape_telegram_markdown(str(e))}")
 

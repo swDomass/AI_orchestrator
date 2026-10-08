@@ -56,6 +56,7 @@ from config import (
     MAX_HANG_RETRIES,
     MAX_RETRIES_PER_PROVIDER,
     MEMORY_HISTORY_HEADING,
+    POLICY_HOLD_NOTIFY_WINDOW_SEC,
     PROMPT_CURATED_MEMORY_TOKENS,
     PROMPT_DAILY_LOG_TOKENS,
     PROMPT_MEMORY_TOKENS,
@@ -95,6 +96,7 @@ from notifier import (
     notify_queue_complete,
     notify_task_done,
     notify_task_started,
+    send_message,
     start_session,
 )
 from providers.base import TRANSIENT_ERRORS, RunResult, contains_auth_expired, error_code_of
@@ -250,6 +252,123 @@ def _clear_auth_expired_notice(provider_name: str) -> None:
     """Re-arm the one-time notice — called on every successful run so the NEXT
     outage (a fresh re-login expiring again later) is announced again."""
     _AUTH_EXPIRED_NOTIFIED.discard(provider_name)
+
+
+# Alert throttle for the policy hold in run_once() (2026-10-08). The hold requeues a
+# task it cannot check by +10 minutes and used to send one Telegram alert per hold —
+# for a fault that lasts (policy.yaml broken in the vault) one alert per open task and
+# cycle, ~144 a day for a single line. Now: one alert per cause and
+# POLICY_HOLD_NOTIFY_WINDOW_SEC, and one all-clear once check_task() passes again.
+# Log, append_log and the requeue still run on EVERY hold; only Telegram is throttled.
+# Same technique as _AUTH_EXPIRED_NOTIFIED above, plus a time window, because a policy
+# fault can outlast a night and one reminder per window beats silence.
+#
+# cause -> (time.monotonic() of its last alert, raised while classifying). The cause is
+# the exception's class and text WITHOUT the task, so every task held for one fault
+# shares one entry and a different fault alerts at once. time.monotonic() does not
+# move with the wall clock; across a Windows sleep/hibernate it keeps counting or
+# stands still depending on the platform clock, so at worst a reminder comes earlier
+# or later — never not at all. Main thread only (run_once() is, see the crash register
+# above), so no lock. In-process only: after a restart the first hold alerts again —
+# at most one extra alert per process start, which is wanted.
+#
+# Only a DELIVERED alert is recorded (notify_error() -> True, 2026-10-08, Korrekturrunde
+# 1): notifier._send swallows network errors, Telegram 5xx/429 and timeouts and returns
+# False, and recording such an alert silenced the cause for the whole window although
+# nothing had arrived. An undelivered alert is tried again on the next hold, every 10
+# minutes per held task as before the throttle; a Telegram that keeps failing (or is
+# switched off, NOTIFY_ON_ERROR) produces attempts, not a flood, because none of them
+# arrives. The all-clear likewise forgets the causes only once send_message() returned
+# True. Remaining risk, named not built: a send that arrives but still reports False
+# (a timeout after delivery) repeats the alert on every hold — as on master, every 10
+# minutes per held task — until one send reports True.
+_POLICY_HOLD_NOTICES: dict[str, tuple[float, bool]] = {}
+# Bound for causes whose text keeps changing; the oldest alert is dropped first.
+_POLICY_HOLD_MAX_CAUSES = 20
+_policy_log = logging.getLogger(__name__)
+_POLICY_RECOVERED_TEXT = (
+    "✅ *Policy-Prüfung wieder in Ordnung*\n"
+    "Gehaltene Tasks laufen ab ihrem Retry-Zeitpunkt (spätestens 10 min) wieder."
+)
+
+
+def _policy_hold_cause(exc: BaseException) -> str:
+    """Throttle key of a hold: exception class and text — never the task."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _notify_policy_hold(task: str, exc: BaseException, msg: str, *, classifying: bool) -> None:
+    """Send the hold alert unless this cause was alerted within the window. Never raises.
+
+    Decide, send, THEN record — and record only an alert notify_error() reports as
+    delivered. A fault in the bookkeeping before the send errs towards sending; a
+    fault after it costs a duplicate on the next hold, never the alert. A send that
+    raises or returns False is not recorded, so the next hold tries again. A
+    negative elapsed time (impossible for a monotonic clock) alerts as well, so no
+    clock jump can keep the throttle silent for good.
+
+    *classifying*: the fault came out of get_engine()/check_task(). Only such causes
+    get an all-clear (_notify_policy_recovered): a check_task() that passes says
+    nothing about the approval path behind it, and treating it as a recovery there
+    would mean an all-clear plus a fresh alert on every cycle of a lasting fault.
+    """
+    cause: str | None = None
+    elapsed: float | None = None
+    try:
+        cause = _policy_hold_cause(exc)
+        last = _POLICY_HOLD_NOTICES.get(cause)
+        if last is not None:
+            elapsed = time.monotonic() - last[0]
+    except Exception as state_exc:
+        _policy_log.debug("policy hold: throttle state unusable, alerting anyway: %s", state_exc)
+    if elapsed is not None and 0 <= elapsed < POLICY_HOLD_NOTIFY_WINDOW_SEC:
+        _policy_log.info("policy hold: alert throttled (same cause %.0f s ago): %s", elapsed, cause)
+        return
+    hours = POLICY_HOLD_NOTIFY_WINDOW_SEC / 3600
+    tail = f"Weitere Meldungen zu derselben Ursache frühestens in {hours:g} h."
+    if classifying:
+        tail += " Sobald die Policy-Prüfung wieder durchläuft, kommt eine Entwarnung."
+    try:
+        delivered = notify_error(task, "policy", f"{msg}\n\n{tail}")
+    except Exception as notify_exc:
+        _policy_log.debug("policy hold: notify_error failed: %s", notify_exc)
+        return
+    if delivered is not True:
+        # Not recorded: the next hold tries again (see the block comment above).
+        _policy_log.debug("policy hold: alert not delivered, retried on the next hold: %s", cause)
+        return
+    if cause is None:
+        return
+    try:
+        _POLICY_HOLD_NOTICES[cause] = (time.monotonic(), classifying)
+        while len(_POLICY_HOLD_NOTICES) > _POLICY_HOLD_MAX_CAUSES:
+            oldest = min(_POLICY_HOLD_NOTICES, key=lambda c: _POLICY_HOLD_NOTICES[c][0])
+            del _POLICY_HOLD_NOTICES[oldest]
+    except Exception as record_exc:
+        _policy_log.debug("policy hold: could not record the alert: %s", record_exc)
+
+
+def _notify_policy_recovered() -> None:
+    """Called once every check_task() of a task has returned. Never raises.
+
+    If a classification fault was alerted (and that alert delivered — nothing else is
+    recorded), send ONE all-clear and forget those causes, so the next fault alerts at
+    once. The causes are forgotten only once send_message() returns True; while it
+    raises or returns False they stay, and the next task that passes tries again.
+    Causes from the approval path stay until they age out (see _notify_policy_hold).
+    """
+    try:
+        recovered = [c for c, (_, classifying) in _POLICY_HOLD_NOTICES.items() if classifying]
+        if not recovered:
+            return
+        if send_message(_POLICY_RECOVERED_TEXT) is not True:
+            _policy_log.debug("policy hold: all-clear not delivered, retried by the next task")
+            return
+        for cause in recovered:
+            _POLICY_HOLD_NOTICES.pop(cause, None)
+        _policy_log.info("policy check recovered: %s", "; ".join(recovered))
+    except Exception as exc:
+        _policy_log.debug("policy hold: all-clear failed: %s", exc)
 
 
 def _charge_process_crash(exc: BaseException) -> None:
@@ -1127,8 +1246,12 @@ def _build_prompt(
 
     PROMPT_COMPLETION_RULE sits directly in front of the delimiter, under its own
     "## Systemregel" heading: before the delimiter so the task stays last, and with a
-    heading so it cannot read as the tail of the last referenced file in step 6. It rides
-    with the delimiter — a prompt that is nothing but the instruction carries neither.
+    heading so it cannot read as the tail of the last referenced file in step 6. Since
+    2026-10-08 it is there in EVERY prompt built here, also one with no context above the
+    task (no SOUL base, a provider without an entry): the rule is about the task, not
+    about the context. The delimiter still needs context — there is nothing to delimit.
+    `#tool:` tasks never reach this function on their run path; their prompts are built
+    in the tools.
     """
     from skills import build_index, load_skill, progressive_body
 
@@ -1186,10 +1309,12 @@ def _build_prompt(
         parts.append(f"{MEMORY_HISTORY_HEADING}\n{mem_block}")
     if wiki_ctx:
         parts.append(f"## Referenzierte Dateien\n{wiki_ctx}")
-    # Only when something precedes the task — a prompt that is nothing but the instruction
-    # has no context to delimit, and the announcement would refer to nothing.
-    if parts:
-        parts.append(f"## Systemregel\n{PROMPT_COMPLETION_RULE}")
+    # The completion rule always; the delimiter only when something precedes the rule — a
+    # prompt that is nothing but rule and instruction has no context to delimit, and the
+    # announcement would refer to nothing.
+    has_context = bool(parts)
+    parts.append(f"## Systemregel\n{PROMPT_COMPLETION_RULE}")
+    if has_context:
         parts.append(PROMPT_TASK_DELIMITER if clean_task else PROMPT_TASK_DELIMITER_EMPTY)
     # 7. The task LAST — see the docstring for why this position is load-bearing.
     # A queue line consisting only of routing tags strips down to nothing; emitting a
@@ -2431,6 +2556,10 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
         memory_context = memory_module.get_context_for_task(task, cwd=cwd)
 
         # --- Feature 9: Policy check ---
+        # Set once every check_task() of this task has returned: a hold before that
+        # is a classification fault, one after it a fault in the approval path
+        # (_notify_policy_hold decides by it which causes get an all-clear).
+        classified = False
         try:
             from policy import (
                 _TIER_ORDER,
@@ -2468,6 +2597,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                         verdict = st_verdict
                     for r in st_reasons:
                         reasons.add(r)
+
+            # Here and not at the end of the block: the branches below return early.
+            classified = True
+            try:
+                _notify_policy_recovered()
+            except Exception as recovered_exc:   # an all-clear must never hold a task
+                _log.debug("policy hold: all-clear failed: %s", recovered_exc)
 
             if verdict == TIER_DENY:
                 msg = f"Task gesperrt (DENY-Policy): {'; '.join(reasons)}"
@@ -2556,8 +2692,9 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 print(f"  ⛔ {msg}")
             except Exception as report_exc:
                 _log.debug("policy hold: report failed: %s", report_exc)
+            # Throttled per cause (2026-10-08) — everything else here runs on every hold.
             try:
-                notify_error(task, "policy", msg)
+                _notify_policy_hold(task, e, msg, classifying=not classified)
             except Exception as notify_exc:
                 _log.debug("policy hold: notify_error failed: %s", notify_exc)
             reset_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")

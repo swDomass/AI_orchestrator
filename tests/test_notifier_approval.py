@@ -410,6 +410,13 @@ def test_even_the_short_form_failing_still_sends_a_request(sent):
     (msg,) = sent
     assert msg == notifier._APPROVAL_BARE_TEXT
     assert _legacy_markdown_problems(msg) == []
+    # Compared with itself above, the constant could drift back to the old wording
+    # unnoticed. dev-loop's plan approval uses the same request and ends ❌ without a
+    # retry, so the fallback must not promise a retry or a pause either.
+    assert "/deny — block this action" in msg
+    assert "/skip — skip this request" in msg
+    assert "retries later" not in msg
+    assert "pause task" not in msg
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,9 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import policy as policy_module
 from config import MIN_CAPACITY_PERCENT
 from limits import AllLimits, ProviderLimits
 from providers.base import RunResult
@@ -864,3 +867,31 @@ def test_poll_loop_survives_unhandled_message_exception():
 
     assert calls["count"] >= 2
     mock_logger.error.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# /deny, /skip, /reject (fallback): neutral replies (2026-10-08)
+# ---------------------------------------------------------------------------
+# The replies said "Task bleibt in Queue" — true for a single-shot approval (the
+# task is re-stamped +10 min), false for dev-loop's plan approval, which shares the
+# engine and ends ❌ without a retry. The texts now claim nothing about the task.
+
+
+@pytest.mark.parametrize("command, answer, reply", [
+    ("/deny", "denied", "❌ Abgelehnt."),
+    ("/skip", "skipped", "⏭️ Übersprungen. Riskante Aktion blockiert."),
+    ("/reject no-such-run", "denied", "❌ Abgelehnt."),   # no SI approval → legacy /deny
+], ids=["deny", "skip", "reject_fallback"])
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_approval_replies_do_not_promise_the_task_stays_queued(mock_send, command, answer, reply):
+    engine = policy_module.get_engine()
+    pending = threading.Event()
+    engine._approval_event = pending            # the one pending slot, as request_approval sets it
+    listener, _ = _make_listener()
+
+    listener._handle_message(_msg(command))
+
+    assert pending.is_set() and engine._approval_response == answer
+    mock_send.assert_called_once_with(reply)
+    assert "bleibt in Queue" not in mock_send.call_args.args[0]

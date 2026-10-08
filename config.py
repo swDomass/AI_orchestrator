@@ -773,6 +773,11 @@ PROFILES_DIR = VAULT_PATH / "99_System" / "AI" / "profiles"
 POLICY_FILE_RELATIVE = Path("99_System") / "AI" / "policy.yaml"
 POLICY_FILE = VAULT_PATH / POLICY_FILE_RELATIVE
 POLICY_APPROVAL_TIMEOUT_SEC = 600  # 10 minutes
+# run_once() holds a task whose policy check failed and retries it every 10 minutes.
+# One Telegram alert per cause and window instead of one per hold: 6 h is at most 4
+# alerts a day for a fault that lasts, and still one reminder per night or working
+# block (orchestrator._notify_policy_hold).
+POLICY_HOLD_NOTIFY_WINDOW_SEC = 6 * 3600
 
 # --- Usage Suggester ---
 USAGE_SUGGEST_MIN_REMAINING_PCT   = 30

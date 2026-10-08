@@ -28,6 +28,15 @@ TIER_APPROVE = "approve"
 TIER_DENY = "deny"
 
 
+class PolicyUnreadableError(ValueError):
+    """policy.yaml exists but its last load failed (`PolicyEngine._load_error`).
+
+    A ValueError, so the callers that already caught get_tool_phase()'s ValueError
+    keep working. Raised by check_task() since 2026-10-08: run_once() holds every
+    task on it instead of classifying with no (or stale) rules as AUTO.
+    """
+
+
 # ── Tool Contracts (P3) ──────────────────────────────────────────────────────
 
 # Recognized reporting paths — used by Doctor schema validation. Unknown paths
@@ -228,11 +237,13 @@ def policy_file_path(vault_path: "Path | None" = None) -> Path:
     built against an explicit vault (every test does that).
 
     Why the parametrised case is needed at all: queue_linter has to stat and
-    parse the file ITSELF — PolicyEngine reports a missing file, an unreadable
-    one and a deliberately empty one all as "no restriction configured"
-    (_reload_if_changed returns early, _load_rules_locked logs and returns), so
-    the linter cannot tell corruption from a fresh install through the engine.
-    Sharing the path is what keeps the two from checking different files.
+    parse the file ITSELF — on the provider side PolicyEngine reports a missing
+    file, an unreadable one and a deliberately empty one all as
+    ``get_allowed_providers() -> None`` = "no restriction configured", so the
+    linter cannot tell corruption from a fresh install through it. (The rule side
+    tells them apart since 2026-10-08 — check_task() raises on an unreadable file
+    — but a missing and an empty one still look alike there.) Sharing the path is
+    what keeps the two from checking different files.
     """
     if vault_path is None:
         from config import POLICY_FILE
@@ -254,9 +265,15 @@ class PolicyEngine:
         # get_tool_phase().
         self._tool_phases: dict[str, object] = {}
         # Why the last attempt to parse an EXISTING policy.yaml failed, or None.
-        # Rules and the other sections keep their last good state on such a
-        # failure (unchanged behaviour); get_tool_phase() refuses to answer from
-        # it instead, because a safety switch nobody can read is not "off".
+        # A file that does not parse at all (or whose top level is no mapping)
+        # leaves rules and every section at their last good state. A section
+        # parser that raises leaves the sections BEFORE it applied from the new
+        # file and the rest at their last good state (see _apply_sections_locked).
+        # check_task() and get_tool_phase() refuse to answer from that state while
+        # the error stands (PolicyUnreadableError), because neither a rule set nor a
+        # safety switch that cannot be read is "off". get_allowed_providers() and
+        # get_tool_contract() still answer from it (the provider side fails open or
+        # closed per provider in dispatcher._allows()).
         self._load_error: str | None = None
         self._mtime: float = 0.0
         self._lock = threading.Lock()
@@ -293,6 +310,18 @@ class PolicyEngine:
         """Reload policy.yaml if the file has changed since last load."""
         path = self.config_path
         if not path.exists():
+            # A missing file is "nothing configured" — also when the file that was
+            # there before it did not load (2026-10-08). Without clearing the error
+            # here, a broken policy.yaml that is then deleted kept get_tool_phase()
+            # raising and, since check_task() raises on it too, held every task until
+            # a restart. The rules and sections of the last good load stay as they
+            # are (unchanged). mtime 0 makes a file created later load even if it
+            # carries the mtime of the one that was deleted.
+            with self._lock:
+                if self._load_error is not None:
+                    logger.info("policy: %s is gone — its load error no longer applies", path)
+                self._load_error = None
+                self._mtime = 0.0
             return
 
         try:
@@ -301,7 +330,13 @@ class PolicyEngine:
             return
 
         with self._lock:
-            if mtime == self._mtime:
+            # While the last load failed, the mtime shortcut does not apply: the mtime
+            # was stored BEFORE parsing, so a file repaired with the SAME mtime
+            # (OneDrive sets mtimes on sync; coarse timestamp resolution) would never
+            # be read again, and check_task() would hold every task until a restart.
+            # A file that is still broken costs one re-parse per call (a small yaml),
+            # logs nothing new and does not re-raise (see _load_rules_locked).
+            if mtime == self._mtime and self._load_error is None:
                 return
             self._mtime = mtime
             self._load_rules_locked(path)
@@ -318,14 +353,19 @@ class PolicyEngine:
         executed without its plan approval. Sections parsed before the failing one are
         applied as before (unchanged on purpose: an all-or-nothing rewrite would drop
         rules the same edit added).
+
+        A failure that repeats the stored `_load_error` word for word (2026-10-08) is
+        the same broken file read again — _reload_if_changed retries on every call
+        while the error stands. It is logged at DEBUG only and NOT re-raised: the call
+        that first hit it already raised, every later one reads `_load_error`, exactly
+        as before the retry existed.
         """
         try:
             import yaml
             with open(path, encoding="utf-8") as f:
                 data = yaml.safe_load(f)
         except Exception as e:
-            logger.warning("policy: could not load %s: %s", path, e)
-            self._load_error = f"{type(e).__name__}: {e}"
+            self._record_load_error_locked(path, f"{type(e).__name__}: {e}")
             return
 
         if data is None:
@@ -333,20 +373,37 @@ class PolicyEngine:
             self._load_error = None
             return
         if not isinstance(data, dict):
-            self._load_error = f"top level is {type(data).__name__}, not a mapping"
+            self._record_load_error_locked(
+                path, f"top level is {type(data).__name__}, not a mapping",
+            )
             return
         try:
             self._apply_sections_locked(data)
         except Exception as e:
-            logger.warning("policy: could not parse %s: %s", path, e)
-            self._load_error = f"{type(e).__name__}: {e}"
-            raise
+            if self._record_load_error_locked(path, f"{type(e).__name__}: {e}"):
+                raise
+            return
         self._load_error = None
 
         logger.debug(
             "policy: loaded %d rules, %d tool policies, %d tool contracts from %s",
             len(self._rules), len(self._tool_providers), len(self._tool_contracts), path,
         )
+
+    def _record_load_error_locked(self, path: Path, error: str) -> bool:
+        """Store *error* as `_load_error`; True when it differs from the stored one.
+
+        Only a new error is logged as a WARNING. The same error again is the retry
+        of an unchanged broken file (see _reload_if_changed) and would otherwise log
+        one warning per policy lookup.
+        """
+        new = error != self._load_error
+        self._load_error = error
+        if new:
+            logger.warning("policy: could not load %s: %s", path, error)
+        else:
+            logger.debug("policy: %s still unreadable: %s", path, error)
+        return new
 
     def _apply_sections_locked(self, data: dict) -> None:
         """Parse and apply the sections of one policy.yaml mapping, in this order:
@@ -436,28 +493,39 @@ class PolicyEngine:
               dev-loop:
                 plan_approval: approve
 
-        Returns *default* when the file is missing, has no ``tool_phases:``
-        section, no entry for *tool*, or no *key* in it. A value that is there is
+        Returns *default* when the file has no ``tool_phases:`` section, no
+        entry for *tool*, or no *key* in it, and when it is missing and never
+        loaded. A file that goes missing AFTER a load keeps answering from the
+        phases of that last good load (2026-10-08: a missing file is "nothing new
+        configured", the same rule rules, providers and contracts follow — so
+        deleting the file lifts neither an ``approve`` nor a ``skip``; a restart
+        or a file without the key does). A value that is there is
         returned as ``str(value)`` WITHOUT validation — the caller knows the
         allowed set (``yes`` parses to ``True`` and comes back as ``"True"``).
 
-        Raises ValueError when the answer cannot be known: the file exists but
-        could not be parsed into a mapping, or the entry for *tool* is not a
-        mapping. Deliberately not *default*: for a safety switch, "unreadable"
-        and "not configured" must stay distinguishable, and only the caller can
-        decide which way to fail.
+        Raises when the answer cannot be known — deliberately not *default*: for a
+        safety switch, "unreadable" and "not configured" must stay distinguishable,
+        and only the caller can decide which way to fail:
 
-        Only dev-loop reads this so far. tools/review_loop.py still imports a
-        ``load_policy`` that does not exist, so its ``tool_phases`` keys
-        (``verification``, ``drift_check_mode``) stay inert until that reader is
-        rewired on purpose.
+        * PolicyUnreadableError (a ValueError) while `_load_error` stands: the file
+          exists but did not parse into a mapping, or a section parser raised on it.
+        * On the one call whose reload hits a failing section parser, that parser's
+          raw exception instead (e.g. TypeError for ``stop_conditions: 1``); every
+          later call raises PolicyUnreadableError until the file loads again.
+        * ValueError when the entry for *tool* is present but not a mapping (a
+          scalar or a list). An entry that is YAML null (``dev-loop:`` with nothing
+          after it) is treated as absent and returns *default*.
+
+        Readers: dev-loop (``plan_approval``, since 2026-10-06) and review-loop
+        (``verification``, ``drift_check_mode``, since 2026-10-08 — until then it
+        imported a ``load_policy`` that never existed, and both keys were inert).
         """
         self._reload_if_changed()
         with self._lock:
             load_error = self._load_error
             entry = self._tool_phases.get(tool)
         if load_error is not None:
-            raise ValueError(f"policy.yaml unreadable ({load_error})")
+            raise PolicyUnreadableError(f"policy.yaml unreadable ({load_error})")
         if entry is None:
             return default
         if not isinstance(entry, dict):
@@ -516,6 +584,41 @@ class PolicyEngine:
                 return tier, hits_by_tier[tier]
         return TIER_AUTO, []
 
+    def _raise_if_unreadable(self) -> None:
+        """Reload, then raise PolicyUnreadableError if the existing policy.yaml did not load.
+
+        Checked on every call, not just on the one that reloads: the reload stores the
+        new mtime before parsing, so a check tied to the reload would see the error
+        once and then classify with the stale rules again (the K6 defect of
+        get_tool_phase, 2026-10-06).
+
+        The call that hits a failing section parser gets that parser's raw exception
+        out of the reload; it is swallowed here once it has been recorded, so that
+        call raises the same PolicyUnreadableError as every later one. run_once()
+        throttles its Telegram alert per error text, and the raw TypeError followed by
+        "policy.yaml unreadable (TypeError: …)" would be two alerts for one fault.
+
+        A MISSING policy.yaml stays "nothing configured" (classified AUTO) on purpose:
+        the queue (99_System/AI/agent-queue.md) lives in the same vault folder, so
+        without that folder nothing runs anyway, and the missing file is already
+        reported by queue_linter (`policy_missing`, WARN) and doctor
+        (`check_policy_file`). Only a file that is there and cannot be read holds.
+        """
+        try:
+            self._reload_if_changed()
+        except Exception:
+            with self._lock:
+                recorded = self._load_error is not None
+            if not recorded:
+                raise
+        with self._lock:
+            load_error = self._load_error
+        if load_error is not None:
+            raise PolicyUnreadableError(
+                f"policy.yaml unreadable ({load_error}) — Datei: {self.config_path}. "
+                f"Bis sie wieder parst, bleibt jeder Task in der Queue."
+            )
+
     def check_task(self, task_text: str, profile_rules: dict | None = None) -> tuple[str, list[str]]:
         """Scan task text for all rule patterns.
 
@@ -524,8 +627,13 @@ class PolicyEngine:
 
         If profile_rules is provided and matches the task, its verdict takes
         priority over global rules (layering: profile > global).
+
+        Raises PolicyUnreadableError while policy.yaml exists but its last load
+        failed (2026-10-08) — on EVERY call, not only on the one that reloads. Until
+        then such a file classified every task with no or stale rules, i.e. as AUTO,
+        `git push` included. run_once() holds the task on the exception.
         """
-        self._reload_if_changed()
+        self._raise_if_unreadable()
 
         if profile_rules:
             cache_key = _freeze_policy_data(profile_rules)

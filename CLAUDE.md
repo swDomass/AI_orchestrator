@@ -15,6 +15,12 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Korrekturrunde 2 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3275 passed /
+# 0 failed / 9 skipped in 101-104 s — +33 gesammelt über die 3251 darunter, per --collect-only:
+# test_harness_index 71 -> 89, test_dashboard_autostart 61 -> 67, test_harness_dashboard 35 -> 44.
+# Der 9. Skip: test_windows_background_mode_keeps_below_normal_and_private_peak (nur win32); ohne
+# `node` skippen 8 (5 + 3). ruff 1122, mypy 122/38 und win32 124/38 unverändert. Windows-Suite am
+# Vorstand 19f55c6 (Auftraggeber): 3250 passed / 0 failed / 1 skipped.
 # Korrekturrunde 1 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3243 passed /
 # 0 failed / 8 skipped in 94-98 s — +59 gesammelt über die 3185 darunter, per --collect-only:
 # test_harness_index 51 -> 71, test_dashboard_autostart 34 -> 61, test_harness_dashboard 23 -> 35.

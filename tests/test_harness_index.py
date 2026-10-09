@@ -1034,3 +1034,25 @@ def test_scheduler_survives_a_raising_index_and_is_off_at_interval_zero(monkeypa
     off = dashboard.start_autostart(port=1, warn=lambda _m: None, info=lambda _m: None)
     assert off.index_thread is None
     off.shutdown()
+
+
+# ── K5: priority / memory calls ─────────────────────────────────────────────
+
+
+def test_lower_priority_reports_success_in_a_child():
+    """Run in a child: on Windows it puts the process into background mode."""
+    proc = subprocess.run(
+        [sys.executable, "-c", "import harness_index as hi; print(hi._lower_priority())"],
+        cwd=str(REPO), env=_child_env(), capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "True", proc.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows API")
+def test_windows_peak_memory_and_pid_check_work():
+    peak = hi._peak_rss_mb_windows()
+    assert peak is not None and peak > 0
+    assert hi._pid_alive_windows(os.getpid()) is True
+    assert hi._pid_alive_windows(_dead_pid()) is False

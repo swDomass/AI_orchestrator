@@ -73,9 +73,11 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import config
 
@@ -275,24 +277,63 @@ def _peak_rss_mb() -> float | None:
         return None
 
 
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = (
+        ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+    )
+
+
+def _kernel32() -> Any:
+    """kernel32 with explicit argtypes/restype — Windows only.
+
+    Without them ctypes passes and returns plain C ints: the pseudo-handle of
+    ``GetCurrentProcess()`` (−1) and real 64-bit handles got truncated, so
+    ``SetPriorityClass`` failed with ERROR_INVALID_PARAMETER (87) and
+    ``GetProcessMemoryInfo`` with ERROR_INVALID_HANDLE (6) — measured twice
+    on Windows by the Auftraggeber, hidden by a blanket ``suppress``. ``use_last_error`` makes
+    ``ctypes.get_last_error()`` reliable. The ``sys.platform`` check keeps mypy
+    on Linux from type-checking Windows-only names (no ``type: ignore`` that
+    would turn into ``unused-ignore`` on Windows).
+    """
+    if sys.platform == "win32":
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k.GetExitCodeProcess.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k.CloseHandle.restype = wintypes.BOOL
+        k.K32GetProcessMemoryInfo.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(_ProcessMemoryCounters), wintypes.DWORD)
+        k.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+        return k
+    raise OSError("kernel32 is Windows-only")
+
+
+def _last_error() -> int:
+    if sys.platform == "win32":
+        return int(ctypes.get_last_error())
+    return 0
+
+
 def _peak_rss_mb_windows() -> float | None:
-    wintypes = importlib.import_module("ctypes.wintypes")
-
-    class _Counters(ctypes.Structure):
-        _fields_ = (
-            ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
-        )
-
-    counters = _Counters()
+    """Peak working set of this process via K32GetProcessMemoryInfo, or None
+    (with one line on stderr naming GetLastError)."""
+    counters = _ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(counters)
-    windll = ctypes.windll  # type: ignore[attr-defined]
-    handle = windll.kernel32.GetCurrentProcess()
-    if windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+    k = _kernel32()
+    if k.K32GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
         return round(float(counters.PeakWorkingSetSize) / 1_048_576, 1)
+    with contextlib.suppress(Exception):
+        print(f"harness_index: GetProcessMemoryInfo failed, GetLastError={_last_error()}", file=sys.stderr)
     return None
 
 
@@ -348,17 +389,17 @@ def _pid_alive_posix(pid: int) -> bool:
 
 def _pid_alive_windows(pid: int) -> bool:
     try:
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        k = _kernel32()
+        handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
-            return bool(kernel32.GetLastError() == 5)  # ERROR_ACCESS_DENIED: it exists
+            return _last_error() == 5  # ERROR_ACCESS_DENIED: it exists
         try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            code = wintypes.DWORD()
+            if not k.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return True
             return code.value == 259  # STILL_ACTIVE
         finally:
-            kernel32.CloseHandle(handle)
+            k.CloseHandle(handle)
     except Exception:
         return True
 
@@ -1676,7 +1717,7 @@ def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[
     return out
 
 
-def _lower_priority() -> None:
+def _lower_priority() -> bool:
     """Lower our own CPU (and on Windows I/O) priority.
 
     POSIX: ``os.nice(10)`` from inside the child — the parent could only do it
@@ -1685,15 +1726,33 @@ def _lower_priority() -> None:
     normal; PROCESS_MODE_BACKGROUND_BEGIN (settable only by a process on itself)
     lowers CPU, I/O and memory priority, so a first run over gigabytes does not
     compete with a running task's disk access.
+
+    Returns whether it worked; a failure is one line on stderr (with
+    GetLastError on Windows), never an exception.
     """
     if os.name == "nt":
-        with contextlib.suppress(Exception):
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00100000)  # PROCESS_MODE_BACKGROUND_BEGIN
-        return
+        try:
+            k = _kernel32()
+            ok = bool(k.SetPriorityClass(k.GetCurrentProcess(), 0x00100000))  # PROCESS_MODE_BACKGROUND_BEGIN
+            error = _last_error()
+        except Exception as e:
+            ok, error = False, -1
+            detail = f"{type(e).__name__}: {e}"
+        else:
+            detail = f"GetLastError={error}"
+        if not ok:
+            with contextlib.suppress(Exception):
+                print(f"harness_index: background mode not set ({detail})", file=sys.stderr)
+        return ok
     if hasattr(os, "nice"):
-        with contextlib.suppress(OSError):
+        try:
             os.nice(10)
+        except OSError as e:
+            with contextlib.suppress(Exception):
+                print(f"harness_index: os.nice failed ({e})", file=sys.stderr)
+            return False
+        return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:

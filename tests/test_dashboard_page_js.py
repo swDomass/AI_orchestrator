@@ -148,3 +148,16 @@ def test_provider_doughnut_gets_one_colour_per_segment(tmp_path):
     assert len(out["colours"]) == 4
     assert len(set(out["colours"])) == 4
     assert out["colours"][2] == "#29b6f6"
+
+
+def test_overview_range_buttons_ask_the_server_for_that_many_days(tmp_path):
+    # /api/data returns only `days` days (default 7); without ?days= the 30/90 buttons
+    # would have nothing more to show than the 7-day button.
+    probe = """
+      const urls = [];
+      globalThis.fetch = (u) => { urls.push(u); return new Promise(() => {}); };
+      setRange(90); setRange(7); setRange(30);
+      return urls;
+    """
+    out = _run(tmp_path, _payload(), probe)
+    assert out == ["/api/data?days=90", "/api/data?days=7", "/api/data?days=30"]

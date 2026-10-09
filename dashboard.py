@@ -567,6 +567,7 @@ function setRange(days) {
   document.querySelectorAll('.time-btn[data-days]').forEach(b =>
     b.classList.toggle('active', +b.dataset.days === days));
   applyRange();
+  load();  // /api/data only carries `days` days (default 7): ask for this range
 }
 
 function setLimitRange(hours) {
@@ -947,9 +948,12 @@ function update(d) {
 
 async function load() {
   try {
-    const r = await fetch('/api/data');
+    const asked = _activeRange;
+    const r = await fetch('/api/data?days=' + asked);
     if (r.ok) {
-      _lastData = await r.json();
+      const d = await r.json();
+      if (asked !== _activeRange) return;  // another range was clicked meanwhile
+      _lastData = d;
       update(_lastData);
       // The tab may have been drawn before the first /api/data (direct #harness):
       // its Claude/opencode tiles need limits_now and provider_meta from here.

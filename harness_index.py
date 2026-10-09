@@ -418,7 +418,10 @@ def _peak_private_mb(counters: _ProcessMemoryCounters) -> float:
     working set at about 32 MB, so that figure read 32.0 MB whatever the run
     used. Measured on Windows (Korrekturrunde 2): a probe allocating 200 MB
     read peak working set 32.0 MB and peak private 318.3 MB; the real first run
-    read 32.0 MB, where 75 MB had been measured from outside on the earlier head."""
+    read 32.0 MB, where 75 MB had been measured from outside on the earlier head.
+    The yardstick for an outside measurement is therefore the PRIVATE memory
+    (Korrekturrunde 3, first run, head 57561c6: own 70.1 MB against 70.05 MB
+    from outside), not the 75 MB working set, which this mode caps at 32 MB."""
     return round(float(counters.PeakPagefileUsage) / 1_048_576, 1)
 
 
@@ -2211,6 +2214,11 @@ def _lower_priority_windows() -> bool:
       Windows by ``test_windows_background_mode_keeps_below_normal_and_private_peak``
       (a second PROCESS_MODE_BACKGROUND_BEGIN must fail with
       ERROR_PROCESS_MODE_ALREADY_BACKGROUND, 402).
+      Measured in Korrekturrunde 3: BELOW_NORMAL in 479 of 479 samples of a
+      first run, and ``ionice`` still 2 in its first ~39 s, then 0, i.e. once
+      the call had been reached (``main`` makes it its first step). OPEN: whether
+      the actual CPU scheduling rises with the second ``SetPriorityClass``
+      (never above BELOW_NORMAL) is not measured, only the reported class.
     """
     step = "background mode"
     try:

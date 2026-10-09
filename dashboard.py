@@ -1509,6 +1509,14 @@ def _safe_report(report, message: str) -> None:
         report(message)
 
 
+def _report_startup_warnings(warn) -> None:
+    """``config.STARTUP_WARNINGS`` (collected at import, before logging was set
+    up), each exactly once per process: a reported entry leaves the list."""
+    pending = config.STARTUP_WARNINGS
+    while pending:
+        _safe_report(warn, pending.pop(0))
+
+
 def _autostart_serve(
     handle: AutostartHandle,
     port: int,
@@ -1646,6 +1654,8 @@ def start_autostart(
     handle = AutostartHandle()
     warn = warn or logger.warning
     info = info or logger.info
+    with contextlib.suppress(Exception):  # never raises, by contract
+        _report_startup_warnings(warn)
     # Local, not handle.error: the server thread sets handle.error itself on a
     # bind failure — concurrently — and reports that one on its own.
     start_error: str | None = None

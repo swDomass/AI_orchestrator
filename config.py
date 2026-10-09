@@ -1,4 +1,3 @@
-import logging
 import os
 import re
 import sys
@@ -1069,7 +1068,7 @@ DASHBOARD_ALLOWED_HOSTS = tuple(
 # the dashboard's "Harness" tab reads only HARNESS_DB_FILE (mode=ro). Every source
 # is read-only; the SQLite (plus its lock file) is the only thing written. No
 # prompt/answer/title text is stored — numbers, model names, types, timestamps,
-# ids, and cwd only as hash + last path segment.
+# ids, and cwd only as a hash (no folder name).
 
 
 def _harness_path(key: str, default: Path) -> Path:
@@ -1094,15 +1093,22 @@ HARNESS_CHANGES_FILE = _harness_path("HARNESS_CHANGES_FILE", Path.home() / ".cla
 HARNESS_WINDOW_DAYS = _parse_int_env("HARNESS_WINDOW_DAYS", 90)
 
 
+# Warnings raised while this module is imported. Logging is not set up yet at
+# that point, so a logging call here reached only Python's last-resort stderr
+# handler — lost in the hidden window of the Scheduled Task. Collected instead:
+# dashboard.start_autostart() writes each one exactly once through its `warn`
+# (logger + append_log), after the logging setup. With DASHBOARD_AUTOSTART off
+# nothing reads them — the values below then only matter to a manual index run.
+STARTUP_WARNINGS: list[str] = []
+
+
 def _bounded_int_env(key: str, default: int, *, valid, rule: str) -> int:
     """``_parse_int_env`` plus a sanity bound: an out-of-bound value falls back to
-    the default with ONE warning line (logged at import, so it reaches stderr even
-    before logging is configured)."""
+    the default with ONE entry in ``STARTUP_WARNINGS``."""
     value = _parse_int_env(key, default)
     if valid(value):
         return value
-    logging.getLogger(__name__).warning(
-        "config: %s=%s ungültig (%s) — Standardwert %s", key, value, rule, default)
+    STARTUP_WARNINGS.append(f"config: {key}={value} ungültig ({rule}) — Standardwert {default}")
     return default
 
 

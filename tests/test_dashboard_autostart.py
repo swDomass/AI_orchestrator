@@ -11,11 +11,14 @@ the main loop's ``time.sleep`` to end ``run_watch`` after one round.
 """
 
 import http.client
+import os
 import socket
+import subprocess
 import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -554,15 +557,15 @@ def test_server_and_index_thread_failing_together_is_one_warning(monkeypatch):
         ("HARNESS_UPDATE_INTERVAL_SEC", "299", 1800), ("HARNESS_UPDATE_INTERVAL_SEC", "300", 300),
     ],
 )
-def test_harness_interval_bounds(monkeypatch, caplog, key, raw, expected):
+def test_harness_interval_bounds(monkeypatch, key, raw, expected):
     monkeypatch.setenv(key, raw)
+    monkeypatch.setattr(config, "STARTUP_WARNINGS", [])
     rules = {"HARNESS_LOCK_STALE_SEC": (7200, lambda v: v >= 600),
              "HARNESS_UPDATE_INTERVAL_SEC": (1800, lambda v: v == 0 or v >= 300)}
     default, valid = rules[key]
-    with caplog.at_level("WARNING", logger="config"):
-        value = config._bounded_int_env(key, default, valid=valid, rule="r")
+    value = config._bounded_int_env(key, default, valid=valid, rule="r")
     assert value == expected
-    warned = [r for r in caplog.records if key in r.getMessage()]
+    warned = [w for w in config.STARTUP_WARNINGS if key in w]
     assert len(warned) == (0 if str(expected) == raw else 1)
 
 
@@ -620,3 +623,55 @@ def test_a_silent_connection_does_not_hold_the_server(monkeypatch, served):
 
 def test_handler_timeout_default():
     assert dashboard._Handler.timeout == 10
+
+
+# ── Korrekturrunde 2: K16 warnings from the config import ──────────────────
+
+
+def test_an_invalid_bound_is_collected_not_logged_at_import(monkeypatch, caplog):
+    """Logged at import it went to the last-resort handler — lost in the hidden
+    window of the Scheduled Task."""
+    monkeypatch.setattr(config, "STARTUP_WARNINGS", [])
+    monkeypatch.setenv("HARNESS_LOCK_STALE_SEC", "5")
+    with caplog.at_level("DEBUG"):
+        value = config._bounded_int_env("HARNESS_LOCK_STALE_SEC", 7200, valid=lambda v: v >= 600, rule=">= 600")
+    assert value == 7200
+    assert config.STARTUP_WARNINGS == ["config: HARNESS_LOCK_STALE_SEC=5 ungültig (>= 600) — Standardwert 7200"]
+    assert caplog.records == []
+
+
+def test_the_real_import_collects_the_warning_and_prints_nothing():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
+    env["HARNESS_UPDATE_INTERVAL_SEC"] = "5"
+    proc = subprocess.run(
+        [sys.executable, "-c", "import config; print(repr(config.STARTUP_WARNINGS))"],
+        cwd=str(Path(config.__file__).parent), env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "HARNESS_UPDATE_INTERVAL_SEC=5 ungültig" in proc.stdout
+    assert "ungültig" not in proc.stderr
+
+
+def test_autostart_reports_each_startup_warning_exactly_once(monkeypatch, no_browser, no_harness_thread):
+    monkeypatch.setattr(config, "STARTUP_WARNINGS", ["config: HARNESS_LOCK_STALE_SEC=5 ungültig (>= 600) — x"])
+    rep = _Reports()
+    first = dashboard.start_autostart(port=_free_port(), warn=rep.warn, info=rep.info)
+    second = dashboard.start_autostart(port=_free_port(), warn=rep.warn, info=rep.info)
+    try:
+        _wait_bound(first)
+        _wait_bound(second)
+        assert rep.warnings == ["config: HARNESS_LOCK_STALE_SEC=5 ungültig (>= 600) — x"]
+        assert config.STARTUP_WARNINGS == []
+    finally:
+        first.shutdown()
+        second.shutdown()
+
+
+def test_the_orchestrator_call_site_routes_startup_warnings_to_the_log(monkeypatch, captured_log):
+    monkeypatch.setattr(config, "STARTUP_WARNINGS", ["config: HARNESS_UPDATE_INTERVAL_SEC=5 ungültig — y"])
+    monkeypatch.setattr(config, "DASHBOARD_AUTOSTART", True)
+    monkeypatch.setattr(config, "HARNESS_UPDATE_INTERVAL_SEC", 0)
+    monkeypatch.setattr(dashboard, "_autostart_serve", lambda handle, *a: handle.bound.set())
+    orchestrator._start_dashboard_autostart()
+    assert [m for m in captured_log if "ungültig" in m] == ["config: HARNESS_UPDATE_INTERVAL_SEC=5 ungültig — y"]

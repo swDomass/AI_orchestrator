@@ -662,8 +662,9 @@ def test_an_invalid_bound_is_collected_not_logged_at_import(monkeypatch, caplog)
 def test_the_real_import_collects_the_warning_and_prints_nothing():
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
     env["HARNESS_UPDATE_INTERVAL_SEC"] = "5"
+    # the child prints "ungültig": its stdout is cp1252 on Windows unless it runs in UTF-8 mode
     proc = subprocess.run(
-        [sys.executable, "-c", "import config; print(repr(config.STARTUP_WARNINGS))"],
+        [sys.executable, "-X", "utf8", "-c", "import config; print(repr(config.STARTUP_WARNINGS))"],
         cwd=str(Path(config.__file__).parent), env=env,
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False,
     )

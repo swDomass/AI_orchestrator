@@ -1568,6 +1568,10 @@ def _harness_index_loop(handle: AutostartHandle, interval: float, warn, info) ->
             if not error:
                 lines = (result.get("stdout") or "").splitlines()
                 logger.info("harness index: %s", lines[-1] if lines else "ok")
+            if result.get("stderr"):
+                # Full error texts of the child: the index stores type names only,
+                # the details land here, in the local orchestrator log.
+                logger.info("harness index stderr: %s", result["stderr"])
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
         if error and error != last_error:

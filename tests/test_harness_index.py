@@ -34,7 +34,7 @@ S_NOENTRY = "6c1d4b22-0000-4000-8000-000000000004"
 AGENT_A = "a34730aa-0000-4000-8000-00000000000a"
 AGENT_B = "b45841bb-0000-4000-8000-00000000000b"
 PROJECT_DIR = "C--proj-beispiel"
-CWD = "C:\\CANARY_DRIVE_PATH\\beispiel"
+CWD = "C:\\CANARY_DRIVE_PATH\\CANARY_FOLDER_NAME"  # neither part may reach the index (K9)
 
 
 def _j(obj) -> str:
@@ -722,35 +722,74 @@ def write_ledger(extra=()):
     path = Path(config.HARNESS_EXTERN_LEDGER)
     return write_jsonl(path, [
         {"ts_local": "2026-10-08T19:25:16+02:00", "voice": "codex", "status": "ok", "blocked_until": None,
-         "repo": "beispiel-repo", "tokens": 59012, "note": ""},
+         "repo": "CANARY_REPO_FOLDER", "tokens": 59012, "note": ""},
         {"ts_local": "2026-09-22T10:19:31+02:00", "voice": "opencode", "status": "stillstand",
-         "blocked_until": None, "repo": "C:\\CANARY_LEDGER_PATH\\beispiel", "tokens": None,
+         "blocked_until": None, "repo": "C:\\CANARY_LEDGER_PATH\\CANARY_LEDGER_FOLDER", "tokens": None,
          "note": "CANARY_LEDGER_NOTE"},
         {"ts_local": "2026-09-22T10:11:28+02:00", "voice": "codex", "status": "limit",
-         "blocked_until": "2026-09-24T09:17:00+02:00", "repo": "beispiel-repo", "tokens": None,
+         "blocked_until": "2026-09-24T09:17:00+02:00", "repo": "CANARY_REPO_FOLDER", "tokens": None,
          "note": "Nutzungslimit erreicht (codex)", "neues_feld": 1},
         *extra,
     ])
 
 
-def test_ledger_rows_are_idempotent_and_keep_no_text():
-    path = write_ledger(extra=['{"ts_local":"broken', {"voice": "codex"}])
+def _ledger_line(ts="2026-10-08T19:25:16+02:00", voice="codex", status="ok", tokens=59012, repo="r"):
+    return {"ts_local": ts, "voice": voice, "status": status, "blocked_until": None, "repo": repo,
+            "tokens": tokens, "note": ""}
+
+
+def test_ledger_rows_keep_no_text_and_count_bad_lines():
+    write_ledger(extra=['{"ts_local":"broken', {"voice": "codex"}])
     summary = run()
-    rows = sorted(q("SELECT ts_local, voice, repo_name, status, tokens, day FROM ledger"))
+    rows = q("SELECT line_no, ts_local, voice, status, tokens, day FROM ledger ORDER BY line_no")
     assert rows == [
-        ("2026-09-22T10:11:28+02:00", "codex", "beispiel-repo", "limit", None, hi._local_day_from_iso(
-            "2026-09-22T10:11:28+02:00")),
-        ("2026-09-22T10:19:31+02:00", "opencode", "beispiel", "stillstand", None, hi._local_day_from_iso(
-            "2026-09-22T10:19:31+02:00")),
-        ("2026-10-08T19:25:16+02:00", "codex", "beispiel-repo", "ok", 59012, hi._local_day_from_iso(
-            "2026-10-08T19:25:16+02:00")),
+        (1, "2026-10-08T19:25:16+02:00", "codex", "ok", 59012, hi._local_day_from_iso("2026-10-08T19:25:16+02:00")),
+        (2, "2026-09-22T10:19:31+02:00", "opencode", "stillstand", None,
+         hi._local_day_from_iso("2026-09-22T10:19:31+02:00")),
+        (3, "2026-09-22T10:11:28+02:00", "codex", "limit", None, hi._local_day_from_iso("2026-09-22T10:11:28+02:00")),
     ]
     assert summary["per_source"]["ledger"]["lines_skipped"] == 2
-    # same line appended again (a re-written ledger) → still one row per natural key
-    append_jsonl(path, [{"ts_local": "2026-10-08T19:25:16+02:00", "voice": "codex", "status": "ok",
-                         "blocked_until": None, "repo": "beispiel-repo", "tokens": 59012, "note": ""}])
+
+
+def test_ledger_two_calls_in_the_same_second_are_two_rows():
+    """Measured on real data: 4 keys (second, voice, repo) carried two lines each,
+    2 of them Codex calls with different tokens — both are real calls."""
+    write_jsonl(Path(config.HARNESS_EXTERN_LEDGER), [_ledger_line(tokens=100), _ledger_line(tokens=36)])
+    run()
+    assert q("SELECT count(*), sum(tokens) FROM ledger") == [(2, 136)]
+
+
+def test_ledger_three_identical_lines_are_three_calls():
+    write_jsonl(Path(config.HARNESS_EXTERN_LEDGER), [_ledger_line()] * 3)
     run()
     assert q("SELECT count(*) FROM ledger") == [(3,)]
+    append_jsonl(Path(config.HARNESS_EXTERN_LEDGER), [_ledger_line()])  # a fourth call
+    run()
+    assert q("SELECT count(*) FROM ledger") == [(4,)]
+
+
+@pytest.mark.parametrize("same_length", [True, False], ids=["same_length", "other_length"])
+def test_ledger_line_edited_in_the_middle_is_picked_up_without_a_ghost(same_length):
+    path = write_jsonl(Path(config.HARNESS_EXTERN_LEDGER),
+                       [_ledger_line(tokens=111), _ledger_line(status="ok", tokens=222), _ledger_line(tokens=333)])
+    run()
+    size, mtime = path.stat().st_size, path.stat().st_mtime_ns
+    edited = _ledger_line(status="no", tokens=999) if same_length else _ledger_line(status="limit", tokens=None)
+    write_jsonl(path, [_ledger_line(tokens=111), edited, _ledger_line(tokens=333)])
+    assert (path.stat().st_size == size) is same_length
+    if same_length:
+        os.utime(path, ns=(mtime, mtime))  # same size AND same mtime: only the content differs
+    run()
+    rows = q("SELECT line_no, status, tokens FROM ledger ORDER BY line_no")
+    assert rows == [(1, "ok", 111), (2, edited["status"], edited["tokens"]), (3, "ok", 333)]
+
+
+def test_deleted_ledger_keeps_its_rows():
+    path = write_jsonl(Path(config.HARNESS_EXTERN_LEDGER), [_ledger_line(), _ledger_line(voice="opencode")])
+    run()
+    path.unlink()
+    run()
+    assert q("SELECT count(*) FROM ledger") == [(2,)]
 
 
 def write_markers(lines=None):
@@ -815,10 +854,10 @@ def test_no_prompt_answer_title_or_path_text_reaches_the_index():
         if p.exists():
             blob += p.read_bytes()
     assert blob, "index file missing"
-    assert b"CANARY" not in blob
+    assert b"CANARY" not in blob  # covers the folder names too (K9: only the cwd hash is kept)
     assert PROJECT_DIR.encode() not in blob  # the encoded cwd directory name is a path too
-    # the allowed parts are there: last cwd segment + hash
-    assert b"beispiel" in blob
+    # the hash of the cwd is what stays
+    assert hi._hash(CWD).encode() in blob
 
 
 def test_index_run_is_logged_with_counts():
@@ -1034,6 +1073,199 @@ def test_scheduler_survives_a_raising_index_and_is_off_at_interval_zero(monkeypa
     off = dashboard.start_autostart(port=1, warn=lambda _m: None, info=lambda _m: None)
     assert off.index_thread is None
     off.shutdown()
+
+
+# ── Korrekturrunde 1: K3 robustness ─────────────────────────────────────────
+
+
+def _proj_path(project: str, session: str) -> Path:
+    return claude_root() / project / f"{session}.jsonl"
+
+
+def test_an_out_of_range_number_skips_one_line_and_never_blocks_the_source():
+    """Review probe: a 2**70 token count raised OverflowError out of the line
+    handler and ended the whole Claude source — every later file (subagents and
+    .meta.json included) was missing on every run."""
+    sa, sb, sc = (f"{c}0000000-0000-4000-8000-00000000000{i}" for i, c in enumerate("abc", 1))
+    write_jsonl(_proj_path("A", sa), [c_header(sa), c_assistant(sa, "a1")])
+    write_jsonl(_proj_path("B", sb), [c_header(sb), c_assistant(sb, "b_big", usage={"input_tokens": 2**70}),
+                                       c_assistant(sb, "b_ok")])
+    write_jsonl(_proj_path("C", sc), [c_header(sc), c_assistant(sc, "c1")])
+    write_jsonl(sub_path(sc, AGENT_A), [c_assistant(sc, "c_sub", sidechain=True, agent_id=AGENT_A)])
+    write_meta(sc, AGENT_A)
+    first = run()
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["a1", "b_ok", "c1", "c_sub"]
+    assert q("SELECT count(*) FROM claude_agent_meta") == [(1,)]
+    claude = first["per_source"]["claude"]
+    assert claude["lines_skipped"] == 1
+    assert claude["skipped_by_type"] == {"_OutOfRangeError": 1}
+    assert claude["errors"] == []
+    second = run()
+    assert second["lines_read"] == 0
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["a1", "b_ok", "c1", "c_sub"]
+
+
+def test_any_unexpected_exception_in_a_line_is_skipped_by_type(monkeypatch):
+    real = hi.model_family
+
+    def picky(model):
+        if model == "claude-explodes":
+            raise RuntimeError("unexpected")
+        return real(model)
+
+    monkeypatch.setattr(hi, "model_family", picky)
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1"),
+                                   c_assistant(S_CLI, "m2", model="claude-explodes"), c_assistant(S_CLI, "m3")])
+    summary = run()
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["m1", "m3"]
+    assert summary["per_source"]["claude"]["skipped_by_type"] == {"RuntimeError": 1}
+
+
+def test_a_failing_file_is_recorded_and_the_next_file_still_runs(monkeypatch):
+    sa, sb = "a0000000-0000-4000-8000-000000000001", "b0000000-0000-4000-8000-000000000002"
+    write_jsonl(_proj_path("A", sa), [c_header(sa), c_assistant(sa, "a1")])
+    write_jsonl(_proj_path("B", sb), [c_header(sb), c_assistant(sb, "b1")])
+    real = hi._claude_main_file
+
+    def fails_for_a(conn, root, path, stats):
+        if path.parent.name == "A":
+            raise LookupError(f"{path} CANARY_ERROR_PATH")  # not an OSError
+        return real(conn, root, path, stats)
+
+    monkeypatch.setattr(hi, "_claude_main_file", fails_for_a)
+    summary = run()
+    assert q("SELECT msg_id FROM claude_msg") == [("b1",)]
+    assert summary["status"] == "partial"
+    (err,) = summary["per_source"]["claude"]["errors"]
+    assert err.endswith(": LookupError")  # K9: type only, no message, no path
+    stored = q("SELECT errors, per_source FROM index_runs")[0]
+    assert "CANARY" not in stored[0] and "CANARY" not in stored[1]
+
+
+def test_a_timestamp_before_1970_skips_the_line_and_the_file_goes_on():
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "old", ts="1969-12-31T23:00:00Z"),
+                                   c_assistant(S_CLI, "new")])
+    summary = run()
+    assert q("SELECT msg_id FROM claude_msg") == [("new",)]
+    assert summary["per_source"]["claude"]["lines_skipped"] == 1
+    assert hi._local_day_from_iso("1969-12-31T23:00:00Z") is None
+    assert hi._local_day_from_iso("1969-12-31T23:00:00") is None
+
+
+def test_int_bounds_follow_sqlite():
+    assert hi._int(2**63 - 1) == 2**63 - 1
+    assert hi._int(-(2**63)) == -(2**63)
+    with pytest.raises(hi._OutOfRangeError):
+        hi._int(2**63)
+    with pytest.raises(hi._OutOfRangeError):
+        hi._int(1e30)
+    assert hi._int(float("nan")) is None
+    assert hi._int(True) is None
+
+
+def test_an_out_of_range_opencode_row_is_skipped_and_the_others_stay():
+    make_opencode_db()
+    conn = sqlite3.connect(str(config.HARNESS_OPENCODE_DB))
+    t = _now_ms(-30)
+    conn.execute("INSERT INTO message VALUES (?,?,?,?,?)",
+                 ("msg_huge", "ses_parent", t, t, _j(oc_assistant(inp=2**70))))
+    conn.commit()
+    conn.close()
+    summary = run()
+    ids = {r[0] for r in q("SELECT id FROM oc_message")}
+    assert {"msg_a1", "msg_a2"} <= ids and "msg_huge" not in ids
+    assert summary["per_source"]["opencode"]["skipped_by_type"].get("_OutOfRangeError") == 1
+
+
+# ── K4: one row per message.id across files ────────────────────────────────
+
+
+def test_a_message_id_counts_once_across_main_fork_and_subagent_files():
+    fork = "f0000000-0000-4000-8000-00000000000f"
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1"), c_assistant(S_CLI, "m2")])
+    write_jsonl(main_path(fork), [c_header(fork), c_assistant(fork, "m1"), c_assistant(fork, "m2"),
+                                  c_assistant(fork, "m3")])
+    write_jsonl(sub_path(S_CLI, AGENT_A), [c_assistant(S_CLI, "m1", sidechain=True, agent_id=AGENT_A),
+                                           c_assistant(S_CLI, "m9", sidechain=True, agent_id=AGENT_A)])
+    run()
+    rows = dict(q("SELECT msg_id, kind FROM claude_msg"))
+    assert rows == {"m1": "main", "m2": "main", "m3": "main", "m9": "subagent"}
+    assert claude_tokens()[0] == 4 * 2  # input_tokens 2 per message, once each
+
+
+def test_two_subagent_files_of_one_parent_with_the_same_id_count_once():
+    write_jsonl(sub_path(S_SDK, AGENT_A), [c_assistant(S_SDK, "s1", sidechain=True, agent_id=AGENT_A)])
+    write_jsonl(sub_path(S_SDK, AGENT_B), [c_assistant(S_SDK, "s1", sidechain=True, agent_id=AGENT_B,
+                                                       usage={"input_tokens": 5, "output_tokens": 70})])
+    run()
+    assert q("SELECT msg_id, kind, input, output FROM claude_msg") == [("s1", "subagent", 5, 70)]
+
+
+def test_a_main_file_read_later_takes_over_a_subagent_row():
+    write_jsonl(sub_path(S_SDK, AGENT_A), [c_assistant(S_SDK, "x1", sidechain=True, agent_id=AGENT_A,
+                                                       entrypoint="cli")])
+    run()
+    assert q("SELECT kind, origin, agent_id FROM claude_msg") == [("subagent", "interaktiv", AGENT_A)]
+    write_jsonl(main_path(S_SDK), [c_header(S_SDK, "sdk-cli"), c_assistant(S_SDK, "x1", entrypoint="sdk-cli")])
+    run()
+    assert q("SELECT kind, origin, agent_id FROM claude_msg") == [("main", "orchestrator", None)]
+
+
+def test_usage_lines_of_one_id_differ_and_the_maximum_per_field_counts():
+    """Real data: 57 % of ids carry DIFFERENT usage across their lines (streaming)."""
+    write_jsonl(main_path(S_CLI), [
+        c_header(S_CLI),
+        c_assistant(S_CLI, "m1", block=0, usage={"input_tokens": 2, "output_tokens": 1, "cache_read_input_tokens": 50}),
+        c_assistant(S_CLI, "m1", block=1, usage={"input_tokens": 2, "output_tokens": 400}),
+    ])
+    run()
+    assert q("SELECT input, output, cache_read FROM claude_msg") == [(2, 400, 50)]
+
+
+# ── K11: index details ─────────────────────────────────────────────────────
+
+
+def test_cost_state_keeps_the_largest_value_per_session():
+    start_ms = int(datetime(2026, 10, 8, 12, 0).timestamp() * 1000)
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_cost(S_CLI, 97.76, start_ms), c_cost(S_CLI, 10.0, start_ms)])
+    run()
+    assert q("SELECT cost_usd FROM claude_cost") == [(97.76,)]
+
+
+def test_unchanged_files_are_not_even_opened(monkeypatch):
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
+    run()
+    real_open = Path.open
+
+    def no_open(self, *a, **kw):
+        if self.suffix == ".jsonl":
+            raise AssertionError(f"opened {self.name}")
+        return real_open(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "open", no_open)
+    summary = run()
+    assert summary["status"] == "ok", summary
+    assert summary["files_read"] == 0
+
+
+def test_an_incomplete_opencode_message_is_reread_even_without_a_new_time_updated():
+    make_opencode_db()
+    conn = sqlite3.connect(str(config.HARNESS_OPENCODE_DB))
+    t = _now_ms(-120)
+    pending = oc_assistant(cost=0.0, inp=0)
+    del pending["time"]["completed"]
+    conn.execute("INSERT INTO message VALUES (?,?,?,?,?)", ("msg_pending", "ses_parent", t, t, _j(pending)))
+    conn.commit()
+    run()
+    assert q("SELECT cost, completed FROM oc_message WHERE id='msg_pending'") == [(0.0, 0)]
+    done = oc_assistant(cost=0.25, inp=900, t=pending["time"]["created"])
+    conn.execute("UPDATE message SET data=? WHERE id='msg_pending'", (_j(done),))  # time_updated unchanged
+    conn.commit()
+    conn.close()
+    second = run()
+    assert q("SELECT cost, t_input, completed FROM oc_message WHERE id='msg_pending'") == [(0.25, 900, 1)]
+    assert second["per_source"]["opencode"]["lines_read"] == 1
+    assert run()["per_source"]["opencode"]["lines_read"] == 0
 
 
 # ── K5: priority / memory calls ─────────────────────────────────────────────

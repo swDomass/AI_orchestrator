@@ -28,23 +28,38 @@ Invariants (each one is pinned by a test in ``tests/test_harness_index.py``):
 * **Read-only towards every source.** The only files written are the SQLite
   database, its WAL/SHM files and the lock file next to it.
 * **No text.** Stored are numbers, model names, types, timestamps, ids and the
-  working directory only as ``sha256(cwd)[:12]`` plus its last path segment.
-  Prompts, answers, thinking, titles, descriptions, notes, paths: never. Source
-  file paths are stored as a hash (the Claude project directory name is the
-  encoded full cwd). Exception by design: the harness-change markers' ``change``
-  and ``expect`` sentences, which the user writes in order to see them on the
+  working directory only as ``sha256(cwd)[:12]`` — no folder name, not even the
+  last path segment (K9, Korrekturrunde 1). Prompts, answers, thinking, titles,
+  descriptions, notes, paths: never. Source file paths are stored as a hash (the
+  Claude project directory name is the encoded full cwd). Error texts in
+  ``index_runs`` are the exception type only (plus ``errno`` for an OSError); the
+  full message goes to stderr, which the scheduler writes to the orchestrator
+  log. Exception by design: the harness-change markers' ``change`` and
+  ``expect`` sentences, which the user writes in order to see them on the
   dashboard (not ``source``).
-* **Idempotent.** Every row has a natural key (``(file, message.id)`` for Claude —
-  one API answer is split into up to four transcript lines with identical usage,
-  counting lines would double to quadruple the usage; ``(sessionId, agentId)``
-  for subagent runs; one row per Codex rollout carrying the LAST cumulative
-  ``token_count``; ``message.id`` for opencode; ``(ts_local, voice, repo)`` for
-  the ledger; ``(date, id)`` for markers). Re-reading anything never double counts.
+* **Idempotent.** Every row has a natural key, and re-reading anything never
+  double counts:
+  - Claude: ``message.id`` alone, across ALL files. One API answer is split into
+    up to four transcript lines, and the same id also appears in a second file
+    (a resumed or forked session, a subagent copy). The lines of one id do NOT
+    all carry the same usage (measured: in 57 % of the multi-line ids at least
+    one counter differs), so every counter keeps its ``max()``; a main-session
+    file wins the attribution over a subagent file.
+  - ``(sessionId, agentId)`` for subagent runs; one row per Codex rollout
+    carrying the LAST cumulative ``token_count``; ``message.id`` for opencode
+    (a message without ``time.completed`` is re-read on later runs).
+  - Ledger: the line number. Each line is one call — two lines with the same
+    second, voice and repo are two calls. The file is small, its whole-file hash
+    is checked every run, and on any change the table is rebuilt from scratch.
+  - Markers: ``(date, id)``, rebuilt the same way as the ledger.
 * **Incremental.** Per file: size, mtime, offset of the end of the last complete
-  line, and a head fingerprint (sha256 of the first ``min(256, size)`` bytes at
-  the last read). Unchanged → not opened. Shrunk below the offset or head changed
+  line, a head fingerprint (sha256 of the first ``min(256, size)`` bytes) and a
+  tail fingerprint (the 256 bytes in front of the offset). Size and mtime
+  unchanged → not opened at all. Shrunk below the offset, head or tail changed
   → read from the start (natural keys absorb it). A line without its newline is
-  not consumed; the offset stays in front of it until it is complete.
+  not consumed; the offset stays in front of it until it is complete. A line
+  that fails in any way is skipped and counted by exception type; a file that
+  fails is reported and leaves every other file's offset alone.
 * **Deleted sources keep their rows.** The heartbeat deletes orchestrator
   transcripts after 14 days (``heartbeat._check_session_cleanup``); afterwards
   this index is the only record of that time.
@@ -75,13 +90,13 @@ import time
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: claude_msg keyed by message.id alone, no folder names, ledger by line
 HEAD_BYTES = 256
 TAIL_BYTES = 256
 # A complete-looking last line without newline is evaluated only once the file
@@ -109,15 +124,13 @@ CREATE TABLE IF NOT EXISTS file_state (
     tail_hash TEXT, info TEXT, last_read REAL,
     PRIMARY KEY (source, file_key));
 CREATE TABLE IF NOT EXISTS claude_session (
-    session_id TEXT PRIMARY KEY, entrypoint TEXT, origin TEXT,
-    project TEXT, cwd_hash TEXT, file_key TEXT);
+    session_id TEXT PRIMARY KEY, entrypoint TEXT, origin TEXT, cwd_hash TEXT, file_key TEXT);
 CREATE TABLE IF NOT EXISTS claude_msg (
-    file_key TEXT NOT NULL, msg_id TEXT NOT NULL, session_id TEXT,
+    msg_id TEXT PRIMARY KEY, file_key TEXT, session_id TEXT,
     kind TEXT, agent_id TEXT, origin TEXT, model TEXT, family TEXT,
     ts TEXT, day TEXT,
     input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
-    project TEXT, cwd_hash TEXT,
-    PRIMARY KEY (file_key, msg_id));
+    cwd_hash TEXT);
 CREATE INDEX IF NOT EXISTS claude_msg_day ON claude_msg (day);
 CREATE TABLE IF NOT EXISTS claude_cost (
     session_id TEXT PRIMARY KEY, file_key TEXT, cost_usd REAL,
@@ -132,7 +145,7 @@ CREATE TABLE IF NOT EXISTS claude_agent_meta (
     PRIMARY KEY (session_id, agent_id));
 CREATE TABLE IF NOT EXISTS codex_rollout (
     file_key TEXT PRIMARY KEY, session_id TEXT, thread_source TEXT, originator TEXT,
-    model TEXT, project TEXT, cwd_hash TEXT, first_ts TEXT, day TEXT,
+    model TEXT, cwd_hash TEXT, first_ts TEXT, day TEXT,
     tc_ts TEXT, input INTEGER, cached_input INTEGER, cache_write INTEGER,
     output INTEGER, reasoning INTEGER, total INTEGER,
     rl_ts TEXT, primary_used REAL, primary_window INTEGER, primary_resets INTEGER,
@@ -147,11 +160,10 @@ CREATE TABLE IF NOT EXISTS oc_message (
     id TEXT PRIMARY KEY, session_id TEXT, role TEXT, agent TEXT, model_id TEXT,
     provider_id TEXT, created_ms INTEGER, time_updated INTEGER, day TEXT, cost REAL,
     t_input INTEGER, t_output INTEGER, t_reasoning INTEGER,
-    t_cache_read INTEGER, t_cache_write INTEGER, finish TEXT);
+    t_cache_read INTEGER, t_cache_write INTEGER, finish TEXT, completed INTEGER);
 CREATE TABLE IF NOT EXISTS ledger (
-    ts_local TEXT NOT NULL, voice TEXT NOT NULL, repo_hash TEXT NOT NULL,
-    repo_name TEXT, status TEXT, blocked_until TEXT, tokens INTEGER, day TEXT,
-    PRIMARY KEY (ts_local, voice, repo_hash));
+    line_no INTEGER PRIMARY KEY, ts_local TEXT, voice TEXT, repo_hash TEXT,
+    status TEXT, blocked_until TEXT, tokens INTEGER, day TEXT);
 CREATE TABLE IF NOT EXISTS marker (
     date TEXT NOT NULL, id TEXT NOT NULL, scope TEXT, change TEXT, expect TEXT,
     PRIMARY KEY (date, id));
@@ -186,19 +198,40 @@ def _str(value: object) -> str | None:
 
 
 def _err_text(exc: BaseException) -> str:
-    """Error text for the index: never a path (OSError messages carry the file name)."""
+    """Error text for the INDEX: type name, plus errno for an OSError — never the
+    message, which can carry a path (OSError, Path.relative_to, …). The full text
+    goes to stderr only (``_note_error``), which the scheduler logs locally."""
     if isinstance(exc, OSError):
         return f"{type(exc).__name__} errno={exc.errno}"
-    return f"{type(exc).__name__}: {str(exc)[:200]}"
+    return type(exc).__name__
+
+
+def _note_error(stats: SourceStats, where: str, exc: BaseException) -> None:
+    """Record an error: sanitized into the run log, in full on stderr."""
+    stats.error(f"{where}: {_err_text(exc)}")
+    with contextlib.suppress(Exception):
+        print(f"harness_index {where}: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+class _OutOfRangeError(ValueError):
+    """A number SQLite cannot store as INTEGER — the line is skipped, not truncated."""
 
 
 def _int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        value = int(value)
     if isinstance(value, int):
+        if not _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
+            raise _OutOfRangeError("integer outside the SQLite range")
         return value
-    if isinstance(value, float) and math.isfinite(value):
-        return int(value)
     return None
 
 
@@ -210,31 +243,36 @@ def _float(value: object) -> float | None:
     return None
 
 
-def _last_segment(path: object) -> str | None:
-    """Last path segment of a Windows or POSIX path, no drive, no parents."""
-    if not isinstance(path, str) or not path.strip():
-        return None
-    parts = [p for p in path.replace("\\", "/").split("/") if p and not p.endswith(":")]
-    return parts[-1][:NAME_MAX] if parts else None
-
-
-def _cwd_fields(cwd: object) -> tuple[str | None, str | None]:
+def _cwd_hash(cwd: object) -> str | None:
+    """The working directory only as a hash — the folder name itself is not stored
+    (it is never read, and folder names can name customers)."""
     if not isinstance(cwd, str) or not cwd:
-        return None, None
-    return _last_segment(cwd), _hash(cwd)
+        return None
+    return _hash(cwd)
+
+
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _local_day_from_iso(ts: object) -> str | None:
-    """Local calendar day of an ISO timestamp (``Z``/offset → converted; naive = local)."""
+    """Local calendar day of an ISO timestamp (``Z``/offset → converted; naive = local).
+
+    None for anything unusable — unparseable, or before 1970 (Windows'
+    ``astimezone()`` raises OSError there, so the rule is the same everywhere).
+    """
     if not isinstance(ts, str) or not ts:
         return None
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
+        if dt.tzinfo is not None:
+            if dt < _EPOCH_UTC:
+                return None
+            dt = dt.astimezone()
+        elif dt.year < 1970:
+            return None
+        return dt.date().isoformat()
+    except (OSError, OverflowError, ValueError):
         return None
-    if dt.tzinfo is not None:
-        dt = dt.astimezone()
-    return dt.date().isoformat()
 
 
 def _local_day_from_ms(ms: object) -> str | None:
@@ -349,17 +387,25 @@ class SourceStats:
     lines_read: int = 0
     lines_skipped: int = 0
     errors: list[str] = field(default_factory=list)
+    skipped_by_type: dict[str, int] = field(default_factory=dict)
 
     def error(self, message: str) -> None:
         if len(self.errors) < 20:
             self.errors.append(message[:300])
+
+    def skip(self, exc: BaseException) -> None:
+        """A line that raised: counted as skipped, by exception TYPE (no text)."""
+        self.lines_skipped += 1
+        name = type(exc).__name__
+        self.skipped_by_type[name] = self.skipped_by_type.get(name, 0) + 1
 
     def as_dict(self) -> dict:
         return {
             "files_seen": self.files_seen, "files_read": self.files_read,
             "files_skipped_window": self.files_skipped_window,
             "bytes_read": self.bytes_read, "lines_read": self.lines_read,
-            "lines_skipped": self.lines_skipped, "errors": list(self.errors),
+            "lines_skipped": self.lines_skipped, "skipped_by_type": dict(self.skipped_by_type),
+            "errors": list(self.errors),
         }
 
 
@@ -497,7 +543,9 @@ def open_index(db_path: Path) -> sqlite3.Connection:
         conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
     elif row[0] != str(SCHEMA_VERSION):
         conn.close()
-        raise SchemaMismatchError(f"schema_version {row[0]} in {db_path}, expected {SCHEMA_VERSION}")
+        raise SchemaMismatchError(
+            f"schema_version {row[0]} in {db_path}, expected {SCHEMA_VERSION} — delete the file, "
+            "the next run rebuilds it (rows of transcripts deleted since are then gone)")
     return conn
 
 
@@ -628,14 +676,13 @@ def _iter_new_lines(
 
 
 def _unchanged(path: Path, prev: FileState | None) -> bool:
-    """True when the file is byte-for-byte where the last run left it (no BEGIN, no read)."""
+    """True when size and mtime are where the last run left them — the file is
+    then not even opened (≈ 3000 files per run; every open is a virus-scanner
+    hit on Windows). A rewrite that keeps both size and mtime is not detected."""
     if prev is None:
         return False
     st = path.stat()
-    if st.st_size != prev.size or st.st_mtime != prev.mtime or st.st_size < prev.head_len:
-        return False
-    with path.open("rb") as f:
-        return _head_hash(f, prev.head_len) == prev.head_hash
+    return st.st_size == prev.size and st.st_mtime == prev.mtime
 
 
 def _parse_line(raw: bytes, needles: tuple[bytes, ...], stats: SourceStats) -> dict | None:
@@ -691,9 +738,13 @@ def _run_file(
                 continue
             try:
                 handle(obj, state, reset)
-            except (KeyError, TypeError, ValueError, AttributeError) as e:
-                stats.lines_skipped += 1
-                stats.error(f"{source}: {type(e).__name__}")
+            except Exception as e:
+                # Database-level failures end this file (rolled back, retried
+                # next run); anything else is a property of THIS line: skipped
+                # and counted by type, the file goes on.
+                if isinstance(e, sqlite3.OperationalError) or type(e) is sqlite3.DatabaseError:
+                    raise
+                stats.skip(e)
         if state is not None:
             if on_done is not None:
                 on_done(state)
@@ -709,7 +760,7 @@ def _in_window(path: Path, cutoff: float, stats: SourceStats) -> bool:
     try:
         mtime = path.stat().st_mtime
     except OSError as e:
-        stats.error(f"stat: {_err_text(e)}")
+        _note_error(stats, "stat", e)
         return False
     if mtime < cutoff:
         stats.files_skipped_window += 1
@@ -750,17 +801,18 @@ def _index_claude(conn: sqlite3.Connection, root: Path, cutoff: float, stats: So
 
 
 def _guard_file(stats: SourceStats, path: Path, work: Callable[..., None], *args: object) -> None:
-    """Run one file's work; an I/O or database error is recorded, the run goes on."""
+    """Run one file's work; ANY failure is recorded and the run goes on with the
+    next file. Every file has its own transaction, so a failing file never moves
+    (or resets) another file's offset."""
     try:
         work(*args)
-    except (OSError, sqlite3.Error, UnicodeError) as e:
-        stats.error(f"{_err_text(e)} in file #{_hash(str(path), 8)}")
+    except Exception as e:
+        _note_error(stats, f"file #{_hash(str(path), 8)}", e)
 
 
 def _claude_assistant(
     conn: sqlite3.Connection, obj: dict, stats: SourceStats, *, file_key: str, kind: str,
-    agent_id: str | None, session_id: str | None, origin: str,
-    project: str | None, cwd_hash: str | None,
+    agent_id: str | None, session_id: str | None, origin: str, cwd_hash: str | None,
 ) -> None:
     msg = obj.get("message")
     if not isinstance(msg, dict):
@@ -768,6 +820,11 @@ def _claude_assistant(
         return
     ts = _str(obj.get("timestamp"))
     day = _local_day_from_iso(ts)
+    if day is None:
+        # no usable timestamp (missing, unparseable, before 1970): the line cannot
+        # be placed on a day, so it is skipped instead of counted invisibly
+        stats.skip(ValueError("timestamp"))
+        return
     content = msg.get("content")
     if isinstance(content, list):
         for item in content:
@@ -794,23 +851,33 @@ def _claude_assistant(
     if msg_id is None:
         stats.lines_skipped += 1
         return
-    # Upsert with max(): the same message.id recurs in up to four lines with
-    # identical usage (one API answer split per content block); should a later
-    # line ever carry a larger (final) count, that one wins. Never a sum.
+    counters = (_int(usage.get("input_tokens")), _int(usage.get("output_tokens")),
+                _int(usage.get("cache_read_input_tokens")), _int(usage.get("cache_creation_input_tokens")))
+    # One row per message.id across ALL files: the API issues it once, but it
+    # recurs in up to four lines of one transcript (one answer split per content
+    # block) and in several files (subagent transcripts of the same parent session,
+    # forks). Counters: max() per field — the lines of one id do NOT carry
+    # identical usage (measured on real data: 57 % of ids differ, streaming), the
+    # last/largest value is the answer's. Never a sum. The attribution (file,
+    # kind, origin, …) is upgraded once, from a subagent row to a main-file row;
+    # otherwise the first file read keeps it (files are read in sorted order).
     conn.execute(
-        "INSERT INTO claude_msg(file_key, msg_id, session_id, kind, agent_id, origin, model, family, "
-        "ts, day, input, output, cache_read, cache_write, project, cwd_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(file_key, msg_id) DO UPDATE SET "
+        "INSERT INTO claude_msg(msg_id, file_key, session_id, kind, agent_id, origin, model, family, "
+        "ts, day, input, output, cache_read, cache_write, cwd_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(msg_id) DO UPDATE SET "
         "input=max(coalesce(input, 0), coalesce(excluded.input, 0)), "
         "output=max(coalesce(output, 0), coalesce(excluded.output, 0)), "
         "cache_read=max(coalesce(cache_read, 0), coalesce(excluded.cache_read, 0)), "
         "cache_write=max(coalesce(cache_write, 0), coalesce(excluded.cache_write, 0)), "
-        "origin=excluded.origin",
-        (file_key, msg_id[:NAME_MAX], session_id, kind, agent_id, origin, _name(model), family,
-         ts, day, _int(usage.get("input_tokens")), _int(usage.get("output_tokens")),
-         _int(usage.get("cache_read_input_tokens")), _int(usage.get("cache_creation_input_tokens")),
-         project, cwd_hash),
+        "file_key=CASE WHEN kind!='main' AND excluded.kind='main' THEN excluded.file_key ELSE file_key END, "
+        "session_id=CASE WHEN kind!='main' AND excluded.kind='main' THEN excluded.session_id ELSE session_id END, "
+        "agent_id=CASE WHEN kind!='main' AND excluded.kind='main' THEN excluded.agent_id ELSE agent_id END, "
+        "origin=CASE WHEN kind!='main' AND excluded.kind='main' THEN excluded.origin ELSE origin END, "
+        "cwd_hash=CASE WHEN kind!='main' AND excluded.kind='main' THEN excluded.cwd_hash ELSE cwd_hash END, "
+        "kind=CASE WHEN kind!='main' AND excluded.kind='main' THEN excluded.kind ELSE kind END",
+        (msg_id[:NAME_MAX], file_key, session_id, kind, agent_id, origin, _name(model), family,
+         ts, day, *counters, cwd_hash),
     )
 
 
@@ -827,31 +894,41 @@ def _claude_main_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
         info = state.info
         if "entrypoint" not in info and "entrypoint" in obj:
             info["entrypoint"] = _name(obj.get("entrypoint"))
-            project, cwd_hash = _cwd_fields(obj.get("cwd"))
-            info["project"], info["cwd_hash"] = project, cwd_hash
+            info["cwd_hash"] = _cwd_hash(obj.get("cwd"))
         session_id = _str(obj.get("sessionId")) or stem_session
         origin = origin_of(info.get("entrypoint"))
         kind = obj.get("type")
         if kind == "assistant":
             _claude_assistant(conn, obj, stats, file_key=file_key, kind="main", agent_id=None,
                               session_id=session_id[:NAME_MAX], origin=origin,
-                              project=info.get("project"), cwd_hash=info.get("cwd_hash"))
+                              cwd_hash=info.get("cwd_hash"))
         elif kind == "cost-state":
             cost = _float(obj.get("totalCostUSD"))
             start_ms = _int(obj.get("startTime"))
+            # cumulative per session: the LARGEST value counts, not the last one
+            # read (a resumed/forked file can carry an older, smaller state)
             conn.execute(
-                "INSERT OR REPLACE INTO claude_cost(session_id, file_key, cost_usd, start_ms, day, origin) "
-                "VALUES (?,?,?,?,?,?)",
+                "INSERT INTO claude_cost(session_id, file_key, cost_usd, start_ms, day, origin) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+                "file_key=CASE WHEN coalesce(excluded.cost_usd,0) >= coalesce(cost_usd,0) "
+                "THEN excluded.file_key ELSE file_key END, "
+                "start_ms=CASE WHEN coalesce(excluded.cost_usd,0) >= coalesce(cost_usd,0) "
+                "THEN excluded.start_ms ELSE start_ms END, "
+                "day=CASE WHEN coalesce(excluded.cost_usd,0) >= coalesce(cost_usd,0) "
+                "THEN excluded.day ELSE day END, "
+                "origin=CASE WHEN coalesce(excluded.cost_usd,0) >= coalesce(cost_usd,0) "
+                "THEN excluded.origin ELSE origin END, "
+                "cost_usd=max(coalesce(cost_usd,0), coalesce(excluded.cost_usd,0))",
                 (session_id[:NAME_MAX], file_key, cost, start_ms, _local_day_from_ms(start_ms), origin),
             )
 
     def on_done(state: FileState) -> None:
         info = state.info
         conn.execute(
-            "INSERT OR REPLACE INTO claude_session(session_id, entrypoint, origin, project, cwd_hash, file_key) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO claude_session(session_id, entrypoint, origin, cwd_hash, file_key) "
+            "VALUES (?,?,?,?,?)",
             (stem_session[:NAME_MAX], info.get("entrypoint"), origin_of(info.get("entrypoint")),
-             info.get("project"), info.get("cwd_hash"), file_key),
+             info.get("cwd_hash"), file_key),
         )
 
     _run_file(conn, "claude", file_key, path, stats, handle=handle, needles=needles, on_done=on_done)
@@ -878,16 +955,14 @@ def _claude_sub_file(conn: sqlite3.Connection, root: Path, path: Path, stats: So
         info = state.info
         if "entrypoint" not in info and "entrypoint" in obj:
             info["entrypoint"] = _name(obj.get("entrypoint"))
-            project, cwd_hash = _cwd_fields(obj.get("cwd"))
-            info["project"], info["cwd_hash"] = project, cwd_hash
+            info["cwd_hash"] = _cwd_hash(obj.get("cwd"))
         if obj.get("type") != "assistant":
             return
         # The subagent's share stays "subagent", attributed to the PARENT's
         # entrypoint; the file's own field only when the parent is unknown.
         origin = parent or origin_of(obj.get("entrypoint") or info.get("entrypoint"))
         _claude_assistant(conn, obj, stats, file_key=file_key, kind="subagent", agent_id=agent_id,
-                          session_id=parent_session, origin=origin,
-                          project=info.get("project"), cwd_hash=info.get("cwd_hash"))
+                          session_id=parent_session, origin=origin, cwd_hash=info.get("cwd_hash"))
 
     _run_file(conn, "claude", file_key, path, stats, handle=handle, needles=needles)
 
@@ -912,16 +987,21 @@ def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
     conn.execute("BEGIN IMMEDIATE")
     try:
         if isinstance(data, dict):
-            conn.execute(
-                "INSERT OR REPLACE INTO claude_agent_meta(session_id, agent_id, file_key, tool_use_id, "
-                "agent_type, model, spawn_depth, request_shape, nested, day, origin) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (session_id, agent_id, file_key, _name(data.get("toolUseId")), _name(data.get("agentType")),
-                 _name(data.get("model")) or "Standard", _int(data.get("spawnDepth")),
-                 _name(data.get("requestShape")), 1 if data.get("parentAgentId") else 0,
-                 datetime.fromtimestamp(st.st_mtime).date().isoformat(),
-                 _parent_origin(conn, session_id) or ORIGIN_UNKNOWN),
-            )
+            try:
+                values = (session_id, agent_id, file_key, _name(data.get("toolUseId")),
+                          _name(data.get("agentType")), _name(data.get("model")) or "Standard",
+                          _int(data.get("spawnDepth")), _name(data.get("requestShape")),
+                          1 if data.get("parentAgentId") else 0,
+                          datetime.fromtimestamp(st.st_mtime).date().isoformat(),
+                          _parent_origin(conn, session_id) or ORIGIN_UNKNOWN)
+            except Exception as e:  # a bad field skips this file's row, not the run
+                stats.skip(e)
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO claude_agent_meta(session_id, agent_id, file_key, tool_use_id, "
+                    "agent_type, model, spawn_depth, request_shape, nested, day, origin) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", values,
+                )
         else:
             stats.lines_skipped += 1
         _save_state(conn, "claude-meta", file_key, FileState(st.st_size, st.st_mtime, st.st_size))
@@ -935,7 +1015,7 @@ def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
 # ── source 2: Codex rollouts ────────────────────────────────────────────────
 
 _CODEX_FIELDS = (
-    "session_id", "thread_source", "originator", "model", "project", "cwd_hash", "first_ts", "day",
+    "session_id", "thread_source", "originator", "model", "cwd_hash", "first_ts", "day",
     "tc_ts", "input", "cached_input", "cache_write", "output", "reasoning", "total",
     "rl_ts", "primary_used", "primary_window", "primary_resets",
     "secondary_used", "secondary_window", "secondary_resets", "plan_type",
@@ -972,7 +1052,7 @@ def _codex_file(conn: sqlite3.Connection, root: Path, path: Path, stats: SourceS
             row["session_id"] = _name(payload.get("id"))
             row["thread_source"] = _name(payload.get("thread_source"))
             row["originator"] = _name(payload.get("originator"))
-            row["project"], row["cwd_hash"] = _cwd_fields(payload.get("cwd"))
+            row["cwd_hash"] = _cwd_hash(payload.get("cwd"))
             first = _str(payload.get("timestamp")) or ts
             row["first_ts"] = first
             row["day"] = _local_day_from_iso(first)
@@ -1065,30 +1145,19 @@ def _opencode_sessions(conn: sqlite3.Connection, src: sqlite3.Connection, floor_
     conn.execute("BEGIN IMMEDIATE")
     try:
         for row in cur:
-            sid, parent, agent, model_raw, created, updated = row[:6]
+            sid, updated = row[0], row[5]
+            if isinstance(updated, int) and (newest is None or updated > newest):
+                newest = updated
             known = conn.execute("SELECT time_updated FROM oc_session WHERE id=?", (sid,)).fetchone()
-            newest = updated if newest is None or (updated or 0) > newest else newest
             if known is not None and known[0] == updated:
                 continue
             stats.lines_read += 1
-            model_id = provider_id = None
-            if isinstance(model_raw, str) and model_raw:
-                try:
-                    model_obj = json.loads(model_raw)
-                except ValueError:
-                    model_obj = None
-                if isinstance(model_obj, dict):
-                    model_id, provider_id = _name(model_obj.get("id")), _name(model_obj.get("providerID"))
-                else:
-                    stats.lines_skipped += 1
-            conn.execute(
-                "INSERT OR REPLACE INTO oc_session(id, parent_id, agent, model_id, provider_id, time_created, "
-                "time_updated, day, cost, t_input, t_output, t_reasoning, t_cache_read, t_cache_write) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (_name(sid), _name(parent), _name(agent), model_id, provider_id, _int(created),
-                 _int(updated), _local_day_from_ms(created), _float(row[6]),
-                 *(_int(v) for v in row[7:12])),
-            )
+            try:
+                _opencode_session_row(conn, row, stats)
+            except Exception as e:  # one bad row is skipped, never the whole source
+                if isinstance(e, sqlite3.OperationalError) or type(e) is sqlite3.DatabaseError:
+                    raise
+                stats.skip(e)
         if newest is not None:
             _meta_set(conn, "oc_session_watermark", str(newest))
         conn.execute("COMMIT")
@@ -1098,49 +1167,119 @@ def _opencode_sessions(conn: sqlite3.Connection, src: sqlite3.Connection, floor_
         raise
 
 
+def _opencode_session_row(conn: sqlite3.Connection, row: tuple, stats: SourceStats) -> None:
+    sid, parent, agent, model_raw, created, updated = row[:6]
+    model_id = provider_id = None
+    if isinstance(model_raw, str) and model_raw:
+        try:
+            model_obj = json.loads(model_raw)
+        except ValueError:
+            model_obj = None
+        if isinstance(model_obj, dict):
+            model_id, provider_id = _name(model_obj.get("id")), _name(model_obj.get("providerID"))
+        else:
+            stats.lines_skipped += 1
+    conn.execute(
+        "INSERT OR REPLACE INTO oc_session(id, parent_id, agent, model_id, provider_id, time_created, "
+        "time_updated, day, cost, t_input, t_output, t_reasoning, t_cache_read, t_cache_write) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (_name(sid), _name(parent), _name(agent), model_id, provider_id, _int(created),
+         _int(updated), _local_day_from_ms(created), _float(row[6]),
+         *(_int(v) for v in row[7:12])),
+    )
+
+
+def _opencode_message_values(mid: object, sid: object, created: object, updated: object,
+                             data: object) -> tuple | None:
+    """The oc_message row for one message, or None when ``data`` is not a JSON object."""
+    try:
+        obj = json.loads(data) if isinstance(data, (str, bytes)) else None
+    except ValueError:
+        obj = None
+    if not isinstance(obj, dict):
+        return None
+    tokens = _dict(obj.get("tokens"))
+    cache = _dict(tokens.get("cache"))
+    times = _dict(obj.get("time"))
+    created_ms = _int(times.get("created")) or _int(created)
+    return (_name(mid), _name(sid), _name(obj.get("role")), _name(obj.get("agent") or obj.get("mode")),
+            _name(obj.get("modelID")), _name(obj.get("providerID")), created_ms, _int(updated),
+            _local_day_from_ms(created_ms), _float(obj.get("cost")),
+            _int(tokens.get("input")), _int(tokens.get("output")), _int(tokens.get("reasoning")),
+            _int(cache.get("read")), _int(cache.get("write")), _name(obj.get("finish")),
+            1 if times.get("completed") is not None else 0)
+
+
+_OC_MESSAGE_COLUMNS = (
+    "id, session_id, role, agent, model_id, provider_id, created_ms, time_updated, day, cost, "
+    "t_input, t_output, t_reasoning, t_cache_read, t_cache_write, finish, completed"
+)
+# An assistant message without time.completed is re-read on every run for this
+# long after it was created, whatever its time_updated says: cost and tokens
+# are written when the answer completes, and it is not verified that opencode
+# bumps time_updated then. Aborted messages never complete — hence the bound.
+OPENCODE_INCOMPLETE_RECHECK_MS = 2 * 24 * 3600 * 1000
+
+
+def _store_opencode_message(conn: sqlite3.Connection, row: tuple, stats: SourceStats,
+                            *, only_if_changed: bool) -> None:
+    mid, sid, created, updated, data = row
+    try:
+        values = _opencode_message_values(mid, sid, created, updated, data)
+    except Exception as e:  # one bad row is skipped, never the whole source
+        if not only_if_changed:
+            stats.lines_read += 1
+        stats.skip(e)
+        return
+    if only_if_changed:
+        stored = conn.execute(f"SELECT {_OC_MESSAGE_COLUMNS} FROM oc_message WHERE id=?", (mid,)).fetchone()
+        if stored is not None and values is not None and tuple(stored) == values:
+            return  # re-checked, nothing new
+    stats.lines_read += 1
+    stats.bytes_read += len(data) if isinstance(data, (str, bytes)) else 0
+    if values is None:
+        # remembered as seen (role NULL), so it is not re-read every run
+        stats.lines_skipped += 1
+        conn.execute("INSERT OR REPLACE INTO oc_message(id, session_id, time_updated) VALUES (?,?,?)",
+                     (_name(mid), _name(sid), _int(updated) if isinstance(updated, int) else None))
+        return
+    conn.execute(
+        f"INSERT OR REPLACE INTO oc_message({_OC_MESSAGE_COLUMNS}) "
+        f"VALUES ({', '.join('?' for _ in range(17))})", values,
+    )
+
+
 def _opencode_messages(conn: sqlite3.Connection, src: sqlite3.Connection, floor_ms: int, stats: SourceStats) -> None:
     since = _watermark(conn, "oc_message_watermark", floor_ms)
+    recheck_floor = int(time.time() * 1000) - OPENCODE_INCOMPLETE_RECHECK_MS
+    incomplete = {r[0] for r in conn.execute(
+        "SELECT id FROM oc_message WHERE role='assistant' AND completed=0 AND created_ms >= ?",
+        (recheck_floor,))}
     cur = src.execute(
         "SELECT id, session_id, time_created, time_updated, data FROM message "
         "WHERE time_updated >= ? ORDER BY time_updated", (since,),
     )
     newest = None
+    seen: set[str] = set()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for mid, sid, created, updated, data in cur:
-            newest = updated if newest is None or (updated or 0) > newest else newest
+        for row in cur:
+            mid, updated = row[0], row[3]
+            seen.add(mid)
+            if isinstance(updated, int) and (newest is None or updated > newest):
+                newest = updated
             known = conn.execute("SELECT time_updated FROM oc_message WHERE id=?", (mid,)).fetchone()
-            if known is not None and known[0] == updated:
+            if known is not None and known[0] == updated and mid not in incomplete:
                 continue
-            stats.lines_read += 1
-            stats.bytes_read += len(data) if isinstance(data, (str, bytes)) else 0
-            try:
-                obj = json.loads(data)
-            except (TypeError, ValueError):
-                obj = None
-            if not isinstance(obj, dict):
-                # remembered as seen (role NULL), so it is not re-read every run
-                stats.lines_skipped += 1
-                conn.execute(
-                    "INSERT OR REPLACE INTO oc_message(id, session_id, time_updated) VALUES (?,?,?)",
-                    (_name(mid), _name(sid), _int(updated)),
-                )
-                continue
-            role = _name(obj.get("role"))
-            tokens = _dict(obj.get("tokens"))
-            cache = _dict(tokens.get("cache"))
-            times = _dict(obj.get("time"))
-            created_ms = _int(times.get("created")) or _int(created)
-            conn.execute(
-                "INSERT OR REPLACE INTO oc_message(id, session_id, role, agent, model_id, provider_id, "
-                "created_ms, time_updated, day, cost, t_input, t_output, t_reasoning, t_cache_read, "
-                "t_cache_write, finish) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (_name(mid), _name(sid), role, _name(obj.get("agent") or obj.get("mode")),
-                 _name(obj.get("modelID")), _name(obj.get("providerID")), created_ms, _int(updated),
-                 _local_day_from_ms(created_ms), _float(obj.get("cost")),
-                 _int(tokens.get("input")), _int(tokens.get("output")), _int(tokens.get("reasoning")),
-                 _int(cache.get("read")), _int(cache.get("write")), _name(obj.get("finish"))),
-            )
+            _store_opencode_message(conn, row, stats, only_if_changed=known is not None and known[0] == updated)
+        recheck = sorted(incomplete - seen)
+        for start in range(0, len(recheck), 500):
+            chunk = recheck[start:start + 500]
+            for row in src.execute(
+                "SELECT id, session_id, time_created, time_updated, data FROM message "
+                f"WHERE id IN ({', '.join('?' for _ in chunk)})", chunk,
+            ):
+                _store_opencode_message(conn, row, stats, only_if_changed=True)
         if newest is not None:
             _meta_set(conn, "oc_message_watermark", str(newest))
         conn.execute("COMMIT")
@@ -1153,30 +1292,69 @@ def _opencode_messages(conn: sqlite3.Connection, src: sqlite3.Connection, floor_
 # ── sources 4 + 5: ledger and markers ───────────────────────────────────────
 
 
+def _read_small_file(conn: sqlite3.Connection, source: str, path: Path,
+                     stats: SourceStats) -> tuple[bytes, os.stat_result] | None:
+    """Content of a small, user-written file if it changed since the last run,
+    else None. Decided by the hash of the WHOLE file, read every run (two files
+    of a few KB) — not by size/mtime, so an edit of the same length with an
+    unchanged mtime is seen too. Such files are re-read and their table rebuilt
+    as a whole: a line edited in the middle neither survives as a ghost nor goes
+    unnoticed."""
+    st = path.stat()
+    prev = _load_state(conn, source, source)
+    raw = path.read_bytes()
+    if prev is not None and prev.head_hash == hashlib.sha256(raw).hexdigest():
+        return None
+    stats.files_read += 1
+    stats.bytes_read += len(raw)
+    return raw, st
+
+
 def _index_ledger(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> None:
+    """The extern-voice ledger: a few hundred lines, appended by a script. Each
+    LINE is one call — two lines with the same second, voice and repo are two
+    calls (measured: 4 such pairs, 2 of them Codex calls with different tokens),
+    so the key is the line number and the table is rebuilt whenever the file's
+    hash changes. A deleted ledger keeps its rows."""
     if not path.is_file():
         return
     stats.files_seen += 1
-
-    def handle(obj: dict, _state: FileState, _reset: bool) -> None:
-        ts = obj.get("ts_local")
-        voice = _name(obj.get("voice"))
-        if not isinstance(ts, str) or not voice:
-            stats.lines_skipped += 1
-            return
-        repo = _str(obj.get("repo")) or ""
-        tokens = obj.get("tokens")
-        conn.execute(
-            "INSERT OR REPLACE INTO ledger(ts_local, voice, repo_hash, repo_name, status, blocked_until, "
-            "tokens, day) VALUES (?,?,?,?,?,?,?,?)",
-            (ts[:40], voice, _hash(repo), _last_segment(repo), _name(obj.get("status")),
-             _name(obj.get("blocked_until")), _int(tokens), _local_day_from_iso(ts)),
-        )
-
-    def run() -> None:
-        _run_file(conn, "ledger", "ledger", path, stats, handle=handle, needles=lambda _s: ())
-
-    _guard_file(stats, path, run)
+    changed = _read_small_file(conn, "ledger", path, stats)
+    if changed is None:
+        return
+    raw, st = changed
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM ledger")
+        for line_no, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            stats.lines_read += 1
+            try:
+                obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    raise ValueError("not an object")
+                ts = obj.get("ts_local")
+                voice = _name(obj.get("voice"))
+                if not isinstance(ts, str) or not voice:
+                    raise ValueError("ts_local/voice missing")
+                values = (line_no, ts[:40], voice, _hash(_str(obj.get("repo")) or ""),
+                          _name(obj.get("status")), _name(obj.get("blocked_until")),
+                          _int(obj.get("tokens")), _local_day_from_iso(ts))
+            except Exception as e:
+                stats.skip(e)
+                continue
+            conn.execute(
+                "INSERT INTO ledger(line_no, ts_local, voice, repo_hash, status, blocked_until, tokens, day) "
+                "VALUES (?,?,?,?,?,?,?,?)", values,
+            )
+        _save_state(conn, "ledger", "ledger",
+                    FileState(st.st_size, st.st_mtime, st.st_size, 0, hashlib.sha256(raw).hexdigest()))
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _index_markers(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> None:
@@ -1185,14 +1363,11 @@ def _index_markers(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> 
     if not path.is_file():
         return
     stats.files_seen += 1
-    st = path.stat()
-    prev = _load_state(conn, "markers", "markers")
-    raw = path.read_bytes()
-    head = hashlib.sha256(raw).hexdigest()
-    if prev is not None and prev.size == st.st_size and prev.mtime == st.st_mtime and prev.head_hash == head:
+    changed = _read_small_file(conn, "markers", path, stats)
+    if changed is None:
         return
-    stats.files_read += 1
-    stats.bytes_read += len(raw)
+    raw, st = changed
+    head = hashlib.sha256(raw).hexdigest()
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("DELETE FROM marker")
@@ -1277,7 +1452,7 @@ def _index_all(conn: sqlite3.Connection, sources: Sources) -> dict[str, SourceSt
         try:
             step()
         except Exception as e:  # one broken source must not stop the others
-            per_source[name].error(_err_text(e))
+            _note_error(per_source[name], name, e)
     return per_source
 
 
@@ -1302,8 +1477,9 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
         try:
             conn = open_index(sources.db)
         except (sqlite3.Error, SchemaMismatchError, OSError) as e:
-            say(f"Harness-Index nicht nutzbar: {_err_text(e)}")
-            return {"status": "error", "error": _err_text(e)}
+            # stdout/stderr only (the index itself is not usable): full text
+            say(f"Harness-Index nicht nutzbar: {type(e).__name__}: {e}")
+            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
         try:
             per_source = _index_all(conn, sources)
             finished = time.time()
@@ -1379,6 +1555,8 @@ def run_update_subprocess(*, timeout: float | None = None) -> dict:
         "returncode": proc.returncode, "timed_out": False,
         "duration_sec": round(time.monotonic() - started, 1),
         "stdout": text[-2000:],
+        # full error texts (paths included) — for the local orchestrator log only
+        "stderr": err.decode("utf-8", "replace").strip()[-2000:],
     }
     if proc.returncode != 0:
         result["error"] = f"Exit {proc.returncode}: {err.decode('utf-8', 'replace').strip()[-300:]}"
@@ -1446,6 +1624,15 @@ def _unavailable(reason: str) -> dict:
     return {"harness": {"available": False, "reason": reason}}
 
 
+def _read_reason(exc: BaseException) -> str:
+    """Reason shown on the page (never stored): SQLite's own message ("database
+    is locked", "interrupted", "file is not a database") carries no path; any
+    other exception is reported by type only."""
+    if isinstance(exc, sqlite3.Error):
+        return f"{type(exc).__name__}: {exc}"
+    return _err_text(exc)
+
+
 def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     uri = db_path.resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=HARNESS_READ_TIMEOUT_SEC)
@@ -1499,16 +1686,16 @@ def dashboard_payload(db_path: Path | str | None = None, *, days: int = 30, wind
     try:
         conn = _connect_read_only(path)
     except sqlite3.Error as e:
-        return _unavailable(f"Index nicht lesbar: {_err_text(e)}")
+        return _unavailable(f"Index nicht lesbar: {_read_reason(e)}")
     try:
         conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1_000)
         return {"harness": _read_payload(conn, days=days, window=window, now=now)}
     except _NotReadyError as e:
         return _unavailable(str(e))
     except sqlite3.Error as e:
-        return _unavailable(f"Index nicht lesbar: {_err_text(e)}")
+        return _unavailable(f"Index nicht lesbar: {_read_reason(e)}")
     except Exception as e:
-        return _unavailable(f"Index-Auswertung fehlgeschlagen: {_err_text(e)}")
+        return _unavailable(f"Index-Auswertung fehlgeschlagen: {_read_reason(e)}")
     finally:
         conn.close()
 

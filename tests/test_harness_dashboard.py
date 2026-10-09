@@ -59,8 +59,8 @@ def add_marker(conn, date, mid, expect, change="Satz zur Änderung"):
 
 def add_ledger(conn, day, n, *, voice="codex", status="ok"):
     for i in range(n):
-        conn.execute("INSERT INTO ledger(ts_local, voice, repo_hash, repo_name, status, tokens, day) "
-                     "VALUES (?,?,?,?,?,?,?)", (f"{day}T10:{i:02d}:00+02:00", voice, "h", "r", status, None, day))
+        conn.execute("INSERT INTO ledger(ts_local, voice, repo_hash, status, tokens, day) "
+                     "VALUES (?,?,?,?,?,?)", (f"{day}T10:{i:02d}:00+02:00", voice, "h", status, None, day))
 
 
 def payload(**kw) -> dict:

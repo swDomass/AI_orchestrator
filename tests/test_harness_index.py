@@ -1674,3 +1674,16 @@ def test_main_prints_each_startup_warning_once_to_stderr(monkeypatch, capsys):
     assert hi.main(["--update"]) == 0
     assert hi.main(["--update"]) == 0
     assert capsys.readouterr().err.splitlines() == ["config: X=1 ungültig — Standardwert 2"]
+
+
+@pytest.mark.parametrize("info", [
+    pytest.param('{"broken": %d}' % 2**70, id="out_of_range"),
+    pytest.param("[" * 200_000, id="recursion_error"),  # not a ValueError
+])
+def test_an_unreadable_broken_stock_gives_0_and_never_raises_in_the_endpoint(info):
+    write_ledger()
+    run()
+    with db() as conn:
+        conn.execute("UPDATE file_state SET info = ? WHERE source = 'ledger'", (info,))
+    page = hi.dashboard_payload(config.HARNESS_DB_FILE)["harness"]["last_run"]
+    assert page["broken_lines"] == {"ledger": 0, "markers": 0}

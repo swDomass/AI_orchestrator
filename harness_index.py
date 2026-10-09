@@ -1938,7 +1938,9 @@ def _read_broken_lines(conn: sqlite3.Connection) -> dict[str, int]:
     for source, info in conn.execute(
         "SELECT source, info FROM file_state WHERE source IN ('ledger', 'markers')",
     ):
-        with contextlib.suppress(ValueError):
+        # Any failure reading the stock (out-of-range number, RecursionError of a
+        # deeply nested value, a non-text cell) leaves 0: the endpoint never fails on it.
+        with contextlib.suppress(Exception):
             out[source] = _int(_dict(json.loads(info or "{}")).get("broken")) or 0
     return out
 

@@ -15,6 +15,25 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Korrekturrunde 2 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3275 passed /
+# 0 failed / 9 skipped in 101-104 s — +33 gesammelt über die 3251 darunter, per --collect-only:
+# test_harness_index 71 -> 89, test_dashboard_autostart 61 -> 67, test_harness_dashboard 35 -> 44.
+# Der 9. Skip: test_windows_background_mode_keeps_below_normal_and_private_peak (nur win32); ohne
+# `node` skippen 8 (5 + 3). ruff 1122, mypy 122/38 und win32 124/38 unverändert. Windows-Suite am
+# Vorstand 19f55c6 (Auftraggeber): 3250 passed / 0 failed / 1 skipped.
+# Korrekturrunde 1 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3243 passed /
+# 0 failed / 8 skipped in 94-98 s — +59 gesammelt über die 3185 darunter, per --collect-only:
+# test_harness_index 51 -> 71, test_dashboard_autostart 34 -> 61, test_harness_dashboard 23 -> 35.
+# Der 8. Skip: test_windows_peak_memory_and_pid_check_work (nur win32). Ohne `node` im PATH
+# skippen jetzt 7 Tests (4 in test_harness_dashboard, 3 in test_dashboard_page_js).
+# ruff 1122 und mypy 122/38 unverändert; `mypy --platform win32` 127/39 -> 124/38 (die drei
+# unused-ignore in harness_index.py sind weg). Die Windows-Suite misst der Auftraggeber.
+# Linux, Cloud (2026-10-09, CPython 3.12.3 und 3.13.16, PR #7: Dashboard-Autostart, Quoten inkl.
+# opencode, Harness-Index + Reiter "Harness"): 3185 passed / 0 failed / 7 skipped in 93-100 s —
+# +131 über die 3054 darunter, per --collect-only (alle Dateien neu): test_harness_index 51,
+# test_dashboard_autostart 34, test_harness_dashboard 23, test_dashboard_limits 20,
+# test_dashboard_page_js 3. Die 5 node-Tests (3 + 2 in test_harness_dashboard) skippen ohne
+# `node` im PATH. ruff 1122 und mypy 122/38 unverändert.
 # Linux, Cloud (2026-10-08, CPython 3.12.3 und 3.13.16, PR #6: kaputte policy.yaml hält an,
 # Meldungsdrossel, review-loop-Leser, Abschlussregel ohne Kontext, Reste aus PR #5):
 # 3040 passed / 0 failed / 7 skipped — +80 über die 2960 darunter, per --collect-only
@@ -149,7 +168,7 @@ python orchestrator.py --watch        # continuous + heartbeat
 python orchestrator.py --dry-run      # parse queue, no execute
 python orchestrator.py --check-limits # provider capacity
 python orchestrator.py --list-tools   # available #tool: handlers
-python orchestrator.py --dashboard    # analytics web dashboard
+python orchestrator.py --dashboard    # analytics web dashboard (opens browser; --watch serves it anyway, DASHBOARD_AUTOSTART)
 python orchestrator.py --lint-queue   # validate agent-queue.md
 
 # Lint / typecheck (config in pyproject.toml; CI runs both, advisory only — continue-on-error)
@@ -256,6 +275,8 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **Subtask-aware queue mutations** — `mark_done/mark_retry/finalize` accept `subtasks` kwarg
 - **Task dependencies** — `#id:`/`#needs:`, two-pass resolution, blocked-task header
 - **Schedule tags** — `#at:`/`#every:` reuse retry primitive; queue file is single source of truth
+- **Harness-Index (2026-10-09)** — `harness_index.py`: SQLite über lokale Transkripte/Rollouts/`opencode.db`/Ledger/Marker, eigener Unterprozess alle 30 min (Scheduler-Thread aus dem Autostart), Lock-Datei, natürliche Schlüssel (`message.id` über **alle** Dateien, `max()` je Zähler — bis zu vier Zeilen je API-Antwort mit **nicht** identischer `usage`, dazu Kopien in Subagent-Transkripten derselben Elternsitzung; Ledger je Zeile, Neuaufbau bei Hash-Änderung), kein Text, keine Ordnernamen (cwd nur Hash, Fehler nur Typname), Schema 4 ohne Migration (Windows: Spitze privater Speicher statt des vom Hintergrundmodus auf ~32 MB gedeckelten Arbeitsspeichers; CPU-Klasse nie über BELOW_NORMAL). Reiter „Harness“ liest nur `/api/harness` (`harness_index.dashboard_payload`, read-only, < 1 s auch bei fehlender/gesperrter/kaputter SQLite). Details `.claude/rules/quota-and-analytics.md`
+- **Dashboard-Autostart (2026-10-09)** — `run_watch` → `_start_dashboard_autostart()` → `dashboard.start_autostart()`: direkt nach den Startprüfungen, **vor** `STARTUP_DELAY_SEC`; Daemon-Thread auf 127.0.0.1, Bind **im** Thread (kein Warten), unter Windows exklusiv (`SO_EXCLUSIVEADDRUSE`), wirft nie, jeder Fehler = genau eine Warnzeile (`logger.warning` + `append_log`). `DASHBOARD_AUTOSTART` (an) / `DASHBOARD_OPEN_BROWSER` (aus, nur Autostart). Eine Exception von dort würde `main()`s Absturznetz dem ersten Queue-Task anrechnen — deshalb der Import von `dashboard` im `try`. Server einfädig: Endpunkte müssen schnell sein; fremder `Host`, `Sec-Fetch-Site: cross-site|same-site` oder fremdes `Origin` → 403
 
 > Fallen- und Messwissen zu Queue/Tasks, Providern, Tools, Git-Auto-Commit, Orchestrator-Runtime, Quota/Analytics und Policy ausgelagert — siehe Index am Dateiende.
 
@@ -297,6 +318,6 @@ Wer an einem dieser Themen arbeitet, ohne eine passende Datei anzufassen (Antwor
 | Claude/Codex/Gemini/OpenRouter/Vibe/opencode-Provider, Liveness-Watchdog, stdin-Zustellung, Fehlerklassifikation, `auth_expired`-Saga | `providers.md` | `providers/*.py` |
 | dev-loop/review-loop/critical-review/scientific-investigation/brainstorm/security-audit/pr-babysitter, Budget-Landung, Arbeitsbaum-Gate | `tools-catalog.md` | `tools/*.py` |
 | Per-Task-Auto-Commit, HEAD-nie-bewegen, Index-Regel, Datei-Deckel, Cleanup-Guard | `git-auto-commit.md` | `git_commit.py` |
-| Quota-Kalibrierung, Analytics, Dashboard, Config-Konstanten, Memory/Noop-Filter, Heartbeat, `.env`-Parsing, Vault-Schreibschutz der Tests | `quota-and-analytics.md` | `quota_calibration.py`, `quota_state.py`, `analytics.py`, `dashboard.py`, `config.py`, `usage_suggester.py`, `usage_budget.py`, `memory.py`, `heartbeat.py`, `tests/conftest.py` |
+| Quota-Kalibrierung, Analytics, Dashboard, Harness-Index (SQLite), Config-Konstanten, Memory/Noop-Filter, Heartbeat, `.env`-Parsing, Vault-Schreibschutz der Tests | `quota-and-analytics.md` | `quota_calibration.py`, `quota_state.py`, `analytics.py`, `dashboard.py`, `harness_index.py`, `config.py`, `usage_suggester.py`, `usage_budget.py`, `memory.py`, `heartbeat.py`, `tests/conftest.py` |
 | Doctor-Checks, `safety_hook.py`, `build_audit_pack.py`, Lint-/Typing-Baseline (`pyproject.toml`) | `scripts-and-setup.md` | `doctor.py`, `scripts/*.py`, `pyproject.toml` |
 | Telegram, Idempotency, Session-Registry, Replay/Taxonomy, Preflight, Skill-Suggester, PR/CI-Watcher, Parallel-Runner, Watchdog-Skript | `misc-infra.md` | `notifier.py`, `telegram_listener.py`, `idempotency.py`, `session_registry.py`, `replay.py`, `taxonomy.py`, `preflight.py`, `skill_suggester.py`, `skills/index.py`, `gh_helpers.py`, `ci_watcher.py`, `parallel_runner.py`, `run_orchestrator.ps1` |

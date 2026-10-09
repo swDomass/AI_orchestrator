@@ -1043,6 +1043,106 @@ SHUTDOWN_DELAY_SEC = 60
 # 8386-8485 → WSAEACCES/WinError 10013 on bind). Overridable via .env; the
 # dashboard also falls back to a free port at bind time if this one is taken.
 DASHBOARD_PORT = _parse_int_env("DASHBOARD_PORT", 8211)
+# Autostart (2026-10-09): `--watch` starts the dashboard as a daemon thread on
+# 127.0.0.1 (dashboard.start_autostart, called from orchestrator.run_watch), so a
+# fixed address is reachable after every Scheduled-Task restart. Never fatal: any
+# failure is one warning line and the orchestrator keeps running.
+DASHBOARD_AUTOSTART = _parse_bool_env("DASHBOARD_AUTOSTART", True)
+# Applies to the autostart ONLY. `python dashboard.py` and `--dashboard` keep
+# opening the browser unless `--no-open` is given — unattended starts must not
+# pop a window, manual starts behave as before.
+DASHBOARD_OPEN_BROWSER = _parse_bool_env("DASHBOARD_OPEN_BROWSER", False)
+# The server answers only requests whose Host header names the loopback
+# (127.0.0.1, localhost, ::1) — an always-on local server is otherwise readable
+# by any web page through DNS rebinding. Extra names (comma-separated, e.g. the
+# host name a local tunnel/reverse proxy forwards) can be allowed here.
+DASHBOARD_ALLOWED_HOSTS = tuple(
+    h.strip().lower() for h in os.getenv("DASHBOARD_ALLOWED_HOSTS", "").split(",") if h.strip()
+)
+
+# --- Harness index (harness_index.py, 2026-10-09) ---
+# Incremental SQLite index over local Claude Code transcripts, Codex rollouts,
+# opencode.db, the extern-voice ledger and the harness-change markers. Runs as its
+# own low-priority subprocess (`python -m harness_index --update`), started every
+# HARNESS_UPDATE_INTERVAL_SEC by a daemon thread the dashboard autostart creates;
+# the dashboard's "Harness" tab reads only HARNESS_DB_FILE (mode=ro). Every source
+# is read-only; the SQLite (plus its lock file) is the only thing written. No
+# prompt/answer/title text is stored — numbers, model names, types, timestamps,
+# ids, and cwd only as a hash (no folder name).
+
+
+def _harness_path(key: str, default: Path) -> Path:
+    """Env override or default; a RELATIVE override is taken relative to this
+    repo, so the dashboard (any cwd) and the index child (cwd = repo) agree."""
+    raw = os.getenv(key)
+    if not raw:
+        return default
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else Path(__file__).parent / path
+
+
+HARNESS_DB_FILE = _harness_path("HARNESS_DB_FILE", Path(__file__).parent / "logs" / "harness-index.sqlite")
+HARNESS_CLAUDE_PROJECTS_DIR = _harness_path("HARNESS_CLAUDE_PROJECTS_DIR", Path.home() / ".claude" / "projects")
+HARNESS_OPENCODE_DB = _harness_path(
+    "HARNESS_OPENCODE_DB", Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+)
+HARNESS_CODEX_SESSIONS_DIR = _harness_path("HARNESS_CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions")
+HARNESS_EXTERN_LEDGER = _harness_path("HARNESS_EXTERN_LEDGER", Path.home() / ".claude" / "extern-ledger.jsonl")
+HARNESS_CHANGES_FILE = _harness_path("HARNESS_CHANGES_FILE", Path.home() / ".claude" / "harness-changes.jsonl")
+# Files whose mtime is older than this are skipped (already indexed rows stay).
+HARNESS_WINDOW_DAYS = _parse_int_env("HARNESS_WINDOW_DAYS", 90)
+
+
+# Warnings raised while this module is imported. Logging is not set up yet at
+# that point, so a logging call here reached only Python's last-resort stderr
+# handler — lost in the hidden window of the Scheduled Task. Collected instead:
+# dashboard.start_autostart() writes each one exactly once through its `warn`
+# (logger + append_log), after the logging setup. With DASHBOARD_AUTOSTART off
+# nothing reads them — the values below then only matter to a manual index run.
+STARTUP_WARNINGS: list[str] = []
+
+
+def _bounded_int_env(key: str, default: int, *, valid, rule: str) -> int:
+    """``_parse_int_env`` plus a sanity bound: an out-of-bound value falls back to
+    the default with ONE entry in ``STARTUP_WARNINGS``."""
+    value = _parse_int_env(key, default)
+    if valid(value):
+        return value
+    STARTUP_WARNINGS.append(f"config: {key}={value} ungültig ({rule}) — Standardwert {default}")
+    return default
+
+
+# The bounds of the two values below, named: the tests check THESE rules
+# (through the reader functions), not a copy of them.
+HARNESS_UPDATE_INTERVAL_MIN_SEC = 300
+HARNESS_LOCK_STALE_MIN_SEC = 600
+
+
+def _harness_update_interval_sec() -> int:
+    """0 disables the periodic index thread (the dashboard still starts);
+    otherwise at least HARNESS_UPDATE_INTERVAL_MIN_SEC — a shorter interval
+    would spawn index processes back to back."""
+    return _bounded_int_env(
+        "HARNESS_UPDATE_INTERVAL_SEC", 1800,
+        valid=lambda v: v == 0 or v >= HARNESS_UPDATE_INTERVAL_MIN_SEC,
+        rule=f"0 oder >= {HARNESS_UPDATE_INTERVAL_MIN_SEC}",
+    )
+
+
+def _harness_lock_stale_sec() -> int:
+    """A lock older than this (or whose PID is dead) is taken over. Also the
+    hard time limit after which the scheduler thread kills its own child
+    process by handle — hence at least HARNESS_LOCK_STALE_MIN_SEC (0 used to
+    kill every child at once)."""
+    return _bounded_int_env(
+        "HARNESS_LOCK_STALE_SEC", 7200,
+        valid=lambda v: v >= HARNESS_LOCK_STALE_MIN_SEC,
+        rule=f">= {HARNESS_LOCK_STALE_MIN_SEC}",
+    )
+
+
+HARNESS_UPDATE_INTERVAL_SEC = _harness_update_interval_sec()
+HARNESS_LOCK_STALE_SEC = _harness_lock_stale_sec()
 SHUTDOWN_COMMAND = (
     ["shutdown", "/s", "/t", "0", "/f"]
     if sys.platform == "win32"

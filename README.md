@@ -146,6 +146,18 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `ORCH_QUOTA_LIVE_ESTIMATE` | No | `false` | Phase 2: decrement the cached quota snapshot by a live per-task estimate between cclimits polls |
 | `ORCH_QUOTA_AUTO_RECALIBRATE` | No | `false` | Requires the flag above: re-derive the per-window `tokens_per_pct` factors daily from `logs/quota-calibration.csv` (min-samples + clamp guarded) |
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
+| `DASHBOARD_AUTOSTART` | No | `true` | `--watch` starts the dashboard itself as a daemon thread on `127.0.0.1` (no extra process). Never fatal: a failure (no free port, import error, server dying later) is one warning line in `orchestrator.log` and `queue-events.log`, the orchestrator keeps running. `false` = nothing is started. |
+| `DASHBOARD_OPEN_BROWSER` | No | `false` | Only for the autostart above: open a browser window when it comes up. `python dashboard.py` / `--dashboard` are unaffected — they open the browser unless `--no-open`. |
+| `DASHBOARD_ALLOWED_HOSTS` | No | *(empty)* | The dashboard answers only requests whose `Host` header is `127.0.0.1`, `localhost` or `::1` (an always-on local server is otherwise readable by any web page via DNS rebinding). Comma-separated extra names, e.g. the name a local tunnel forwards; compared exactly like the header (case, port and IPv6 brackets ignored). Independent of this list, a request with `Sec-Fetch-Site: cross-site`/`same-site` or with an `Origin` that is not an allowed host gets 403 (exception: a top-level navigation to the page itself); requests without these headers (curl) are unaffected. |
+| `HARNESS_DB_FILE` | No | `logs/harness-index.sqlite` | SQLite written by the harness index (a relative path is taken relative to the repo) (`python -m harness_index --update`); the dashboard's "Harness" tab reads only this file, read-only. |
+| `HARNESS_CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code transcripts (read-only). |
+| `HARNESS_CODEX_SESSIONS_DIR` | No | `~/.codex/sessions` | Codex rollouts (read-only). |
+| `HARNESS_OPENCODE_DB` | No | `~/.local/share/opencode/opencode.db` | opencode database, opened `mode=ro`; only `session`/`message` are read. |
+| `HARNESS_EXTERN_LEDGER` | No | `~/.claude/extern-ledger.jsonl` | Extern-voice ledger (read-only). |
+| `HARNESS_CHANGES_FILE` | No | `~/.claude/harness-changes.jsonl` | Harness-change markers (read-only). |
+| `HARNESS_WINDOW_DAYS` | No | `90` | Source files whose mtime is older are skipped (already indexed rows stay). |
+| `HARNESS_UPDATE_INTERVAL_SEC` | No | `1800` | `--watch` starts the index as its own low-priority process this often (first run 60 s after the autostart). `0` = off; any other value must be ≥ 300 — a smaller (or negative) value falls back to `1800` with one warning line; a non-number falls back silently, like every integer setting (`_parse_int_env`). |
+| `HARNESS_LOCK_STALE_SEC` | No | `7200` | A lock older than this (or of a dead process) is taken over; also the time limit after which the scheduler kills its own child. Values below `600` fall back to `7200` with one warning line (a non-number silently). |
 | ~~`TELEGRAM_MAX_TASK_LENGTH`~~ | — | `500` | Max characters for `/task`. **Not readable from `.env`** — `config.py:519` assigns it literally, with no `os.getenv()`. Listed here only because it was documented as configurable until 2026-09-05; change the constant, or wire it through `_parse_int_env()`. |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
 | `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
@@ -199,7 +211,7 @@ python orchestrator.py --watch          # Continuous mode
 python orchestrator.py --dry-run        # Parse queue without executing
 python orchestrator.py --check-limits   # Show provider capacity
 python orchestrator.py --list-tools     # Show available #tool: handlers
-python orchestrator.py --dashboard      # Launch analytics dashboard
+python orchestrator.py --dashboard      # Launch analytics dashboard (opens browser; --watch already serves it, see DASHBOARD_AUTOSTART)
 python orchestrator.py --doctor         # Validate setup
 python orchestrator.py --doctor --fix   # Auto-fix issues
 python orchestrator.py --doctor --fix --yes
@@ -940,8 +952,10 @@ Rate limits (anti-spam):
 
 ## Analytics Dashboard
 
+**Autostart (since 2026-10-09):** `python orchestrator.py --watch` (and therefore the Scheduled Task via `run_orchestrator.ps1`) serves the dashboard on `http://127.0.0.1:8211` by itself — a daemon thread, no browser window, nothing to start by hand. `DASHBOARD_AUTOSTART=false` in `.env` switches it off; `DASHBOARD_OPEN_BROWSER=true` makes the autostart open a browser. It comes up right after the startup checks, **before** `STARTUP_DELAY_SEC` (the delay is for provider tokens; a local read-only server does not need it). The autostart never stops the orchestrator: the bind runs inside the thread (no waiting in `run_watch`), and any failure is one warning line, with the actually bound URL if the port had to fall back. If you additionally start `python dashboard.py`, a second dashboard comes up on a fallback port — on Windows too: the port is bound with `SO_EXCLUSIVEADDRUSE` instead of `SO_REUSEADDR`, which on Windows let a second server bind the same port and take over requests at random (the Windows branch of the socket options is tested on every platform with a recording socket; the real two-dashboards case on Windows is measured by hand).
+
 ```bash
-# Start dashboard (opens browser automatically)
+# Start dashboard manually (opens browser automatically)
 python orchestrator.py --dashboard
 
 # Standalone with options
@@ -951,13 +965,18 @@ python dashboard.py --no-open
 ```
 
 Dashboard sections:
+- **Quoten jetzt** (since 2026-10-09): one tile per exact capacity-log key — Claude 5 h, Claude 7 Tage, Codex 5 h, Codex 7 Tage, opencode (Tagesbudget = % of the OpenRouter key's daily limit, no dollar values), Gemini if present — with the age of the value, marked *veraltet* after 45 min and *nicht verfügbar* for `available=false`/`-1.0`. Source: `limits_now` in `/api/data` (newest value per exact key from `logs/capacity-log.md`); the older aggregated `current_limits` key is unchanged.
 - **Summary cards**: total tasks, success rate, avg duration, active providers
 - **Tasks/day** (30 days): bar chart of daily throughput
-- **Provider distribution**: donut chart of usage per provider
-- **Provider capacity** (48h / 7d / 30d): three timeline charts
+- **Provider distribution**: donut chart of usage per provider (one colour per provider, unknown names get a stable rest colour)
+- **Provider capacity** (48h / 7d / 30d): three timeline charts — 5-h windows (Claude 5 h, Codex 5 h), 7-day windows (Claude 7 Tage, Codex 7 Tage), daily budget & others (opencode, Gemini, any provider the table does not know). Group, colour and label of every key come from one Python table (`dashboard.provider_meta`), shipped as `provider_meta` with `/api/data`.
 - **Recent events**: error lines from logs + queue events
 - **Session stats**: live data for the current `--watch` session
 - **Billing analytics**: weighted token cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and cache hit rate from Claude prompt cache. Quota gating uses ONLY `input + output` — cache fields are billing-only.
+
+**"Harness" tab (since 2026-10-09):** a second tab next to the unchanged overview, fed only by `GET /api/harness?days=7|30|90&window=3|7|14`, which reads only the index SQLite (read-only, 0.2 s busy timeout, 3 s query budget — the server is single-threaded, so a missing, empty, locked, corrupt or old-schema index answers `available: false` at once). It shows (a) Claude token usage per day split into *interaktiv* / *Orchestrator bzw. claude -p* / *Subagent* (subagents attributed to the parent's entrypoint, with a total row that the three add up to), model mix (Opus/Sonnet/Haiku/Fable/andere), subagent share, subagent calls per `subagent_type` and model with a control count against `.meta.json` files, costs per day (Claude: the highest `cost-state` value per session, assigned to the session's start day — probably includes its subagents, an indication on real data, no proof; opencode at catalogue price, not the invoice); (b) Codex headroom from the newest rollout (`100 − used_percent`; a window whose `resets_at` has passed is shown as expired) next to Claude/opencode from "Quoten jetzt"; (c) extern voices per day/voice/status from the ledger (incl. the share of `tokens: null`), opencode runs and catalogue cost per model, opencode sessions per day (top-level sessions; child sessions separately), Codex rollouts per day; (d) every line of `~/.claude/harness-changes.jsonl` as a vertical line in the charts, plus a before/after table (equal windows, the marker day in neither) for markers whose `expect` contains a keyword of the fixed table `harness_index.MARKER_KPIS` — no keyword, only the line. A "before" day earlier than the KPI source's first day with data (or the index's lower bound) is **missing**, not 0, and an "after" day counts only once it is over; averages run over the covered days, and a percentage change is shown only when both windows are complete — otherwise "vorher/nachher unvollständig (n von N Tagen)" and averages marked `*`. A marker dated today or later shows "noch keine Nachher-Tage".
+
+**Harness index (since 2026-10-09):** `python -m harness_index --update` builds/updates `logs/harness-index.sqlite` from local files only — Claude Code transcripts, Codex rollouts, `opencode.db` (read-only), the extern-voice ledger and `~/.claude/harness-changes.jsonl`. Incremental (size, mtime, offset, head and tail fingerprint per file; a file whose size and mtime are unchanged is not opened), idempotent by natural keys (a Claude `message.id` counts once across all transcript files, the main session wins over a subagent copy; the ledger counts each line, two calls in the same second are two calls), one run at a time (lock file), and it stores no prompt/answer/title text and no folder names (working directories only as hash; error texts only as exception type). A line or file that fails is skipped and counted, never the end of the run. `--watch` runs it every 30 min as a separate low-priority process; the first run over a large history is the expensive one, later runs take seconds. Deleted transcripts keep their rows — the heartbeat deletes orchestrator transcripts after 14 days, the index keeps their numbers. An index file of an older schema (1 before the first correction round, 2 before the second) is not migrated: the tab says the schema does not match — delete `logs/harness-index.sqlite` (with its `-wal`/`-shm` files), the next run rebuilds it.
 
 Default port: `8211` (configurable via `DASHBOARD_PORT`). If the port is already in use or reserved by Windows (Hyper-V/WSL dynamic ranges → `WinError 10013`), the server automatically falls back to a free port and logs the actual URL.
 

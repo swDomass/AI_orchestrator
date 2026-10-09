@@ -1398,3 +1398,81 @@ def test_windows_background_mode_keeps_below_normal_and_private_peak():
     assert int(cls) in (BELOW_NORMAL, IDLE), cls
     assert (again, err) == ("0", "402"), "background mode ended by SetPriorityClass(BELOW_NORMAL)"
     assert float(peak) >= 90, peak
+
+
+# ── Korrekturrunde 2: K14 a line that raises while parsing ──────────────────
+
+DEEP = "[" * 200_000  # json.loads raises RecursionError, not ValueError
+
+
+def test_a_deeply_nested_line_is_skipped_and_never_blocks_its_file():
+    """Review probe: the parse ran outside the line's try, so RecursionError
+    rolled the whole file back — on every run."""
+    path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1"), DEEP,
+                                          c_assistant(S_CLI, "m2")])
+    first = run()
+    claude = first["per_source"]["claude"]
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["m1", "m2"]
+    assert (claude["lines_skipped"], claude["skipped_by_type"], claude["errors"]) == (1, {"RecursionError": 1}, [])
+    assert q("SELECT offset FROM file_state WHERE source='claude'") == [(path.stat().st_size,)]
+    second = run()
+    assert (second["lines_read"], second["lines_skipped"], second["errors"]) == (0, 0, {})
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["m1", "m2"]
+    append_jsonl(path, [c_assistant(S_CLI, "m3")])
+    third = run()
+    assert (third["lines_read"], third["lines_skipped"]) == (1, 0)
+    assert claude_tokens()[4] == 3
+
+
+def test_a_deeply_nested_quiet_tail_does_not_block_the_file():
+    path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1"), DEEP], newline_at_end=False)
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    summary = run()
+    assert summary["errors"] == {}
+    assert q("SELECT msg_id FROM claude_msg") == [("m1",)]
+
+
+def test_a_deeply_nested_meta_file_and_marker_line_are_skipped_by_type():
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
+    p = meta_path(S_CLI, AGENT_A)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(DEEP, encoding="utf-8")
+    write_markers([{"date": "2026-09-25", "id": "a", "expect": "x"}, DEEP, {"date": "2026-09-26", "id": "b"}])
+    first = run()
+    assert first["errors"] == {}
+    assert first["per_source"]["claude"]["skipped_by_type"] == {"RecursionError": 1}
+    assert first["per_source"]["markers"]["skipped_by_type"] == {"RecursionError": 1}
+    assert [r[0] for r in q("SELECT id FROM marker ORDER BY id")] == ["a", "b"]
+    assert run()["lines_read"] == 0  # the meta file is not retried on every run
+
+
+def test_a_skipped_line_leaves_no_partial_rows():
+    """The agent call of a line whose usage is out of range used to stay behind."""
+    bad = c_agent_call(S_CLI, "m_bad", "toolu_bad")
+    bad["message"]["usage"] = {"input_tokens": 2**70}
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), bad, c_agent_call(S_CLI, "m_ok", "toolu_ok")])
+    summary = run()
+    assert summary["per_source"]["claude"]["skipped_by_type"] == {"_OutOfRangeError": 1}
+    assert q("SELECT tool_use_id FROM claude_agent_call") == [("toolu_ok",)]
+    assert q("SELECT msg_id FROM claude_msg") == [("m_ok",)]
+
+
+def test_a_skipped_line_leaves_no_file_info_behind():
+    """A line's entrypoint is file information — from a skipped line, none is kept."""
+    bad = c_assistant(S_SDK, "m_bad", entrypoint="sdk-cli", usage={"input_tokens": 2**70})
+    write_jsonl(main_path(S_SDK), [bad, c_assistant(S_SDK, "m_ok", entrypoint=None)])
+    run()
+    assert q("SELECT origin FROM claude_msg") == [("unbekannt",)]
+    assert q("SELECT entrypoint, cwd_hash FROM claude_session") == [(None, None)]
+
+
+def test_a_skipped_codex_line_does_not_mix_into_the_rollout_row():
+    """Review probe: input of the broken token_count line, output of the one before."""
+    broken = _tc("2026-10-08T17:26:10.000Z", 900, 90)
+    broken["payload"]["info"]["total_token_usage"]["output_tokens"] = 2**70
+    write_codex_rollout(extra=[broken])
+    summary = run()
+    assert summary["per_source"]["codex"]["skipped_by_type"] == {"_OutOfRangeError": 1}
+    assert q("SELECT input, output, total, tc_ts FROM codex_rollout") == [
+        (600, 60, 660, "2026-10-08T17:26:00.000Z")]

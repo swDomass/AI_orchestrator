@@ -685,7 +685,7 @@ def _iter_new_lines(
                 if now - mtime >= TAIL_QUIET_SEC:
                     try:
                         json.loads(raw)
-                    except ValueError:
+                    except Exception:  # not ValueError only: deep nesting raises RecursionError
                         pass
                     else:
                         stats.lines_read += 1
@@ -736,6 +736,16 @@ def _parse_line(raw: bytes, needles: tuple[bytes, ...], stats: SourceStats) -> d
     return obj
 
 
+def _undo_line(conn: sqlite3.Connection, info: dict, before: dict) -> None:
+    """Undo a line whose handler raised: its rows back to ``SAVEPOINT line``,
+    the file's in-memory ``info`` back to its copy from before the line."""
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute("ROLLBACK TO line")
+        conn.execute("RELEASE line")
+    info.clear()
+    info.update(before)
+
+
 def _run_file(
     conn: sqlite3.Connection,
     source: str,
@@ -761,11 +771,24 @@ def _run_file(
                 on_reset()
             if not raw:
                 continue
-            obj = _parse_line(raw, needles(state), stats)
-            if obj is None:
-                continue
             try:
-                handle(obj, state, reset)
+                # inside the try: json.loads raises RecursionError (not a
+                # ValueError) on a deeply nested line — that line is skipped,
+                # not the file rolled back on every run
+                obj = _parse_line(raw, needles(state), stats)
+                if obj is None:
+                    continue
+                # One line = one unit: a line that raises leaves no partial
+                # write behind (e.g. the agent call of a line whose usage then
+                # held a number out of range), neither in the rows nor in `info`.
+                before = dict(state.info)
+                conn.execute("SAVEPOINT line")
+                try:
+                    handle(obj, state, reset)
+                except BaseException:
+                    _undo_line(conn, state.info, before)
+                    raise
+                conn.execute("RELEASE line")
             except Exception as e:
                 # Database-level failures end this file (rolled back, retried
                 # next run); anything else is a property of THIS line: skipped
@@ -1009,7 +1032,8 @@ def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
     stats.lines_read += 1
     try:
         data = json.loads(raw)
-    except ValueError:
+    except Exception as e:  # not ValueError only: deep nesting raises RecursionError
+        stats.skip(e)
         data = None
     session_id = path.parent.parent.name[:NAME_MAX]
     agent_id = path.name.removeprefix("agent-").removesuffix(".meta.json")[:NAME_MAX]
@@ -1031,7 +1055,7 @@ def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
                     "agent_type, model, spawn_depth, request_shape, nested, day, origin) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)", values,
                 )
-        else:
+        elif data is not None:  # valid JSON, but not an object
             stats.lines_skipped += 1
         _save_state(conn, "claude-meta", file_key, FileState(st.st_size, st.st_mtime, st.st_size))
         conn.execute("COMMIT")
@@ -1074,41 +1098,46 @@ def _codex_file(conn: sqlite3.Connection, root: Path, path: Path, stats: SourceS
         return (b'"type":"session_meta"', b'"type":"turn_context"', b'"type":"token_count"')
 
     def handle(obj: dict, _state: FileState, _reset: bool) -> None:
+        # The line's values go into `upd` and reach `row` only once the whole
+        # line succeeded: a line that raises halfway (a number out of range)
+        # must not leave the row mixed from two token_count lines.
+        upd: dict = {}
         kind = obj.get("type")
         payload = _dict(obj.get("payload"))
         ts = _str(obj.get("timestamp"))
         if kind == "session_meta":
-            row["session_id"] = _name(payload.get("id"))
-            row["thread_source"] = _name(payload.get("thread_source"))
-            row["originator"] = _name(payload.get("originator"))
-            row["cwd_hash"] = _cwd_hash(payload.get("cwd"))
+            upd["session_id"] = _name(payload.get("id"))
+            upd["thread_source"] = _name(payload.get("thread_source"))
+            upd["originator"] = _name(payload.get("originator"))
+            upd["cwd_hash"] = _cwd_hash(payload.get("cwd"))
             first = _str(payload.get("timestamp")) or ts
-            row["first_ts"] = first
-            row["day"] = _local_day_from_iso(first)
+            upd["first_ts"] = first
+            upd["day"] = _local_day_from_iso(first)
         elif kind == "turn_context":
             if payload.get("model") is not None:
-                row["model"] = _name(payload.get("model"))
+                upd["model"] = _name(payload.get("model"))
         elif kind == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
             if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
                 # LAST cumulative value wins — never a sum over events.
                 total = info["total_token_usage"]
-                row["tc_ts"] = ts
-                row["input"] = _int(total.get("input_tokens"))
-                row["cached_input"] = _int(total.get("cached_input_tokens"))
-                row["cache_write"] = _int(total.get("cache_write_input_tokens"))
-                row["output"] = _int(total.get("output_tokens"))
-                row["reasoning"] = _int(total.get("reasoning_output_tokens"))
-                row["total"] = _int(total.get("total_tokens"))
+                upd["tc_ts"] = ts
+                upd["input"] = _int(total.get("input_tokens"))
+                upd["cached_input"] = _int(total.get("cached_input_tokens"))
+                upd["cache_write"] = _int(total.get("cache_write_input_tokens"))
+                upd["output"] = _int(total.get("output_tokens"))
+                upd["reasoning"] = _int(total.get("reasoning_output_tokens"))
+                upd["total"] = _int(total.get("total_tokens"))
             limits = payload.get("rate_limits")
             if isinstance(limits, dict):
-                row["rl_ts"] = ts
+                upd["rl_ts"] = ts
                 for key in ("primary", "secondary"):
                     win = _dict(limits.get(key))
-                    row[f"{key}_used"] = _float(win.get("used_percent"))
-                    row[f"{key}_window"] = _int(win.get("window_minutes"))
-                    row[f"{key}_resets"] = _int(win.get("resets_at"))
-                row["plan_type"] = _name(limits.get("plan_type"))
+                    upd[f"{key}_used"] = _float(win.get("used_percent"))
+                    upd[f"{key}_window"] = _int(win.get("window_minutes"))
+                    upd[f"{key}_resets"] = _int(win.get("resets_at"))
+                upd["plan_type"] = _name(limits.get("plan_type"))
+        row.update(upd)
 
     def on_done(_state: FileState) -> None:
         if not row:
@@ -1406,8 +1435,8 @@ def _index_markers(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> 
             stats.lines_read += 1
             try:
                 obj = json.loads(line)
-            except ValueError:
-                stats.lines_skipped += 1
+            except Exception as e:  # not ValueError only: deep nesting raises RecursionError
+                stats.skip(e)
                 continue
             if not isinstance(obj, dict) or not isinstance(obj.get("date"), str) or not obj.get("id"):
                 stats.lines_skipped += 1

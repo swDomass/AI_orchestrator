@@ -750,16 +750,17 @@ def test_a_run_across_midnight_covers_the_day_before_its_start():
         ro.close()
 
 
-def test_coverage_comes_from_the_real_run_log(monkeypatch):
+def test_coverage_comes_from_the_real_run_log():
     """End to end: a real run_update, read three days later."""
+    now = datetime.now()  # once: a midnight between the lines must not shift the expected days
     conn = new_index()
-    add_marker(conn, (datetime.now().date() - timedelta(days=7)).isoformat(), "extern-diaet",
+    add_marker(conn, (now.date() - timedelta(days=7)).isoformat(), "extern-diaet",
                _LIVE_EXPECT["extern-diaet"])
     conn.close()
     hi.run_update(hi.Sources.from_config(), out=lambda _m: None)
-    later = datetime.now() + timedelta(days=3)
+    later = now + timedelta(days=3)
     calls = hi.dashboard_payload(db_path(), now=later)["harness"]["markers"][0]["kpis"][0]
-    assert calls["covered_to"] == (datetime.now().date() - timedelta(days=1)).isoformat()
+    assert calls["covered_to"] == (now.date() - timedelta(days=1)).isoformat()
     assert calls["delta_pct"] is None
     assert any(n.startswith("Index vollständig nur bis") for n in calls["notes"])
 

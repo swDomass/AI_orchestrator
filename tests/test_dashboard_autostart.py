@@ -449,15 +449,49 @@ def test_second_dashboard_on_the_same_port_falls_back_instead_of_sharing():
 
 
 def test_reuse_server_socket_options_per_platform():
+    """The options the REAL socket ends up with, on the platform the suite runs on."""
     server = dashboard._ReuseServer(("127.0.0.1", 0), dashboard._Handler)
     try:
+        reuse = server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
         if sys.platform == "win32":
-            assert dashboard._ReuseServer.allow_reuse_address is False
             assert server.socket.getsockopt(socket.SOL_SOCKET, dashboard._SO_EXCLUSIVEADDRUSE) != 0
+            assert reuse == 0
         else:
-            assert dashboard._ReuseServer.allow_reuse_address is True
+            assert reuse != 0
     finally:
         server.server_close()
+
+
+class _RecordingSocket:
+    """Stands in for the server socket: records setsockopt, binds for real."""
+
+    def __init__(self, real: socket.socket) -> None:
+        self.real = real
+        self.options: list[tuple[int, int, int]] = []
+
+    def setsockopt(self, level: int, name: int, value: int) -> None:
+        self.options.append((level, name, value))
+
+    def __getattr__(self, name: str):
+        return getattr(self.real, name)
+
+
+@pytest.mark.parametrize("windows", [True, False], ids=["windows", "posix"])
+def test_bind_sets_exclusive_use_on_windows_and_reuse_elsewhere(monkeypatch, windows):
+    """Runs the Windows branch on every platform. Without it, the K6 regression
+    (SO_REUSEADDR on Windows) stays green everywhere but on Windows — measured:
+    that mutation passed all of this file on Linux."""
+    monkeypatch.setattr(dashboard, "_is_windows", lambda: windows)
+    server = dashboard._ReuseServer(("127.0.0.1", 0), dashboard._Handler, bind_and_activate=False)
+    recorder = _RecordingSocket(server.socket)
+    server.socket = recorder
+    try:
+        server.server_bind()
+        expected = dashboard._SO_EXCLUSIVEADDRUSE if windows else socket.SO_REUSEADDR
+        assert recorder.options == [(socket.SOL_SOCKET, expected, 1)]
+        assert server.server_address[0] == "127.0.0.1"
+    finally:
+        recorder.real.close()
 
 
 # ── K8: the dashboard starts with the orchestrator, not after the delay ─────

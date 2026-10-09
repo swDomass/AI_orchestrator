@@ -1410,21 +1410,31 @@ class _Handler(BaseHTTPRequestHandler):
 _SO_EXCLUSIVEADDRUSE = getattr(socket, "SO_EXCLUSIVEADDRUSE", -5)
 
 
+def _is_windows() -> bool:
+    """Seam for the socket-option test: it runs the Windows branch on Linux too."""
+    return sys.platform == "win32"
+
+
 class _ReuseServer(socketserver.TCPServer):
     """TCP server that never shares its port with a second server.
 
     POSIX: SO_REUSEADDR only lets a restarted server rebind past TIME_WAIT; a
     port another socket is LISTENING on still fails, so the second dashboard
     falls back as documented. Windows: SO_REUSEADDR lets a second socket bind a
-    port that is in use (measured twice: two dashboards on 8211, no fallback,
-    no warning) — so there it is off and SO_EXCLUSIVEADDRUSE is set instead.
+    port that is in use (measured twice by the Auftraggeber: two dashboards on
+    8211, no fallback, no warning) — so there it is never set and
+    SO_EXCLUSIVEADDRUSE is set instead. Both options are chosen in
+    ``server_bind`` at bind time rather than in the class attribute, so a test
+    can run the Windows branch on any platform.
     """
 
-    allow_reuse_address = sys.platform != "win32"
+    allow_reuse_address = False  # TCPServer must not add SO_REUSEADDR itself
 
     def server_bind(self) -> None:
-        if sys.platform == "win32":
+        if _is_windows():
             self.socket.setsockopt(socket.SOL_SOCKET, _SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         super().server_bind()
 
 

@@ -793,3 +793,49 @@ def test_status_line_shows_broken_ledger_and_marker_lines_apart(tmp_path):
     conn.execute("DELETE FROM file_state")
     conn.close()
     assert "kaputte Zeilen" not in _run_tab(tmp_path, payload())["status"]
+
+
+# ── Korrekturrunde 3: K28 timer reload of the tab ──────────────────────────
+
+
+def _run_tick(tmp_path, setup: str) -> list:
+    script = re.findall(r"<script>(.*?)</script>", dashboard._HTML_PAGE, re.S)[0]
+    js = tmp_path / "tick.js"
+    js.write_text(
+        _STUB + script
+        + "\nconst urls = [];\nglobalThis.fetch = u => { urls.push(u); return new Promise(() => {}); };\n"
+        + setup + "\nconsole.log(JSON.stringify(urls));\n",
+        encoding="utf-8")
+    assert NODE is not None
+    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=30, check=False)
+    assert proc.returncode == 0, proc.stderr
+    urls: list = json.loads(proc.stdout.strip().splitlines()[-1])
+    return urls
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_the_tab_reloads_on_the_timer_only_while_it_is_shown(tmp_path):
+    shown = "document.getElementById('tab-harness').style.display = ''; harnessTick();"
+    assert [u for u in _run_tick(tmp_path, shown) if u.startswith("/api/harness")] != []
+    hidden_tab = "document.getElementById('tab-harness').style.display = 'none'; harnessTick();"
+    assert [u for u in _run_tick(tmp_path, hidden_tab) if u.startswith("/api/harness")] == []
+    hidden_window = ("document.getElementById('tab-harness').style.display = ''; "
+                     "document.hidden = true; harnessTick();")
+    assert [u for u in _run_tick(tmp_path, hidden_window) if u.startswith("/api/harness")] == []
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_overlapping_harness_loads_send_one_request(tmp_path):
+    two = "document.getElementById('tab-harness').style.display = ''; harnessTick(); harnessTick(); loadHarness(true);"
+    assert len([u for u in _run_tick(tmp_path, two) if u.startswith("/api/harness")]) == 1
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_a_click_during_a_slow_load_is_asked_again_once_it_ended(tmp_path):
+    urls = _run_tick(tmp_path, (
+        "globalThis.fetch = u => { urls.push(u); return Promise.resolve({ok: false}); };"
+        " loadHarness(); _hDays = 7; loadHarness();"
+        " setTimeout(() => console.log(JSON.stringify(urls)), 20);"))
+    assert [u for u in urls if u.startswith("/api/harness")] == [
+        "/api/harness?days=30&window=7", "/api/harness?days=7&window=7"]

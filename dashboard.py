@@ -1023,11 +1023,25 @@ function setHarnessMetric(m) {
   if (_harness && _harness.available) renderHarnessUsageChart(_harness);
 }
 
-async function loadHarness() {
+let _hLoading = false, _hAgain = false;
+async function loadHarness(fromTimer) {
+  if (_hLoading) {  // a slow answer must not be overtaken by a second request
+    if (!fromTimer) _hAgain = true;  // a click on another range is asked once more afterwards
+    return;
+  }
+  _hLoading = true;
   try {
     const r = await fetch('/api/harness?days=' + _hDays + '&window=' + _hWindow);
     if (r.ok) renderHarness((await r.json()).harness);
   } catch (e) { console.warn('harness fetch failed', e); }
+  finally { _hLoading = false; }
+  if (_hAgain) { _hAgain = false; loadHarness(); }
+}
+// Every 5 min, only while the tab is shown and the window is not hidden: no request otherwise.
+function harnessTick() {
+  if (document.hidden) return;
+  if (document.getElementById('tab-harness').style.display === 'none') return;
+  loadHarness(true);
 }
 
 function harnessChart(id, type, stacked) {
@@ -1255,6 +1269,7 @@ initCharts();
 load();
 setInterval(load, 60000);
 setInterval(refreshActiveRuns, 30000);
+setInterval(harnessTick, 300000);
 if (location.hash === '#harness') showTab('harness');
 </script>
 </body>

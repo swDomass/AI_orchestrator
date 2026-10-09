@@ -1284,7 +1284,117 @@ def test_lower_priority_reports_success_in_a_child():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows API")
 def test_windows_peak_memory_and_pid_check_work():
-    peak = hi._peak_rss_mb_windows()
+    peak = hi._peak_private_mb_windows()
     assert peak is not None and peak > 0
     assert hi._pid_alive_windows(os.getpid()) is True
     assert hi._pid_alive_windows(_dead_pid()) is False
+
+
+# ── Korrekturrunde 2: K13 memory peak and priority class ────────────────────
+
+
+def test_peak_is_the_private_peak_not_the_capped_working_set():
+    """Background mode caps the working set at ~32 MB; the private peak is what
+    the run used (review probe on Windows: 32.0 against 318.3 MB)."""
+    counters = hi._ProcessMemoryCounters()
+    counters.PeakWorkingSetSize = 32 * 1_048_576
+    counters.PeakPagefileUsage = int(318.3 * 1_048_576)
+    assert hi._peak_private_mb(counters) == 318.3
+
+
+def test_run_log_names_the_peak_by_what_it_measures(monkeypatch):
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
+    monkeypatch.setattr(hi, "_peak_memory_mb", lambda: ("peak_private_mb", 75.0))
+    summary = run()
+    assert q("SELECT peak_private_mb, peak_rss_mb FROM index_runs") == [(75.0, None)]
+    assert (summary["peak_private_mb"], summary["peak_rss_mb"]) == (75.0, None)
+    assert "Spitze privater Speicher 75.0 MB" in summary["_out"][-1]
+    monkeypatch.setattr(hi, "_peak_memory_mb", lambda: ("peak_rss_mb", 26.7))
+    append_jsonl(main_path(S_CLI), [c_assistant(S_CLI, "m2")])
+    assert "Spitze RSS 26.7 MB" in run()["_out"][-1]
+    assert q("SELECT peak_private_mb, peak_rss_mb FROM index_runs ORDER BY id") == [(75.0, None), (None, 26.7)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the POSIX branch of _peak_memory_mb")
+def test_posix_peak_is_the_resident_set():
+    column, mb = hi._peak_memory_mb()
+    assert column == "peak_rss_mb" and mb is not None and mb > 0
+
+
+class _FakeKernel32:
+    """Records SetPriorityClass calls; GetPriorityClass answers ``reads``."""
+
+    def __init__(self, reads: int, fail: tuple[int, ...] = ()):
+        self.reads, self.fail = reads, fail
+        self.calls: list[int] = []
+
+    def GetCurrentProcess(self):  # noqa: N802 — the Windows API name
+        return -1
+
+    def SetPriorityClass(self, handle, value):  # noqa: N802
+        self.calls.append(value)
+        return 0 if value in self.fail else 1
+
+    def GetPriorityClass(self, handle):  # noqa: N802
+        return self.reads
+
+
+BACKGROUND, BELOW_NORMAL, NORMAL, IDLE = 0x00100000, 0x4000, 0x20, 0x40
+
+
+@pytest.mark.parametrize(
+    ("reads", "fail", "expected"),
+    [
+        (NORMAL, (), ([BACKGROUND, BELOW_NORMAL], True)),     # measured: background mode read NORMAL
+        (0, (), ([BACKGROUND, BELOW_NORMAL], True)),          # GetPriorityClass failed: set it anyway
+        (BELOW_NORMAL, (), ([BACKGROUND], True)),
+        (IDLE, (), ([BACKGROUND], True)),                     # lower than BELOW_NORMAL: kept
+        (NORMAL, (BACKGROUND,), ([BACKGROUND], False)),
+        (NORMAL, (BELOW_NORMAL,), ([BACKGROUND, BELOW_NORMAL], False)),
+    ],
+    ids=["normal", "unknown", "below_normal", "idle", "background_fails", "below_normal_fails"],
+)
+def test_windows_priority_class_is_never_left_above_below_normal(monkeypatch, capsys, reads, fail, expected):
+    """The Windows branch with a recording kernel32 — runs on every platform."""
+    calls, ok = expected
+    fake = _FakeKernel32(reads, fail)
+    monkeypatch.setattr(hi, "_kernel32", lambda: fake)
+    assert hi._lower_priority_windows() is ok
+    assert fake.calls == calls
+    err = capsys.readouterr().err
+    assert ("not set" in err) is (not ok)
+
+
+_BACKGROUND_PROBE = textwrap.dedent("""
+    import ctypes
+    import harness_index as hi
+    ok = hi._lower_priority()
+    k = hi._kernel32()
+    me = k.GetCurrentProcess()
+    cls = k.GetPriorityClass(me)
+    # documented probe: a second BEGIN fails with ERROR_PROCESS_MODE_ALREADY_BACKGROUND
+    # (402) exactly while the process is still in background mode
+    again = k.SetPriorityClass(me, 0x00100000)
+    err = ctypes.get_last_error()
+    block = bytearray(100 * 1_048_576)
+    for i in range(0, len(block), 4096):
+        block[i] = 1
+    print(ok, cls, again, err, hi._peak_private_mb_windows())
+""")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows API")
+def test_windows_background_mode_keeps_below_normal_and_private_peak():
+    """In a child (background mode would slow this test process down): the class
+    reads at most BELOW_NORMAL, background mode is still on after the second
+    SetPriorityClass, and 100 MB touched in background mode show as ≥ 90 MB."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _BACKGROUND_PROBE], cwd=str(REPO), env=_child_env(),
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    ok, cls, again, err, peak = proc.stdout.split()
+    assert ok == "True", proc.stderr
+    assert int(cls) in (BELOW_NORMAL, IDLE), cls
+    assert (again, err) == ("0", "402"), "background mode ended by SetPriorityClass(BELOW_NORMAL)"
+    assert float(peak) >= 90, peak

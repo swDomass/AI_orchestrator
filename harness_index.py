@@ -97,7 +97,8 @@ from typing import Any
 
 import config
 
-SCHEMA_VERSION = 2  # 2: claude_msg keyed by message.id alone, no folder names, ledger by line
+SCHEMA_VERSION = 3  # 2: claude_msg keyed by message.id alone, no folder names, ledger by line;
+                    # 3: index_runs.peak_private_mb (Windows) next to peak_rss_mb (POSIX)
 HEAD_BYTES = 256
 TAIL_BYTES = 256
 # A complete-looking last line without newline is evaluated only once the file
@@ -171,7 +172,8 @@ CREATE TABLE IF NOT EXISTS marker (
 CREATE TABLE IF NOT EXISTS index_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started TEXT, finished TEXT,
     duration_sec REAL, files_read INTEGER, bytes_read INTEGER, lines_read INTEGER,
-    lines_skipped INTEGER, errors TEXT, per_source TEXT, peak_rss_mb REAL, status TEXT);
+    lines_skipped INTEGER, errors TEXT, per_source TEXT,
+    peak_private_mb REAL, peak_rss_mb REAL, status TEXT);
 """
 
 
@@ -303,17 +305,29 @@ def origin_of(entrypoint: object) -> str:
     return _ENTRYPOINT_ORIGIN.get(entrypoint, ORIGIN_UNKNOWN)
 
 
-def _peak_rss_mb() -> float | None:
-    """Peak resident memory of this process in MB, best effort (None if unknown)."""
+# The run log's memory figure, by platform: one column per meaning, never one
+# column with two meanings.
+PEAK_LABELS = {"peak_private_mb": "Spitze privater Speicher", "peak_rss_mb": "Spitze RSS"}
+
+
+def _peak_memory_mb() -> tuple[str, float | None]:
+    """``(column, MB)`` of this process's memory peak, best effort (MB None if unknown).
+
+    Windows: peak PRIVATE memory (``peak_private_mb``, see ``_peak_private_mb``).
+    POSIX: peak resident set (``peak_rss_mb``, ``getrusage``).
+    """
+    if os.name == "nt":
+        try:
+            return "peak_private_mb", _peak_private_mb_windows()
+        except Exception:
+            return "peak_private_mb", None
     try:
-        if os.name == "nt":
-            return _peak_rss_mb_windows()
         resource = importlib.import_module("resource")  # POSIX only
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         # Linux reports KiB, macOS bytes.
-        return round(float(peak) / (1_048_576 if sys.platform == "darwin" else 1024), 1)
+        return "peak_rss_mb", round(float(peak) / (1_048_576 if sys.platform == "darwin" else 1024), 1)
     except Exception:
-        return None
+        return "peak_rss_mb", None
 
 
 class _ProcessMemoryCounters(ctypes.Structure):
@@ -344,6 +358,8 @@ def _kernel32() -> Any:
         k.GetCurrentProcess.restype = wintypes.HANDLE
         k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
         k.SetPriorityClass.restype = wintypes.BOOL
+        k.GetPriorityClass.argtypes = (wintypes.HANDLE,)
+        k.GetPriorityClass.restype = wintypes.DWORD
         k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         k.OpenProcess.restype = wintypes.HANDLE
         k.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
@@ -363,14 +379,25 @@ def _last_error() -> int:
     return 0
 
 
-def _peak_rss_mb_windows() -> float | None:
-    """Peak working set of this process via K32GetProcessMemoryInfo, or None
+def _peak_private_mb(counters: _ProcessMemoryCounters) -> float:
+    """Peak private memory in MB: ``PeakPagefileUsage``, the peak commit charge.
+
+    Not ``PeakWorkingSetSize``: background mode (``_lower_priority``) caps the
+    working set at about 32 MB, so that figure read 32.0 MB whatever the run
+    used. Measured on Windows (Korrekturrunde 2): a probe allocating 200 MB
+    read peak working set 32.0 MB and peak private 318.3 MB; the real first run
+    read 32.0 MB, where 75 MB had been measured from outside on the earlier head."""
+    return round(float(counters.PeakPagefileUsage) / 1_048_576, 1)
+
+
+def _peak_private_mb_windows() -> float | None:
+    """Peak private memory of this process via K32GetProcessMemoryInfo, or None
     (with one line on stderr naming GetLastError)."""
     counters = _ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(counters)
     k = _kernel32()
     if k.K32GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
-        return round(float(counters.PeakWorkingSetSize) / 1_048_576, 1)
+        return _peak_private_mb(counters)
     with contextlib.suppress(Exception):
         print(f"harness_index: GetProcessMemoryInfo failed, GetLastError={_last_error()}", file=sys.stderr)
     return None
@@ -1428,15 +1455,16 @@ class Sources:
 
 
 def _record_run(conn: sqlite3.Connection, *, started: float, finished: float,
-                totals: dict, errors: dict, per_source: dict, peak: float | None, status: str) -> None:
+                totals: dict, errors: dict, per_source: dict, peak: dict, status: str) -> None:
     conn.execute(
         "INSERT INTO index_runs(started, finished, duration_sec, files_read, bytes_read, lines_read, "
-        "lines_skipped, errors, per_source, peak_rss_mb, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "lines_skipped, errors, per_source, peak_private_mb, peak_rss_mb, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (datetime.fromtimestamp(started).isoformat(timespec="seconds"),
          datetime.fromtimestamp(finished).isoformat(timespec="seconds"),
          round(finished - started, 3), totals["files_read"], totals["bytes_read"],
          totals["lines_read"], totals["lines_skipped"], json.dumps(errors),
-         json.dumps(per_source), peak, status),
+         json.dumps(per_source), peak.get("peak_private_mb"), peak.get("peak_rss_mb"), status),
     )
 
 
@@ -1493,7 +1521,8 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
             }
             errors = {k: v.errors for k, v in per_source.items() if v.errors}
             status = "partial" if errors else "ok"
-            peak = _peak_rss_mb()
+            peak_column, peak_mb = _peak_memory_mb()
+            peak = {"peak_private_mb": None, "peak_rss_mb": None, peak_column: peak_mb}
             detail = {k: v.as_dict() for k, v in per_source.items()}
             try:
                 _record_run(conn, started=started, finished=finished, totals=totals, errors=errors,
@@ -1505,12 +1534,13 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
             conn.close()
         summary = {
             "status": status, "duration_sec": round(finished - started, 3), **totals,
-            "errors": errors, "peak_rss_mb": peak, "per_source": detail,
+            "errors": errors, **peak, "per_source": detail,
         }
         say(
             f"Harness-Index {status}: {totals['files_read']} Dateien, {totals['lines_read']} Zeilen, "
             f"{totals['bytes_read'] / 1_048_576:.1f} MB gelesen, {totals['lines_skipped']} übersprungen, "
-            f"{summary['duration_sec']:.1f} s, Spitze {peak if peak is not None else '?'} MB"
+            f"{summary['duration_sec']:.1f} s, {PEAK_LABELS[peak_column]} "
+            f"{peak_mb if peak_mb is not None else '?'} MB"
         )
         for name, errs in errors.items():
             say(f"  Fehler {name}: {'; '.join(errs[:3])}")
@@ -1965,33 +1995,23 @@ def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[
     return out
 
 
+_IDLE_PRIORITY_CLASS = 0x0040
+_BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+_PROCESS_MODE_BACKGROUND_BEGIN = 0x00100000
+
+
 def _lower_priority() -> bool:
-    """Lower our own CPU (and on Windows I/O) priority.
+    """Lower our own CPU (and on Windows I/O and memory) priority.
 
     POSIX: ``os.nice(10)`` from inside the child — the parent could only do it
-    through ``preexec_fn``, which is not thread-safe. Windows: the parent already
-    starts us with BELOW_NORMAL_PRIORITY_CLASS, which leaves the I/O priority
-    normal; PROCESS_MODE_BACKGROUND_BEGIN (settable only by a process on itself)
-    lowers CPU, I/O and memory priority, so a first run over gigabytes does not
-    compete with a running task's disk access.
+    through ``preexec_fn``, which is not thread-safe. Windows: see
+    ``_lower_priority_windows``.
 
     Returns whether it worked; a failure is one line on stderr (with
     GetLastError on Windows), never an exception.
     """
     if os.name == "nt":
-        try:
-            k = _kernel32()
-            ok = bool(k.SetPriorityClass(k.GetCurrentProcess(), 0x00100000))  # PROCESS_MODE_BACKGROUND_BEGIN
-            error = _last_error()
-        except Exception as e:
-            ok, error = False, -1
-            detail = f"{type(e).__name__}: {e}"
-        else:
-            detail = f"GetLastError={error}"
-        if not ok:
-            with contextlib.suppress(Exception):
-                print(f"harness_index: background mode not set ({detail})", file=sys.stderr)
-        return ok
+        return _lower_priority_windows()
     if hasattr(os, "nice"):
         try:
             os.nice(10)
@@ -2001,6 +2021,48 @@ def _lower_priority() -> bool:
             return False
         return True
     return False
+
+
+def _lower_priority_windows() -> bool:
+    """Background mode, and a CPU priority class never above BELOW_NORMAL.
+
+    The parent starts us with BELOW_NORMAL_PRIORITY_CLASS, which leaves the
+    I/O priority normal; PROCESS_MODE_BACKGROUND_BEGIN (settable only by a
+    process on itself) lowers I/O and memory priority as well, so a first run
+    over gigabytes does not compete with a running task's disk access. Two
+    side effects, both measured on Windows in Korrekturrunde 2:
+
+    * The mode caps the WORKING SET at about 32 MB. Microsoft does not document
+      it; B. Dawson, "32 MiB Working Sets on a 64 GiB machine" (randomascii,
+      2023-10-01) measured the same cap, with passes over a 64 MiB buffer
+      about 250 times slower. Beyond the cap pages are trimmed and come back as
+      soft page faults, so a run takes longer; the index streams its files, and
+      the measured first run took 51.7 s in this mode. It is also why the run
+      log reports peak PRIVATE memory, not the working set (``_peak_private_mb``).
+    * ``GetPriorityClass`` read NORMAL (32) during the run, although the parent
+      had started the child BELOW_NORMAL (16384). Microsoft's documentation of
+      SetPriorityClass says nothing about the class in background mode. So the
+      class is read back and set to BELOW_NORMAL again whenever it reads higher
+      than that. That background mode survives the second call is pinned on
+      Windows by ``test_windows_background_mode_keeps_below_normal_and_private_peak``
+      (a second PROCESS_MODE_BACKGROUND_BEGIN must fail with
+      ERROR_PROCESS_MODE_ALREADY_BACKGROUND, 402).
+    """
+    step = "background mode"
+    try:
+        k = _kernel32()
+        me = k.GetCurrentProcess()
+        ok = bool(k.SetPriorityClass(me, _PROCESS_MODE_BACKGROUND_BEGIN))
+        if ok and k.GetPriorityClass(me) not in (_IDLE_PRIORITY_CLASS, _BELOW_NORMAL_PRIORITY_CLASS):
+            step = "BELOW_NORMAL after background mode"
+            ok = bool(k.SetPriorityClass(me, _BELOW_NORMAL_PRIORITY_CLASS))
+        detail = "" if ok else f"GetLastError={_last_error()}"
+    except Exception as e:
+        ok, detail = False, f"{type(e).__name__}: {e}"
+    if not ok:
+        with contextlib.suppress(Exception):
+            print(f"harness_index: {step} not set ({detail})", file=sys.stderr)
+    return ok
 
 
 def main(argv: list[str] | None = None) -> int:

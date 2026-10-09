@@ -1325,6 +1325,336 @@ def run_update_subprocess(*, timeout: float | None = None) -> dict:
     return result
 
 
+# ── read side: the dashboard's /api/harness ────────────────────────────────
+
+# Harness-change marker → KPI. `expect` is free text, so the mapping is a FIXED
+# keyword table, visible here: a keyword found in `expect` (case-insensitive)
+# links the marker to a daily series; a marker without any keyword gets only its
+# vertical line, never a guessed metric. All series are per DAY — the index has
+# no loop/pass identifier (that is the excluded phase 2).
+MARKER_KPIS: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("externe aufrufe",), "ledger_calls", "Externe Aufrufe je Tag (Ledger)"),
+    (("fehlversuche",), "ledger_failures", "Externe Fehlversuche je Tag (Ledger, Status ≠ ok)"),
+    (("opencode-kosten", "kosten je pass"), "opencode_cost", "opencode-Kosten je Tag (Katalogpreis, USD)"),
+    (("sessions je pass",), "opencode_sessions", "opencode-Sitzungen je Tag"),
+)
+MARKER_WINDOWS = (3, 7, 14)
+HARNESS_READ_TIMEOUT_SEC = 0.5     # sqlite busy timeout of the read connection
+HARNESS_QUERY_BUDGET_SEC = 3.0     # hard cap for all queries of one request
+CATEGORIES = ("interaktiv", "orchestrator", "subagent", "unbekannt")
+_COUNTERS = ("input", "output", "cache_read", "cache_write")
+
+
+def marker_kpis(expect: object) -> list[tuple[str, str]]:
+    """The (kpi key, label) pairs a marker's ``expect`` text names, in table order."""
+    text = str(expect or "").lower()
+    return [(key, label) for words, key, label in MARKER_KPIS if any(w in text for w in words)]
+
+
+def marker_window(series: dict[str, float], marker_day: str, n: int, today: str) -> dict:
+    """Before/after comparison around a marker: n days each, the marker day in neither.
+
+    ``before`` = [D-n, D-1], ``after`` = [D+1, D+n]; only completed days (before
+    ``today``) count for "after", so a window still running is reported as
+    ``complete=False`` with ``after_days`` < n. Averages are per day over the
+    days counted; a missing day in ``series`` is 0.
+    """
+    d = datetime.strptime(marker_day, "%Y-%m-%d").date()
+    last_full = datetime.strptime(today, "%Y-%m-%d").date() - timedelta(days=1)
+    before = [(d - timedelta(days=i)).isoformat() for i in range(n, 0, -1)]
+    after_all = [(d + timedelta(days=i)).isoformat() for i in range(1, n + 1)]
+    after = [x for x in after_all if datetime.strptime(x, "%Y-%m-%d").date() <= last_full]
+    before_sum = sum(series.get(x, 0) for x in before)
+    after_sum = sum(series.get(x, 0) for x in after)
+    before_avg = before_sum / len(before) if before else None
+    after_avg = after_sum / len(after) if after else None
+    delta = None
+    if before_avg not in (None, 0) and after_avg is not None:
+        delta = round((after_avg - before_avg) / before_avg * 100, 1)
+    return {
+        "n": n, "before_days": before, "after_days": after, "complete": len(after) == n,
+        "before_sum": round(before_sum, 6), "after_sum": round(after_sum, 6),
+        "before_avg": None if before_avg is None else round(before_avg, 6),
+        "after_avg": None if after_avg is None else round(after_avg, 6),
+        "delta_pct": delta,
+    }
+
+
+def _unavailable(reason: str) -> dict:
+    return {"harness": {"available": False, "reason": reason}}
+
+
+def _connect_read_only(db_path: Path) -> sqlite3.Connection:
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=HARNESS_READ_TIMEOUT_SEC)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    return conn
+
+
+def _category(kind: str | None, origin: str | None) -> str:
+    if kind == "subagent":
+        return "subagent"
+    return origin if origin in ("interaktiv", "orchestrator") else "unbekannt"
+
+
+def _days_between(first: str, last: str) -> list[str]:
+    a = datetime.strptime(first, "%Y-%m-%d").date()
+    b = datetime.strptime(last, "%Y-%m-%d").date()
+    return [(a + timedelta(days=i)).isoformat() for i in range((b - a).days + 1)]
+
+
+def _codex_window(used: float | None, minutes: int | None, resets: int | None, now: float) -> dict | None:
+    if used is None and minutes is None:
+        return None
+    expired = resets is not None and resets < now
+    return {
+        "used_pct": used, "free_pct": None if used is None else round(100.0 - used, 1),
+        "window_minutes": minutes, "resets_at": resets, "expired": bool(expired),
+    }
+
+
+def dashboard_payload(db_path: Path | str | None = None, *, days: int = 30, window: int = 7,
+                      now: datetime | None = None) -> dict:
+    """Everything the "Harness" tab draws, read from the index ONLY. Never raises.
+
+    Read-only connection (``mode=ro``, ``query_only``), busy timeout
+    ``HARNESS_READ_TIMEOUT_SEC`` and a hard query budget, because the dashboard
+    server is single-threaded: a missing, empty, locked, corrupt or
+    other-schema database answers ``{"harness": {"available": false, ...}}``
+    quickly instead of raising or waiting.
+    """
+    path = Path(db_path if db_path is not None else config.HARNESS_DB_FILE)
+    if not path.is_file():
+        return _unavailable("Index noch nicht gelaufen (keine Datei)")
+    days = max(1, min(int(days), 365))
+    window = window if window in MARKER_WINDOWS else 7
+    now = now or datetime.now()
+    deadline = time.monotonic() + HARNESS_QUERY_BUDGET_SEC
+    try:
+        conn = _connect_read_only(path)
+    except sqlite3.Error as e:
+        return _unavailable(f"Index nicht lesbar: {_err_text(e)}")
+    try:
+        conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1_000)
+        return {"harness": _read_payload(conn, days=days, window=window, now=now)}
+    except _NotReadyError as e:
+        return _unavailable(str(e))
+    except sqlite3.Error as e:
+        return _unavailable(f"Index nicht lesbar: {_err_text(e)}")
+    except Exception as e:
+        return _unavailable(f"Index-Auswertung fehlgeschlagen: {_err_text(e)}")
+    finally:
+        conn.close()
+
+
+class _NotReadyError(Exception):
+    pass
+
+
+def _read_payload(conn: sqlite3.Connection, *, days: int, window: int, now: datetime) -> dict:
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            raise _NotReadyError("Index noch nicht gelaufen (leere Datenbank)") from e
+        raise
+    if version is None or version[0] != str(SCHEMA_VERSION):
+        raise _NotReadyError(
+            f"Index-Schema {version[0] if version else '?'} passt nicht (erwartet {SCHEMA_VERSION}) — "
+            "neuer Indexlauf nötig")
+    run = conn.execute(
+        "SELECT finished, duration_sec, lines_read, lines_skipped, status, errors, files_read, bytes_read "
+        "FROM index_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if run is None:
+        raise _NotReadyError("Index noch nicht gelaufen (kein abgeschlossener Lauf)")
+    today = now.date().isoformat()
+    first = (now.date() - timedelta(days=days - 1)).isoformat()
+    day_list = _days_between(first, today)
+    try:
+        finished = datetime.fromisoformat(run[0])
+        age = max(0, int((now - finished).total_seconds()))
+    except (TypeError, ValueError):
+        age = None
+    try:
+        errors = json.loads(run[5] or "{}")
+    except ValueError:
+        errors = {}
+    payload: dict = {
+        "available": True, "generated_at": now.isoformat(timespec="seconds"),
+        "days": days, "window": window, "day_list": day_list,
+        "last_run": {"finished": run[0], "age_sec": age, "duration_sec": run[1], "lines_read": run[2],
+                     "lines_skipped": run[3], "status": run[4], "errors": errors,
+                     "files_read": run[6], "bytes_read": run[7]},
+    }
+    payload["usage"] = _read_usage(conn, first)
+    payload["agent_calls"] = _read_agent_calls(conn, first)
+    payload["cost"] = _read_costs(conn, first)
+    payload["quota"] = _read_codex_quota(conn, now)
+    payload["extern"] = _read_extern(conn, first)
+    payload["markers"] = _read_markers(conn, window=window, today=today)
+    return payload
+
+
+def _read_usage(conn: sqlite3.Connection, first: str) -> dict:
+    by_day: dict[str, dict[str, dict[str, int]]] = {}
+    totals = {c: dict.fromkeys((*_COUNTERS, "total", "messages"), 0) for c in (*CATEGORIES, "all")}
+    sub_by_origin = {"interaktiv": 0, "orchestrator": 0, "unbekannt": 0}
+    for day, kind, origin, inp, out, cr, cw, n in conn.execute(
+        "SELECT day, kind, origin, sum(coalesce(input,0)), sum(coalesce(output,0)), "
+        "sum(coalesce(cache_read,0)), sum(coalesce(cache_write,0)), count(*) "
+        "FROM claude_msg WHERE day >= ? GROUP BY day, kind, origin", (first,),
+    ):
+        cat = _category(kind, origin)
+        values = dict(zip(_COUNTERS, (inp, out, cr, cw), strict=True))
+        cell = by_day.setdefault(day, {}).setdefault(cat, dict.fromkeys((*_COUNTERS, "total"), 0))
+        for key, v in values.items():
+            cell[key] += v
+            totals[cat][key] += v
+            totals["all"][key] += v
+        s = sum(values.values())
+        cell["total"] += s
+        totals[cat]["total"] += s
+        totals["all"]["total"] += s
+        totals[cat]["messages"] += n
+        totals["all"]["messages"] += n
+        if cat == "subagent":
+            sub_by_origin[origin if origin in sub_by_origin else "unbekannt"] += s
+    all_total = totals["all"]["total"]
+    all_io = totals["all"]["input"] + totals["all"]["output"]
+    sub = totals["subagent"]
+    families: dict[str, dict[str, dict[str, int]]] = {}
+    for kind, origin, family, tok, out, n in conn.execute(
+        "SELECT kind, origin, family, sum(coalesce(input,0)+coalesce(output,0)+coalesce(cache_read,0)"
+        "+coalesce(cache_write,0)), sum(coalesce(output,0)), count(*) FROM claude_msg WHERE day >= ? "
+        "GROUP BY kind, origin, family", (first,),
+    ):
+        for cat in (_category(kind, origin), "all"):
+            cell = families.setdefault(cat, {}).setdefault(family or "andere", {"tokens": 0, "output": 0, "messages": 0})
+            cell["tokens"] += tok
+            cell["output"] += out
+            cell["messages"] += n
+    return {
+        "by_day": by_day, "totals": totals, "families": families,
+        "subagent_share_pct": round(sub["total"] / all_total * 100, 1) if all_total else None,
+        "subagent_share_io_pct": round((sub["input"] + sub["output"]) / all_io * 100, 1) if all_io else None,
+        "subagent_by_origin": sub_by_origin,
+    }
+
+
+def _read_agent_calls(conn: sqlite3.Connection, first: str) -> dict:
+    rows = [
+        {"subagent_type": t or "?", "model": m or "Standard", "calls": n}
+        for t, m, n in conn.execute(
+            "SELECT subagent_type, model_req, count(*) FROM claude_agent_call WHERE day >= ? "
+            "GROUP BY subagent_type, model_req ORDER BY count(*) DESC, subagent_type", (first,))
+    ]
+    by_origin = dict(conn.execute(
+        "SELECT origin, count(*) FROM claude_agent_call WHERE day >= ? GROUP BY origin", (first,)).fetchall())
+    tool_use = sum(r["calls"] for r in rows)
+    meta = conn.execute("SELECT count(*) FROM claude_agent_meta WHERE day >= ?", (first,)).fetchone()[0]
+    return {"rows": rows, "by_origin": by_origin, "tool_use_count": tool_use, "meta_count": meta,
+            "difference": tool_use - meta}
+
+
+def _read_costs(conn: sqlite3.Connection, first: str) -> dict:
+    claude = dict(conn.execute(
+        "SELECT day, round(sum(cost_usd), 4) FROM claude_cost WHERE day >= ? GROUP BY day", (first,)).fetchall())
+    claude_by_origin = dict(conn.execute(
+        "SELECT origin, round(sum(cost_usd), 4) FROM claude_cost WHERE day >= ? GROUP BY origin",
+        (first,)).fetchall())
+    opencode = dict(conn.execute(
+        "SELECT day, round(sum(cost), 6) FROM oc_message WHERE role='assistant' AND day >= ? GROUP BY day",
+        (first,)).fetchall())
+    return {"claude_by_day": claude, "claude_by_origin": claude_by_origin, "opencode_by_day": opencode}
+
+
+def _read_codex_quota(conn: sqlite3.Connection, now: datetime) -> dict:
+    row = conn.execute(
+        "SELECT rl_ts, primary_used, primary_window, primary_resets, secondary_used, secondary_window, "
+        "secondary_resets, plan_type FROM codex_rollout WHERE rl_ts IS NOT NULL ORDER BY rl_ts DESC LIMIT 1",
+    ).fetchone()
+    if row is None:
+        return {"codex": None}
+    epoch = now.timestamp()
+    return {"codex": {
+        "ts": row[0], "plan_type": row[7],
+        "primary": _codex_window(row[1], row[2], row[3], epoch),
+        "secondary": _codex_window(row[4], row[5], row[6], epoch),
+    }}
+
+
+def _read_extern(conn: sqlite3.Connection, first: str) -> dict:
+    ledger_by_day: dict[str, dict[str, int]] = {}
+    status_counts: dict[str, dict[str, int]] = {}
+    for day, voice, status, n in conn.execute(
+        "SELECT day, voice, coalesce(status, '?'), count(*) FROM ledger WHERE day >= ? "
+        "GROUP BY day, voice, status", (first,),
+    ):
+        ledger_by_day.setdefault(day, {})
+        ledger_by_day[day][voice] = ledger_by_day[day].get(voice, 0) + n
+        status_counts.setdefault(voice, {})[status] = n + status_counts.get(voice, {}).get(status, 0)
+    total, nulls = conn.execute(
+        "SELECT count(*), sum(CASE WHEN tokens IS NULL THEN 1 ELSE 0 END) FROM ledger WHERE day >= ?",
+        (first,)).fetchone()
+    oc_models = [
+        {"model": m or "?", "sessions": s, "messages": n, "cost": c}
+        for m, s, n, c in conn.execute(
+            "SELECT model_id, count(DISTINCT session_id), count(*), round(sum(coalesce(cost,0)), 6) "
+            "FROM oc_message WHERE role='assistant' AND day >= ? GROUP BY model_id ORDER BY 4 DESC", (first,))
+    ]
+    oc_sessions: dict[str, dict[str, int]] = {}
+    for day, child, n in conn.execute(
+        "SELECT day, parent_id IS NOT NULL, count(*) FROM oc_session WHERE day >= ? GROUP BY 1, 2", (first,),
+    ):
+        oc_sessions.setdefault(day, {"top": 0, "child": 0})["child" if child else "top"] += n
+    codex: dict[str, dict[str, dict[str, int]]] = {}
+    for day, source, n, tok in conn.execute(
+        "SELECT day, coalesce(thread_source, '?'), count(*), sum(coalesce(total, 0)) FROM codex_rollout "
+        "WHERE day >= ? GROUP BY 1, 2", (first,),
+    ):
+        codex.setdefault(day, {})[source] = {"rollouts": n, "tokens": tok}
+    return {
+        "ledger_by_day": ledger_by_day, "ledger_status": status_counts,
+        "ledger_total": total or 0, "ledger_tokens_null": nulls or 0,
+        "opencode_by_model": oc_models, "opencode_sessions_by_day": oc_sessions, "codex_by_day": codex,
+    }
+
+
+def _kpi_series(conn: sqlite3.Connection, key: str, since: str) -> dict[str, float]:
+    queries = {
+        "ledger_calls": "SELECT day, count(*) FROM ledger WHERE day >= ? GROUP BY day",
+        "ledger_failures": "SELECT day, count(*) FROM ledger WHERE day >= ? AND coalesce(status,'') != 'ok' "
+                           "GROUP BY day",
+        "opencode_cost": "SELECT day, sum(coalesce(cost,0)) FROM oc_message WHERE role='assistant' AND day >= ? "
+                         "GROUP BY day",
+        "opencode_sessions": "SELECT day, count(*) FROM oc_session WHERE day >= ? GROUP BY day",
+    }
+    return {d: float(v or 0) for d, v in conn.execute(queries[key], (since,))}
+
+
+def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[dict]:
+    markers = conn.execute("SELECT date, id, scope, change, expect FROM marker ORDER BY date, id").fetchall()
+    if not markers:
+        return []
+    since = (datetime.strptime(markers[0][0], "%Y-%m-%d").date() - timedelta(days=max(MARKER_WINDOWS))).isoformat()
+    series_cache: dict[str, dict[str, float]] = {}
+    out = []
+    for date, mid, scope, change, expect in markers:
+        rows = []
+        for key, label in marker_kpis(expect):
+            if key not in series_cache:
+                series_cache[key] = _kpi_series(conn, key, since)
+            rows.append({"kpi": key, "label": label,
+                         **marker_window(series_cache[key], date, window, today)})
+        out.append({"date": date, "id": mid, "scope": scope, "change": change, "expect": expect,
+                    "kpis": rows})
+    return out
+
+
 def _lower_priority() -> None:
     """POSIX: nice ourselves (the parent cannot without preexec_fn, which is not
     thread-safe). Windows gets BELOW_NORMAL_PRIORITY_CLASS from the parent."""

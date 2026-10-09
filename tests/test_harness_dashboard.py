@@ -726,6 +726,18 @@ def test_a_source_that_failed_since_is_covered_only_up_to_its_last_complete_run(
     assert "Quelle in keinem Indexlauf vollständig" in never["notes"]
 
 
+def test_a_run_across_midnight_covers_the_day_before_its_start():
+    """It read some files before midnight: the day it started is not complete."""
+    conn = new_index()
+    add_run(conn, started="2026-10-05T23:50:00", finished="2026-10-06T00:05:00")
+    conn.close()
+    ro = hi._connect_read_only(db_path())
+    try:
+        assert hi._source_covered_to(ro, "ledger") == "2026-10-04"
+    finally:
+        ro.close()
+
+
 def test_coverage_comes_from_the_real_run_log(monkeypatch):
     """End to end: a real run_update, read three days later."""
     conn = new_index()

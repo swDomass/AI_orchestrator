@@ -15,9 +15,9 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Korrekturrunde 1 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3241 passed /
-# 0 failed / 8 skipped in 99-104 s — +57 gesammelt über die 3185 darunter, per --collect-only:
-# test_harness_index 51 -> 71, test_dashboard_autostart 34 -> 59, test_harness_dashboard 23 -> 35.
+# Korrekturrunde 1 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3243 passed /
+# 0 failed / 8 skipped in 94-98 s — +59 gesammelt über die 3185 darunter, per --collect-only:
+# test_harness_index 51 -> 71, test_dashboard_autostart 34 -> 61, test_harness_dashboard 23 -> 35.
 # Der 8. Skip: test_windows_peak_memory_and_pid_check_work (nur win32). Ohne `node` im PATH
 # skippen jetzt 7 Tests (4 in test_harness_dashboard, 3 in test_dashboard_page_js).
 # ruff 1122 und mypy 122/38 unverändert; `mypy --platform win32` 127/39 -> 124/38 (die drei

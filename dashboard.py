@@ -1024,23 +1024,31 @@ function setHarnessMetric(m) {
 }
 
 let _hLoading = false, _hAgain = false;
+let _hTimeoutMs = 15000;  // a request that never answers must not lock the tab for good
+function harnessShown() {
+  if (document.hidden) return false;
+  return document.getElementById('tab-harness').style.display !== 'none';
+}
 async function loadHarness(fromTimer) {
   if (_hLoading) {  // a slow answer must not be overtaken by a second request
     if (!fromTimer) _hAgain = true;  // a click on another range is asked once more afterwards
     return;
   }
   _hLoading = true;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), _hTimeoutMs);
   try {
-    const r = await fetch('/api/harness?days=' + _hDays + '&window=' + _hWindow);
+    const r = await fetch('/api/harness?days=' + _hDays + '&window=' + _hWindow, { signal: ctl.signal });
     if (r.ok) renderHarness((await r.json()).harness);
-  } catch (e) { console.warn('harness fetch failed', e); }
-  finally { _hLoading = false; }
-  if (_hAgain) { _hAgain = false; loadHarness(); }
+  } catch (e) {
+    console.warn('harness fetch failed', e);
+    if (ctl.signal.aborted) renderHarness({ available: false, reason: 'keine Antwort innerhalb von ' + Math.round(_hTimeoutMs / 1000) + ' s' });
+  } finally { clearTimeout(timer); _hLoading = false; }
+  if (_hAgain) { _hAgain = false; if (harnessShown()) loadHarness(); }
 }
 // Every 5 min, only while the tab is shown and the window is not hidden: no request otherwise.
 function harnessTick() {
-  if (document.hidden) return;
-  if (document.getElementById('tab-harness').style.display === 'none') return;
+  if (!harnessShown()) return;
   loadHarness(true);
 }
 

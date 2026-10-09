@@ -839,3 +839,32 @@ def test_a_click_during_a_slow_load_is_asked_again_once_it_ended(tmp_path):
         " setTimeout(() => console.log(JSON.stringify(urls)), 20);"))
     assert [u for u in urls if u.startswith("/api/harness")] == [
         "/api/harness?days=30&window=7", "/api/harness?days=7&window=7"]
+
+
+_SIGNAL_FETCH = (
+    "globalThis.fetch = (u, o) => { urls.push(u); return new Promise((res, rej) => {"
+    " if (o && o.signal) o.signal.addEventListener('abort', () => rej(new Error('aborted'))); }); };"
+)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_a_request_that_never_answers_frees_the_tab_after_the_time_limit(tmp_path):
+    """R4-06: without the time limit the first hung request locked the tab until reload."""
+    urls = _run_tick(tmp_path, (
+        _SIGNAL_FETCH + " _hTimeoutMs = 20; loadHarness();"
+        " setTimeout(() => { loadHarness(); }, 80);"
+        " setTimeout(() => console.log(JSON.stringify(urls.concat([document.getElementById('h-status').textContent]))), 120);"))
+    assert [u for u in urls if u.startswith("/api/harness")] == [
+        "/api/harness?days=30&window=7", "/api/harness?days=30&window=7"]
+    assert "Harness-Index nicht verfügbar" in urls[-1]
+    assert "keine Antwort" in urls[-1]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_no_catch_up_request_when_the_tab_was_hidden_meanwhile(tmp_path):
+    urls = _run_tick(tmp_path, (
+        "globalThis.fetch = u => { urls.push(u); return new Promise(r => setTimeout(() => r({ok: false}), 30)); };"
+        " loadHarness(); _hDays = 7; loadHarness();"
+        " document.getElementById('tab-harness').style.display = 'none';"
+        " setTimeout(() => console.log(JSON.stringify(urls)), 100);"))
+    assert [u for u in urls if u.startswith("/api/harness")] == ["/api/harness?days=30&window=7"]

@@ -3597,6 +3597,13 @@ def run_watch(dry_run: bool = False) -> None:
     append_log("Orchestrator gestartet (watch)")
     start_session()
 
+    # Dashboard on 127.0.0.1 as a daemon thread — never raises, never waits.
+    # After the startup checks (the only point left that can still end this
+    # process) and BEFORE the startup delay: the delay is for provider tokens,
+    # a local read-only server does not need it, and an unreachable dashboard
+    # for 5 min after every restart looks broken.
+    _start_dashboard_autostart()
+
     # Startup delay: wait for provider tokens to renew
     if STARTUP_DELAY_SEC > 0:
         print(f"\n[startup] Warte {fmt_time(STARTUP_DELAY_SEC)} vor Queue-Verarbeitung (Token-Erneuerung)...")
@@ -3629,9 +3636,6 @@ def run_watch(dry_run: bool = False) -> None:
     # is blocked for hours inside a long-running task.
     _hb_stop = threading.Event()
     start_heartbeat_thread(heartbeat, read_queue, _hb_stop, pause_event=pause_event)
-
-    # Dashboard on 127.0.0.1 as a daemon thread — never raises, never waits.
-    _start_dashboard_autostart()
 
     def _cleanup():
         listener.stop()

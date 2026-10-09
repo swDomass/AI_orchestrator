@@ -425,3 +425,33 @@ def test_extra_allowed_host_from_config(served, monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_ALLOWED_HOSTS", ("pc.tailnet.example",))
     assert _request_with_host(served, "/", "pc.tailnet.example:443") == 200
     assert _request_with_host(served, "/", "other.example") == 403
+
+
+# ── K8: the dashboard starts with the orchestrator, not after the delay ─────
+
+
+def test_autostart_runs_before_the_first_sleep_of_the_startup_delay(monkeypatch, captured_log):
+    _patch_run_watch_startup(monkeypatch)
+    monkeypatch.setattr(orchestrator, "STARTUP_DELAY_SEC", 300)
+    events: list[str] = []
+    monkeypatch.setattr(orchestrator, "_start_dashboard_autostart", lambda: events.append("autostart"))
+
+    class _DelayTime(_FakeTime):
+        def sleep(self, sec):
+            events.append(f"sleep {sec}")
+            raise _StopLoopError
+
+    monkeypatch.setattr(orchestrator, "time", _DelayTime())
+    with pytest.raises(_StopLoopError):
+        orchestrator.run_watch()
+    assert events == ["autostart", "sleep 10"]  # the first sleep IS the startup delay's
+
+
+def test_no_autostart_when_the_startup_checks_end_the_process(monkeypatch, captured_log):
+    _patch_run_watch_startup(monkeypatch)
+    monkeypatch.setattr(doctor, "run_startup_checks", lambda: False)
+    started = Mock()
+    monkeypatch.setattr(orchestrator, "_start_dashboard_autostart", started)
+    with pytest.raises(SystemExit):
+        orchestrator.run_watch()
+    started.assert_not_called()

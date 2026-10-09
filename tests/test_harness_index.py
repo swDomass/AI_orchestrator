@@ -1601,3 +1601,37 @@ def test_an_unchanged_file_keeps_its_stock():
     second = run()  # unchanged: not rebuilt, the stock stays where it is
     assert second["per_source"]["markers"]["broken_lines"] is None
     assert hi.dashboard_payload(config.HARNESS_DB_FILE)["harness"]["last_run"]["broken_lines"]["markers"] == 2
+
+
+def test_main_lowers_priority_before_the_lock_is_taken(monkeypatch):
+    order: list[str] = []
+
+    class FakeLock:
+        held_by = None
+        taken_over = None
+
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            order.append("lock")
+            return False
+
+    monkeypatch.setattr(hi, "_lower_priority", lambda: order.append("priority") or True)
+    monkeypatch.setattr(hi, "IndexLock", FakeLock)
+    assert hi.main(["--update"]) == 0
+    assert order == ["priority", "lock"]
+
+
+def test_startup_sec_is_stored_in_the_run_log_and_named_on_the_console(monkeypatch):
+    write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
+    monkeypatch.setattr(hi, "_startup_sec", lambda now=None: 41.5)
+    summary = run()
+    assert q("SELECT startup_sec FROM index_runs") == [(41.5,)]
+    assert summary["startup_sec"] == 41.5
+    assert "Start davor 41.5 s" in summary["_out"][-1]
+
+
+def test_startup_sec_is_a_real_non_negative_number():
+    value = hi._startup_sec()
+    assert value is not None and value >= 0

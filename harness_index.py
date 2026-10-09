@@ -97,8 +97,11 @@ from typing import Any
 
 import config
 
-SCHEMA_VERSION = 3  # 2: claude_msg keyed by message.id alone, no folder names, ledger by line;
-                    # 3: index_runs.peak_private_mb (Windows) next to peak_rss_mb (POSIX)
+_IMPORT_MONO = time.monotonic()  # POSIX start reference for ``index_runs.startup_sec``
+
+SCHEMA_VERSION = 4  # 2: claude_msg keyed by message.id alone, no folder names, ledger by line;
+                    # 3: index_runs.peak_private_mb (Windows) next to peak_rss_mb (POSIX);
+                    # 4: index_runs.startup_sec (no migration: the schema is not shipped yet)
 HEAD_BYTES = 256
 TAIL_BYTES = 256
 # A complete-looking last line without newline is evaluated only once the file
@@ -173,7 +176,7 @@ CREATE TABLE IF NOT EXISTS index_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started TEXT, finished TEXT,
     duration_sec REAL, files_read INTEGER, bytes_read INTEGER, lines_read INTEGER,
     lines_skipped INTEGER, errors TEXT, per_source TEXT,
-    peak_private_mb REAL, peak_rss_mb REAL, status TEXT);
+    peak_private_mb REAL, peak_rss_mb REAL, status TEXT, startup_sec REAL);
 """
 
 
@@ -371,6 +374,35 @@ def _kernel32() -> Any:
         k.K32GetProcessMemoryInfo.restype = wintypes.BOOL
         return k
     raise OSError("kernel32 is Windows-only")
+
+
+class _FileTime(ctypes.Structure):
+    _fields_ = (("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD))
+
+
+_FILETIME_TO_EPOCH_SEC = 11_644_473_600  # 1601-01-01 -> 1970-01-01
+
+
+def _startup_sec(now: float | None = None) -> float | None:
+    """Seconds from process creation to ``now``: what ran BEFORE ``started``
+    (interpreter start, imports, a cold cache). Windows: ``GetProcessTimes``
+    creation time; POSIX: ``time.monotonic()`` taken at module import (the
+    interpreter start itself is not included). ``None`` when it cannot be read."""
+    now = time.time() if now is None else now
+    if sys.platform != "win32":
+        return round(max(0.0, time.monotonic() - _IMPORT_MONO), 3)
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.GetProcessTimes.argtypes = (wintypes.HANDLE, *(ctypes.POINTER(_FileTime),) * 4)
+        k.GetProcessTimes.restype = wintypes.BOOL
+        created, exited, kernel, user = _FileTime(), _FileTime(), _FileTime(), _FileTime()
+        if not k.GetProcessTimes(k.GetCurrentProcess(), *(ctypes.byref(t) for t in (created, exited, kernel, user))):
+            return None
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return float(round(max(0.0, now - (ticks / 10_000_000 - _FILETIME_TO_EPOCH_SEC)), 3))
+    except Exception:
+        return None
 
 
 def _last_error() -> int:
@@ -1526,16 +1558,17 @@ class Sources:
 
 
 def _record_run(conn: sqlite3.Connection, *, started: float, finished: float,
-                totals: dict, errors: dict, per_source: dict, peak: dict, status: str) -> None:
+                totals: dict, errors: dict, per_source: dict, peak: dict, status: str,
+                startup_sec: float | None = None) -> None:
     conn.execute(
         "INSERT INTO index_runs(started, finished, duration_sec, files_read, bytes_read, lines_read, "
-        "lines_skipped, errors, per_source, peak_private_mb, peak_rss_mb, status) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "lines_skipped, errors, per_source, peak_private_mb, peak_rss_mb, status, startup_sec) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (datetime.fromtimestamp(started).isoformat(timespec="seconds"),
          datetime.fromtimestamp(finished).isoformat(timespec="seconds"),
          round(finished - started, 3), totals["files_read"], totals["bytes_read"],
          totals["lines_read"], totals["lines_skipped"], json.dumps(errors),
-         json.dumps(per_source), peak.get("peak_private_mb"), peak.get("peak_rss_mb"), status),
+         json.dumps(per_source), peak.get("peak_private_mb"), peak.get("peak_rss_mb"), status, startup_sec),
     )
 
 
@@ -1575,6 +1608,7 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
         if lock.taken_over is not None:
             say(f"Veralteten Lock übernommen (pid {lock.taken_over.get('pid', '?')}).")
         started = time.time()
+        startup_sec = _startup_sec(started)
         try:
             conn = open_index(sources.db)
         except (sqlite3.Error, SchemaMismatchError, OSError) as e:
@@ -1597,7 +1631,7 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
             detail = {k: v.as_dict() for k, v in per_source.items()}
             try:
                 _record_run(conn, started=started, finished=finished, totals=totals, errors=errors,
-                            per_source=detail, peak=peak, status=status)
+                            per_source=detail, peak=peak, status=status, startup_sec=startup_sec)
                 conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error as e:  # the data is committed; only the run log is missing
                 say(f"index_runs nicht geschrieben: {_err_text(e)}")
@@ -1605,12 +1639,12 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
             conn.close()
         summary = {
             "status": status, "duration_sec": round(finished - started, 3), **totals,
-            "errors": errors, **peak, "per_source": detail,
+            "errors": errors, **peak, "startup_sec": startup_sec, "per_source": detail,
         }
         say(
             f"Harness-Index {status}: {totals['files_read']} Dateien, {totals['lines_read']} Zeilen, "
             f"{totals['bytes_read'] / 1_048_576:.1f} MB gelesen, {totals['lines_skipped']} übersprungen, "
-            f"{summary['duration_sec']:.1f} s, {PEAK_LABELS[peak_column]} "
+            f"{summary['duration_sec']:.1f} s (Start davor {startup_sec if startup_sec is not None else '?'} s), {PEAK_LABELS[peak_column]} "
             f"{peak_mb if peak_mb is not None else '?'} MB"
         )
         for name, errs in errors.items():

@@ -408,6 +408,23 @@ def test_a_broken_rest_of_a_quiet_file_is_skipped_once_and_the_file_is_then_left
     assert [r[0] for r in q("SELECT msg_id FROM claude_msg")] == ["m1"]
 
 
+def test_a_quiet_rest_completed_later_is_skipped_in_both_halves_and_never_counted_twice(monkeypatch):
+    """R4-04, known limit: the writer finishes the rest only after the quiet time."""
+    path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
+    with path.open("a", encoding="utf-8", newline="") as f:
+        f.write('{"type":"assistant","message":{"id":"m_half')
+    monkeypatch.setattr(hi, "TAIL_QUIET_SEC", 0)
+    first = run()
+    assert first["per_source"]["claude"]["lines_skipped"] == 1  # first half
+    with path.open("a", encoding="utf-8", newline="") as f:
+        f.write('_rest","usage":{}}}\n' + _j(c_assistant(S_CLI, "m_next")) + "\n")
+    second = run()
+    assert second["per_source"]["claude"]["lines_skipped"] == 1  # second half, now a complete line
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["m1", "m_next"]
+    assert claude_tokens()[4] == 2  # nothing twice
+    assert run()["per_source"]["claude"]["lines_skipped"] == 0
+
+
 def test_non_compact_json_is_still_parsed_despite_the_prefilter():
     spaced = json.dumps(c_assistant(S_CLI, "m_spaced"))  # default separators: ", " and ": "
     assert '"type": "assistant"' in spaced
@@ -1526,6 +1543,8 @@ def test_a_deeply_nested_quiet_tail_does_not_block_the_file():
     summary = run()
     assert summary["errors"] == {}
     assert q("SELECT msg_id FROM claude_msg") == [("m1",)]
+    assert summary["per_source"]["claude"]["lines_skipped"] == 1
+    assert q("SELECT offset, size FROM file_state WHERE source='claude'") == [(path.stat().st_size,) * 2]
 
 
 def test_a_deeply_nested_meta_file_is_skipped_by_type_and_not_retried():

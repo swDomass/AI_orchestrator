@@ -1383,7 +1383,7 @@ class _Handler(BaseHTTPRequestHandler):
                 data = {"active_runs": _load_active_runs()}
             else:
                 days = max(1, min(int(params.get("days", ["7"])[0]), 365))
-                # Copy: get_dashboard_data() returns its 30-s cache object.
+                # Copy: get_dashboard_data() returns its 90-s cache object.
                 full: dict = dict(get_dashboard_data(days=days))
                 full["provider_meta"] = provider_meta_map(_provider_names_in(full))
                 data = full

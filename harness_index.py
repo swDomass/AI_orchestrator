@@ -1720,7 +1720,7 @@ def marker_window(series: dict[str, float], marker_day: str, n: int, today: str,
     last = last_full.isoformat()
     before = [x for x in before_all if (covered_from is None or x >= covered_from) and x <= last]
     after_all = [(d + timedelta(days=i)).isoformat() for i in range(1, n + 1)]
-    after = [x for x in after_all if x <= last]
+    after = [x for x in after_all if (covered_from is None or x >= covered_from) and x <= last]
     result["before_days"], result["after_days"] = before, after
     result["before_complete"], result["after_complete"] = len(before) == n, len(after) == n
     result["complete"] = result["before_complete"] and result["after_complete"]

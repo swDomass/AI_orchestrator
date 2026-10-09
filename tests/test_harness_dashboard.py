@@ -521,6 +521,18 @@ def test_before_window_reaching_back_before_the_source_gives_no_percentage():
     assert w3["delta_pct"] == 0.0
 
 
+def test_after_window_starting_before_the_data_is_incomplete_and_averages_only_covered_days():
+    """K20: marker 2026-09-15, data from 2026-09-20 (5 days later), window 7 — the four
+    'after' days before the data counted as 0 and 'after' was called complete."""
+    series = _series("2026-09-20", "2026-10-08", 7.0)
+    w = hi.marker_window(series, "2026-09-15", 7, today="2026-10-09", covered_from="2026-09-20")
+    assert w["after_days"] == ["2026-09-20", "2026-09-21", "2026-09-22"]
+    assert w["after_complete"] is False
+    assert "nachher unvollständig (3 von 7 Tagen)" in w["notes"]
+    assert w["after_avg"] == 7.0  # over the three covered days, not (3 * 7) / 7 = 3.0
+    assert w["delta_pct"] is None
+
+
 def test_fully_covered_windows_give_the_real_change():
     series = {**_series("2026-09-01", "2026-09-14", 4.0), **_series("2026-09-16", "2026-09-30", 2.0)}
     w = hi.marker_window(series, "2026-09-15", 7, today="2026-10-09", covered_from="2026-09-01")

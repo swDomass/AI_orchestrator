@@ -73,7 +73,8 @@ def _run(tmp_path, payload: dict, probe: str) -> dict:
         encoding="utf-8",
     )
     assert NODE is not None
-    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, timeout=30, check=False)
+    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=30, check=False)
     assert proc.returncode == 0, proc.stderr
     result: dict = json.loads(proc.stdout.strip().splitlines()[-1])
     return result

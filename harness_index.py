@@ -1358,7 +1358,9 @@ MARKER_KPIS: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("sessions je pass",), "opencode_sessions", "opencode-Sitzungen je Tag"),
 )
 MARKER_WINDOWS = (3, 7, 14)
-HARNESS_READ_TIMEOUT_SEC = 0.5     # sqlite busy timeout of the read connection
+# sqlite busy timeout of the read connection. 0.2 s, not 0.5: on Windows SQLite
+# sleeps in timer-granular steps and a 0.5 s timeout measured 1.08–1.15 s.
+HARNESS_READ_TIMEOUT_SEC = 0.2
 HARNESS_QUERY_BUDGET_SEC = 3.0     # hard cap for all queries of one request
 CATEGORIES = ("interaktiv", "orchestrator", "subagent", "unbekannt")
 _COUNTERS = ("input", "output", "cache_read", "cache_write")

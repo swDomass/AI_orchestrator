@@ -389,7 +389,8 @@ def test_end_to_end_from_source_files():
                      "usage": {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": 3,
                                "cache_creation_input_tokens": 4}}},
     ]
-    (projects / f"{sid}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    (projects / f"{sid}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8",
+                                          newline="")
     Path(config.HARNESS_CHANGES_FILE).parent.mkdir(parents=True, exist_ok=True)
     Path(config.HARNESS_CHANGES_FILE).write_text(json.dumps(
         {"date": "2026-10-08", "id": "oc-endpunktpreise-lesebeleg", "scope": "beide", "change": "c",
@@ -448,7 +449,8 @@ def _run_tab(tmp_path, harness: dict, data: dict | None = None) -> dict:
         + "console.log(JSON.stringify((function(){" + probe + "})()));\n",
         encoding="utf-8")
     assert NODE is not None
-    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, timeout=30, check=False)
+    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=30, check=False)
     assert proc.returncode == 0, proc.stderr
     result: dict = json.loads(proc.stdout.strip().splitlines()[-1])
     return result

@@ -46,12 +46,13 @@ def write_jsonl(path: Path, objs, *, newline_at_end: bool = True) -> Path:
     text = "\n".join(o if isinstance(o, str) else _j(o) for o in objs)
     if newline_at_end and objs:
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    # newline="": byte-exact \n on every platform — the offsets below are counted in \n bytes
+    path.write_text(text, encoding="utf-8", newline="")
     return path
 
 
 def append_jsonl(path: Path, objs) -> None:
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8", newline="") as f:
         for o in objs:
             f.write((o if isinstance(o, str) else _j(o)) + "\n")
 
@@ -340,14 +341,14 @@ def test_half_last_line_waits_and_then_counts_exactly_once():
     path = main_path(S_CLI)
     full = _j(c_assistant(S_CLI, "m_tail"))
     write_jsonl(path, [c_header(S_CLI), c_assistant(S_CLI, "m1")])
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8", newline="") as f:
         f.write(full[: len(full) // 2])  # the writer is mid-line
     first = run()
     assert q("SELECT msg_id FROM claude_msg") == [("m1",)]
     assert first["lines_skipped"] == 0
     state_offset = q("SELECT offset FROM file_state WHERE source='claude'")[0][0]
     assert state_offset == len((_j(c_header(S_CLI)) + "\n" + _j(c_assistant(S_CLI, "m1")) + "\n").encode())
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8", newline="") as f:
         f.write(full[len(full) // 2:] + "\n")
     second = run()
     assert sorted(q("SELECT msg_id FROM claude_msg")) == [("m1",), ("m_tail",)]
@@ -551,7 +552,7 @@ def test_codex_append_broken_half_and_extra_fields():
     future = _tc("2026-10-08T17:30:00.000Z", 900, 90)
     future["payload"]["info"]["brand_new"] = {"x": 1}
     append_jsonl(path, ['{"timestamp":"broken', future])
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8", newline="") as f:
         f.write(_j(_tc("2026-10-08T17:31:00.000Z", 1200, 120))[:40])  # half line
     second = run()
     assert second["per_source"]["codex"]["lines_skipped"] == 1
@@ -868,7 +869,8 @@ def _child_env() -> dict:
 def _run_cli() -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-X", "utf8", "-m", "harness_index", "--update"],
-        cwd=str(REPO), env=_child_env(), capture_output=True, text=True, timeout=120, check=False,
+        cwd=str(REPO), env=_child_env(), capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=120, check=False,
     )
 
 
@@ -886,7 +888,7 @@ def test_a_live_lock_held_by_another_process_ends_the_run_cleanly():
         lock.release()
     """)
     holder = subprocess.Popen([sys.executable, "-c", holder_code], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, text=True, env=_child_env())
+                              stdout=subprocess.PIPE, text=True, encoding="utf-8", env=_child_env())
     try:
         assert holder.stdout is not None
         assert holder.stdout.readline().strip() == "HELD"

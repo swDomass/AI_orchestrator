@@ -497,3 +497,167 @@ def test_tab_without_index_says_so_and_hides_the_body(tmp_path):
     assert "noch nicht gelaufen" in out["status"]
     assert "python -m harness_index --update" in out["status"]
     assert "warn" in out["statusClass"]
+
+
+# ── Korrekturrunde 1: K2 coverage of the before window ─────────────────────
+
+
+def _series(first: str, last: str, value: float = 4.0) -> dict[str, float]:
+    return dict.fromkeys(hi._days_between(first, last), value)
+
+
+def test_before_window_reaching_back_before_the_source_gives_no_percentage():
+    """Real data: the ledger starts 2026-09-21, marker 2026-09-25 — 3 of 7 'before'
+    days counted as 0 and the sign flipped with the window (+176 % / −81 %)."""
+    series = _series("2026-09-21", "2026-10-08")  # constant 4 per day from day X
+    w7 = hi.marker_window(series, "2026-09-24", 7, today="2026-10-09", covered_from="2026-09-21")
+    assert w7["delta_pct"] is None
+    assert w7["before_days"] == ["2026-09-21", "2026-09-22", "2026-09-23"]
+    assert "vorher unvollständig (3 von 7 Tagen)" in w7["notes"]
+    assert w7["before_avg"] == 4.0  # averaged over the covered days only, never over zeros
+    w3 = hi.marker_window(series, "2026-09-24", 3, today="2026-10-09", covered_from="2026-09-21")
+    assert w3["notes"] == []
+    assert w3["delta_pct"] == 0.0
+
+
+def test_fully_covered_windows_give_the_real_change():
+    series = {**_series("2026-09-01", "2026-09-14", 4.0), **_series("2026-09-16", "2026-09-30", 2.0)}
+    w = hi.marker_window(series, "2026-09-15", 7, today="2026-10-09", covered_from="2026-09-01")
+    assert (w["before_avg"], w["after_avg"], w["delta_pct"]) == (4.0, 2.0, -50.0)
+    assert w["complete"] is True
+
+
+@pytest.mark.parametrize("marker_day", ["2026-10-09", "2026-10-12"], ids=["today", "future"])
+def test_marker_today_or_later_is_not_calculated(marker_day):
+    w = hi.marker_window(_series("2026-09-01", "2026-10-09"), marker_day, 7, today="2026-10-09",
+                         covered_from="2026-09-01")
+    assert w["notes"] == ["noch keine Nachher-Tage"]
+    assert w["before_days"] == [] and w["before_avg"] is None and w["delta_pct"] is None
+
+
+def test_an_empty_after_window_shows_no_zero_sum():
+    w = hi.marker_window(_series("2026-09-01", "2026-10-08"), "2026-10-08", 7, today="2026-10-09",
+                         covered_from="2026-09-01")
+    assert w["after_sum"] is None and w["after_avg"] is None
+    assert "nachher unvollständig (0 von 7 Tagen)" in w["notes"]
+
+
+def test_marker_payload_bounds_the_before_window_by_the_ledger_start():
+    conn = new_index()
+    add_run(conn)
+    add_marker(conn, "2026-09-25", "extern-diaet", _LIVE_EXPECT["extern-diaet"])
+    for d in range(21, 30):  # ledger starts 2026-09-21
+        add_ledger(conn, f"2026-09-{d:02d}", 4)
+    for d in range(1, 3):
+        add_ledger(conn, f"2026-10-{d:02d}", 4)
+    conn.close()
+    (calls, _fails) = {m["id"]: m for m in payload(window=7)["markers"]}["extern-diaet"]["kpis"]
+    assert calls["covered_from"] == "2026-09-21"
+    assert calls["delta_pct"] is None
+    assert "vorher unvollständig (4 von 7 Tagen)" in calls["notes"]
+    (calls3, _f3) = payload(window=3)["markers"][0]["kpis"]
+    assert calls3["notes"] == [] and calls3["delta_pct"] == 0.0
+
+
+# ── K11 read side ───────────────────────────────────────────────────────────
+
+
+def test_kosten_je_pass_maps_to_opencode_only_with_opencode_in_the_text():
+    assert hi.marker_kpis("Kosten je Pass sinken") == []
+    assert [k for k, _ in hi.marker_kpis("opencode: Kosten je Pass sinken")] == ["opencode_cost"]
+
+
+def test_opencode_sessions_kpi_counts_top_level_sessions_only():
+    conn = new_index()
+    add_run(conn)
+    conn.execute("INSERT INTO oc_session(id, parent_id, day) VALUES ('a', NULL, '2026-10-01')")
+    conn.execute("INSERT INTO oc_session(id, parent_id, day) VALUES ('b', 'a', '2026-10-01')")
+    conn.close()
+    with hi._connect_read_only(db_path()) as ro:
+        assert hi._kpi_series(ro, "opencode_sessions", "2026-09-01") == {"2026-10-01": 1.0}
+
+
+def test_skipped_lines_are_summed_over_all_runs():
+    conn = new_index()
+    add_run(conn, finished="2026-10-09T10:00:00", skipped=4)
+    add_run(conn, finished="2026-10-09T11:30:00", skipped=0)
+    conn.close()
+    run = payload()["last_run"]
+    assert (run["lines_skipped"], run["skipped_total"], run["runs_total"]) == (0, 4, 2)
+
+
+def test_control_count_uses_the_day_of_the_calling_tool_use():
+    conn = new_index()
+    add_run(conn)
+    # meta file touched long after the call (mtime day outside the range), call inside it
+    conn.execute("INSERT INTO claude_agent_call(tool_use_id, day, subagent_type, model_req) "
+                 "VALUES ('t1', '2026-10-08', 'Explore', 'sonnet')")
+    conn.execute("INSERT INTO claude_agent_meta(session_id, agent_id, tool_use_id, day) "
+                 "VALUES ('s', 'a', 't1', '2025-01-01')")
+    conn.close()
+    ac = payload(days=7)["agent_calls"]
+    assert (ac["tool_use_count"], ac["meta_count"], ac["difference"]) == (1, 1, 0)
+
+
+# ── the tab, executed: notes instead of zeros, redraw after load, escaping ──
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_tab_shows_coverage_notes_instead_of_zero_sums(tmp_path):
+    conn = new_index()
+    add_run(conn, skipped=1)
+    add_run(conn, finished="2026-10-09T11:45:00", skipped=2)
+    add_marker(conn, "2026-09-25", "extern-diaet", _LIVE_EXPECT["extern-diaet"])
+    add_marker(conn, "2026-10-09", "heute", "externe Aufrufe sinken")
+    for d in range(21, 30):
+        add_ledger(conn, f"2026-09-{d:02d}", 4)
+    conn.close()
+    out = _run_tab(tmp_path, payload(window=7))
+    assert "vorher unvollständig (4 von 7 Tagen)" in out["markers"]
+    assert "noch keine Nachher-Tage" in out["markers"]
+    # the incompletely covered "before" mean is marked, never shown as a plain number or a 0 sum
+    assert ">4.0*<" in out["markers"]
+    assert "Σ" not in out["markers"] and "sum" not in out["markers"]
+    # the marker of today: no numbers at all in its row
+    today_row = out["markers"].split("heute")[1].split("</tr>")[0]
+    assert ">—<" in today_row and "0.0" not in today_row
+    assert "übersprungen über alle 2 Läufe: 3" in out["status"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_tab_redraws_its_quota_tiles_once_api_data_arrives_and_escapes_session(tmp_path):
+    conn = new_index()
+    add_run(conn)
+    conn.close()
+    h = payload()
+    data = {
+        "generated_at": "2026-10-09T12:00:00", "total_tasks": 0, "success_rate": 0, "avg_duration_sec": 0,
+        "active_providers": [], "tasks_per_day": {"labels": [], "values": []},
+        "provider_distribution": {"labels": [], "values": []}, "limits_timeline": {},
+        "limits_now": {"claude_five_hour": {"ts": "2026-10-09T11:50:00", "age_sec": 600, "remaining_pct": 58.0,
+                                            "available": True, "stale": False, "state": "ok"}},
+        "current_limits": {}, "recent_events": [], "usage_suggest_today": 0,
+        "session": {"started_at": "2026-10-09T<b>XSS</b>", "providers_used": {"<img src=x>": 1},
+                    "tasks_done": 1, "tasks_failed": 0},
+        "billing_recent": {}, "billing_total": {}, "cache_hit_rate_recent": None, "cache_hit_rate_total": None,
+        "tool_trace_stats": {}, "failure_counts": {}, "failure_timeline": {}, "active_runs": [],
+        "provider_meta": dashboard.provider_meta_map(["claude_five_hour"]),
+    }
+    script = re.findall(r"<script>(.*?)</script>", dashboard._HTML_PAGE, re.S)[0]
+    js = tmp_path / "redraw.js"
+    js.write_text(
+        _STUB + script
+        + f"\nrenderHarness({json.dumps(h)});\n"
+        + "const before = document.getElementById('h-quota').innerHTML;\n"
+        + f"globalThis.fetch = () => Promise.resolve({{ok: true, json: () => Promise.resolve({json.dumps(data)})}});\n"
+        + "load().then(() => console.log(JSON.stringify({before, after: document.getElementById('h-quota').innerHTML,"
+        + " session: document.getElementById('session-grid').innerHTML})));\n",
+        encoding="utf-8")
+    assert NODE is not None
+    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=30, check=False)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert "Claude 5 h" not in out["before"]
+    assert "Claude 5 h" in out["after"]
+    assert "<img" not in out["session"] and "&lt;img" in out["session"]

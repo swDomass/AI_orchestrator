@@ -489,7 +489,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       <table id="h-agent-table"></table>
       <h4>Kosten je Tag (USD)</h4>
       <canvas id="h-cost-chart" height="120"></canvas>
-      <div class="empty-hint">Claude: letzte <code>cost-state</code>-Zeile je Sitzung, dem Starttag der Sitzung zugeordnet (nicht tagesgenau; ob Subagenten enthalten sind, ist nicht verifiziert). opencode: Katalogpreis, nicht die Rechnung. Codex: keine Kosten.</div>
+      <div class="empty-hint">Claude: höchster <code>cost-state</code>-Wert je Sitzung, dem Starttag der Sitzung zugeordnet (nicht tagesgenau); schließt Subagenten vermutlich ein (an echten Daten ein Indiz, kein Beweis). opencode: Katalogpreis, nicht die Rechnung. Codex: keine Kosten.</div>
     </section>
     <section class="billing-box harness-box">
       <h3>(b) Quoten-Spielraum (frei = 100 − verbraucht)</h3>
@@ -936,10 +936,10 @@ function update(d) {
   if (s.started_at) {
     box.style.display = '';
     document.getElementById('session-grid').innerHTML =
-      '<div class="item">Erledigt: <span>' + (s.tasks_done || 0) + '</span></div>' +
-      '<div class="item">Fehler: <span>' + (s.tasks_failed || 0) + '</span></div>' +
-      '<div class="item">Gestartet: <span>' + s.started_at.slice(11, 16) + '</span></div>' +
-      '<div class="item">Provider: <span>' + Object.keys(s.providers_used || {}).join(', ') + '</span></div>';
+      '<div class="item">Erledigt: <span>' + escapeHtml(s.tasks_done || 0) + '</span></div>' +
+      '<div class="item">Fehler: <span>' + escapeHtml(s.tasks_failed || 0) + '</span></div>' +
+      '<div class="item">Gestartet: <span>' + escapeHtml(String(s.started_at).slice(11, 16)) + '</span></div>' +
+      '<div class="item">Provider: <span>' + escapeHtml(Object.keys(s.providers_used || {}).join(', ')) + '</span></div>';
   } else {
     box.style.display = 'none';
   }
@@ -948,7 +948,13 @@ function update(d) {
 async function load() {
   try {
     const r = await fetch('/api/data');
-    if (r.ok) { _lastData = await r.json(); update(_lastData); }
+    if (r.ok) {
+      _lastData = await r.json();
+      update(_lastData);
+      // The tab may have been drawn before the first /api/data (direct #harness):
+      // its Claude/opencode tiles need limits_now and provider_meta from here.
+      if (_harness && _harness.available) renderHarnessQuota(_harness);
+    }
   } catch (e) { console.warn('fetch failed', e); }
 }
 
@@ -1075,7 +1081,8 @@ function renderHarness(h) {
   status.textContent = 'Letzter Indexlauf ' + fmtAge(run.age_sec) + ' (' + run.finished + ', '
     + (run.duration_sec != null ? run.duration_sec.toFixed(1) : '?') + ' s, ' + formatNumber(run.lines_read)
     + ' Zeilen gelesen, ' + (run.lines_skipped || 0) + ' übersprungen, Status ' + run.status
-    + (errs.length ? ', Fehler in: ' + errs.join(', ') : '') + ')';
+    + (errs.length ? ', Fehler in: ' + errs.join(', ') : '') + ') — übersprungen über alle '
+    + (run.runs_total || 0) + ' Läufe: ' + (run.skipped_total || 0);
 
   // (a) usage
   renderHarnessUsageChart(h);
@@ -1123,7 +1130,7 @@ function renderHarness(h) {
   const cost = h.cost || {};
   hCostChart.data.labels = h.day_list;
   hCostChart.data.datasets = [
-    { label: 'Claude (cost-state, Starttag)', data: h.day_list.map(d => (cost.claude_by_day || {})[d] || 0), backgroundColor: '#6c63ff' },
+    { label: 'Claude (cost-state, Starttag, inkl. Subagenten vermutlich)', data: h.day_list.map(d => (cost.claude_by_day || {})[d] || 0), backgroundColor: '#6c63ff' },
     { label: 'opencode (Katalogpreis)', data: h.day_list.map(d => (cost.opencode_by_day || {})[d] || 0), backgroundColor: '#29b6f6' },
   ];
   hCostChart.update();
@@ -1213,6 +1220,7 @@ function renderHarnessMarkers(h) {
   const fmt = (key, v) => v == null ? '—' : (key === 'opencode_cost' ? fmtUsd(v) : (+v).toFixed(1));
   let html = '<thead><tr><th>Datum</th><th>Marker</th><th>Kennzahl</th><th class="num">vorher Ø/Tag</th>'
     + '<th class="num">nachher Ø/Tag</th><th class="num">Δ</th></tr></thead><tbody>';
+  // * = Mittel über weniger als N Tage (Fenster nicht voll abgedeckt)
   for (const m of markers) {
     const head = '<td>' + escapeHtml(m.date) + '</td><td title="' + escapeHtml(m.change || '') + '"><b>'
       + escapeHtml(m.id) + '</b> <span class="empty-hint">' + escapeHtml(m.scope || '') + '</span><br>'
@@ -1222,11 +1230,15 @@ function renderHarnessMarkers(h) {
       continue;
     }
     m.kpis.forEach((k, i) => {
-      const note = k.complete ? '' : ' <span class="kpi-incomplete">unvollständig (' + k.after_days.length
-        + ' von ' + k.n + ' Tagen)</span>';
-      html += '<tr>' + (i === 0 ? head : '<td></td><td></td>') + '<td>' + escapeHtml(k.label) + '</td>'
-        + '<td class="num">' + fmt(k.kpi, k.before_avg) + '</td><td class="num">' + fmt(k.kpi, k.after_avg) + note
-        + '</td><td class="num">' + (k.delta_pct == null ? '—' : (k.delta_pct > 0 ? '+' : '') + k.delta_pct + ' %') + '</td></tr>';
+      // An incompletely covered window shows its note, never a "0" and never a
+      // percentage (harness_index.marker_window: delta only when both are full).
+      const notes = (k.notes || []).map(t => '<span class="kpi-incomplete">' + escapeHtml(t) + '</span>');
+      const cell = (avg, complete) => avg == null ? '—' : fmt(k.kpi, avg) + (complete ? '' : '*');
+      html += '<tr>' + (i === 0 ? head : '<td></td><td></td>') + '<td>' + escapeHtml(k.label)
+        + (notes.length ? '<br>' + notes.join('<br>') : '') + '</td>'
+        + '<td class="num">' + cell(k.before_avg, k.before_complete) + '</td>'
+        + '<td class="num">' + cell(k.after_avg, k.after_complete) + '</td>'
+        + '<td class="num">' + (k.delta_pct == null ? '—' : (k.delta_pct > 0 ? '+' : '') + k.delta_pct + ' %') + '</td></tr>';
     });
   }
   document.getElementById('h-markers').innerHTML = html + '</tbody>';

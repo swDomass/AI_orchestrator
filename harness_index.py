@@ -1566,16 +1566,23 @@ def run_update_subprocess(*, timeout: float | None = None) -> dict:
 # ── read side: the dashboard's /api/harness ────────────────────────────────
 
 # Harness-change marker → KPI. `expect` is free text, so the mapping is a FIXED
-# keyword table, visible here: a keyword found in `expect` (case-insensitive)
-# links the marker to a daily series; a marker without any keyword gets only its
-# vertical line, never a guessed metric. All series are per DAY — the index has
-# no loop/pass identifier (that is the excluded phase 2).
-MARKER_KPIS: tuple[tuple[tuple[str, ...], str, str], ...] = (
-    (("externe aufrufe",), "ledger_calls", "Externe Aufrufe je Tag (Ledger)"),
-    (("fehlversuche",), "ledger_failures", "Externe Fehlversuche je Tag (Ledger, Status ≠ ok)"),
-    (("opencode-kosten", "kosten je pass"), "opencode_cost", "opencode-Kosten je Tag (Katalogpreis, USD)"),
-    (("sessions je pass",), "opencode_sessions", "opencode-Sitzungen je Tag"),
+# keyword table, visible here. Each entry lists alternatives; an alternative
+# matches when ALL its words occur in `expect` (case-insensitive). A marker
+# without any match gets only its vertical line, never a guessed metric. All
+# series are per DAY — the index has no loop/pass identifier (excluded phase 2).
+MARKER_KPIS: tuple[tuple[tuple[tuple[str, ...], ...], str, str], ...] = (
+    ((("externe aufrufe",),), "ledger_calls", "Externe Aufrufe je Tag (Ledger)"),
+    ((("fehlversuche",),), "ledger_failures", "Externe Fehlversuche je Tag (Ledger, Status ≠ ok)"),
+    ((("opencode-kosten",), ("kosten je pass", "opencode")), "opencode_cost",
+     "opencode-Kosten je Tag (Katalogpreis, USD)"),
+    ((("sessions je pass",),), "opencode_sessions", "opencode-Sitzungen je Tag (ohne Unter-Sitzungen)"),
 )
+# Which source a KPI's series comes from — its first day with data bounds the
+# "before" window (days before it are MISSING, not 0).
+_KPI_SOURCE = {
+    "ledger_calls": "ledger", "ledger_failures": "ledger",
+    "opencode_cost": "opencode", "opencode_sessions": "opencode",
+}
 MARKER_WINDOWS = (3, 7, 14)
 # sqlite busy timeout of the read connection. 0.2 s, not 0.5: on Windows SQLite
 # sleeps in timer-granular steps and a 0.5 s timeout measured 1.08–1.15 s.
@@ -1588,36 +1595,56 @@ _COUNTERS = ("input", "output", "cache_read", "cache_write")
 def marker_kpis(expect: object) -> list[tuple[str, str]]:
     """The (kpi key, label) pairs a marker's ``expect`` text names, in table order."""
     text = str(expect or "").lower()
-    return [(key, label) for words, key, label in MARKER_KPIS if any(w in text for w in words)]
+    return [
+        (key, label) for alternatives, key, label in MARKER_KPIS
+        if any(all(w in text for w in words) for words in alternatives)
+    ]
 
 
-def marker_window(series: dict[str, float], marker_day: str, n: int, today: str) -> dict:
+def marker_window(series: dict[str, float], marker_day: str, n: int, today: str,
+                  covered_from: str | None = None) -> dict:
     """Before/after comparison around a marker: n days each, the marker day in neither.
 
-    ``before`` = [D-n, D-1], ``after`` = [D+1, D+n]; only completed days (before
-    ``today``) count for "after", so a window still running is reported as
-    ``complete=False`` with ``after_days`` < n. Averages are per day over the
-    days counted; a missing day in ``series`` is 0.
+    ``before`` = [D-n, D-1], ``after`` = [D+1, D+n]. A "before" day earlier than
+    ``covered_from`` (the source's first day with data, or the index window's
+    lower bound) is MISSING, not 0; an "after" day counts only once completed
+    (before ``today``). Averages run over the days counted. A percentage change
+    is given ONLY when both windows are fully covered — a half-covered window
+    flipped the sign with the window length on real data (+176 % / −81 %);
+    otherwise ``notes`` say "vorher/nachher unvollständig (n von N Tagen)". A
+    marker dated today or later gets no calculation at all.
     """
     d = datetime.strptime(marker_day, "%Y-%m-%d").date()
-    last_full = datetime.strptime(today, "%Y-%m-%d").date() - timedelta(days=1)
-    before = [(d - timedelta(days=i)).isoformat() for i in range(n, 0, -1)]
+    today_d = datetime.strptime(today, "%Y-%m-%d").date()
+    last_full = today_d - timedelta(days=1)
+    before_all = [(d - timedelta(days=i)).isoformat() for i in range(n, 0, -1)]
+    result: dict = {
+        "n": n, "before_days": [], "after_days": [], "before_complete": False,
+        "after_complete": False, "complete": False, "before_sum": None, "after_sum": None,
+        "before_avg": None, "after_avg": None, "delta_pct": None, "notes": [],
+    }
+    if d >= today_d:
+        result["notes"] = ["noch keine Nachher-Tage"]
+        return result
+    before = [x for x in before_all if covered_from is None or x >= covered_from]
     after_all = [(d + timedelta(days=i)).isoformat() for i in range(1, n + 1)]
     after = [x for x in after_all if datetime.strptime(x, "%Y-%m-%d").date() <= last_full]
-    before_sum = sum(series.get(x, 0) for x in before)
-    after_sum = sum(series.get(x, 0) for x in after)
-    before_avg = before_sum / len(before) if before else None
-    after_avg = after_sum / len(after) if after else None
-    delta = None
-    if before_avg not in (None, 0) and after_avg is not None:
-        delta = round((after_avg - before_avg) / before_avg * 100, 1)
-    return {
-        "n": n, "before_days": before, "after_days": after, "complete": len(after) == n,
-        "before_sum": round(before_sum, 6), "after_sum": round(after_sum, 6),
-        "before_avg": None if before_avg is None else round(before_avg, 6),
-        "after_avg": None if after_avg is None else round(after_avg, 6),
-        "delta_pct": delta,
-    }
+    result["before_days"], result["after_days"] = before, after
+    result["before_complete"], result["after_complete"] = len(before) == n, len(after) == n
+    result["complete"] = result["before_complete"] and result["after_complete"]
+    if before:
+        result["before_sum"] = round(sum(series.get(x, 0) for x in before), 6)
+        result["before_avg"] = round(result["before_sum"] / len(before), 6)
+    if after:
+        result["after_sum"] = round(sum(series.get(x, 0) for x in after), 6)
+        result["after_avg"] = round(result["after_sum"] / len(after), 6)
+    if not result["before_complete"]:
+        result["notes"].append(f"vorher unvollständig ({len(before)} von {n} Tagen)")
+    if not result["after_complete"]:
+        result["notes"].append(f"nachher unvollständig ({len(after)} von {n} Tagen)")
+    if result["complete"] and result["before_avg"]:
+        result["delta_pct"] = round((result["after_avg"] - result["before_avg"]) / result["before_avg"] * 100, 1)
+    return result
 
 
 def _unavailable(reason: str) -> dict:
@@ -1714,12 +1741,14 @@ def _read_payload(conn: sqlite3.Connection, *, days: int, window: int, now: date
     if version is None or version[0] != str(SCHEMA_VERSION):
         raise _NotReadyError(
             f"Index-Schema {version[0] if version else '?'} passt nicht (erwartet {SCHEMA_VERSION}) — "
-            "neuer Indexlauf nötig")
+            "Datei löschen, der nächste Indexlauf baut sie neu auf")
     run = conn.execute(
         "SELECT finished, duration_sec, lines_read, lines_skipped, status, errors, files_read, bytes_read "
         "FROM index_runs ORDER BY id DESC LIMIT 1").fetchone()
     if run is None:
         raise _NotReadyError("Index noch nicht gelaufen (kein abgeschlossener Lauf)")
+    skipped_total, runs_total = conn.execute(
+        "SELECT coalesce(sum(lines_skipped), 0), count(*) FROM index_runs").fetchone()
     today = now.date().isoformat()
     first = (now.date() - timedelta(days=days - 1)).isoformat()
     day_list = _days_between(first, today)
@@ -1737,7 +1766,8 @@ def _read_payload(conn: sqlite3.Connection, *, days: int, window: int, now: date
         "days": days, "window": window, "day_list": day_list,
         "last_run": {"finished": run[0], "age_sec": age, "duration_sec": run[1], "lines_read": run[2],
                      "lines_skipped": run[3], "status": run[4], "errors": errors,
-                     "files_read": run[6], "bytes_read": run[7]},
+                     "files_read": run[6], "bytes_read": run[7],
+                     "skipped_total": skipped_total, "runs_total": runs_total},
     }
     payload["usage"] = _read_usage(conn, first)
     payload["agent_calls"] = _read_agent_calls(conn, first)
@@ -1804,7 +1834,12 @@ def _read_agent_calls(conn: sqlite3.Connection, first: str) -> dict:
     by_origin = dict(conn.execute(
         "SELECT origin, count(*) FROM claude_agent_call WHERE day >= ? GROUP BY origin", (first,)).fetchall())
     tool_use = sum(r["calls"] for r in rows)
-    meta = conn.execute("SELECT count(*) FROM claude_agent_meta WHERE day >= ?", (first,)).fetchone()[0]
+    # Day of a run = the day of its calling tool_use line (via toolUseId); the
+    # meta file's mtime only where no call is indexed — so both counts use the
+    # same day boundaries.
+    meta = conn.execute(
+        "SELECT count(*) FROM claude_agent_meta m LEFT JOIN claude_agent_call c "
+        "ON c.tool_use_id = m.tool_use_id WHERE coalesce(c.day, m.day) >= ?", (first,)).fetchone()[0]
     return {"rows": rows, "by_origin": by_origin, "tool_use_count": tool_use, "meta_count": meta,
             "difference": tool_use - meta}
 
@@ -1880,9 +1915,28 @@ def _kpi_series(conn: sqlite3.Connection, key: str, since: str) -> dict[str, flo
                            "GROUP BY day",
         "opencode_cost": "SELECT day, sum(coalesce(cost,0)) FROM oc_message WHERE role='assistant' AND day >= ? "
                          "GROUP BY day",
-        "opencode_sessions": "SELECT day, count(*) FROM oc_session WHERE day >= ? GROUP BY day",
+        "opencode_sessions": "SELECT day, count(*) FROM oc_session WHERE parent_id IS NULL AND day >= ? "
+                             "GROUP BY day",
     }
     return {d: float(v or 0) for d, v in conn.execute(queries[key], (since,))}
+
+
+def _source_first_day(conn: sqlite3.Connection, source: str, today: str) -> str:
+    """First day the source has data — earlier days are missing, not zero.
+
+    opencode is additionally bounded by the index window (rows older than
+    ``HARNESS_WINDOW_DAYS`` are never read); the ledger is read whole."""
+    if source == "ledger":
+        first = conn.execute("SELECT min(day) FROM ledger").fetchone()[0]
+        return first or today  # no data at all: every "before" day is missing
+    first = conn.execute(
+        "SELECT min(d) FROM (SELECT min(day) AS d FROM oc_message WHERE role='assistant' "
+        "UNION ALL SELECT min(day) FROM oc_session)").fetchone()[0]
+    if not first:
+        return today
+    floor = (datetime.strptime(today, "%Y-%m-%d").date()
+             - timedelta(days=int(config.HARNESS_WINDOW_DAYS))).isoformat()
+    return str(max(first, floor))
 
 
 def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[dict]:
@@ -1891,14 +1945,19 @@ def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[
         return []
     since = (datetime.strptime(markers[0][0], "%Y-%m-%d").date() - timedelta(days=max(MARKER_WINDOWS))).isoformat()
     series_cache: dict[str, dict[str, float]] = {}
+    first_day: dict[str, str] = {}
     out = []
     for date, mid, scope, change, expect in markers:
         rows = []
         for key, label in marker_kpis(expect):
             if key not in series_cache:
                 series_cache[key] = _kpi_series(conn, key, since)
-            rows.append({"kpi": key, "label": label,
-                         **marker_window(series_cache[key], date, window, today)})
+            source = _KPI_SOURCE[key]
+            if source not in first_day:
+                first_day[source] = _source_first_day(conn, source, today)
+            rows.append({"kpi": key, "label": label, "covered_from": first_day[source],
+                         **marker_window(series_cache[key], date, window, today,
+                                         covered_from=first_day[source])})
         out.append({"date": date, "id": mid, "scope": scope, "change": change, "expect": expect,
                     "kpis": rows})
     return out

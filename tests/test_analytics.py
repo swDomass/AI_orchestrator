@@ -1,6 +1,8 @@
 """Tests for analytics.py — parsing, aggregation, and caching."""
 
+import re
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -297,6 +299,58 @@ class TestParseLogSuggestEvents:
         assert len(suggest_items) == 1
         assert "declined" in suggest_items[0]["msg"]
         assert d["usage_suggest_today"] >= 1
+
+
+class TestDashboardCache:
+    """A slow build (48–58 s measured under load) must still be served from the cache."""
+
+    def _build_counting(self, tmp_path, clock):
+        import analytics
+        builds = []
+
+        def counting_active_runs():
+            builds.append(clock[0])
+            clock[0] += 50  # this build takes 50 s
+            return []
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / "orchestrator.log").write_text("", encoding="utf-8")
+        patches = [
+            patch("analytics.VAULT_PATH", tmp_path),
+            patch("analytics.LOG_FILE", log_dir / "orchestrator.log"),
+            patch("analytics.QUEUE_FILE", tmp_path / "queue.md"),
+            patch("analytics.QUEUE_EVENTS_LOG_FILE", tmp_path / "queue-events.log"),
+            patch("analytics.CAPACITY_LOG_FILE", tmp_path / "capacity-log.md"),
+            patch("analytics._load_active_runs", counting_active_runs),
+            patch("analytics.time", SimpleNamespace(time=lambda: clock[0])),  # not the global clock
+        ]
+        return analytics, builds, patches
+
+    def test_a_slow_build_counts_its_ttl_from_the_end(self, tmp_path):
+        clock = [1000.0]
+        analytics, builds, patches = self._build_counting(tmp_path, clock)
+        analytics._cache.update({"data": None, "ts": 0.0, "days": None})
+        for p in patches:
+            p.start()
+        try:
+            analytics.get_dashboard_data(days=30)  # build 1000 → 1050
+            clock[0] = 1000 + analytics._CACHE_TTL + 5  # past a TTL counted from the START
+            analytics.get_dashboard_data(days=30)
+            assert len(builds) == 1, "a slow build arrived expired and was built again"
+            clock[0] = 1050 + analytics._CACHE_TTL + 1  # past the TTL counted from the end
+            analytics.get_dashboard_data(days=30)
+            assert len(builds) == 2
+        finally:
+            for p in patches:
+                p.stop()
+            analytics._cache.update({"data": None, "ts": 0.0, "days": None})
+
+    def test_the_ttl_outlasts_the_page_reload(self):
+        import analytics
+        import dashboard
+        reload_ms = int(re.search(r"setInterval\(load, (\d+)\)", dashboard._HTML_PAGE).group(1))
+        assert reload_ms < analytics._CACHE_TTL * 1000
 
 
 class TestGetCurrentLimits:

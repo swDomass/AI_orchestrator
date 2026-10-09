@@ -529,7 +529,10 @@ def _recent_events(
 # ── Public API ───────────────────────────────────────────────────────────────
 
 _cache: dict[str, object] = {"data": None, "ts": 0.0}
-_CACHE_TTL = 30  # seconds
+# Longer than the page's 60-s reload (dashboard.py ``setInterval(load, 60000)``),
+# counted from the END of a build: under load a build alone took 48–58 s, and a
+# 30-s window counted from its start had expired before it was even stored.
+_CACHE_TTL = 90  # seconds
 
 
 def _get_current_limits() -> dict:
@@ -745,7 +748,8 @@ def _tool_trace_stats(events: list[ToolTraceEvent]) -> dict:
 def get_dashboard_data(days: int = 7) -> dict:
     """Single entry-point: aggregate all data sources into a dict.
 
-    Results are cached for 30 seconds (single-slot: new days value invalidates).
+    Results are cached for ``_CACHE_TTL`` seconds after the build finished
+    (single-slot: new days value invalidates).
     """
     now = time.time()
     if (
@@ -836,7 +840,7 @@ def get_dashboard_data(days: int = 7) -> dict:
     }
 
     _cache["data"] = data
-    _cache["ts"] = now
+    _cache["ts"] = time.time()  # end of the build, not `now`: a slow build must not arrive expired
     _cache["days"] = days
     return data
 

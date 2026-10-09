@@ -597,6 +597,39 @@ def test_codex_append_broken_half_and_extra_fields():
     assert q("SELECT input, output FROM codex_rollout") == [(900, 90)]
 
 
+def test_two_interleaved_codex_runs_end_on_the_newer_counter(monkeypatch):
+    """K21: run B commits (counter 990) between run A's start and A's transaction. A built on
+    the counter it had read before (660) and wrote it back: 660 -> 990 -> 660."""
+    path = write_codex_rollout()
+    run()
+    assert q("SELECT total FROM codex_rollout") == [(660,)]
+    append_jsonl(path, [_tc("2026-10-08T17:30:00.000Z", 900, 90)])
+    root = Path(config.HARNESS_CODEX_SESSIONS_DIR)
+    fired = []
+    real_load = hi._load_state
+
+    def load_with_a_second_run_in_between(conn, source, file_key):
+        if source == "codex" and not fired:
+            fired.append(1)
+            conn_b = sqlite3.connect(str(config.HARNESS_DB_FILE), timeout=30, isolation_level=None)
+            try:
+                hi._codex_file(conn_b, root, path, hi.SourceStats())
+            finally:
+                conn_b.close()
+            # a later line that carries no counter (info: null) — all that is left for A to read
+            append_jsonl(path, [_tc("2026-10-08T17:31:00.000Z", 0, 0, info=False, rl=_rl(11.0, 15.0))])
+        return real_load(conn, source, file_key)
+
+    monkeypatch.setattr(hi, "_load_state", load_with_a_second_run_in_between)
+    conn_a = sqlite3.connect(str(config.HARNESS_DB_FILE), timeout=30, isolation_level=None)
+    try:
+        hi._codex_file(conn_a, root, path, hi.SourceStats())
+    finally:
+        conn_a.close()
+    assert fired
+    assert q("SELECT input, output, total, primary_used FROM codex_rollout") == [(900, 90, 990, 11.0)]
+
+
 def test_codex_subagent_thread_source_is_kept():
     write_codex_rollout(codex_path("rollout-2026-10-08T18-00-00-02b22c9d.jsonl"), thread_source="subagent")
     run()

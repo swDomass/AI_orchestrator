@@ -773,15 +773,25 @@ def _run_file(
     *,
     handle: Callable[[dict, FileState, bool], None],
     needles: Callable[[FileState], tuple[bytes, ...]],
+    on_begin: Callable[[], None] | None = None,
     on_reset: Callable[[], None] | None = None,
     on_done: Callable[[FileState], None] | None = None,
 ) -> None:
-    """Read the new lines of one file inside ONE transaction (rows + state)."""
-    prev = _load_state(conn, source, file_key)
-    if _unchanged(path, prev):
+    """Read the new lines of one file inside ONE transaction (rows + state).
+
+    The state read before the transaction only decides whether the file needs
+    opening at all (a stale "unchanged" is harmless: the next run looks again).
+    What the run builds on — the file's state and, via ``on_begin``, whatever
+    the handler carries over from the database — is read after ``BEGIN
+    IMMEDIATE``: a second run (after a lock takeover) that committed in between
+    would otherwise be overwritten by this one with older numbers."""
+    if _unchanged(path, _load_state(conn, source, file_key)):
         return
     conn.execute("BEGIN IMMEDIATE")
     try:
+        prev = _load_state(conn, source, file_key)
+        if on_begin is not None:
+            on_begin()
         state: FileState | None = None
         now = time.time()
         for raw, state, reset in _iter_new_lines(path, prev, stats, now):
@@ -1104,10 +1114,16 @@ def _index_codex(conn: sqlite3.Connection, root: Path, cutoff: float, stats: Sou
 
 def _codex_file(conn: sqlite3.Connection, root: Path, path: Path, stats: SourceStats) -> None:
     file_key = _hash("codex:" + _rel(root, path), 20)
-    existing = conn.execute(
-        f"SELECT {', '.join(_CODEX_FIELDS)} FROM codex_rollout WHERE file_key=?", (file_key,),
-    ).fetchone()
-    row: dict = dict(zip(_CODEX_FIELDS, existing, strict=True)) if existing else {}
+    row: dict = {}
+
+    def on_begin() -> None:
+        # inside the transaction, with the file state: both come from the same commit
+        existing = conn.execute(
+            f"SELECT {', '.join(_CODEX_FIELDS)} FROM codex_rollout WHERE file_key=?", (file_key,),
+        ).fetchone()
+        row.clear()
+        if existing:
+            row.update(zip(_CODEX_FIELDS, existing, strict=True))
 
     def on_reset() -> None:
         row.clear()  # the file's content is the truth: start the one row afresh
@@ -1169,7 +1185,7 @@ def _codex_file(conn: sqlite3.Connection, root: Path, path: Path, stats: SourceS
         )
 
     _run_file(conn, "codex", file_key, path, stats, handle=handle, needles=needles,
-              on_reset=on_reset, on_done=on_done)
+              on_begin=on_begin, on_reset=on_reset, on_done=on_done)
 
 
 # ── source 3: opencode.db ───────────────────────────────────────────────────

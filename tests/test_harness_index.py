@@ -1683,7 +1683,7 @@ def test_main_prints_each_startup_warning_once_to_stderr(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("info", [
-    pytest.param('{"broken": %d}' % 2**70, id="out_of_range"),
+    pytest.param('{"broken": ' + str(2**70) + '}', id="out_of_range"),
     pytest.param("[" * 200_000, id="recursion_error"),  # not a ValueError
 ])
 def test_an_unreadable_broken_stock_gives_0_and_never_raises_in_the_endpoint(info):

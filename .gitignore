@@ -1,5 +1,6 @@
 # Environment / Secrets
 .env
+.env.bak*
 
 # Python
 __pycache__/

@@ -15,6 +15,8 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Stand 2026-10-09 nach 821574f (Windows, Auftraggeber): 3308 passed / 0 failed / 2 skipped. Gegenprobe im
+# Worktree docs-sync: `--collect-only` 3310 (= 3308 + 2), voller Lauf Exit 0.
 # Korrekturrunde 2 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3275 passed /
 # 0 failed / 9 skipped in 101-104 s — +33 gesammelt über die 3251 darunter, per --collect-only:
 # test_harness_index 71 -> 89, test_dashboard_autostart 61 -> 67, test_harness_dashboard 35 -> 44.

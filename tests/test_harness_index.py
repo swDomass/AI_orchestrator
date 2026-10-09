@@ -1629,6 +1629,15 @@ def test_main_lowers_priority_before_the_lock_is_taken(monkeypatch):
     assert order == ["priority", "lock"]
 
 
+def test_main_lowers_priority_before_the_startup_warnings(monkeypatch):
+    order: list[str] = []
+    monkeypatch.setattr(hi, "_lower_priority", lambda: order.append("priority") or True)
+    monkeypatch.setattr(hi, "_print_startup_warnings", lambda: order.append("warnings"))
+    monkeypatch.setattr(hi, "run_update", lambda: {"status": "ok"})
+    assert hi.main(["--update"]) == 0
+    assert order == ["priority", "warnings"]
+
+
 def test_startup_sec_is_stored_in_the_run_log_and_named_on_the_console(monkeypatch):
     write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
     monkeypatch.setattr(hi, "_startup_sec", lambda now=None: 41.5)

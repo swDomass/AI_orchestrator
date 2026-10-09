@@ -2253,8 +2253,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.update:
         parser.print_help()
         return 0
-    _print_startup_warnings()
     _lower_priority()
+    _print_startup_warnings()
     summary = run_update()
     return 1 if summary.get("status") == "error" else 0
 

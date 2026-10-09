@@ -1043,6 +1043,16 @@ SHUTDOWN_DELAY_SEC = 60
 # 8386-8485 → WSAEACCES/WinError 10013 on bind). Overridable via .env; the
 # dashboard also falls back to a free port at bind time if this one is taken.
 DASHBOARD_PORT = _parse_int_env("DASHBOARD_PORT", 8211)
+# Autostart (2026-10-09): `--watch` starts the dashboard as a daemon thread on
+# 127.0.0.1 (dashboard.start_autostart, called from orchestrator.run_watch), so a
+# fixed address is reachable after every Scheduled-Task restart. Never fatal: any
+# failure is one warning line and the orchestrator keeps running.
+DASHBOARD_AUTOSTART = _parse_bool_env("DASHBOARD_AUTOSTART", True)
+# Applies to the autostart ONLY. `python dashboard.py` and `--dashboard` keep
+# opening the browser unless `--no-open` is given — unattended starts must not
+# pop a window, manual starts behave as before.
+DASHBOARD_OPEN_BROWSER = _parse_bool_env("DASHBOARD_OPEN_BROWSER", False)
+
 SHUTDOWN_COMMAND = (
     ["shutdown", "/s", "/t", "0", "/f"]
     if sys.platform == "win32"

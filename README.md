@@ -146,6 +146,8 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `ORCH_QUOTA_LIVE_ESTIMATE` | No | `false` | Phase 2: decrement the cached quota snapshot by a live per-task estimate between cclimits polls |
 | `ORCH_QUOTA_AUTO_RECALIBRATE` | No | `false` | Requires the flag above: re-derive the per-window `tokens_per_pct` factors daily from `logs/quota-calibration.csv` (min-samples + clamp guarded) |
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
+| `DASHBOARD_AUTOSTART` | No | `true` | `--watch` starts the dashboard itself as a daemon thread on `127.0.0.1` (no extra process). Never fatal: a failure (no free port, import error, server dying later) is one warning line in `orchestrator.log` and `queue-events.log`, the orchestrator keeps running. `false` = nothing is started. |
+| `DASHBOARD_OPEN_BROWSER` | No | `false` | Only for the autostart above: open a browser window when it comes up. `python dashboard.py` / `--dashboard` are unaffected — they open the browser unless `--no-open`. |
 | ~~`TELEGRAM_MAX_TASK_LENGTH`~~ | — | `500` | Max characters for `/task`. **Not readable from `.env`** — `config.py:519` assigns it literally, with no `os.getenv()`. Listed here only because it was documented as configurable until 2026-09-05; change the constant, or wire it through `_parse_int_env()`. |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
 | `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
@@ -199,7 +201,7 @@ python orchestrator.py --watch          # Continuous mode
 python orchestrator.py --dry-run        # Parse queue without executing
 python orchestrator.py --check-limits   # Show provider capacity
 python orchestrator.py --list-tools     # Show available #tool: handlers
-python orchestrator.py --dashboard      # Launch analytics dashboard
+python orchestrator.py --dashboard      # Launch analytics dashboard (opens browser; --watch already serves it, see DASHBOARD_AUTOSTART)
 python orchestrator.py --doctor         # Validate setup
 python orchestrator.py --doctor --fix   # Auto-fix issues
 python orchestrator.py --doctor --fix --yes
@@ -940,8 +942,10 @@ Rate limits (anti-spam):
 
 ## Analytics Dashboard
 
+**Autostart (since 2026-10-09):** `python orchestrator.py --watch` (and therefore the Scheduled Task via `run_orchestrator.ps1`) serves the dashboard on `http://127.0.0.1:8211` by itself — a daemon thread, no browser window, nothing to start by hand. `DASHBOARD_AUTOSTART=false` in `.env` switches it off; `DASHBOARD_OPEN_BROWSER=true` makes the autostart open a browser. The autostart never stops the orchestrator: the bind runs inside the thread (no waiting in `run_watch`), and any failure is one warning line, with the actually bound URL if the port had to fall back. If you additionally start `python dashboard.py`, a second dashboard comes up on a fallback port.
+
 ```bash
-# Start dashboard (opens browser automatically)
+# Start dashboard manually (opens browser automatically)
 python orchestrator.py --dashboard
 
 # Standalone with options

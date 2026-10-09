@@ -20,7 +20,9 @@ Task format in agent-queue.md:
 """
 
 import argparse
+import contextlib
 import hashlib
+import importlib
 
 # Module level on purpose, against this file's habit of lazy `import logging as
 # _logging` inside functions: main()'s BaseException handler and
@@ -41,6 +43,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime, timedelta
 
+import config
 import git_commit
 import memory as memory_module
 import replay
@@ -3539,6 +3542,48 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
     return False
 
 
+def _start_dashboard_autostart() -> None:
+    """Start the dashboard for ``--watch`` (config.DASHBOARD_AUTOSTART). NEVER raises.
+
+    The dashboard is a convenience, the queue is the job: any failure — the
+    import of ``dashboard`` itself included, which is why it sits inside the
+    ``try`` — becomes one warning line (``logger.warning`` + ``append_log``) and
+    the orchestrator carries on. ``main()``'s crash net must never see an
+    exception from here: it would count a dashboard problem as a process crash
+    against the first queue task. ``dashboard.start_autostart()`` binds inside
+    its own thread, so this returns without waiting for the port.
+    """
+    log = logging.getLogger(__name__)
+
+    # contextlib.suppress: a reporter must not raise into run_watch, and the
+    # stdout of a hidden --watch window may be gone.
+    def _warn(message: str) -> None:
+        with contextlib.suppress(Exception):
+            log.warning(message)
+        with contextlib.suppress(Exception):
+            append_log(message)
+
+    def _info(message: str) -> None:
+        with contextlib.suppress(Exception):
+            log.info(message)
+            print(f"[dashboard] {message}")
+
+    try:
+        if not config.DASHBOARD_AUTOSTART:
+            return
+        # importlib on purpose: the import itself is part of what must not
+        # escape (a broken dashboard.py is an ImportError/SyntaxError here).
+        dashboard = importlib.import_module("dashboard")
+        dashboard.start_autostart(
+            open_browser=config.DASHBOARD_OPEN_BROWSER, warn=_warn, info=_info,
+        )
+    except Exception as e:  # never raises, by contract
+        _warn(
+            f"Dashboard-Autostart fehlgeschlagen ({type(e).__name__}: {e}) — "
+            "Orchestrator läuft ohne Dashboard weiter"
+        )
+
+
 def run_watch(dry_run: bool = False) -> None:
     """Continuously process queue, sleeping when all providers are exhausted."""
     from doctor import run_startup_checks
@@ -3584,6 +3629,9 @@ def run_watch(dry_run: bool = False) -> None:
     # is blocked for hours inside a long-running task.
     _hb_stop = threading.Event()
     start_heartbeat_thread(heartbeat, read_queue, _hb_stop, pause_event=pause_event)
+
+    # Dashboard on 127.0.0.1 as a daemon thread — never raises, never waits.
+    _start_dashboard_autostart()
 
     def _cleanup():
         listener.stop()

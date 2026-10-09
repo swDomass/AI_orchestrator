@@ -149,7 +149,7 @@ python orchestrator.py --watch        # continuous + heartbeat
 python orchestrator.py --dry-run      # parse queue, no execute
 python orchestrator.py --check-limits # provider capacity
 python orchestrator.py --list-tools   # available #tool: handlers
-python orchestrator.py --dashboard    # analytics web dashboard
+python orchestrator.py --dashboard    # analytics web dashboard (opens browser; --watch serves it anyway, DASHBOARD_AUTOSTART)
 python orchestrator.py --lint-queue   # validate agent-queue.md
 
 # Lint / typecheck (config in pyproject.toml; CI runs both, advisory only — continue-on-error)
@@ -256,6 +256,7 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **Subtask-aware queue mutations** — `mark_done/mark_retry/finalize` accept `subtasks` kwarg
 - **Task dependencies** — `#id:`/`#needs:`, two-pass resolution, blocked-task header
 - **Schedule tags** — `#at:`/`#every:` reuse retry primitive; queue file is single source of truth
+- **Dashboard-Autostart (2026-10-09)** — `run_watch` → `_start_dashboard_autostart()` → `dashboard.start_autostart()`: Daemon-Thread auf 127.0.0.1, Bind **im** Thread (kein Warten), wirft nie, jeder Fehler = genau eine Warnzeile (`logger.warning` + `append_log`). `DASHBOARD_AUTOSTART` (an) / `DASHBOARD_OPEN_BROWSER` (aus, nur Autostart). Eine Exception von dort würde `main()`s Absturznetz dem ersten Queue-Task anrechnen — deshalb der Import von `dashboard` im `try`. Server einfädig: Endpunkte müssen schnell sein
 
 > Fallen- und Messwissen zu Queue/Tasks, Providern, Tools, Git-Auto-Commit, Orchestrator-Runtime, Quota/Analytics und Policy ausgelagert — siehe Index am Dateiende.
 

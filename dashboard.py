@@ -4,7 +4,14 @@ AI Orchestrator — Web Dashboard
 Lightweight HTTP server serving an analytics dashboard.
 Uses only stdlib (http.server) + Chart.js via CDN.
 
-Standalone usage:
+Autostart (2026-10-09): ``python orchestrator.py --watch`` starts this server
+itself via ``start_autostart()`` — a daemon thread on 127.0.0.1, no browser
+(``config.DASHBOARD_OPEN_BROWSER``, default False), switched off with
+``DASHBOARD_AUTOSTART=false``. It never raises into the orchestrator and never
+makes ``run_watch`` wait: the bind happens inside the thread, and every failure
+(no port, import error, ``serve_forever`` dying later) is one warning line.
+
+Standalone usage (unchanged — these still open the browser unless --no-open):
     python dashboard.py              # open browser on port 8211 (or free fallback)
     python dashboard.py --port 9000  # custom port
     python dashboard.py --no-open    # don't auto-open browser
@@ -13,9 +20,14 @@ Programmatic usage:
     from dashboard import start_server
     start_server()                   # blocking
     start_server(background=True)    # returns immediately
+    start_autostart()                # --watch path: never raises, never waits
+
+The server is single-threaded (``socketserver.TCPServer``): one slow request
+blocks the others, so every endpoint must answer quickly.
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import socketserver
@@ -24,6 +36,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler
 
+import config
 from analytics import get_dashboard_data
 from config import DASHBOARD_PORT
 
@@ -800,6 +813,140 @@ def _bind_server(port: int) -> tuple["_ReuseServer", int]:
         return server, actual
     # port 0 above should always succeed; be explicit if it somehow didn't.
     raise last_err or OSError(f"dashboard: could not bind any port near {port}")
+
+
+class AutostartHandle:
+    """What ``start_autostart()`` set in motion.
+
+    ``run_watch`` ignores it on purpose (it must neither wait for nor depend on
+    the dashboard); tests and diagnostics use it. ``bound`` is set once the bind
+    attempt inside the server thread has finished — successfully (``server``/
+    ``url`` set) or not (``error`` set). ``stop`` ends the server and every
+    scheduler thread hanging off this handle.
+    """
+
+    def __init__(self) -> None:
+        self.bound = threading.Event()
+        self.stop = threading.Event()
+        self.server: _ReuseServer | None = None
+        self.url: str | None = None
+        self.error: str | None = None
+        self.server_thread: threading.Thread | None = None
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Stop the server thread (tests; the orchestrator lets the daemon die)."""
+        self.stop.set()
+        server = self.server
+        if server is not None:
+            with contextlib.suppress(Exception):  # best effort, never raises
+                server.shutdown()
+        thread = self.server_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+
+
+def _safe_report(report, message: str) -> None:
+    """Call a reporting callback; a throwing reporter must not take the caller down."""
+    with contextlib.suppress(Exception):  # the reporter is the last line
+        report(message)
+
+
+def _autostart_serve(
+    handle: AutostartHandle,
+    port: int,
+    open_browser: bool,
+    warn,
+    info,
+) -> None:
+    """Server-thread body: bind, announce, serve. Never raises.
+
+    The bind happens HERE and not in ``start_autostart()``: the caller is
+    ``run_watch``, which must not wait for a bind result. Every failure ends in
+    exactly one ``warn`` line; a server that bound and then died is closed in
+    ``finally`` so no half-open socket stays behind.
+    """
+    server: _ReuseServer | None = None
+    try:
+        try:
+            server, actual = _bind_server(port)
+        except Exception as e:  # OSError and anything else alike
+            handle.error = f"{type(e).__name__}: {e}"
+            _safe_report(
+                warn,
+                f"Dashboard-Autostart: kein Port frei ({handle.error}) — "
+                "Orchestrator läuft ohne Dashboard weiter",
+            )
+            return
+        url = f"http://127.0.0.1:{actual}"
+        handle.server = server
+        handle.url = url
+        handle.bound.set()
+        if actual != port:
+            _safe_report(warn, f"Dashboard-Autostart: Port {port} belegt, Dashboard läuft unter {url}")
+        else:
+            _safe_report(info, f"Dashboard läuft unter {url}")
+        if open_browser:
+            try:
+                webbrowser.open(url)
+            except Exception as e:  # a missing browser is not a dashboard failure
+                logger.debug("dashboard autostart: webbrowser.open failed: %s", e)
+        # Always reached after a successful bind: AutostartHandle.shutdown() relies
+        # on serve_forever() running (socketserver.shutdown waits for it).
+        server.serve_forever()
+    except Exception as e:  # a dying server thread must log, not vanish
+        handle.error = f"{type(e).__name__}: {e}"
+        _safe_report(
+            warn,
+            f"Dashboard-Autostart: Server beendet ({handle.error}) — Orchestrator läuft weiter",
+        )
+    finally:
+        if server is not None:
+            with contextlib.suppress(Exception):
+                server.server_close()
+        handle.bound.set()
+
+
+def start_autostart(
+    *,
+    open_browser: bool | None = None,
+    port: int | None = None,
+    warn=None,
+    info=None,
+) -> AutostartHandle:
+    """Start the dashboard for ``--watch`` as a daemon thread. NEVER raises.
+
+    Returns at once — no join, no waiting for the bind (that happens in the
+    thread). Any failure (thread start, bind, ``serve_forever`` dying later) is
+    reported through ``warn`` exactly once and recorded in ``handle.error``; the
+    orchestrator keeps running either way. ``open_browser`` defaults to
+    ``config.DASHBOARD_OPEN_BROWSER`` (False) — this is the unattended path; the
+    manual paths (``python dashboard.py``, ``--dashboard``) keep their own default.
+    Bound to 127.0.0.1 only (``_bind_server``).
+    """
+    handle = AutostartHandle()
+    warn = warn or logger.warning
+    info = info or logger.info
+    try:
+        if open_browser is None:
+            open_browser = bool(config.DASHBOARD_OPEN_BROWSER)
+        port = port or config.DASHBOARD_PORT
+        thread = threading.Thread(
+            target=_autostart_serve,
+            args=(handle, port, open_browser, warn, info),
+            name="dashboard-autostart",
+            daemon=True,
+        )
+        handle.server_thread = thread
+        thread.start()
+    except Exception as e:  # never raises, by contract
+        handle.error = f"{type(e).__name__}: {e}"
+        handle.server_thread = None
+        handle.bound.set()
+        _safe_report(
+            warn,
+            f"Dashboard-Autostart fehlgeschlagen ({handle.error}) — Orchestrator läuft ohne Dashboard weiter",
+        )
+    return handle
 
 
 def start_server(

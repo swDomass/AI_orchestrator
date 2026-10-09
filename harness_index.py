@@ -1079,6 +1079,9 @@ def _claude_sub_file(conn: sqlite3.Connection, root: Path, path: Path, stats: So
     _run_file(conn, "claude", file_key, path, stats, handle=handle, needles=needles)
 
 
+_UNPARSABLE = object()
+
+
 def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: SourceStats) -> None:
     rel = _rel(root, path)
     file_key = _hash("claude:" + rel, 20)
@@ -1093,8 +1096,8 @@ def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
     try:
         data = json.loads(raw)
     except Exception as e:  # not ValueError only: deep nesting raises RecursionError
-        stats.skip(e)
-        data = None
+        stats.skip(e)  # counted here, so the not-an-object branch below must not count it twice
+        data = _UNPARSABLE
     session_id = path.parent.parent.name[:NAME_MAX]
     agent_id = path.name.removeprefix("agent-").removesuffix(".meta.json")[:NAME_MAX]
     conn.execute("BEGIN IMMEDIATE")
@@ -1115,7 +1118,7 @@ def _claude_meta_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
                     "agent_type, model, spawn_depth, request_shape, nested, day, origin) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)", values,
                 )
-        elif data is not None:  # valid JSON, but not an object
+        elif data is not _UNPARSABLE:  # valid JSON (``null`` too), but not an object
             stats.lines_skipped += 1
         _save_state(conn, "claude-meta", file_key, FileState(st.st_size, st.st_mtime, st.st_size))
         conn.execute("COMMIT")
@@ -1647,6 +1650,10 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
             f"{summary['duration_sec']:.1f} s (Start davor {startup_sec if startup_sec is not None else '?'} s), {PEAK_LABELS[peak_column]} "
             f"{peak_mb if peak_mb is not None else '?'} MB"
         )
+        for name in ("ledger", "markers"):
+            broken = per_source[name].broken_lines
+            if broken:
+                say(f"  {'Ledger' if name == 'ledger' else 'Marker'}: {broken} kaputte Zeilen")
         for name, errs in errors.items():
             say(f"  Fehler {name}: {'; '.join(errs[:3])}")
         return summary
@@ -2220,6 +2227,15 @@ def _lower_priority_windows() -> bool:
     return ok
 
 
+def _print_startup_warnings() -> None:
+    """``config.STARTUP_WARNINGS`` to stderr, each entry once (it leaves the list)."""
+    pending = config.STARTUP_WARNINGS
+    while pending:
+        with contextlib.suppress(Exception):
+            print(pending[0], file=sys.stderr)
+        pending.pop(0)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Harness index (SQLite) over local transcripts and logs")
     parser.add_argument("--update", action="store_true", help="run one incremental update")
@@ -2227,6 +2243,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.update:
         parser.print_help()
         return 0
+    _print_startup_warnings()
     _lower_priority()
     summary = run_update()
     return 1 if summary.get("status") == "error" else 0

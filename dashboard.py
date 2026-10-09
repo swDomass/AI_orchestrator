@@ -1739,6 +1739,8 @@ def main():
     parser.add_argument("--no-open", action="store_true",
                         help="Don't auto-open browser")
     args = parser.parse_args()
+    with contextlib.suppress(Exception):
+        _report_startup_warnings(lambda message: print(message, file=sys.stderr))
     start_server(port=args.port, open_browser=not args.no_open)
 
 

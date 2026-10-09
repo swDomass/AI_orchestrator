@@ -695,3 +695,13 @@ def test_the_orchestrator_call_site_routes_startup_warnings_to_the_log(monkeypat
     monkeypatch.setattr(dashboard, "_autostart_serve", lambda handle, *a: handle.bound.set())
     orchestrator._start_dashboard_autostart()
     assert [m for m in captured_log if "ungültig" in m] == ["config: HARNESS_UPDATE_INTERVAL_SEC=5 ungültig — y"]
+
+
+def test_dashboard_main_prints_the_startup_warning_once_to_stderr(monkeypatch, capsys):
+    monkeypatch.setattr(config, "STARTUP_WARNINGS", ["config: X=1 ungültig — Standardwert 2"])
+    monkeypatch.setattr(dashboard, "start_server", lambda **kw: None)
+    monkeypatch.setattr(sys, "argv", ["dashboard.py"])
+    dashboard.main()
+    dashboard.main()
+    assert capsys.readouterr().err.splitlines() == ["config: X=1 ungültig — Standardwert 2"]
+    assert config.STARTUP_WARNINGS == []

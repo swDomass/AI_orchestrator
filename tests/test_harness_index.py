@@ -1635,3 +1635,42 @@ def test_startup_sec_is_stored_in_the_run_log_and_named_on_the_console(monkeypat
 def test_startup_sec_is_a_real_non_negative_number():
     value = hi._startup_sec()
     assert value is not None and value >= 0
+
+
+def test_a_meta_file_that_holds_null_is_counted_as_skipped_once():
+    sess = "a0000000-0000-4000-8000-000000000001"
+    write_jsonl(_proj_path("A", sess), [c_header(sess), c_assistant(sess, "a1")])
+    path = meta_path(sess, AGENT_A)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("null", encoding="utf-8")
+    claude = run()["per_source"]["claude"]
+    assert q("SELECT count(*) FROM claude_agent_meta") == [(0,)]
+    assert claude["lines_skipped"] == 1
+    assert run()["per_source"]["claude"]["lines_skipped"] == 0  # file state saved: not counted again
+
+
+def test_a_garbled_meta_file_is_still_counted_exactly_once():
+    sess = "a0000000-0000-4000-8000-000000000001"
+    write_jsonl(_proj_path("A", sess), [c_header(sess), c_assistant(sess, "a1")])
+    path = meta_path(sess, AGENT_A)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{kaputt", encoding="utf-8")
+    assert run()["per_source"]["claude"]["lines_skipped"] == 1
+
+
+def test_the_console_names_broken_ledger_and_marker_lines_only_when_there_are_some():
+    write_ledger()
+    clean = "\n".join(run()["_out"])
+    assert "kaputte Zeilen" not in clean
+    write_ledger(extra=['{"ts_local":"broken'])
+    out = run()["_out"]
+    assert any("Ledger: 1 kaputte Zeilen" in line for line in out)
+
+
+def test_main_prints_each_startup_warning_once_to_stderr(monkeypatch, capsys):
+    monkeypatch.setattr(config, "STARTUP_WARNINGS", ["config: X=1 ungültig — Standardwert 2"])
+    monkeypatch.setattr(hi, "_lower_priority", lambda: True)
+    monkeypatch.setattr(hi, "run_update", lambda *a, **k: {"status": "ok"})
+    assert hi.main(["--update"]) == 0
+    assert hi.main(["--update"]) == 0
+    assert capsys.readouterr().err.splitlines() == ["config: X=1 ungültig — Standardwert 2"]

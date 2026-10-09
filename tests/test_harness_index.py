@@ -358,18 +358,56 @@ def test_half_last_line_waits_and_then_counts_exactly_once():
     assert claude_tokens()[4] == 2
 
 
-def test_quiet_complete_tail_without_newline_is_evaluated_without_moving_the_offset(monkeypatch):
+def test_quiet_complete_tail_without_newline_is_evaluated_once_and_the_offset_moves_to_the_end():
     path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m_tail")], newline_at_end=False)
     old = time.time() - 3600
     os.utime(path, (old, old))
     run()
     assert q("SELECT msg_id FROM claude_msg") == [("m_tail",)]
-    offset = q("SELECT offset FROM file_state WHERE source='claude'")[0][0]
-    assert offset == len((_j(c_header(S_CLI)) + "\n").encode())
+    assert q("SELECT offset, size FROM file_state WHERE source='claude'") == [(path.stat().st_size,) * 2]
     append_jsonl(path, ["", _j(c_assistant(S_CLI, "m_next"))])  # writer adds the newline later
     run()
     assert sorted(q("SELECT msg_id FROM claude_msg")) == [("m_next",), ("m_tail",)]
     assert claude_tokens()[4] == 2
+
+
+def _age(path: Path, seconds: float = 3600) -> None:
+    old = time.time() - seconds
+    os.utime(path, (old, old))  # only the mtime: size and content stay
+
+
+def test_a_fresh_last_line_without_newline_is_counted_once_after_the_file_got_quiet():
+    """K19: size and mtime of run 1 are what run 2 sees — only the clock moved on."""
+    path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m_tail")], newline_at_end=False)
+    first = run()  # the file was written just now: the writer may still be mid-line
+    assert q("SELECT msg_id FROM claude_msg") == []
+    assert first["per_source"]["claude"]["lines_skipped"] == 0
+    _age(path)
+    second = run()
+    assert q("SELECT msg_id FROM claude_msg") == [("m_tail",)]
+    assert second["per_source"]["claude"]["lines_read"] == 1
+    third = run()
+    assert third["per_source"]["claude"]["lines_read"] == 0
+    assert third["per_source"]["claude"]["files_read"] == 0
+    assert claude_tokens()[4] == 1
+
+
+def test_a_broken_rest_of_a_quiet_file_is_skipped_once_and_the_file_is_then_left_alone(monkeypatch):
+    path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
+    with path.open("a", encoding="utf-8", newline="") as f:
+        f.write('{"type":"assistant","message":{"id":"m_half')  # never completed
+    run()
+    _age(path)
+    second = run()
+    assert second["per_source"]["claude"]["lines_skipped"] == 1
+    assert q("SELECT offset, size FROM file_state WHERE source='claude'") == [(path.stat().st_size,) * 2]
+    opened = []
+    real_open = Path.open
+    monkeypatch.setattr(Path, "open", lambda self, *a, **k: (opened.append(self), real_open(self, *a, **k))[1])
+    third = run()
+    assert third["per_source"]["claude"]["lines_skipped"] == 0
+    assert path not in opened
+    assert [r[0] for r in q("SELECT msg_id FROM claude_msg")] == ["m1"]
 
 
 def test_non_compact_json_is_still_parsed_despite_the_prefilter():

@@ -655,9 +655,10 @@ def _iter_new_lines(
     (its offset already sits behind the last complete line). ``reset`` is True
     when the file is read from the start because it shrank below the stored
     offset or its head changed. Nothing is yielded for an unchanged file.
-    A trailing segment without newline is not consumed; it is yielded (without
-    advancing the offset) only if it parses as JSON and the file has been quiet
-    for ``TAIL_QUIET_SEC`` — natural keys make that re-evaluation harmless.
+    A trailing segment without newline waits (the offset stays in front of it)
+    while the file is younger than ``TAIL_QUIET_SEC``. Once the file is quiet the
+    segment is settled once: yielded if it parses as JSON, else counted as
+    skipped, and the offset moves to the end of the file either way.
     """
     st = path.stat()
     size, mtime = st.st_size, st.st_mtime
@@ -666,8 +667,8 @@ def _iter_new_lines(
         offset = 0
         if prev is not None:
             same_head = size >= prev.head_len and _head_hash(f, prev.head_len) == prev.head_hash
-            if same_head and size == prev.size and mtime == prev.mtime:
-                return  # unchanged: not read at all
+            if same_head and size == prev.size and mtime == prev.mtime and prev.offset >= prev.size:
+                return  # unchanged and nothing left behind the offset: not read at all
             if (
                 not same_head or size < prev.offset
                 or (prev.tail_hash and _tail_hash(f, prev.offset) != prev.tail_hash)
@@ -686,13 +687,20 @@ def _iter_new_lines(
         first = True
         for raw in f:
             if not raw.endswith(b"\n"):
-                # incomplete last line: keep the offset in front of it
+                # incomplete last line: while the file is young the offset stays in
+                # front of it (the writer may be mid-line)
                 stats.bytes_read += len(raw)
                 if now - mtime >= TAIL_QUIET_SEC:
+                    # quiet file: the rest will not grow into a line any more. Either
+                    # way the offset moves to the end — a rest that is valid JSON is
+                    # evaluated once, one that is not is counted as skipped once; the
+                    # file is not reopened for it on every run.
+                    new_state.offset += len(raw)
                     try:
                         json.loads(raw)
                     except Exception:  # not ValueError only: deep nesting raises RecursionError
-                        pass
+                        if raw.strip():
+                            stats.lines_skipped += 1
                     else:
                         stats.lines_read += 1
                         yield raw, new_state, reset and first
@@ -712,8 +720,12 @@ def _iter_new_lines(
 def _unchanged(path: Path, prev: FileState | None) -> bool:
     """True when size and mtime are where the last run left them — the file is
     then not even opened (≈ 3000 files per run; every open is a virus-scanner
-    hit on Windows). A rewrite that keeps both size and mtime is not detected."""
-    if prev is None:
+    hit on Windows). A rewrite that keeps both size and mtime is not detected.
+
+    Not while a rest sits behind the offset (``offset < size``, an unfinished last
+    line): it ages without the file changing, so it is looked at again until it
+    is quiet and settled (see ``_iter_new_lines``)."""
+    if prev is None or prev.offset < prev.size:
         return False
     st = path.stat()
     return st.st_size == prev.size and st.st_mtime == prev.mtime

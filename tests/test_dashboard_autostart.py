@@ -558,15 +558,34 @@ def test_server_and_index_thread_failing_together_is_one_warning(monkeypatch):
     ],
 )
 def test_harness_interval_bounds(monkeypatch, key, raw, expected):
+    """The REAL rules: config's own reader functions with the numbers spelled out
+    here (K17 — the test used to carry a copy of the rules, and stayed green when
+    config's bound was changed)."""
     monkeypatch.setenv(key, raw)
     monkeypatch.setattr(config, "STARTUP_WARNINGS", [])
-    rules = {"HARNESS_LOCK_STALE_SEC": (7200, lambda v: v >= 600),
-             "HARNESS_UPDATE_INTERVAL_SEC": (1800, lambda v: v == 0 or v >= 300)}
-    default, valid = rules[key]
-    value = config._bounded_int_env(key, default, valid=valid, rule="r")
-    assert value == expected
+    reader = {"HARNESS_LOCK_STALE_SEC": config._harness_lock_stale_sec,
+              "HARNESS_UPDATE_INTERVAL_SEC": config._harness_update_interval_sec}[key]
+    assert reader() == expected
     warned = [w for w in config.STARTUP_WARNINGS if key in w]
     assert len(warned) == (0 if str(expected) == raw else 1)
+
+
+@pytest.mark.parametrize(
+    ("interval", "stale", "expected"),
+    [("299", "599", "1800 7200"), ("300", "600", "300 600")],
+)
+def test_the_module_values_follow_the_bounds(interval, stale, expected):
+    """End values of a real import (child process) — the wiring, not only the rule."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
+    env.update({"HARNESS_UPDATE_INTERVAL_SEC": interval, "HARNESS_LOCK_STALE_SEC": stale})
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import config; print(config.HARNESS_UPDATE_INTERVAL_SEC, config.HARNESS_LOCK_STALE_SEC)"],
+        cwd=str(Path(config.__file__).parent), env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected
 
 
 def _request(port: int, path: str, headers: dict[str, str]) -> int:

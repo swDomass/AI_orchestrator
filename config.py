@@ -1112,17 +1112,37 @@ def _bounded_int_env(key: str, default: int, *, valid, rule: str) -> int:
     return default
 
 
-# 0 disables the periodic index thread (the dashboard still starts); otherwise at
-# least 300 s — a shorter interval would spawn index processes back to back.
-HARNESS_UPDATE_INTERVAL_SEC = _bounded_int_env(
-    "HARNESS_UPDATE_INTERVAL_SEC", 1800, valid=lambda v: v == 0 or v >= 300, rule="0 oder >= 300",
-)
-# A lock older than this (or whose PID is dead) is taken over. Also the hard time
-# limit after which the scheduler thread kills its own child process by handle —
-# hence at least 600 s (0 used to kill every child at once).
-HARNESS_LOCK_STALE_SEC = _bounded_int_env(
-    "HARNESS_LOCK_STALE_SEC", 7200, valid=lambda v: v >= 600, rule=">= 600",
-)
+# The bounds of the two values below, named: the tests check THESE rules
+# (through the reader functions), not a copy of them.
+HARNESS_UPDATE_INTERVAL_MIN_SEC = 300
+HARNESS_LOCK_STALE_MIN_SEC = 600
+
+
+def _harness_update_interval_sec() -> int:
+    """0 disables the periodic index thread (the dashboard still starts);
+    otherwise at least HARNESS_UPDATE_INTERVAL_MIN_SEC — a shorter interval
+    would spawn index processes back to back."""
+    return _bounded_int_env(
+        "HARNESS_UPDATE_INTERVAL_SEC", 1800,
+        valid=lambda v: v == 0 or v >= HARNESS_UPDATE_INTERVAL_MIN_SEC,
+        rule=f"0 oder >= {HARNESS_UPDATE_INTERVAL_MIN_SEC}",
+    )
+
+
+def _harness_lock_stale_sec() -> int:
+    """A lock older than this (or whose PID is dead) is taken over. Also the
+    hard time limit after which the scheduler thread kills its own child
+    process by handle — hence at least HARNESS_LOCK_STALE_MIN_SEC (0 used to
+    kill every child at once)."""
+    return _bounded_int_env(
+        "HARNESS_LOCK_STALE_SEC", 7200,
+        valid=lambda v: v >= HARNESS_LOCK_STALE_MIN_SEC,
+        rule=f">= {HARNESS_LOCK_STALE_MIN_SEC}",
+    )
+
+
+HARNESS_UPDATE_INTERVAL_SEC = _harness_update_interval_sec()
+HARNESS_LOCK_STALE_SEC = _harness_lock_stale_sec()
 SHUTDOWN_COMMAND = (
     ["shutdown", "/s", "/t", "0", "/f"]
     if sys.platform == "win32"

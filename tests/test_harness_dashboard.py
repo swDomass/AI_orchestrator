@@ -738,3 +738,33 @@ def test_coverage_comes_from_the_real_run_log(monkeypatch):
     assert calls["covered_to"] == (datetime.now().date() - timedelta(days=1)).isoformat()
     assert calls["delta_pct"] is None
     assert any(n.startswith("Index vollständig nur bis") for n in calls["notes"])
+
+
+# ── Korrekturrunde 2: K18 broken ledger/marker lines, shown apart ──────────
+
+
+def test_broken_ledger_and_marker_lines_come_from_the_file_state_not_the_runs():
+    conn = new_index()
+    add_run(conn, skipped=0)
+    add_run(conn, skipped=0)
+    conn.execute("INSERT INTO file_state(source, file_key, info) VALUES ('ledger', 'ledger', ?)",
+                 (json.dumps({"broken": 1, "broken_by_type": {"JSONDecodeError": 1}}),))
+    conn.close()
+    run = payload()["last_run"]
+    assert run["broken_lines"] == {"ledger": 1, "markers": 0}
+    assert run["skipped_total"] == 0
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_status_line_shows_broken_ledger_and_marker_lines_apart(tmp_path):
+    conn = new_index()
+    add_run(conn, skipped=0)
+    conn.execute("INSERT INTO file_state(source, file_key, info) VALUES ('markers', 'markers', ?)",
+                 (json.dumps({"broken": 2}),))
+    conn.close()
+    out = _run_tab(tmp_path, payload())
+    assert "übersprungen über alle 1 Läufe: 0; Ledger/Marker: 0/2 kaputte Zeilen" in out["status"]
+    conn = new_index()
+    conn.execute("DELETE FROM file_state")
+    conn.close()
+    assert "kaputte Zeilen" not in _run_tab(tmp_path, payload())["status"]

@@ -1083,6 +1083,13 @@ function renderHarness(h) {
     + ' Zeilen gelesen, ' + (run.lines_skipped || 0) + ' übersprungen, Status ' + run.status
     + (errs.length ? ', Fehler in: ' + errs.join(', ') : '') + ') — übersprungen über alle '
     + (run.runs_total || 0) + ' Läufe: ' + (run.skipped_total || 0);
+  // Ledger and marker file: broken lines as they are NOW (a stock, not summed
+  // over runs — both files are rebuilt whenever they change).
+  const broken = run.broken_lines || {};
+  if (broken.ledger || broken.markers) {
+    status.textContent += '; Ledger/Marker: ' + (broken.ledger || 0) + '/' + (broken.markers || 0)
+      + ' kaputte Zeilen';
+  }
 
   // (a) usage
   renderHarnessUsageChart(h);

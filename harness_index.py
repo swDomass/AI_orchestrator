@@ -416,6 +416,11 @@ class SourceStats:
     lines_skipped: int = 0
     errors: list[str] = field(default_factory=list)
     skipped_by_type: dict[str, int] = field(default_factory=dict)
+    # Ledger and markers only: broken lines of the file as it is NOW (a stock,
+    # replaced on every rebuild — K18), never added to lines_skipped, whose sum
+    # over all runs would otherwise count the same broken line on every rebuild.
+    broken_lines: int | None = None
+    broken_by_type: dict[str, int] = field(default_factory=dict)
 
     def error(self, message: str) -> None:
         if len(self.errors) < 20:
@@ -433,6 +438,7 @@ class SourceStats:
             "files_skipped_window": self.files_skipped_window,
             "bytes_read": self.bytes_read, "lines_read": self.lines_read,
             "lines_skipped": self.lines_skipped, "skipped_by_type": dict(self.skipped_by_type),
+            "broken_lines": self.broken_lines, "broken_by_type": dict(self.broken_by_type),
             "errors": list(self.errors),
         }
 
@@ -1368,6 +1374,15 @@ def _read_small_file(conn: sqlite3.Connection, source: str, path: Path,
     return raw, st
 
 
+def _broken_stock(stats: SourceStats, broken: dict[str, int]) -> dict:
+    """The broken lines of a rebuilt small file as a STOCK: into this run's
+    stats (``broken_lines``, not ``lines_skipped``) and, returned, into the
+    file's state ``info`` — where the next rebuild overwrites it."""
+    stats.broken_lines = sum(broken.values())
+    stats.broken_by_type = dict(broken)
+    return {"broken": stats.broken_lines, "broken_by_type": dict(broken)}
+
+
 def _index_ledger(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> None:
     """The extern-voice ledger: a few hundred lines, appended by a script. Each
     LINE is one call — two lines with the same second, voice and repo are two
@@ -1381,6 +1396,7 @@ def _index_ledger(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> N
     if changed is None:
         return
     raw, st = changed
+    broken: dict[str, int] = {}
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("DELETE FROM ledger")
@@ -1400,14 +1416,15 @@ def _index_ledger(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> N
                           _name(obj.get("status")), _name(obj.get("blocked_until")),
                           _int(obj.get("tokens")), _local_day_from_iso(ts))
             except Exception as e:
-                stats.skip(e)
+                broken[type(e).__name__] = broken.get(type(e).__name__, 0) + 1
                 continue
             conn.execute(
                 "INSERT INTO ledger(line_no, ts_local, voice, repo_hash, status, blocked_until, tokens, day) "
                 "VALUES (?,?,?,?,?,?,?,?)", values,
             )
         _save_state(conn, "ledger", "ledger",
-                    FileState(st.st_size, st.st_mtime, st.st_size, 0, hashlib.sha256(raw).hexdigest()))
+                    FileState(st.st_size, st.st_mtime, st.st_size, 0, hashlib.sha256(raw).hexdigest(),
+                              _broken_stock(stats, broken)))
         conn.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(sqlite3.Error):
@@ -1426,6 +1443,7 @@ def _index_markers(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> 
         return
     raw, st = changed
     head = hashlib.sha256(raw).hexdigest()
+    broken: dict[str, int] = {}
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("DELETE FROM marker")
@@ -1433,25 +1451,21 @@ def _index_markers(conn: sqlite3.Connection, path: Path, stats: SourceStats) -> 
             if not line.strip():
                 continue
             stats.lines_read += 1
-            try:
+            try:  # not ValueError only: deep nesting raises RecursionError
                 obj = json.loads(line)
-            except Exception as e:  # not ValueError only: deep nesting raises RecursionError
-                stats.skip(e)
-                continue
-            if not isinstance(obj, dict) or not isinstance(obj.get("date"), str) or not obj.get("id"):
-                stats.lines_skipped += 1
-                continue
-            try:
-                date = datetime.strptime(obj["date"][:10], "%Y-%m-%d").date().isoformat()
-            except ValueError:
-                stats.lines_skipped += 1
+                if not isinstance(obj, dict) or not isinstance(obj.get("date"), str) or not obj.get("id"):
+                    raise ValueError("date/id missing")
+                values = (datetime.strptime(obj["date"][:10], "%Y-%m-%d").date().isoformat(),
+                          _name(obj.get("id")), _name(obj.get("scope")),
+                          str(obj.get("change") or "")[:300], str(obj.get("expect") or "")[:300])
+            except Exception as e:
+                broken[type(e).__name__] = broken.get(type(e).__name__, 0) + 1
                 continue
             conn.execute(
-                "INSERT OR REPLACE INTO marker(date, id, scope, change, expect) VALUES (?,?,?,?,?)",
-                (date, _name(obj.get("id")), _name(obj.get("scope")),
-                 str(obj.get("change") or "")[:300], str(obj.get("expect") or "")[:300]),
+                "INSERT OR REPLACE INTO marker(date, id, scope, change, expect) VALUES (?,?,?,?,?)", values,
             )
-        _save_state(conn, "markers", "markers", FileState(st.st_size, st.st_mtime, st.st_size, 0, head))
+        _save_state(conn, "markers", "markers",
+                    FileState(st.st_size, st.st_mtime, st.st_size, 0, head, _broken_stock(stats, broken)))
         conn.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(sqlite3.Error):
@@ -1836,7 +1850,8 @@ def _read_payload(conn: sqlite3.Connection, *, days: int, window: int, now: date
         "last_run": {"finished": run[0], "age_sec": age, "duration_sec": run[1], "lines_read": run[2],
                      "lines_skipped": run[3], "status": run[4], "errors": errors,
                      "files_read": run[6], "bytes_read": run[7],
-                     "skipped_total": skipped_total, "runs_total": runs_total},
+                     "skipped_total": skipped_total, "runs_total": runs_total,
+                     "broken_lines": _read_broken_lines(conn)},
     }
     payload["usage"] = _read_usage(conn, first)
     payload["agent_calls"] = _read_agent_calls(conn, first)
@@ -1845,6 +1860,18 @@ def _read_payload(conn: sqlite3.Connection, *, days: int, window: int, now: date
     payload["extern"] = _read_extern(conn, first)
     payload["markers"] = _read_markers(conn, window=window, today=today)
     return payload
+
+
+def _read_broken_lines(conn: sqlite3.Connection) -> dict[str, int]:
+    """Broken lines of the ledger and the marker file as they are NOW — the
+    stock their last rebuild left in ``file_state.info`` (not a sum over runs)."""
+    out = {"ledger": 0, "markers": 0}
+    for source, info in conn.execute(
+        "SELECT source, info FROM file_state WHERE source IN ('ledger', 'markers')",
+    ):
+        with contextlib.suppress(ValueError):
+            out[source] = _int(_dict(json.loads(info or "{}")).get("broken")) or 0
+    return out
 
 
 def _read_usage(conn: sqlite3.Connection, first: str) -> dict:

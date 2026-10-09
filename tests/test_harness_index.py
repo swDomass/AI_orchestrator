@@ -748,7 +748,8 @@ def test_ledger_rows_keep_no_text_and_count_bad_lines():
          hi._local_day_from_iso("2026-09-22T10:19:31+02:00")),
         (3, "2026-09-22T10:11:28+02:00", "codex", "limit", None, hi._local_day_from_iso("2026-09-22T10:11:28+02:00")),
     ]
-    assert summary["per_source"]["ledger"]["lines_skipped"] == 2
+    # K18: a stock of the file as it is now, not lines_skipped (summed over runs)
+    assert (summary["per_source"]["ledger"]["broken_lines"], summary["per_source"]["ledger"]["lines_skipped"]) == (2, 0)
 
 
 def test_ledger_two_calls_in_the_same_second_are_two_rows():
@@ -813,7 +814,7 @@ def test_markers_are_replaced_when_the_file_changes_and_kept_when_it_is_deleted(
                     "expect": "externe Aufrufe sinken"}, "{broken"])
     summary = run()
     assert q("SELECT date, id FROM marker") == [("2026-09-26", "extern-diaet")]
-    assert summary["per_source"]["markers"]["lines_skipped"] == 1
+    assert summary["per_source"]["markers"]["broken_lines"] == 1  # K18: stock, not lines_skipped
     path.unlink()
     run()
     assert q("SELECT date, id FROM marker") == [("2026-09-26", "extern-diaet")]
@@ -1442,7 +1443,7 @@ def test_a_deeply_nested_meta_file_and_marker_line_are_skipped_by_type():
     first = run()
     assert first["errors"] == {}
     assert first["per_source"]["claude"]["skipped_by_type"] == {"RecursionError": 1}
-    assert first["per_source"]["markers"]["skipped_by_type"] == {"RecursionError": 1}
+    assert first["per_source"]["markers"]["broken_by_type"] == {"RecursionError": 1}
     assert [r[0] for r in q("SELECT id FROM marker ORDER BY id")] == ["a", "b"]
     assert run()["lines_read"] == 0  # the meta file is not retried on every run
 
@@ -1476,3 +1477,33 @@ def test_a_skipped_codex_line_does_not_mix_into_the_rollout_row():
     assert summary["per_source"]["codex"]["skipped_by_type"] == {"_OutOfRangeError": 1}
     assert q("SELECT input, output, total, tc_ts FROM codex_rollout") == [
         (600, 60, 660, "2026-10-08T17:26:00.000Z")]
+
+
+# ── Korrekturrunde 2: K18 broken ledger/marker lines are a stock ────────────
+
+
+def test_a_broken_ledger_line_is_a_stock_not_counted_on_every_rebuild():
+    """Since K1 the ledger is rebuilt on every change — several times a day; its
+    broken line used to be added to "übersprungen über alle Läufe" each time."""
+    path = write_jsonl(Path(config.HARNESS_EXTERN_LEDGER), [_ledger_line(), "{broken"])
+    run()
+    for i in range(3):  # three rebuilds
+        append_jsonl(path, [_ledger_line(tokens=i)])
+        assert run()["per_source"]["ledger"]["broken_lines"] == 1
+    assert q("SELECT count(*), sum(lines_skipped) FROM index_runs") == [(4, 0)]
+    page = hi.dashboard_payload(config.HARNESS_DB_FILE)["harness"]["last_run"]
+    assert page["broken_lines"] == {"ledger": 1, "markers": 0}
+    assert page["skipped_total"] == 0
+    write_jsonl(path, [_ledger_line()])  # line repaired: the stock follows the file
+    run()
+    assert hi.dashboard_payload(config.HARNESS_DB_FILE)["harness"]["last_run"]["broken_lines"]["ledger"] == 0
+
+
+def test_an_unchanged_file_keeps_its_stock():
+    write_markers([{"date": "2026-09-25", "id": "a"}, "{broken", {"id": "no-date"}])
+    first = run()
+    assert (first["per_source"]["markers"]["broken_lines"], first["per_source"]["markers"]["broken_by_type"]) == (
+        2, {"JSONDecodeError": 1, "ValueError": 1})
+    second = run()  # unchanged: not rebuilt, the stock stays where it is
+    assert second["per_source"]["markers"]["broken_lines"] is None
+    assert hi.dashboard_payload(config.HARNESS_DB_FILE)["harness"]["last_run"]["broken_lines"]["markers"] == 2

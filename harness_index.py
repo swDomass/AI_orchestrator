@@ -91,7 +91,7 @@ import time
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1662,14 +1662,16 @@ def marker_kpis(expect: object) -> list[tuple[str, str]]:
     ]
 
 
-def marker_window(series: dict[str, float], marker_day: str, n: int, today: str,
-                  covered_from: str | None = None) -> dict:
+def marker_window(series: dict[str, float], marker_day: str, n: int, today: str, *,
+                  covered_from: str | None = None, covered_to: str | None = None) -> dict:
     """Before/after comparison around a marker: n days each, the marker day in neither.
 
-    ``before`` = [D-n, D-1], ``after`` = [D+1, D+n]. A "before" day earlier than
-    ``covered_from`` (the source's first day with data, or the index window's
-    lower bound) is MISSING, not 0; an "after" day counts only once completed
-    (before ``today``). Averages run over the days counted. A percentage change
+    ``before`` = [D-n, D-1], ``after`` = [D+1, D+n]. A day outside the source's
+    coverage is MISSING, not 0: earlier than ``covered_from`` (the source's
+    first day with data, or the index window's lower bound), or later than
+    ``covered_to`` (the last day the index holds completely —
+    ``_source_covered_to``; None = no bound) or not completed yet (``today``
+    or later). Averages run over the days counted. A percentage change
     is given ONLY when both windows are fully covered — a half-covered window
     flipped the sign with the window length on real data (+176 % / −81 %);
     otherwise ``notes`` say "vorher/nachher unvollständig (n von N Tagen)". A
@@ -1678,6 +1680,8 @@ def marker_window(series: dict[str, float], marker_day: str, n: int, today: str,
     d = datetime.strptime(marker_day, "%Y-%m-%d").date()
     today_d = datetime.strptime(today, "%Y-%m-%d").date()
     last_full = today_d - timedelta(days=1)
+    if covered_to is not None:
+        last_full = min(last_full, datetime.strptime(covered_to, "%Y-%m-%d").date())
     before_all = [(d - timedelta(days=i)).isoformat() for i in range(n, 0, -1)]
     result: dict = {
         "n": n, "before_days": [], "after_days": [], "before_complete": False,
@@ -1687,9 +1691,10 @@ def marker_window(series: dict[str, float], marker_day: str, n: int, today: str,
     if d >= today_d:
         result["notes"] = ["noch keine Nachher-Tage"]
         return result
-    before = [x for x in before_all if covered_from is None or x >= covered_from]
+    last = last_full.isoformat()
+    before = [x for x in before_all if (covered_from is None or x >= covered_from) and x <= last]
     after_all = [(d + timedelta(days=i)).isoformat() for i in range(1, n + 1)]
-    after = [x for x in after_all if datetime.strptime(x, "%Y-%m-%d").date() <= last_full]
+    after = [x for x in after_all if x <= last]
     result["before_days"], result["after_days"] = before, after
     result["before_complete"], result["after_complete"] = len(before) == n, len(after) == n
     result["complete"] = result["before_complete"] and result["after_complete"]
@@ -1703,6 +1708,9 @@ def marker_window(series: dict[str, float], marker_day: str, n: int, today: str,
         result["notes"].append(f"vorher unvollständig ({len(before)} von {n} Tagen)")
     if not result["after_complete"]:
         result["notes"].append(f"nachher unvollständig ({len(after)} von {n} Tagen)")
+    if last_full < today_d - timedelta(days=1) and any(x > last for x in (*before_all, *after_all)):
+        result["notes"].append("Quelle in keinem Indexlauf vollständig" if last_full == date.min
+                               else f"Index vollständig nur bis {last}")
     if result["complete"] and result["before_avg"]:
         result["delta_pct"] = round((result["after_avg"] - result["before_avg"]) / result["before_avg"] * 100, 1)
     return result
@@ -2000,6 +2008,32 @@ def _source_first_day(conn: sqlite3.Connection, source: str, today: str) -> str:
     return str(max(first, floor))
 
 
+# Newest runs `_source_covered_to` looks at (≈ 10 days at one run per 30 min).
+COVERAGE_RUNS = 500
+
+
+def _source_covered_to(conn: sqlite3.Connection, source: str) -> str:
+    """Last day the index holds COMPLETELY for ``source``: the day before the
+    START of the newest run in which the source reported no error.
+
+    The start, not the end: a run across midnight read some files before it.
+    A day after this is MISSING in a marker window, not 0 — the index may not
+    have run since (``python dashboard.py`` without the orchestrator), or the
+    source failed in every run since. No such run among the newest
+    ``COVERAGE_RUNS`` → ``date.min`` (no day counts as covered).
+    """
+    for started, per_source in conn.execute(
+        "SELECT started, per_source FROM index_runs ORDER BY id DESC LIMIT ?", (COVERAGE_RUNS,),
+    ):
+        try:
+            if _dict(_dict(json.loads(per_source or "{}")).get(source)).get("errors"):
+                continue
+            return (datetime.fromisoformat(started).date() - timedelta(days=1)).isoformat()
+        except (TypeError, ValueError):
+            continue
+    return date.min.isoformat()
+
+
 def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[dict]:
     markers = conn.execute("SELECT date, id, scope, change, expect FROM marker ORDER BY date, id").fetchall()
     if not markers:
@@ -2007,8 +2041,9 @@ def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[
     since = (datetime.strptime(markers[0][0], "%Y-%m-%d").date() - timedelta(days=max(MARKER_WINDOWS))).isoformat()
     series_cache: dict[str, dict[str, float]] = {}
     first_day: dict[str, str] = {}
+    last_day: dict[str, str] = {}
     out = []
-    for date, mid, scope, change, expect in markers:
+    for day, mid, scope, change, expect in markers:
         rows = []
         for key, label in marker_kpis(expect):
             if key not in series_cache:
@@ -2016,10 +2051,12 @@ def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[
             source = _KPI_SOURCE[key]
             if source not in first_day:
                 first_day[source] = _source_first_day(conn, source, today)
+                last_day[source] = _source_covered_to(conn, source)
             rows.append({"kpi": key, "label": label, "covered_from": first_day[source],
-                         **marker_window(series_cache[key], date, window, today,
-                                         covered_from=first_day[source])})
-        out.append({"date": date, "id": mid, "scope": scope, "change": change, "expect": expect,
+                         "covered_to": last_day[source],
+                         **marker_window(series_cache[key], day, window, today,
+                                         covered_from=first_day[source], covered_to=last_day[source])})
+        out.append({"date": day, "id": mid, "scope": scope, "change": change, "expect": expect,
                     "kpis": rows})
     return out
 

@@ -17,7 +17,7 @@ import subprocess
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -37,11 +37,12 @@ def new_index() -> sqlite3.Connection:
     return hi.open_index(db_path())
 
 
-def add_run(conn, *, finished="2026-10-09T11:30:00", skipped=3, status="ok"):
+def add_run(conn, *, finished="2026-10-09T11:30:00", skipped=3, status="ok",
+            started="2026-10-09T11:29:00", per_source="{}"):
     conn.execute(
         "INSERT INTO index_runs(started, finished, duration_sec, files_read, bytes_read, lines_read, "
         "lines_skipped, errors, per_source, peak_rss_mb, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("2026-10-09T11:29:00", finished, 60.0, 10, 1000, 500, skipped, "{}", "{}", 30.0, status))
+        (started, finished, 60.0, 10, 1000, 500, skipped, "{}", per_source, 30.0, status))
 
 
 def add_msg(conn, msg_id, *, day="2026-10-08", kind="main", origin="interaktiv", family="opus",
@@ -661,3 +662,79 @@ def test_tab_redraws_its_quota_tiles_once_api_data_arrives_and_escapes_session(t
     assert "Claude 5 h" not in out["before"]
     assert "Claude 5 h" in out["after"]
     assert "<img" not in out["session"] and "&lt;img" in out["session"]
+
+
+# ── Korrekturrunde 2: K15 coverage of the after window ─────────────────────
+
+
+def test_days_after_the_last_complete_run_are_missing_not_zero():
+    """Review probe: a last run older than yesterday left the after window's
+    unindexed days at 0 and complete — a delta like −100 %."""
+    series = _series("2026-09-01", "2026-10-05")  # nothing indexed after the run of 10-06
+    w = hi.marker_window(series, "2026-09-29", 7, today="2026-10-09", covered_from="2026-09-01",
+                         covered_to="2026-10-05")
+    assert w["after_days"] == [f"2026-{d}" for d in ("09-30", "10-01", "10-02", "10-03", "10-04", "10-05")]
+    assert w["delta_pct"] is None and w["complete"] is False
+    assert "nachher unvollständig (6 von 7 Tagen)" in w["notes"]
+    assert "Index vollständig nur bis 2026-10-05" in w["notes"]
+    assert w["after_avg"] == 4.0  # over the covered days only
+
+
+def test_the_before_window_is_bounded_by_the_coverage_too():
+    w = hi.marker_window(_series("2026-09-01", "2026-09-10"), "2026-09-15", 7, today="2026-10-09",
+                         covered_from="2026-09-01", covered_to="2026-09-10")
+    assert w["before_days"] == ["2026-09-08", "2026-09-09", "2026-09-10"] and w["after_days"] == []
+    assert w["delta_pct"] is None
+
+
+def test_coverage_up_to_yesterday_changes_nothing():
+    series = _series("2026-09-01", "2026-10-08")
+    bounded = hi.marker_window(series, "2026-09-29", 7, today="2026-10-09", covered_to="2026-10-08")
+    assert bounded == hi.marker_window(series, "2026-09-29", 7, today="2026-10-09")
+    assert bounded["complete"] is True
+
+
+def _ledger_marker_index(*runs):
+    for suffix in ("", "-wal", "-shm"):  # a fresh index per call
+        Path(str(db_path()) + suffix).unlink(missing_ok=True)
+    conn = new_index()
+    for started, per_source in runs:
+        add_run(conn, started=started, finished=started, per_source=per_source)
+    add_marker(conn, "2026-09-29", "extern-diaet", _LIVE_EXPECT["extern-diaet"])
+    for day in hi._days_between("2026-09-15", "2026-10-05"):
+        add_ledger(conn, day, 4)
+    conn.close()
+    return {m["id"]: m for m in payload(window=7)["markers"]}["extern-diaet"]["kpis"][0]
+
+
+def test_last_run_three_days_ago_marker_ten_days_ago_gives_no_delta():
+    """The review's case: last run 3 days ago, marker 10 days ago, window 7."""
+    calls = _ledger_marker_index(("2026-10-06T09:00:00", "{}"))
+    assert calls["covered_to"] == "2026-10-05"
+    assert calls["delta_pct"] is None
+    assert "nachher unvollständig (6 von 7 Tagen)" in calls["notes"]
+
+
+def test_a_source_that_failed_since_is_covered_only_up_to_its_last_complete_run():
+    failed = json.dumps({"ledger": {"errors": ["ledger: PermissionError errno=13"]}, "claude": {"errors": []}})
+    calls = _ledger_marker_index(("2026-10-04T09:00:00", "{}"), ("2026-10-09T09:00:00", failed))
+    assert calls["covered_to"] == "2026-10-03"
+    assert calls["delta_pct"] is None
+    never = _ledger_marker_index(("2026-10-09T09:00:00", failed))
+    assert never["covered_to"] == "0001-01-01"
+    assert never["after_days"] == [] and never["before_days"] == []
+    assert "Quelle in keinem Indexlauf vollständig" in never["notes"]
+
+
+def test_coverage_comes_from_the_real_run_log(monkeypatch):
+    """End to end: a real run_update, read three days later."""
+    conn = new_index()
+    add_marker(conn, (datetime.now().date() - timedelta(days=7)).isoformat(), "extern-diaet",
+               _LIVE_EXPECT["extern-diaet"])
+    conn.close()
+    hi.run_update(hi.Sources.from_config(), out=lambda _m: None)
+    later = datetime.now() + timedelta(days=3)
+    calls = hi.dashboard_payload(db_path(), now=later)["harness"]["markers"][0]["kpis"][0]
+    assert calls["covered_to"] == (datetime.now().date() - timedelta(days=1)).isoformat()
+    assert calls["delta_pct"] is None
+    assert any(n.startswith("Index vollständig nur bis") for n in calls["notes"])

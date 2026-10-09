@@ -427,6 +427,39 @@ def test_extra_allowed_host_from_config(served, monkeypatch):
     assert _request_with_host(served, "/", "other.example") == 403
 
 
+# ── K6: a second dashboard never shares the port ────────────────────────────
+
+
+def test_second_dashboard_on_the_same_port_falls_back_instead_of_sharing():
+    """Two real _ReuseServer instances (both with the server's own socket options),
+    not a plain blocker socket: on Windows SO_REUSEADDR let the second one bind
+    the busy port. The fallback warning comes from _bind_server unchanged."""
+    port = _free_port()
+    first, first_port = dashboard._bind_server(port)
+    try:
+        second, second_port = dashboard._bind_server(port)
+        try:
+            assert first_port == port
+            assert second_port != port
+            assert second.server_address[0] == "127.0.0.1"
+        finally:
+            second.server_close()
+    finally:
+        first.server_close()
+
+
+def test_reuse_server_socket_options_per_platform():
+    server = dashboard._ReuseServer(("127.0.0.1", 0), dashboard._Handler)
+    try:
+        if sys.platform == "win32":
+            assert dashboard._ReuseServer.allow_reuse_address is False
+            assert server.socket.getsockopt(socket.SOL_SOCKET, dashboard._SO_EXCLUSIVEADDRUSE) != 0
+        else:
+            assert dashboard._ReuseServer.allow_reuse_address is True
+    finally:
+        server.server_close()
+
+
 # ── K8: the dashboard starts with the orchestrator, not after the delay ─────
 
 
@@ -455,3 +488,101 @@ def test_no_autostart_when_the_startup_checks_end_the_process(monkeypatch, captu
     with pytest.raises(SystemExit):
         orchestrator.run_watch()
     started.assert_not_called()
+
+
+# ── K10: one warning line, bounds, host list, cross-site, handler timeout ──
+
+
+def test_server_and_index_thread_failing_together_is_one_warning(monkeypatch):
+    class _NoThread:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(dashboard.threading, "Thread", _NoThread)
+    monkeypatch.setattr(config, "HARNESS_UPDATE_INTERVAL_SEC", 1800)
+    rep = _Reports()
+    handle = dashboard.start_autostart(port=_free_port(), warn=rep.warn, info=rep.info)
+    assert len(rep.warnings) == 1, rep.warnings
+    assert "Dashboard-Autostart fehlgeschlagen" in rep.warnings[0]
+    assert "Harness-Index-Thread ebenfalls nicht gestartet" in rep.warnings[0]
+    assert handle.index_thread is None
+
+
+@pytest.mark.parametrize(
+    ("key", "raw", "expected"),
+    [
+        ("HARNESS_LOCK_STALE_SEC", "0", 7200), ("HARNESS_LOCK_STALE_SEC", "599", 7200),
+        ("HARNESS_LOCK_STALE_SEC", "600", 600),
+        ("HARNESS_UPDATE_INTERVAL_SEC", "0", 0), ("HARNESS_UPDATE_INTERVAL_SEC", "-1", 1800),
+        ("HARNESS_UPDATE_INTERVAL_SEC", "299", 1800), ("HARNESS_UPDATE_INTERVAL_SEC", "300", 300),
+    ],
+)
+def test_harness_interval_bounds(monkeypatch, caplog, key, raw, expected):
+    monkeypatch.setenv(key, raw)
+    rules = {"HARNESS_LOCK_STALE_SEC": (7200, lambda v: v >= 600),
+             "HARNESS_UPDATE_INTERVAL_SEC": (1800, lambda v: v == 0 or v >= 300)}
+    default, valid = rules[key]
+    with caplog.at_level("WARNING", logger="config"):
+        value = config._bounded_int_env(key, default, valid=valid, rule="r")
+    assert value == expected
+    warned = [r for r in caplog.records if key in r.getMessage()]
+    assert len(warned) == (0 if str(expected) == raw else 1)
+
+
+def _request(port: int, path: str, headers: dict[str, str]) -> int:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.putrequest("GET", path, skip_host="Host" in headers)
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
+def test_allowed_hosts_are_normalized_like_the_header(served, monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_ALLOWED_HOSTS", ("PC.Tailnet.Example:443", "[fe80::1]"))
+    assert _request(served, "/", {"Host": "pc.tailnet.example"}) == 200
+    assert _request(served, "/", {"Host": "[FE80::1]:8211"}) == 200
+    assert _request(served, "/", {"Host": "other.example"}) == 403
+
+
+@pytest.mark.parametrize(
+    ("path", "headers", "status"),
+    [
+        ("/api/data", {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"}, 403),
+        ("/api/harness?days=90", {"Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors"}, 403),
+        ("/api/data", {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}, 403),
+        ("/", {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"}, 403),
+        ("/", {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}, 200),
+        ("/api/data", {"Origin": "https://evil.example"}, 403),
+        ("/api/data", {"Origin": "null"}, 403),
+        ("/api/data", {"Origin": "http://127.0.0.1:8211", "Sec-Fetch-Site": "same-origin"}, 200),
+        ("/api/data", {"Sec-Fetch-Site": "none"}, 200),
+        ("/api/data", {}, 200),
+    ],
+    ids=["xsite-nocors", "samesite-cors", "xsite-navigate-api", "xsite-nocors-page", "xsite-navigate-page",
+         "foreign-origin", "null-origin", "same-origin", "typed-url", "curl"],
+)
+def test_blind_cross_site_requests_are_refused(served, path, headers, status):
+    assert _request(served, path, headers) == status
+
+
+def test_a_silent_connection_does_not_hold_the_server(monkeypatch, served):
+    monkeypatch.setattr(dashboard._Handler, "timeout", 0.3)
+    assert dashboard._Handler.timeout == 0.3
+    idle = socket.create_connection(("127.0.0.1", served))  # connects, never sends a request
+    try:
+        started = time.monotonic()
+        assert _request(served, "/", {}) == 200
+        assert time.monotonic() - started < 3.0
+    finally:
+        idle.close()
+
+
+def test_handler_timeout_default():
+    assert dashboard._Handler.timeout == 10

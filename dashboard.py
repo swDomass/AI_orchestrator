@@ -32,7 +32,9 @@ import hashlib
 import importlib
 import json
 import logging
+import socket
 import socketserver
+import sys
 import threading
 import urllib.parse
 import webbrowser
@@ -1245,28 +1247,64 @@ _CLIENT_DISCONNECT_ERRORS = (ConnectionAbortedError, ConnectionResetError, Broke
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def _normalize_host(value: str) -> str:
+    """``Host``-style value → bare lower-case name: port and IPv6 brackets off."""
+    host = value.strip().lower()
+    if host.startswith("["):          # [::1]:8211
+        return host[1:host.find("]")] if "]" in host else host[1:]
+    if host.count(":") == 1:          # name:port
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def _allowed_hosts() -> frozenset[str]:
+    extra = {_normalize_host(h) for h in getattr(config, "DASHBOARD_ALLOWED_HOSTS", ()) if str(h).strip()}
+    return _LOOPBACK_HOSTS | extra
+
+
 def _host_allowed(host_header: str | None) -> bool:
     """Anti DNS-rebinding: a browser always sends the name it resolved, so a page
     on evil.example that rebinds to 127.0.0.1 arrives with Host: evil.example.
-    No Host header at all (a non-browser client) is let through."""
+    No Host header at all (a non-browser client) is let through. Configured extra
+    names are normalized exactly like the header (port, brackets, case)."""
     if not host_header:
         return True
-    host = host_header.strip().lower()
-    if host.startswith("["):          # [::1]:8211
-        host = host[1:host.find("]")] if "]" in host else host[1:]
-    elif host.count(":") == 1:        # name:port
-        host = host.rsplit(":", 1)[0]
-    return host in _LOOPBACK_HOSTS or host in getattr(config, "DASHBOARD_ALLOWED_HOSTS", ())
+    return _normalize_host(host_header) in _allowed_hosts()
+
+
+def _cross_site_refused(headers, path: str) -> bool:
+    """Blind cross-site requests: any web page could fire ``no-cors`` fetches
+    (with varying ``days``) and keep the log parser in the orchestrator process
+    busy, without ever reading the answer. Refused: ``Sec-Fetch-Site:
+    cross-site|same-site``, or an ``Origin`` that is not an allowed host. One
+    exception, deliberately: a top-level NAVIGATION to the page itself (a link
+    to the dashboard clicked on another site) only gets the static HTML. Without
+    these headers (curl, old clients) nothing changes."""
+    site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site in ("cross-site", "same-site"):
+        mode = (headers.get("Sec-Fetch-Mode") or "").strip().lower()
+        return not (mode == "navigate" and path in ("/", "/index.html"))
+    origin = headers.get("Origin")
+    if origin is None:
+        return False
+    hostname = urllib.parse.urlsplit(origin.strip()).hostname
+    return hostname is None or hostname.lower() not in _allowed_hosts()
 
 
 class _Handler(BaseHTTPRequestHandler):
     """Handles GET / (HTML), GET /api/data and GET /api/harness (JSON)."""
+
+    # A silent open connection must not hold the single-threaded server forever.
+    timeout = 10
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         try:
             if not _host_allowed(self.headers.get("Host")):
                 self.send_error(403, "Host not allowed")
+                return
+            if _cross_site_refused(self.headers, parsed.path):
+                self.send_error(403, "Cross-site request refused")
                 return
             if parsed.path == "/api/data":
                 self._json_response(parsed.query)
@@ -1355,8 +1393,27 @@ class _Handler(BaseHTTPRequestHandler):
         logger.debug("dashboard: %s", format % args)
 
 
+# Windows: SO_EXCLUSIVEADDRUSE (winsock2.h, value ~SO_REUSEADDR == -5). Older
+# Python builds do not export the name, hence the literal fallback.
+_SO_EXCLUSIVEADDRUSE = getattr(socket, "SO_EXCLUSIVEADDRUSE", -5)
+
+
 class _ReuseServer(socketserver.TCPServer):
-    allow_reuse_address = True
+    """TCP server that never shares its port with a second server.
+
+    POSIX: SO_REUSEADDR only lets a restarted server rebind past TIME_WAIT; a
+    port another socket is LISTENING on still fails, so the second dashboard
+    falls back as documented. Windows: SO_REUSEADDR lets a second socket bind a
+    port that is in use (measured twice: two dashboards on 8211, no fallback,
+    no warning) — so there it is off and SO_EXCLUSIVEADDRUSE is set instead.
+    """
+
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, _SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def _bind_server(port: int) -> tuple["_ReuseServer", int]:
@@ -1520,11 +1577,14 @@ def _harness_index_loop(handle: AutostartHandle, interval: float, warn, info) ->
         last_error = error
 
 
-def _start_harness_index_thread(handle: AutostartHandle, warn, info) -> None:
-    """Start the index scheduler (independent of the dashboard's bind result)."""
+def _start_harness_index_thread(handle: AutostartHandle, warn, info) -> str | None:
+    """Start the index scheduler (independent of the dashboard's bind result).
+
+    Returns the error text if the thread could not be started — the caller
+    reports it, together with a server failure in ONE line."""
     interval = float(config.HARNESS_UPDATE_INTERVAL_SEC)
     if interval <= 0:
-        return
+        return None
     try:
         thread = threading.Thread(
             target=_harness_index_loop, args=(handle, interval, warn, info),
@@ -1534,7 +1594,8 @@ def _start_harness_index_thread(handle: AutostartHandle, warn, info) -> None:
         thread.start()
     except Exception as e:  # never raises, by contract
         handle.index_thread = None
-        _safe_report(warn, f"Harness-Index-Thread nicht gestartet ({type(e).__name__}: {e})")
+        return f"{type(e).__name__}: {e}"
+    return None
 
 
 def start_autostart(
@@ -1559,6 +1620,9 @@ def start_autostart(
     handle = AutostartHandle()
     warn = warn or logger.warning
     info = info or logger.info
+    # Local, not handle.error: the server thread sets handle.error itself on a
+    # bind failure — concurrently — and reports that one on its own.
+    start_error: str | None = None
     try:
         if open_browser is None:
             open_browser = bool(config.DASHBOARD_OPEN_BROWSER)
@@ -1572,16 +1636,21 @@ def start_autostart(
         handle.server_thread = thread
         thread.start()
     except Exception as e:  # never raises, by contract
-        handle.error = f"{type(e).__name__}: {e}"
+        start_error = handle.error = f"{type(e).__name__}: {e}"
         handle.server_thread = None
         handle.bound.set()
-        _safe_report(
-            warn,
-            f"Dashboard-Autostart fehlgeschlagen ({handle.error}) — Orchestrator läuft ohne Dashboard weiter",
-        )
     # The index is useful even when this dashboard did not come up (a manual
-    # `python dashboard.py` reads the same SQLite), so it does not depend on the bind.
-    _start_harness_index_thread(handle, warn, info)
+    # `python dashboard.py` reads the same SQLite), so it is tried regardless —
+    # and a failure of both is ONE warning line, not two.
+    index_error = _start_harness_index_thread(handle, warn, info)
+    if start_error and index_error:
+        _safe_report(warn, f"Dashboard-Autostart fehlgeschlagen ({start_error}); Harness-Index-Thread "
+                           f"ebenfalls nicht gestartet ({index_error}) — Orchestrator läuft ohne beide weiter")
+    elif start_error:
+        _safe_report(warn, f"Dashboard-Autostart fehlgeschlagen ({start_error}) — "
+                           "Orchestrator läuft ohne Dashboard weiter")
+    elif index_error:
+        _safe_report(warn, f"Harness-Index-Thread nicht gestartet ({index_error}) — Orchestrator läuft weiter")
     return handle
 
 

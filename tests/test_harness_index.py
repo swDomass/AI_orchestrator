@@ -371,18 +371,15 @@ def test_quiet_complete_tail_without_newline_is_evaluated_once_and_the_offset_mo
     assert claude_tokens()[4] == 2
 
 
-def _age(path: Path, seconds: float = 3600) -> None:
-    old = time.time() - seconds
-    os.utime(path, (old, old))  # only the mtime: size and content stay
-
-
-def test_a_fresh_last_line_without_newline_is_counted_once_after_the_file_got_quiet():
-    """K19: size and mtime of run 1 are what run 2 sees — only the clock moved on."""
+def test_a_fresh_last_line_without_newline_is_counted_once_after_the_file_got_quiet(monkeypatch):
+    """K19: size and mtime of run 1 are what run 2 sees — only the clock moved on (the quiet
+    time is shortened between the runs; touching the file would hide the bug)."""
     path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m_tail")], newline_at_end=False)
+    stat_1 = path.stat()
     first = run()  # the file was written just now: the writer may still be mid-line
     assert q("SELECT msg_id FROM claude_msg") == []
     assert first["per_source"]["claude"]["lines_skipped"] == 0
-    _age(path)
+    monkeypatch.setattr(hi, "TAIL_QUIET_SEC", 0)
     second = run()
     assert q("SELECT msg_id FROM claude_msg") == [("m_tail",)]
     assert second["per_source"]["claude"]["lines_read"] == 1
@@ -390,14 +387,15 @@ def test_a_fresh_last_line_without_newline_is_counted_once_after_the_file_got_qu
     assert third["per_source"]["claude"]["lines_read"] == 0
     assert third["per_source"]["claude"]["files_read"] == 0
     assert claude_tokens()[4] == 1
+    assert (path.stat().st_size, path.stat().st_mtime_ns) == (stat_1.st_size, stat_1.st_mtime_ns)
 
 
 def test_a_broken_rest_of_a_quiet_file_is_skipped_once_and_the_file_is_then_left_alone(monkeypatch):
     path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
     with path.open("a", encoding="utf-8", newline="") as f:
         f.write('{"type":"assistant","message":{"id":"m_half')  # never completed
-    run()
-    _age(path)
+    run()  # young: the rest may still grow
+    monkeypatch.setattr(hi, "TAIL_QUIET_SEC", 0)
     second = run()
     assert second["per_source"]["claude"]["lines_skipped"] == 1
     assert q("SELECT offset, size FROM file_state WHERE source='claude'") == [(path.stat().st_size,) * 2]
@@ -597,33 +595,58 @@ def test_codex_append_broken_half_and_extra_fields():
     assert q("SELECT input, output FROM codex_rollout") == [(900, 90)]
 
 
-def test_two_interleaved_codex_runs_end_on_the_newer_counter(monkeypatch):
-    """K21: run B commits (counter 990) between run A's start and A's transaction. A built on
-    the counter it had read before (660) and wrote it back: 660 -> 990 -> 660."""
+class _BeginHook:
+    """A connection whose first BEGIN IMMEDIATE is preceded by ``before_begin()``."""
+
+    def __init__(self, conn, before_begin):
+        self._conn, self._before_begin, self.fired = conn, before_begin, False
+
+    def execute(self, sql, *args):
+        if sql == "BEGIN IMMEDIATE" and not self.fired:
+            self.fired = True
+            self._before_begin()
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+@pytest.mark.parametrize("window", ["before_state_read", "before_begin"])
+def test_two_interleaved_codex_runs_end_on_the_newer_counter(monkeypatch, window):
+    """K21: run B commits (counter 990) while run A is on its way into its transaction. A built
+    on the counter it had read before (660) and wrote it back: 660 -> 990 -> 660. The two
+    windows are the ones between the old reads: row before file state, and reads before BEGIN."""
     path = write_codex_rollout()
     run()
     assert q("SELECT total FROM codex_rollout") == [(660,)]
     append_jsonl(path, [_tc("2026-10-08T17:30:00.000Z", 900, 90)])
     root = Path(config.HARNESS_CODEX_SESSIONS_DIR)
     fired = []
-    real_load = hi._load_state
 
-    def load_with_a_second_run_in_between(conn, source, file_key):
-        if source == "codex" and not fired:
-            fired.append(1)
-            conn_b = sqlite3.connect(str(config.HARNESS_DB_FILE), timeout=30, isolation_level=None)
-            try:
-                hi._codex_file(conn_b, root, path, hi.SourceStats())
-            finally:
-                conn_b.close()
-            # a later line that carries no counter (info: null) — all that is left for A to read
-            append_jsonl(path, [_tc("2026-10-08T17:31:00.000Z", 0, 0, info=False, rl=_rl(11.0, 15.0))])
-        return real_load(conn, source, file_key)
+    def second_run_in_between():
+        fired.append(1)
+        conn_b = sqlite3.connect(str(config.HARNESS_DB_FILE), timeout=30, isolation_level=None)
+        try:
+            hi._codex_file(conn_b, root, path, hi.SourceStats())
+        finally:
+            conn_b.close()
+        # a later line that carries no counter (info: null) — all that is left for A to read
+        append_jsonl(path, [_tc("2026-10-08T17:31:00.000Z", 0, 0, info=False, rl=_rl(11.0, 15.0))])
 
-    monkeypatch.setattr(hi, "_load_state", load_with_a_second_run_in_between)
     conn_a = sqlite3.connect(str(config.HARNESS_DB_FILE), timeout=30, isolation_level=None)
     try:
-        hi._codex_file(conn_a, root, path, hi.SourceStats())
+        if window == "before_state_read":
+            real_load = hi._load_state
+
+            def load(conn, source, file_key):
+                if source == "codex" and not fired:
+                    second_run_in_between()
+                return real_load(conn, source, file_key)
+
+            monkeypatch.setattr(hi, "_load_state", load)
+            hi._codex_file(conn_a, root, path, hi.SourceStats())
+        else:
+            hi._codex_file(_BeginHook(conn_a, second_run_in_between), root, path, hi.SourceStats())
     finally:
         conn_a.close()
     assert fired

@@ -40,11 +40,12 @@ Invariants (each one is pinned by a test in ``tests/test_harness_index.py``):
 * **Idempotent.** Every row has a natural key, and re-reading anything never
   double counts:
   - Claude: ``message.id`` alone, across ALL files. One API answer is split into
-    up to four transcript lines, and the same id also appears in a second file
-    (a resumed or forked session, a subagent copy). The lines of one id do NOT
-    all carry the same usage (measured: in 57 % of the multi-line ids at least
-    one counter differs), so every counter keeps its ``max()``; a main-session
-    file wins the attribution over a subagent file.
+    up to four transcript lines, and the same id also appears in several files
+    (measured by the Auftraggeber: 101 ids, all of them in subagent transcripts
+    of the same parent session; main+subagent and main+main: none). The lines of
+    one id do NOT all carry the same usage (measured: in 57 % of the ids at least
+    one counter differs, streaming), so every counter keeps its ``max()``; should
+    a main-session file ever carry the id, it wins the attribution.
   - ``(sessionId, agentId)`` for subagent runs; one row per Codex rollout
     carrying the LAST cumulative ``token_count``; ``message.id`` for opencode
     (a message without ``time.completed`` is re-read on later runs).
@@ -855,9 +856,10 @@ def _claude_assistant(
                 _int(usage.get("cache_read_input_tokens")), _int(usage.get("cache_creation_input_tokens")))
     # One row per message.id across ALL files: the API issues it once, but it
     # recurs in up to four lines of one transcript (one answer split per content
-    # block) and in several files (subagent transcripts of the same parent session,
-    # forks). Counters: max() per field — the lines of one id do NOT carry
-    # identical usage (measured on real data: 57 % of ids differ, streaming), the
+    # block) and in several files (measured by the Auftraggeber: subagent
+    # transcripts of the same parent session, never a main file). Counters: max()
+    # per field — the lines of one id do NOT carry identical usage (measured on
+    # real data: 57 % of ids differ, streaming), the
     # last/largest value is the answer's. Never a sum. The attribution (file,
     # kind, origin, …) is upgraded once, from a subagent row to a main-file row;
     # otherwise the first file read keeps it (files are read in sorted order).
@@ -906,7 +908,7 @@ def _claude_main_file(conn: sqlite3.Connection, root: Path, path: Path, stats: S
             cost = _float(obj.get("totalCostUSD"))
             start_ms = _int(obj.get("startTime"))
             # cumulative per session: the LARGEST value counts, not the last one
-            # read (a resumed/forked file can carry an older, smaller state)
+            # read (files are read in sorted order, which says nothing about time)
             conn.execute(
                 "INSERT INTO claude_cost(session_id, file_key, cost_usd, start_ms, day, origin) "
                 "VALUES (?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "

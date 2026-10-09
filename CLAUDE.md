@@ -15,6 +15,13 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Korrekturrunde 1 zu PR #7 (2026-10-09, Linux, Cloud, CPython 3.12.3 und 3.13.16): 3241 passed /
+# 0 failed / 8 skipped in 99-104 s — +57 gesammelt über die 3185 darunter, per --collect-only:
+# test_harness_index 51 -> 71, test_dashboard_autostart 34 -> 59, test_harness_dashboard 23 -> 35.
+# Der 8. Skip: test_windows_peak_memory_and_pid_check_work (nur win32). Ohne `node` im PATH
+# skippen jetzt 7 Tests (4 in test_harness_dashboard, 3 in test_dashboard_page_js).
+# ruff 1122 und mypy 122/38 unverändert; `mypy --platform win32` 127/39 -> 124/38 (die drei
+# unused-ignore in harness_index.py sind weg). Die Windows-Suite misst der Auftraggeber.
 # Linux, Cloud (2026-10-09, CPython 3.12.3 und 3.13.16, PR #7: Dashboard-Autostart, Quoten inkl.
 # opencode, Harness-Index + Reiter "Harness"): 3185 passed / 0 failed / 7 skipped in 93-100 s —
 # +131 über die 3054 darunter, per --collect-only (alle Dateien neu): test_harness_index 51,
@@ -262,8 +269,8 @@ Stichworte — Long-form in [`docs/architecture/patterns.md`](docs/architecture/
 - **Subtask-aware queue mutations** — `mark_done/mark_retry/finalize` accept `subtasks` kwarg
 - **Task dependencies** — `#id:`/`#needs:`, two-pass resolution, blocked-task header
 - **Schedule tags** — `#at:`/`#every:` reuse retry primitive; queue file is single source of truth
-- **Harness-Index (2026-10-09)** — `harness_index.py`: SQLite über lokale Transkripte/Rollouts/`opencode.db`/Ledger/Marker, eigener Unterprozess alle 30 min (Scheduler-Thread aus dem Autostart), Lock-Datei, natürliche Schlüssel (`(Datei, message.id)` — bis zu vier Zeilen je API-Antwort!), kein Text. Reiter „Harness“ liest nur `/api/harness` (`harness_index.dashboard_payload`, read-only, < 1 s auch bei fehlender/gesperrter/kaputter SQLite). Details `.claude/rules/quota-and-analytics.md`
-- **Dashboard-Autostart (2026-10-09)** — `run_watch` → `_start_dashboard_autostart()` → `dashboard.start_autostart()`: Daemon-Thread auf 127.0.0.1, Bind **im** Thread (kein Warten), wirft nie, jeder Fehler = genau eine Warnzeile (`logger.warning` + `append_log`). `DASHBOARD_AUTOSTART` (an) / `DASHBOARD_OPEN_BROWSER` (aus, nur Autostart). Eine Exception von dort würde `main()`s Absturznetz dem ersten Queue-Task anrechnen — deshalb der Import von `dashboard` im `try`. Server einfädig: Endpunkte müssen schnell sein
+- **Harness-Index (2026-10-09)** — `harness_index.py`: SQLite über lokale Transkripte/Rollouts/`opencode.db`/Ledger/Marker, eigener Unterprozess alle 30 min (Scheduler-Thread aus dem Autostart), Lock-Datei, natürliche Schlüssel (`message.id` über **alle** Dateien, `max()` je Zähler — bis zu vier Zeilen je API-Antwort mit **nicht** identischer `usage`, dazu Kopien in Subagent-Transkripten derselben Elternsitzung; Ledger je Zeile, Neuaufbau bei Hash-Änderung), kein Text, keine Ordnernamen (cwd nur Hash, Fehler nur Typname), Schema 2 ohne Migration. Reiter „Harness“ liest nur `/api/harness` (`harness_index.dashboard_payload`, read-only, < 1 s auch bei fehlender/gesperrter/kaputter SQLite). Details `.claude/rules/quota-and-analytics.md`
+- **Dashboard-Autostart (2026-10-09)** — `run_watch` → `_start_dashboard_autostart()` → `dashboard.start_autostart()`: direkt nach den Startprüfungen, **vor** `STARTUP_DELAY_SEC`; Daemon-Thread auf 127.0.0.1, Bind **im** Thread (kein Warten), unter Windows exklusiv (`SO_EXCLUSIVEADDRUSE`), wirft nie, jeder Fehler = genau eine Warnzeile (`logger.warning` + `append_log`). `DASHBOARD_AUTOSTART` (an) / `DASHBOARD_OPEN_BROWSER` (aus, nur Autostart). Eine Exception von dort würde `main()`s Absturznetz dem ersten Queue-Task anrechnen — deshalb der Import von `dashboard` im `try`. Server einfädig: Endpunkte müssen schnell sein; fremder `Host`, `Sec-Fetch-Site: cross-site|same-site` oder fremdes `Origin` → 403
 
 > Fallen- und Messwissen zu Queue/Tasks, Providern, Tools, Git-Auto-Commit, Orchestrator-Runtime, Quota/Analytics und Policy ausgelagert — siehe Index am Dateiende.
 

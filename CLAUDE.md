@@ -15,6 +15,12 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Linux, Cloud (2026-10-09, CPython 3.12.3 und 3.13.16, PR #7: Dashboard-Autostart, Quoten inkl.
+# opencode, Harness-Index + Reiter "Harness"): 3185 passed / 0 failed / 7 skipped in 93-100 s —
+# +131 über die 3054 darunter, per --collect-only (alle Dateien neu): test_harness_index 51,
+# test_dashboard_autostart 34, test_harness_dashboard 23, test_dashboard_limits 20,
+# test_dashboard_page_js 3. Die 5 node-Tests (3 + 2 in test_harness_dashboard) skippen ohne
+# `node` im PATH. ruff 1122 und mypy 122/38 unverändert.
 # Linux, Cloud (2026-10-08, CPython 3.12.3 und 3.13.16, PR #6: kaputte policy.yaml hält an,
 # Meldungsdrossel, review-loop-Leser, Abschlussregel ohne Kontext, Reste aus PR #5):
 # 3040 passed / 0 failed / 7 skipped — +80 über die 2960 darunter, per --collect-only

@@ -148,6 +148,15 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
 | `DASHBOARD_AUTOSTART` | No | `true` | `--watch` starts the dashboard itself as a daemon thread on `127.0.0.1` (no extra process). Never fatal: a failure (no free port, import error, server dying later) is one warning line in `orchestrator.log` and `queue-events.log`, the orchestrator keeps running. `false` = nothing is started. |
 | `DASHBOARD_OPEN_BROWSER` | No | `false` | Only for the autostart above: open a browser window when it comes up. `python dashboard.py` / `--dashboard` are unaffected — they open the browser unless `--no-open`. |
+| `HARNESS_DB_FILE` | No | `logs/harness-index.sqlite` | SQLite written by the harness index (`python -m harness_index --update`); the dashboard's "Harness" tab reads only this file, read-only. |
+| `HARNESS_CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code transcripts (read-only). |
+| `HARNESS_CODEX_SESSIONS_DIR` | No | `~/.codex/sessions` | Codex rollouts (read-only). |
+| `HARNESS_OPENCODE_DB` | No | `~/.local/share/opencode/opencode.db` | opencode database, opened `mode=ro`; only `session`/`message` are read. |
+| `HARNESS_EXTERN_LEDGER` | No | `~/.claude/extern-ledger.jsonl` | Extern-voice ledger (read-only). |
+| `HARNESS_CHANGES_FILE` | No | `~/.claude/harness-changes.jsonl` | Harness-change markers (read-only). |
+| `HARNESS_WINDOW_DAYS` | No | `90` | Source files whose mtime is older are skipped (already indexed rows stay). |
+| `HARNESS_UPDATE_INTERVAL_SEC` | No | `1800` | `--watch` starts the index as its own low-priority process this often (first run 60 s after start). `0` = off. |
+| `HARNESS_LOCK_STALE_SEC` | No | `7200` | A lock older than this (or of a dead process) is taken over; also the time limit after which the scheduler kills its own child. |
 | ~~`TELEGRAM_MAX_TASK_LENGTH`~~ | — | `500` | Max characters for `/task`. **Not readable from `.env`** — `config.py:519` assigns it literally, with no `os.getenv()`. Listed here only because it was documented as configurable until 2026-09-05; change the constant, or wire it through `_parse_int_env()`. |
 | `CLAUDE_SESSION_ENABLED` | No | `false` | Opt-in: Claude `--session-id`/`--resume` across tool phases for prompt-cache reuse. Off = today's stateless behaviour. |
 | `ORCH_SESSION_RETENTION_DAYS` | No | `14` | Heartbeat session-cleanup retention for orchestrator-created session JSONL files in `~/.claude/projects/`. Whitelist via sidecar registry. |
@@ -963,6 +972,8 @@ Dashboard sections:
 - **Recent events**: error lines from logs + queue events
 - **Session stats**: live data for the current `--watch` session
 - **Billing analytics**: weighted token cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and cache hit rate from Claude prompt cache. Quota gating uses ONLY `input + output` — cache fields are billing-only.
+
+**Harness index (since 2026-10-09):** `python -m harness_index --update` builds/updates `logs/harness-index.sqlite` from local files only — Claude Code transcripts, Codex rollouts, `opencode.db` (read-only), the extern-voice ledger and `~/.claude/harness-changes.jsonl`. Incremental (size, mtime, offset, head fingerprint per file), idempotent by natural keys, one run at a time (lock file), and it stores no prompt/answer/title text (working directories only as hash + last folder name). `--watch` runs it every 30 min as a separate low-priority process; the first run over a large history is the expensive one, later runs take seconds. Deleted transcripts keep their rows — the heartbeat deletes orchestrator transcripts after 14 days, the index keeps their numbers.
 
 Default port: `8211` (configurable via `DASHBOARD_PORT`). If the port is already in use or reserved by Windows (Hyper-V/WSL dynamic ranges → `WinError 10013`), the server automatically falls back to a free port and logs the actual URL.
 

@@ -36,6 +36,7 @@
   still gets it — an autouse fixture in an ordinary test file only applies to
   tests collected from THAT module.
 """
+import importlib
 import os
 import re
 import sys
@@ -128,6 +129,24 @@ os.environ["_ORCH_TEST_REAL_VAULT_PATH"] = str(_REAL_VAULT_PATH)
 if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
     _TEST_VAULT_ROOT = Path(tempfile.mkdtemp(prefix="orch_test_vault_"))
     os.environ["ORCH_VAULT_PATH"] = str(_TEST_VAULT_ROOT)
+
+# Harness-index sources (harness_index.py, 2026-10-09): the suite must never read
+# the real ~/.claude/projects, ~/.codex/sessions, opencode.db, ledger or marker
+# file, nor write the real logs/harness-index.sqlite. Set as environment variables
+# BEFORE config is imported, so config's own defaults AND every child process the
+# suite spawns (`python -m harness_index --update`) inherit scratch paths; the
+# autouse fixture `_isolate_harness_sources` below then narrows them per test.
+_TEST_HARNESS_ROOT = Path(tempfile.mkdtemp(prefix="orch_test_harness_"))
+_HARNESS_ENV_PATHS = {
+    "HARNESS_DB_FILE": "index/harness-index.sqlite",
+    "HARNESS_CLAUDE_PROJECTS_DIR": "claude-projects",
+    "HARNESS_OPENCODE_DB": "opencode/opencode.db",
+    "HARNESS_CODEX_SESSIONS_DIR": "codex-sessions",
+    "HARNESS_EXTERN_LEDGER": "claude/extern-ledger.jsonl",
+    "HARNESS_CHANGES_FILE": "claude/harness-changes.jsonl",
+}
+for _key, _rel in _HARNESS_ENV_PATHS.items():
+    os.environ[_key] = str(_TEST_HARNESS_ROOT / _rel)
 
 import replay  # noqa: E402 — must follow sys.path tweak
 
@@ -388,6 +407,32 @@ def _isolate_active_runs_dir(tmp_path: Path, monkeypatch):
         yield
         return
     monkeypatch.setattr(base_tool, "ACTIVE_RUNS_DIR", tmp_path / "active_runs")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_harness_sources(tmp_path: Path, monkeypatch):
+    """Point every harness-index path at an empty per-test directory.
+
+    Both halves: the ``config`` attributes (in-process readers such as
+    ``harness_index.Sources.from_config`` and the dashboard's /api/harness) and the
+    environment (child processes started by ``run_update_subprocess``). The
+    periodic index thread is off (``HARNESS_UPDATE_INTERVAL_SEC = 0``) unless a
+    test turns it on, so no autostart in a test spawns an index process by
+    accident. ``tests/test_harness_index.py::test_suite_paths_never_point_at_real_sources``
+    proves the redirection.
+    """
+    try:
+        config = importlib.import_module("config")
+    except ImportError:
+        yield
+        return
+    root = tmp_path / "_harness"
+    for key, rel in _HARNESS_ENV_PATHS.items():
+        path = root / rel
+        monkeypatch.setattr(config, key, path, raising=False)
+        monkeypatch.setenv(key, str(path))
+    monkeypatch.setattr(config, "HARNESS_UPDATE_INTERVAL_SEC", 0, raising=False)
     yield
 
 

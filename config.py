@@ -1053,6 +1053,38 @@ DASHBOARD_AUTOSTART = _parse_bool_env("DASHBOARD_AUTOSTART", True)
 # pop a window, manual starts behave as before.
 DASHBOARD_OPEN_BROWSER = _parse_bool_env("DASHBOARD_OPEN_BROWSER", False)
 
+# --- Harness index (harness_index.py, 2026-10-09) ---
+# Incremental SQLite index over local Claude Code transcripts, Codex rollouts,
+# opencode.db, the extern-voice ledger and the harness-change markers. Runs as its
+# own low-priority subprocess (`python -m harness_index --update`), started every
+# HARNESS_UPDATE_INTERVAL_SEC by a daemon thread the dashboard autostart creates;
+# the dashboard's "Harness" tab reads only HARNESS_DB_FILE (mode=ro). Every source
+# is read-only; the SQLite (plus its lock file) is the only thing written. No
+# prompt/answer/title text is stored — numbers, model names, types, timestamps,
+# ids, and cwd only as hash + last path segment.
+HARNESS_DB_FILE = Path(os.getenv("HARNESS_DB_FILE") or str(Path(__file__).parent / "logs" / "harness-index.sqlite"))
+HARNESS_CLAUDE_PROJECTS_DIR = Path(
+    os.getenv("HARNESS_CLAUDE_PROJECTS_DIR") or str(Path.home() / ".claude" / "projects")
+)
+HARNESS_OPENCODE_DB = Path(
+    os.getenv("HARNESS_OPENCODE_DB") or str(Path.home() / ".local" / "share" / "opencode" / "opencode.db")
+)
+HARNESS_CODEX_SESSIONS_DIR = Path(
+    os.getenv("HARNESS_CODEX_SESSIONS_DIR") or str(Path.home() / ".codex" / "sessions")
+)
+HARNESS_EXTERN_LEDGER = Path(
+    os.getenv("HARNESS_EXTERN_LEDGER") or str(Path.home() / ".claude" / "extern-ledger.jsonl")
+)
+HARNESS_CHANGES_FILE = Path(
+    os.getenv("HARNESS_CHANGES_FILE") or str(Path.home() / ".claude" / "harness-changes.jsonl")
+)
+# Files whose mtime is older than this are skipped (already indexed rows stay).
+HARNESS_WINDOW_DAYS = _parse_int_env("HARNESS_WINDOW_DAYS", 90)
+# 0 or negative disables the periodic index thread (the dashboard still starts).
+HARNESS_UPDATE_INTERVAL_SEC = _parse_int_env("HARNESS_UPDATE_INTERVAL_SEC", 1800)
+# A lock older than this (or whose PID is dead) is taken over. Also the hard time
+# limit after which the scheduler thread kills its own child process by handle.
+HARNESS_LOCK_STALE_SEC = _parse_int_env("HARNESS_LOCK_STALE_SEC", 7200)
 SHUTDOWN_COMMAND = (
     ["shutdown", "/s", "/t", "0", "/f"]
     if sys.platform == "win32"

@@ -29,6 +29,7 @@ blocks the others, so every endpoint must answer quickly.
 import argparse
 import contextlib
 import hashlib
+import importlib
 import json
 import logging
 import socketserver
@@ -1002,6 +1003,8 @@ class AutostartHandle:
         self.url: str | None = None
         self.error: str | None = None
         self.server_thread: threading.Thread | None = None
+        self.index_thread: threading.Thread | None = None
+        self.index_runs = 0
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """Stop the server thread (tests; the orchestrator lets the daemon die)."""
@@ -1010,9 +1013,9 @@ class AutostartHandle:
         if server is not None:
             with contextlib.suppress(Exception):  # best effort, never raises
                 server.shutdown()
-        thread = self.server_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout)
+        for thread in (self.server_thread, self.index_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout)
 
 
 def _safe_report(report, message: str) -> None:
@@ -1076,6 +1079,57 @@ def _autostart_serve(
         handle.bound.set()
 
 
+# First harness-index run this long after the autostart (the orchestrator's own
+# startup goes first); then every config.HARNESS_UPDATE_INTERVAL_SEC.
+HARNESS_FIRST_RUN_DELAY_SEC = 60.0
+
+
+def _harness_index_loop(handle: AutostartHandle, interval: float, warn, info) -> None:
+    """Scheduler-thread body: launch the index as its OWN child process. Never raises.
+
+    The child (``harness_index.run_update_subprocess``) runs at low priority
+    and is killed by handle after ``HARNESS_LOCK_STALE_SEC``; this thread only
+    waits for it. A failure is reported once per distinct message (no warning
+    every 30 minutes for the same broken state), a recovery once.
+    """
+    delay = min(HARNESS_FIRST_RUN_DELAY_SEC, interval)
+    last_error: str | None = None
+    while not handle.stop.wait(delay):
+        delay = interval
+        error: str | None
+        try:
+            harness_index = importlib.import_module("harness_index")
+            result = harness_index.run_update_subprocess(timeout=float(config.HARNESS_LOCK_STALE_SEC))
+            error = result.get("error")
+            handle.index_runs += 1
+            if not error:
+                logger.info("harness index: %s", (result.get("stdout") or "").splitlines()[-1:] or "ok")
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+        if error and error != last_error:
+            _safe_report(warn, f"Harness-Index: {error} — Orchestrator läuft weiter")
+        elif not error and last_error:
+            _safe_report(info, "Harness-Index läuft wieder")
+        last_error = error
+
+
+def _start_harness_index_thread(handle: AutostartHandle, warn, info) -> None:
+    """Start the index scheduler (independent of the dashboard's bind result)."""
+    interval = float(config.HARNESS_UPDATE_INTERVAL_SEC)
+    if interval <= 0:
+        return
+    try:
+        thread = threading.Thread(
+            target=_harness_index_loop, args=(handle, interval, warn, info),
+            name="harness-index-scheduler", daemon=True,
+        )
+        handle.index_thread = thread
+        thread.start()
+    except Exception as e:  # never raises, by contract
+        handle.index_thread = None
+        _safe_report(warn, f"Harness-Index-Thread nicht gestartet ({type(e).__name__}: {e})")
+
+
 def start_autostart(
     *,
     open_browser: bool | None = None,
@@ -1088,7 +1142,9 @@ def start_autostart(
     Returns at once — no join, no waiting for the bind (that happens in the
     thread). Any failure (thread start, bind, ``serve_forever`` dying later) is
     reported through ``warn`` exactly once and recorded in ``handle.error``; the
-    orchestrator keeps running either way. ``open_browser`` defaults to
+    orchestrator keeps running either way. Also starts the harness-index
+    scheduler thread (``HARNESS_UPDATE_INTERVAL_SEC``, 0 = off), whose work runs
+    in a separate low-priority process. ``open_browser`` defaults to
     ``config.DASHBOARD_OPEN_BROWSER`` (False) — this is the unattended path; the
     manual paths (``python dashboard.py``, ``--dashboard``) keep their own default.
     Bound to 127.0.0.1 only (``_bind_server``).
@@ -1116,6 +1172,9 @@ def start_autostart(
             warn,
             f"Dashboard-Autostart fehlgeschlagen ({handle.error}) — Orchestrator läuft ohne Dashboard weiter",
         )
+    # The index is useful even when this dashboard did not come up (a manual
+    # `python dashboard.py` reads the same SQLite), so it does not depend on the bind.
+    _start_harness_index_thread(handle, warn, info)
     return handle
 
 

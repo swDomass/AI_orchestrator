@@ -10,6 +10,7 @@ faked: ``webbrowser.open``, the bind function where a failure is simulated, and
 the main loop's ``time.sleep`` to end ``run_watch`` after one round.
 """
 
+import http.client
 import socket
 import sys
 import threading
@@ -381,3 +382,46 @@ def test_run_watch_keeps_running_when_dashboard_fails(
             time.sleep(0.01)
     dash_lines = [m for m in captured_log if "Dashboard" in m]
     assert len(dash_lines) == 1, captured_log
+
+
+# ── anti DNS-rebinding: only loopback Host headers ──────────────────────────
+
+
+def _request_with_host(port: int, path: str, host: str | None) -> int:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.putrequest("GET", path, skip_host=True)
+        if host is not None:
+            conn.putheader("Host", host)
+        conn.endheaders()
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def served(monkeypatch):
+    monkeypatch.setattr(dashboard, "get_dashboard_data", lambda days=7: {})
+    server, port = dashboard._bind_server(_free_port())
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    yield port
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize("path", ["/", "/api/data", "/api/harness"])
+@pytest.mark.parametrize("host", ["evil.example", "evil.example:8211", "127.0.0.1.evil.example"])
+def test_foreign_host_header_is_refused(served, path, host):
+    assert _request_with_host(served, path, host) == 403
+
+
+@pytest.mark.parametrize("host", [None, "127.0.0.1", "localhost:8211", "[::1]:8211"])
+def test_loopback_host_header_is_served(served, host):
+    assert _request_with_host(served, "/", host) == 200
+
+
+def test_extra_allowed_host_from_config(served, monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_ALLOWED_HOSTS", ("pc.tailnet.example",))
+    assert _request_with_host(served, "/", "pc.tailnet.example:443") == 200
+    assert _request_with_host(served, "/", "other.example") == 403

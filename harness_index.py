@@ -81,6 +81,7 @@ import config
 
 SCHEMA_VERSION = 1
 HEAD_BYTES = 256
+TAIL_BYTES = 256
 # A complete-looking last line without newline is evaluated only once the file
 # has not been written for this long (it may still be growing otherwise).
 TAIL_QUIET_SEC = 60
@@ -103,7 +104,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS file_state (
     source TEXT NOT NULL, file_key TEXT NOT NULL,
     size INTEGER, mtime REAL, offset INTEGER, head_len INTEGER, head_hash TEXT,
-    info TEXT, last_read REAL,
+    tail_hash TEXT, info TEXT, last_read REAL,
     PRIMARY KEY (source, file_key));
 CREATE TABLE IF NOT EXISTS claude_session (
     session_id TEXT PRIMARY KEY, entrypoint TEXT, origin TEXT,
@@ -479,11 +480,15 @@ class FileState:
     head_len: int = 0
     head_hash: str = ""
     info: dict = field(default_factory=dict)
+    # sha256 of the (up to) TAIL_BYTES bytes right before `offset`: catches a file
+    # rewritten in place with the same head, where the old offset would land in
+    # the middle of a new line and everything before it would be missed.
+    tail_hash: str = ""
 
 
 def _load_state(conn: sqlite3.Connection, source: str, file_key: str) -> FileState | None:
     row = conn.execute(
-        "SELECT size, mtime, offset, head_len, head_hash, info FROM file_state "
+        "SELECT size, mtime, offset, head_len, head_hash, info, tail_hash FROM file_state "
         "WHERE source=? AND file_key=?", (source, file_key),
     ).fetchone()
     if row is None:
@@ -492,14 +497,14 @@ def _load_state(conn: sqlite3.Connection, source: str, file_key: str) -> FileSta
         info = json.loads(row[5]) if row[5] else {}
     except ValueError:
         info = {}
-    return FileState(row[0] or 0, row[1] or 0.0, row[2] or 0, row[3] or 0, row[4] or "", info)
+    return FileState(row[0] or 0, row[1] or 0.0, row[2] or 0, row[3] or 0, row[4] or "", info, row[6] or "")
 
 
 def _save_state(conn: sqlite3.Connection, source: str, file_key: str, st: FileState) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO file_state(source, file_key, size, mtime, offset, head_len, "
-        "head_hash, info, last_read) VALUES (?,?,?,?,?,?,?,?,?)",
-        (source, file_key, st.size, st.mtime, st.offset, st.head_len, st.head_hash,
+        "head_hash, tail_hash, info, last_read) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (source, file_key, st.size, st.mtime, st.offset, st.head_len, st.head_hash, st.tail_hash,
          json.dumps(st.info, sort_keys=True), time.time()),
     )
 
@@ -507,6 +512,12 @@ def _save_state(conn: sqlite3.Connection, source: str, file_key: str, st: FileSt
 def _head_hash(f, length: int) -> str:
     f.seek(0)
     return hashlib.sha256(f.read(length)).hexdigest()
+
+
+def _tail_hash(f, offset: int) -> str:
+    start = max(0, offset - TAIL_BYTES)
+    f.seek(start)
+    return hashlib.sha256(f.read(offset - start)).hexdigest()
 
 
 def _iter_new_lines(
@@ -534,7 +545,10 @@ def _iter_new_lines(
             same_head = size >= prev.head_len and _head_hash(f, prev.head_len) == prev.head_hash
             if same_head and size == prev.size and mtime == prev.mtime:
                 return  # unchanged: not read at all
-            if not same_head or size < prev.offset:
+            if (
+                not same_head or size < prev.offset
+                or (prev.tail_hash and _tail_hash(f, prev.offset) != prev.tail_hash)
+            ):
                 reset = True
             else:
                 offset = prev.offset
@@ -566,6 +580,7 @@ def _iter_new_lines(
             stats.lines_read += 1
             yield raw, new_state, reset and first
             first = False
+        new_state.tail_hash = _tail_hash(f, new_state.offset)
         if first:
             # nothing yielded (e.g. only an incomplete tail): still hand out the state
             yield b"", new_state, reset
@@ -1230,19 +1245,23 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
     ``partial`` (a source reported errors), ``busy`` (another live run holds
     the lock) or ``error`` (the index itself could not be opened)."""
     sources = sources or Sources.from_config()
+    def say(message: str) -> None:  # an orphaned child's broken stdout must not abort a run
+        with contextlib.suppress(Exception):
+            out(message)
+
     lock = IndexLock(lock_path_for(sources.db), sources.stale_sec)
     if not lock.acquire():
         holder = lock.held_by or {}
-        out(f"Harness-Index läuft bereits (pid {holder.get('pid', '?')}) — dieser Lauf endet ohne Arbeit.")
+        say(f"Harness-Index läuft bereits (pid {holder.get('pid', '?')}) — dieser Lauf endet ohne Arbeit.")
         return {"status": "busy", "held_by": holder.get("pid")}
     try:
         if lock.taken_over is not None:
-            out(f"Veralteten Lock übernommen (pid {lock.taken_over.get('pid', '?')}).")
+            say(f"Veralteten Lock übernommen (pid {lock.taken_over.get('pid', '?')}).")
         started = time.time()
         try:
             conn = open_index(sources.db)
         except (sqlite3.Error, SchemaMismatchError, OSError) as e:
-            out(f"Harness-Index nicht nutzbar: {_err_text(e)}")
+            say(f"Harness-Index nicht nutzbar: {_err_text(e)}")
             return {"status": "error", "error": _err_text(e)}
         try:
             per_source = _index_all(conn, sources)
@@ -1262,20 +1281,20 @@ def run_update(sources: Sources | None = None, *, out: Callable[[str], None] = p
                             per_source=detail, peak=peak, status=status)
                 conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error as e:  # the data is committed; only the run log is missing
-                out(f"index_runs nicht geschrieben: {_err_text(e)}")
+                say(f"index_runs nicht geschrieben: {_err_text(e)}")
         finally:
             conn.close()
         summary = {
             "status": status, "duration_sec": round(finished - started, 3), **totals,
             "errors": errors, "peak_rss_mb": peak, "per_source": detail,
         }
-        out(
+        say(
             f"Harness-Index {status}: {totals['files_read']} Dateien, {totals['lines_read']} Zeilen, "
             f"{totals['bytes_read'] / 1_048_576:.1f} MB gelesen, {totals['lines_skipped']} übersprungen, "
             f"{summary['duration_sec']:.1f} s, Spitze {peak if peak is not None else '?'} MB"
         )
         for name, errs in errors.items():
-            out(f"  Fehler {name}: {'; '.join(errs[:3])}")
+            say(f"  Fehler {name}: {'; '.join(errs[:3])}")
         return summary
     finally:
         lock.release()
@@ -1656,8 +1675,20 @@ def _read_markers(conn: sqlite3.Connection, *, window: int, today: str) -> list[
 
 
 def _lower_priority() -> None:
-    """POSIX: nice ourselves (the parent cannot without preexec_fn, which is not
-    thread-safe). Windows gets BELOW_NORMAL_PRIORITY_CLASS from the parent."""
+    """Lower our own CPU (and on Windows I/O) priority.
+
+    POSIX: ``os.nice(10)`` from inside the child — the parent could only do it
+    through ``preexec_fn``, which is not thread-safe. Windows: the parent already
+    starts us with BELOW_NORMAL_PRIORITY_CLASS, which leaves the I/O priority
+    normal; PROCESS_MODE_BACKGROUND_BEGIN (settable only by a process on itself)
+    lowers CPU, I/O and memory priority, so a first run over gigabytes does not
+    compete with a running task's disk access.
+    """
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00100000)  # PROCESS_MODE_BACKGROUND_BEGIN
+        return
     if hasattr(os, "nice"):
         with contextlib.suppress(OSError):
             os.nice(10)

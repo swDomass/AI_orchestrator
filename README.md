@@ -148,7 +148,8 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `DASHBOARD_PORT` | No | `8211` | Port for the analytics web dashboard (auto-falls back to a free port if taken/Windows-reserved) |
 | `DASHBOARD_AUTOSTART` | No | `true` | `--watch` starts the dashboard itself as a daemon thread on `127.0.0.1` (no extra process). Never fatal: a failure (no free port, import error, server dying later) is one warning line in `orchestrator.log` and `queue-events.log`, the orchestrator keeps running. `false` = nothing is started. |
 | `DASHBOARD_OPEN_BROWSER` | No | `false` | Only for the autostart above: open a browser window when it comes up. `python dashboard.py` / `--dashboard` are unaffected — they open the browser unless `--no-open`. |
-| `HARNESS_DB_FILE` | No | `logs/harness-index.sqlite` | SQLite written by the harness index (`python -m harness_index --update`); the dashboard's "Harness" tab reads only this file, read-only. |
+| `DASHBOARD_ALLOWED_HOSTS` | No | *(empty)* | The dashboard answers only requests whose `Host` header is `127.0.0.1`, `localhost` or `::1` (an always-on local server is otherwise readable by any web page via DNS rebinding). Comma-separated extra names, e.g. the name a local tunnel forwards. |
+| `HARNESS_DB_FILE` | No | `logs/harness-index.sqlite` | SQLite written by the harness index (a relative path is taken relative to the repo) (`python -m harness_index --update`); the dashboard's "Harness" tab reads only this file, read-only. |
 | `HARNESS_CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code transcripts (read-only). |
 | `HARNESS_CODEX_SESSIONS_DIR` | No | `~/.codex/sessions` | Codex rollouts (read-only). |
 | `HARNESS_OPENCODE_DB` | No | `~/.local/share/opencode/opencode.db` | opencode database, opened `mode=ro`; only `session`/`message` are read. |

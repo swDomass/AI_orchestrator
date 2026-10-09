@@ -428,6 +428,21 @@ def test_file_replaced_by_a_larger_one_with_another_head_is_reread_without_doubl
     assert claude_tokens()[4] == 6  # m1 once + n0..n4
 
 
+def test_file_rewritten_in_place_with_the_same_head_is_reread_from_the_start():
+    """Same first 256 bytes, larger, different body: the stored offset would land
+    in the middle of a new line and everything in front of it would be missed."""
+    path = write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1"), c_assistant(S_CLI, "m2")])
+    run()
+    head = _j(c_header(S_CLI))
+    assert len(head.encode()) > hi.HEAD_BYTES  # the head fingerprint cannot see the change
+    write_jsonl(path, [c_header(S_CLI), c_assistant(S_CLI, "x1", usage={"input_tokens": 1000}),
+                       c_assistant(S_CLI, "x2"), c_assistant(S_CLI, "x3"), c_assistant(S_CLI, "m2")])
+    second = run()
+    assert second["lines_skipped"] == 0  # no half line was parsed
+    assert sorted(r[0] for r in q("SELECT msg_id FROM claude_msg")) == ["m1", "m2", "x1", "x2", "x3"]
+    assert q("SELECT input FROM claude_msg WHERE msg_id='x1'") == [(1000,)]
+
+
 def test_deleted_file_keeps_its_rows():
     write_jsonl(main_path(S_SDK), [c_header(S_SDK, "sdk-cli"), c_assistant(S_SDK, "m1", entrypoint="sdk-cli")])
     run()
@@ -826,6 +841,15 @@ def test_suite_paths_never_point_at_real_sources(tmp_path):
         assert value.is_relative_to(tmp_path), (key, value)
         assert os.environ[key] == str(value)
         assert not any(value.is_relative_to(r) for r in real), (key, value)
+
+
+def test_relative_harness_paths_are_taken_relative_to_the_repo(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_DB_FILE", "logs/other.sqlite")
+    assert config._harness_path("HARNESS_DB_FILE", tmp_path / "x") == REPO / "logs" / "other.sqlite"
+    monkeypatch.setenv("HARNESS_DB_FILE", str(tmp_path / "abs.sqlite"))
+    assert config._harness_path("HARNESS_DB_FILE", tmp_path / "x") == tmp_path / "abs.sqlite"
+    monkeypatch.delenv("HARNESS_DB_FILE")
+    assert config._harness_path("HARNESS_DB_FILE", tmp_path / "x") == tmp_path / "x"
 
 
 # ── lock and child process ──────────────────────────────────────────────────

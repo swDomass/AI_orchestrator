@@ -1052,6 +1052,13 @@ DASHBOARD_AUTOSTART = _parse_bool_env("DASHBOARD_AUTOSTART", True)
 # opening the browser unless `--no-open` is given — unattended starts must not
 # pop a window, manual starts behave as before.
 DASHBOARD_OPEN_BROWSER = _parse_bool_env("DASHBOARD_OPEN_BROWSER", False)
+# The server answers only requests whose Host header names the loopback
+# (127.0.0.1, localhost, ::1) — an always-on local server is otherwise readable
+# by any web page through DNS rebinding. Extra names (comma-separated, e.g. the
+# host name a local tunnel/reverse proxy forwards) can be allowed here.
+DASHBOARD_ALLOWED_HOSTS = tuple(
+    h.strip().lower() for h in os.getenv("DASHBOARD_ALLOWED_HOSTS", "").split(",") if h.strip()
+)
 
 # --- Harness index (harness_index.py, 2026-10-09) ---
 # Incremental SQLite index over local Claude Code transcripts, Codex rollouts,
@@ -1062,22 +1069,26 @@ DASHBOARD_OPEN_BROWSER = _parse_bool_env("DASHBOARD_OPEN_BROWSER", False)
 # is read-only; the SQLite (plus its lock file) is the only thing written. No
 # prompt/answer/title text is stored — numbers, model names, types, timestamps,
 # ids, and cwd only as hash + last path segment.
-HARNESS_DB_FILE = Path(os.getenv("HARNESS_DB_FILE") or str(Path(__file__).parent / "logs" / "harness-index.sqlite"))
-HARNESS_CLAUDE_PROJECTS_DIR = Path(
-    os.getenv("HARNESS_CLAUDE_PROJECTS_DIR") or str(Path.home() / ".claude" / "projects")
+
+
+def _harness_path(key: str, default: Path) -> Path:
+    """Env override or default; a RELATIVE override is taken relative to this
+    repo, so the dashboard (any cwd) and the index child (cwd = repo) agree."""
+    raw = os.getenv(key)
+    if not raw:
+        return default
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else Path(__file__).parent / path
+
+
+HARNESS_DB_FILE = _harness_path("HARNESS_DB_FILE", Path(__file__).parent / "logs" / "harness-index.sqlite")
+HARNESS_CLAUDE_PROJECTS_DIR = _harness_path("HARNESS_CLAUDE_PROJECTS_DIR", Path.home() / ".claude" / "projects")
+HARNESS_OPENCODE_DB = _harness_path(
+    "HARNESS_OPENCODE_DB", Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 )
-HARNESS_OPENCODE_DB = Path(
-    os.getenv("HARNESS_OPENCODE_DB") or str(Path.home() / ".local" / "share" / "opencode" / "opencode.db")
-)
-HARNESS_CODEX_SESSIONS_DIR = Path(
-    os.getenv("HARNESS_CODEX_SESSIONS_DIR") or str(Path.home() / ".codex" / "sessions")
-)
-HARNESS_EXTERN_LEDGER = Path(
-    os.getenv("HARNESS_EXTERN_LEDGER") or str(Path.home() / ".claude" / "extern-ledger.jsonl")
-)
-HARNESS_CHANGES_FILE = Path(
-    os.getenv("HARNESS_CHANGES_FILE") or str(Path.home() / ".claude" / "harness-changes.jsonl")
-)
+HARNESS_CODEX_SESSIONS_DIR = _harness_path("HARNESS_CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions")
+HARNESS_EXTERN_LEDGER = _harness_path("HARNESS_EXTERN_LEDGER", Path.home() / ".claude" / "extern-ledger.jsonl")
+HARNESS_CHANGES_FILE = _harness_path("HARNESS_CHANGES_FILE", Path.home() / ".claude" / "harness-changes.jsonl")
 # Files whose mtime is older than this are skipped (already indexed rows stay).
 HARNESS_WINDOW_DAYS = _parse_int_env("HARNESS_WINDOW_DAYS", 90)
 # 0 or negative disables the periodic index thread (the dashboard still starts).

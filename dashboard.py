@@ -1242,6 +1242,21 @@ if (location.hash === '#harness') showTab('harness');
 
 
 _CLIENT_DISCONNECT_ERRORS = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_allowed(host_header: str | None) -> bool:
+    """Anti DNS-rebinding: a browser always sends the name it resolved, so a page
+    on evil.example that rebinds to 127.0.0.1 arrives with Host: evil.example.
+    No Host header at all (a non-browser client) is let through."""
+    if not host_header:
+        return True
+    host = host_header.strip().lower()
+    if host.startswith("["):          # [::1]:8211
+        host = host[1:host.find("]")] if "]" in host else host[1:]
+    elif host.count(":") == 1:        # name:port
+        host = host.rsplit(":", 1)[0]
+    return host in _LOOPBACK_HOSTS or host in getattr(config, "DASHBOARD_ALLOWED_HOSTS", ())
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1250,6 +1265,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         try:
+            if not _host_allowed(self.headers.get("Host")):
+                self.send_error(403, "Host not allowed")
+                return
             if parsed.path == "/api/data":
                 self._json_response(parsed.query)
             elif parsed.path == "/api/harness":
@@ -1491,7 +1509,8 @@ def _harness_index_loop(handle: AutostartHandle, interval: float, warn, info) ->
             error = result.get("error")
             handle.index_runs += 1
             if not error:
-                logger.info("harness index: %s", (result.get("stdout") or "").splitlines()[-1:] or "ok")
+                lines = (result.get("stdout") or "").splitlines()
+                logger.info("harness index: %s", lines[-1] if lines else "ok")
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
         if error and error != last_error:

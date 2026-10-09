@@ -1528,18 +1528,24 @@ def test_a_deeply_nested_quiet_tail_does_not_block_the_file():
     assert q("SELECT msg_id FROM claude_msg") == [("m1",)]
 
 
-def test_a_deeply_nested_meta_file_and_marker_line_are_skipped_by_type():
+def test_a_deeply_nested_meta_file_is_skipped_by_type_and_not_retried():
     write_jsonl(main_path(S_CLI), [c_header(S_CLI), c_assistant(S_CLI, "m1")])
     p = meta_path(S_CLI, AGENT_A)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(DEEP, encoding="utf-8")
-    write_markers([{"date": "2026-09-25", "id": "a", "expect": "x"}, DEEP, {"date": "2026-09-26", "id": "b"}])
     first = run()
     assert first["errors"] == {}
     assert first["per_source"]["claude"]["skipped_by_type"] == {"RecursionError": 1}
+    assert q("SELECT msg_id FROM claude_msg") == [("m1",)]  # the source went on after the meta file
+    assert run()["lines_read"] == 0  # the meta file is not retried on every run
+
+
+def test_a_deeply_nested_marker_line_is_counted_by_type_and_the_others_stay():
+    write_markers([{"date": "2026-09-25", "id": "a", "expect": "x"}, DEEP, {"date": "2026-09-26", "id": "b"}])
+    first = run()
+    assert first["errors"] == {}
     assert first["per_source"]["markers"]["broken_by_type"] == {"RecursionError": 1}
     assert [r[0] for r in q("SELECT id FROM marker ORDER BY id")] == ["a", "b"]
-    assert run()["lines_read"] == 0  # the meta file is not retried on every run
 
 
 def test_a_skipped_line_leaves_no_partial_rows():

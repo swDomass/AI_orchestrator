@@ -58,7 +58,11 @@ Invariants (each one is pinned by a test in ``tests/test_harness_index.py``):
   tail fingerprint (the 256 bytes in front of the offset). Size and mtime
   unchanged → not opened at all. Shrunk below the offset, head or tail changed
   → read from the start (natural keys absorb it). A line without its newline is
-  not consumed; the offset stays in front of it until it is complete. A line
+  not consumed; the offset stays in front of it while the file is younger than
+  60 s. Once the file is quiet, the rest is settled once (valid → counted,
+  invalid → skipped) and the offset moves to the end; a file with a young open
+  rest is opened again. Known limit: a rest the writer completes only after
+  60 s is skipped in both halves, never counted twice. A line
   that fails in any way is skipped and counted by exception type; a file that
   fails is reported and leaves every other file's offset alone.
 * **Deleted sources keep their rows.** The heartbeat deletes orchestrator

@@ -955,10 +955,11 @@ python dashboard.py --no-open
 ```
 
 Dashboard sections:
+- **Quoten jetzt** (since 2026-10-09): one tile per exact capacity-log key — Claude 5 h, Claude 7 Tage, Codex 5 h, Codex 7 Tage, opencode (Tagesbudget = % of the OpenRouter key's daily limit, no dollar values), Gemini if present — with the age of the value, marked *veraltet* after 45 min and *nicht verfügbar* for `available=false`/`-1.0`. Source: `limits_now` in `/api/data` (newest value per exact key from `logs/capacity-log.md`); the older aggregated `current_limits` key is unchanged.
 - **Summary cards**: total tasks, success rate, avg duration, active providers
 - **Tasks/day** (30 days): bar chart of daily throughput
-- **Provider distribution**: donut chart of usage per provider
-- **Provider capacity** (48h / 7d / 30d): three timeline charts
+- **Provider distribution**: donut chart of usage per provider (one colour per provider, unknown names get a stable rest colour)
+- **Provider capacity** (48h / 7d / 30d): three timeline charts — 5-h windows (Claude 5 h, Codex 5 h), 7-day windows (Claude 7 Tage, Codex 7 Tage), daily budget & others (opencode, Gemini, any provider the table does not know). Group, colour and label of every key come from one Python table (`dashboard.provider_meta`), shipped as `provider_meta` with `/api/data`.
 - **Recent events**: error lines from logs + queue events
 - **Session stats**: live data for the current `--watch` session
 - **Billing analytics**: weighted token cost (`input × 1.0 + cache_creation × 1.25 + cache_read × 0.1 + output × 5.0`) and cache hit rate from Claude prompt cache. Quota gating uses ONLY `input + output` — cache fields are billing-only.

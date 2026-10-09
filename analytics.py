@@ -567,6 +567,58 @@ def _get_current_limits() -> dict:
         return {}
 
 
+# "Quoten jetzt" (P2, 2026-10-09): a value older than this is shown as "veraltet".
+# The capacity log is written every heartbeat log-capacity run (20 min) and at
+# --watch start, so 45 min means at least two missed writes.
+LIMITS_NOW_STALE_SEC = 45 * 60
+
+
+def _limits_now(snapshots: list[LimitSnapshot], now: datetime | None = None) -> dict[str, dict]:
+    """Newest snapshot per EXACT provider key, for the dashboard's "Quoten jetzt" tiles.
+
+    Deliberately separate from ``_get_current_limits()``, which aggregates per
+    base provider (minimum over the windows) and therefore cannot tell Claude
+    5 h from Claude 7 days or Codex primary from secondary — that key stays as it
+    is for its existing readers. Here every key (``claude_five_hour``,
+    ``codex_secondary_window``, ``opencode``, ``gemini``, …) keeps its own newest
+    value plus its age. ``available`` is False for ``available=false`` lines and
+    for the ``-1.0`` placeholder (``remaining_pct`` is then None); ``state`` is
+    ``unavailable`` / ``stale`` (older than ``LIMITS_NOW_STALE_SEC``) / ``ok``,
+    and ``stale`` is reported separately so an old "nicht verfügbar" still says
+    it is old. Legacy unprefixed bucket names are dropped like in the timeline.
+    """
+    now = now or datetime.now()
+    latest: dict[str, LimitSnapshot] = {}
+    for s in snapshots:
+        if s.provider in _LEGACY_UNPREFIXED_LIMIT_BUCKETS:
+            continue
+        current = latest.get(s.provider)
+        if current is None or s.timestamp >= current.timestamp:
+            latest[s.provider] = s
+    result: dict[str, dict] = {}
+    for name in sorted(latest):
+        s = latest[name]
+        age_sec = max(0, int((now - s.timestamp).total_seconds()))
+        known = s.remaining_pct >= 0
+        available = s.available and known
+        stale = age_sec > LIMITS_NOW_STALE_SEC
+        if not available:
+            state = "unavailable"
+        elif stale:
+            state = "stale"
+        else:
+            state = "ok"
+        result[name] = {
+            "ts": s.timestamp.isoformat(timespec="seconds"),
+            "age_sec": age_sec,
+            "remaining_pct": round(s.remaining_pct, 1) if known else None,
+            "available": available,
+            "stale": stale,
+            "state": state,
+        }
+    return result
+
+
 def _parse_tool_traces(
     allowed_roots: list[Path],
     *,
@@ -759,6 +811,8 @@ def get_dashboard_data(days: int = 7) -> dict:
         "provider_distribution": {"labels": pd_labels, "values": pd_values},
         "limits_timeline": _limits_timeline(snapshots, hours=90 * 24),
         "current_limits": _get_current_limits(),
+        # Newest value per exact key + age (P2); current_limits above is unchanged.
+        "limits_now": _limits_now(persistent_snaps),
         "recent_events": _recent_events(error_lines, queue_events, suggest_events),
         "usage_suggest_today": suggest_today,
         "session": session,

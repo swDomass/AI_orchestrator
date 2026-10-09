@@ -28,6 +28,7 @@ blocks the others, so every endpoint must answer quickly.
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import socketserver
@@ -41,6 +42,139 @@ from analytics import get_dashboard_data
 from config import DASHBOARD_PORT
 
 logger = logging.getLogger(__name__)
+
+# ── Provider → group / colour / label: the ONE place (P2, 2026-10-09) ─────────
+# The page's JavaScript only looks names up in `provider_meta` (shipped with
+# /api/data), it does not decide anything itself — JS inside the HTML string is
+# not testable, this table is. Capacity-chart groups: "short" = 5-hour windows,
+# "long" = 7-day windows, "other" = daily budget & everything else (opencode,
+# Gemini, unknown names). A name nobody listed here still gets a group, a stable
+# colour from _REST_PALETTE and a readable label instead of vanishing.
+LIMIT_GROUPS = ("short", "long", "other")
+
+# base provider → (label, colour, colour of the long window)
+_PROVIDER_BASES: dict[str, tuple[str, str, str]] = {
+    "claude": ("Claude", "#6c63ff", "#b0a8ff"),
+    "codex": ("Codex", "#4caf50", "#81c784"),
+    "opencode": ("opencode", "#29b6f6", "#81d4fa"),
+    "gemini": ("Gemini", "#ffc107", "#ffda6a"),
+    "openrouter": ("OpenRouter", "#ec407a", "#f48fb1"),
+    "vibe": ("Vibe", "#ff7043", "#ffab91"),
+}
+# Window suffix of the capacity-log key → (group, window label). Derived from
+# the key's window pattern, not per full key. Codex primary/secondary = 5 h /
+# 7 days: measured in a Codex rollout (2026-10-08, rate_limits.primary
+# window_minutes 300, secondary 10080) — the key itself does not carry it.
+_WINDOW_SUFFIXES: dict[str, tuple[str, str]] = {
+    "five_hour": ("short", "5 h"),
+    "primary_window": ("short", "5 h"),
+    "seven_day": ("long", "7 Tage"),
+    "secondary_window": ("long", "7 Tage"),
+}
+# A bare key without window (e.g. "opencode") sits in "other"; these get a label
+# that says what the number means.
+_BARE_LABELS: dict[str, str] = {
+    "opencode": "opencode (Tagesbudget)",
+}
+# Tile order of "Quoten jetzt"; anything not listed follows alphabetically.
+_TILE_ORDER = (
+    "claude_five_hour", "claude_seven_day",
+    "codex_primary_window", "codex_secondary_window",
+    "opencode", "gemini",
+)
+# Rest colours for names not in _PROVIDER_BASES — more than there are providers,
+# none equal to a base colour; on overflow they repeat (never an error).
+_REST_PALETTE = (
+    "#ef5350", "#ab47bc", "#26a69a", "#d4e157", "#8d6e63", "#5c6bc0",
+    "#ffa726", "#26c6da", "#9ccc65", "#7e57c2", "#bdbdbd", "#ff8a65",
+)
+_FALLBACK_GROUP = "other"
+
+
+def _stable_index(name: str, size: int) -> int:
+    """Index into a palette that is the same for a name in every process
+    (``hash()`` is salted per process, sha256 is not)."""
+    return int(hashlib.sha256(name.encode("utf-8")).hexdigest()[:8], 16) % size
+
+
+def _gemini_model_label(name: str) -> str:
+    # gemini_gemini_2_5_flash_ → "Gemini 2.5 Flash" (former providerLabel in JS)
+    parts = [p for p in name.removeprefix("gemini_gemini_").split("_") if p]
+    ver = [p for p in parts if p.isdigit()]
+    words = [p[:1].upper() + p[1:] for p in parts if not p.isdigit()]
+    return " ".join(["Gemini", ".".join(ver), *words]).replace("  ", " ").strip()
+
+
+def provider_meta(name: str) -> dict:
+    """Group, colour, label and tile order for one provider/window key.
+
+    Never raises and never returns None: an unknown name lands in the "other"
+    group with a stable rest colour.
+    """
+    name = str(name)
+    base, _, suffix = name.partition("_")
+    order = _TILE_ORDER.index(name) if name in _TILE_ORDER else len(_TILE_ORDER)
+    known = _PROVIDER_BASES.get(base)
+    if known is not None:
+        label, colour, long_colour = known
+        if not suffix:
+            return {"group": _FALLBACK_GROUP, "color": colour,
+                    "label": _BARE_LABELS.get(name, label), "order": order, "known": True}
+        window = _WINDOW_SUFFIXES.get(suffix)
+        if window is not None:
+            group, window_label = window
+            return {"group": group, "color": colour if group == "short" else long_colour,
+                    "label": f"{label} {window_label}", "order": order, "known": True}
+        if base == "gemini":
+            return {"group": _FALLBACK_GROUP, "color": long_colour if name.startswith("gemini_gemini_1") else colour,
+                    "label": _gemini_model_label(name) if name.startswith("gemini_gemini_") else name.replace("_", " "),
+                    "order": order, "known": True}
+    return {
+        "group": _FALLBACK_GROUP,
+        "color": _REST_PALETTE[_stable_index(name, len(_REST_PALETTE))],
+        "label": name.replace("_", " "),
+        "order": order,
+        "known": False,
+    }
+
+
+def provider_meta_map(names) -> dict[str, dict]:
+    """``provider_meta`` for every name, with distinct rest colours.
+
+    Unknown names keep their stable palette slot unless another name in the same
+    set already uses that colour; then the next free slot is taken (sorted
+    order, so the result is deterministic). Only when the palette is used up do
+    colours repeat — the doughnut never runs out of colours.
+    """
+    result: dict[str, dict] = {}
+    used: set[str] = set()
+    unknown: list[str] = []
+    for name in sorted({str(n) for n in names if n is not None}):
+        meta = provider_meta(name)
+        result[name] = meta
+        if meta["known"]:
+            used.add(meta["color"])
+        else:
+            unknown.append(name)
+    for name in unknown:
+        start = _stable_index(name, len(_REST_PALETTE))
+        for step in range(len(_REST_PALETTE)):
+            candidate = _REST_PALETTE[(start + step) % len(_REST_PALETTE)]
+            if candidate not in used:
+                result[name]["color"] = candidate
+                break
+        used.add(result[name]["color"])
+    return result
+
+
+def _provider_names_in(data: dict) -> set[str]:
+    """Every provider/window name the page will draw from a /api/data payload."""
+    names: set[str] = set()
+    names.update((data.get("limits_timeline") or {}).keys())
+    names.update((data.get("limits_now") or {}).keys())
+    names.update((data.get("provider_distribution") or {}).get("labels") or [])
+    return names
+
 
 _HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="de">
@@ -78,6 +212,13 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   }
   .card .value { font-size: 2rem; font-weight: 700; color: var(--accent); }
   .card .label { font-size: 0.8rem; color: var(--muted); margin-top: 0.3rem; }
+  .quota-now h3 { font-size: 0.9rem; margin-bottom: 0.8rem; color: var(--muted); }
+  .card .age { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; }
+  .card .badge { display: inline-block; font-size: 0.7rem; border-radius: 4px; padding: 0.05rem 0.4rem; margin-top: 0.3rem; }
+  .card.stale .value { color: var(--muted); }
+  .card.stale .badge.stale { background: var(--yellow); color: #000; }
+  .card.unavailable .value { color: var(--red); font-size: 1.1rem; }
+  .card.unavailable .badge.unavail { background: var(--red); color: #fff; }
   .charts {
     display: grid; grid-template-columns: 2fr 1fr; gap: 1rem; margin-bottom: 1.5rem;
   }
@@ -178,6 +319,13 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   <span class="ts" id="gen-ts">—</span>
 </header>
 
+<section class="quota-now">
+  <h3>Quoten jetzt</h3>
+  <div class="cards" id="quota-now">
+    <div class="card"><div class="value">—</div><div class="label">Noch keine Kapazitätswerte</div></div>
+  </div>
+</section>
+
 <section class="active-box">
   <h3><span class="live-dot"></span>Active Runs <span id="active-count">(0)</span></h3>
   <table>
@@ -227,17 +375,17 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="timeline-grid">
     <div class="timeline-box">
-      <h3>5h + 24h (Claude 5h, Codex (1))</h3>
+      <h3>5-h-Fenster (Claude 5 h, Codex 5 h)</h3>
       <canvas id="limit-chart-short" height="140"></canvas>
       <button class="zoom-reset" id="lim-short-reset">Zoom zurücksetzen</button>
     </div>
     <div class="timeline-box">
-      <h3>Gemini Modelle</h3>
-      <canvas id="limit-chart-gemini" height="140"></canvas>
-      <button class="zoom-reset" id="lim-gemini-reset">Zoom zurücksetzen</button>
+      <h3>Tagesbudget &amp; Sonstige (opencode, Gemini, weitere)</h3>
+      <canvas id="limit-chart-other" height="140"></canvas>
+      <button class="zoom-reset" id="lim-other-reset">Zoom zurücksetzen</button>
     </div>
     <div class="timeline-box">
-      <h3>7d (Claude 7d, Codex (2))</h3>
+      <h3>7-Tage-Fenster (Claude 7 Tage, Codex 7 Tage)</h3>
       <canvas id="limit-chart-long" height="140"></canvas>
       <button class="zoom-reset" id="lim-long-reset">Zoom zurücksetzen</button>
     </div>
@@ -291,35 +439,12 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
           .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
-function providerColor(name) {
-  if (name === 'claude_seven_day') return '#b0a8ff';
-  if (name.startsWith('claude')) return '#6c63ff';
-  if (name.includes('secondary')) return '#81c784';
-  if (name.startsWith('codex')) return '#4caf50';
-  if (name.startsWith('gemini_gemini_1')) return '#ffda6a';
-  if (name.startsWith('gemini')) return '#ffc107';
-  return '#888';
+// Provider group/colour/label come from Python (dashboard.provider_meta_map,
+// shipped as `provider_meta` in /api/data) — no mapping logic lives here.
+let _providerMeta = {};
+function providerMeta(name) {
+  return _providerMeta[name] || { group: 'other', color: '#888', label: String(name), order: 99 };
 }
-function providerLabel(name) {
-  const known = {
-    claude: 'Claude', claude_five_hour: 'Claude 5h', claude_seven_day: 'Claude 7d',
-    gemini: 'Gemini', codex: 'Codex',
-    codex_primary_window: 'Codex (1)', codex_secondary_window: 'Codex (2)',
-  };
-  if (known[name]) return known[name];
-  // gemini model windows: gemini_gemini_2_5_flash_ → "Gemini 2.5 Flash"
-  if (name.startsWith('gemini_gemini_')) {
-    const parts = name.replace(/^gemini_gemini_/, '').replace(/_+$/, '').split('_');
-    const ver = [], words = [];
-    for (const p of parts) (/^\d+$/.test(p) ? ver : words).push(p);
-    return 'Gemini ' + ver.join('.') + (words.length ? ' ' + words.map(w => w[0].toUpperCase() + w.slice(1)).join(' ') : '');
-  }
-  return name.replace(/_/g, ' ');
-}
-// kept for doughnut chart colours
-const COLORS = {
-  claude: '#6c63ff', gemini: '#ffc107', codex: '#4caf50',
-};
 const chartOpts = {
   responsive: true,
   plugins: { legend: { labels: { color: '#888' } } },
@@ -333,7 +458,7 @@ const zoomPlugin = {
   pan:  { enabled: true, mode: 'x' },
 };
 
-let tpdChart, pdChart, limitShortChart, limitGeminiChart, limitLongChart;
+let tpdChart, pdChart, limitShortChart, limitOtherChart, limitLongChart;
 let failureDoughnut, failureTimeline;
 let _allTpd = { labels: [], values: [] };
 let _activeRange = 30;
@@ -379,10 +504,7 @@ function tsKey(ts) {
 }
 
 function providerInLimitGroup(provider, group) {
-  if (group === 'short') return provider === 'claude_five_hour' || provider === 'codex_primary_window';
-  if (group === 'gemini') return provider === 'gemini' || provider.startsWith('gemini_');
-  if (group === 'long') return provider === 'claude_seven_day' || provider === 'codex_secondary_window';
-  return false;
+  return providerMeta(provider).group === group;
 }
 
 function buildLimitChartData(group) {
@@ -404,9 +526,9 @@ function buildLimitChartData(group) {
   const datasets = [];
   for (const [prov, pts] of Object.entries(provFiltered)) {
     datasets.push({
-      label: providerLabel(prov),
+      label: providerMeta(prov).label,
       data: pts.map(p => ({ x: tsKey(p.ts), y: p.pct })),
-      borderColor: providerColor(prov),
+      borderColor: providerMeta(prov).color,
       backgroundColor: 'transparent',
       tension: 0.3,
       pointRadius: 2,
@@ -427,7 +549,7 @@ function updateLimitChart(chart, group) {
 
 function applyLimitRange() {
   updateLimitChart(limitShortChart, 'short');
-  updateLimitChart(limitGeminiChart, 'gemini');
+  updateLimitChart(limitOtherChart, 'other');
   updateLimitChart(limitLongChart, 'long');
 }
 
@@ -455,7 +577,7 @@ function initCharts() {
   const pdCtx = document.getElementById('pd-chart').getContext('2d');
   pdChart = new Chart(pdCtx, {
     type: 'doughnut',
-    data: { labels: [], datasets: [{ data: [], backgroundColor: ['#6c63ff', '#ffc107', '#4caf50', '#ef5350', '#29b6f6'] }] },
+    data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] },
     options: { responsive: true, plugins: { legend: { labels: { color: '#888' }, position: 'bottom' } } },
   });
 
@@ -487,12 +609,12 @@ function initCharts() {
   }
 
   limitShortChart = createLimitChart('limit-chart-short');
-  limitGeminiChart = createLimitChart('limit-chart-gemini');
+  limitOtherChart = createLimitChart('limit-chart-other');
   limitLongChart = createLimitChart('limit-chart-long');
 
   document.getElementById('tpd-reset').onclick = () => safeResetZoom(tpdChart);
   document.getElementById('lim-short-reset').onclick = () => safeResetZoom(limitShortChart);
-  document.getElementById('lim-gemini-reset').onclick = () => safeResetZoom(limitGeminiChart);
+  document.getElementById('lim-other-reset').onclick = () => safeResetZoom(limitOtherChart);
   document.getElementById('lim-long-reset').onclick = () => safeResetZoom(limitLongChart);
 
   const fdCtx = document.getElementById('failure-doughnut').getContext('2d');
@@ -640,7 +762,47 @@ async function refreshActiveRuns() {
   } catch (e) { console.warn('active-runs fetch failed', e); }
 }
 
+function fmtAge(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  if (sec < 60) return 'gerade eben';
+  if (sec < 3600) return 'vor ' + Math.floor(sec / 60) + ' min';
+  if (sec < 86400) return 'vor ' + Math.floor(sec / 3600) + ' h';
+  return 'vor ' + Math.floor(sec / 86400) + ' Tagen';
+}
+
+function renderQuotaNow(now) {
+  const box = document.getElementById('quota-now');
+  const entries = Object.entries(now || {});
+  if (!entries.length) {
+    box.innerHTML = '<div class="card"><div class="value">—</div>'
+      + '<div class="label">Noch keine Kapazitätswerte (logs/capacity-log.md)</div></div>';
+    return;
+  }
+  entries.sort((a, b) => (providerMeta(a[0]).order - providerMeta(b[0]).order) || a[0].localeCompare(b[0]));
+  box.innerHTML = entries.map(([name, q]) => {
+    const meta = providerMeta(name);
+    const cls = ['card'];
+    if (q.stale) cls.push('stale');
+    if (!q.available) cls.push('unavailable');
+    let value;
+    if (!q.available) {
+      value = 'nicht verfügbar' + (q.remaining_pct != null ? ' (' + q.remaining_pct.toFixed(0) + ' %)' : '');
+    } else {
+      value = q.remaining_pct.toFixed(0) + ' %';
+    }
+    const badges = (q.stale ? '<span class="badge stale">veraltet</span> ' : '')
+      + (!q.available ? '<span class="badge unavail">nicht verfügbar</span>' : '');
+    return '<div class="' + cls.join(' ') + '" title="' + escapeHtml(name + ' · Stand ' + q.ts) + '">'
+      + '<div class="value" style="color:' + escapeHtml(q.available && !q.stale ? meta.color : '') + '">' + escapeHtml(value) + '</div>'
+      + '<div class="label">' + escapeHtml(meta.label) + '</div>'
+      + '<div class="age">' + escapeHtml(fmtAge(q.age_sec)) + '</div>'
+      + (badges ? '<div>' + badges + '</div>' : '')
+      + '</div>';
+  }).join('');
+}
+
 function update(d) {
+  _providerMeta = d.provider_meta || {};
   document.getElementById('gen-ts').textContent = 'Stand: ' + d.generated_at;
   document.getElementById('total-tasks').textContent = d.total_tasks;
   document.getElementById('success-rate').textContent = d.success_rate + '%';
@@ -653,9 +815,14 @@ function update(d) {
   _allTpd = d.tasks_per_day || { labels: [], values: [] };
   applyRange();
 
-  // Provider dist
-  pdChart.data.labels = d.provider_distribution.labels || [];
+  // Quoten jetzt — newest value per exact key (analytics._limits_now)
+  renderQuotaNow(d.limits_now);
+
+  // Provider dist — one colour per label from provider_meta (distinct, never runs out)
+  const pdLabels = d.provider_distribution.labels || [];
+  pdChart.data.labels = pdLabels;
   pdChart.data.datasets[0].data = d.provider_distribution.values || [];
+  pdChart.data.datasets[0].backgroundColor = pdLabels.map(l => providerMeta(l).color);
   pdChart.update();
 
   // Limits timeline — store full history and apply active range to all three charts
@@ -755,7 +922,10 @@ class _Handler(BaseHTTPRequestHandler):
                 data = {"active_runs": _load_active_runs()}
             else:
                 days = max(1, min(int(params.get("days", ["7"])[0]), 365))
-                data = get_dashboard_data(days=days)
+                # Copy: get_dashboard_data() returns its 30-s cache object.
+                full: dict = dict(get_dashboard_data(days=days))
+                full["provider_meta"] = provider_meta_map(_provider_names_in(full))
+                data = full
             body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         except Exception as e:
             logger.exception("dashboard data error")

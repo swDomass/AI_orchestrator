@@ -22,13 +22,16 @@ import pytest
 
 import config
 import dashboard
+import doctor
+import heartbeat
 import orchestrator
 
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        port: int = s.getsockname()[1]
+        return port
 
 
 @pytest.fixture
@@ -247,7 +250,7 @@ def test_orchestrator_dashboard_flag_keeps_blocking_browser_default(monkeypatch)
 @pytest.fixture
 def captured_log(monkeypatch):
     lines: list[str] = []
-    monkeypatch.setattr(orchestrator, "append_log", lambda msg: lines.append(msg))
+    monkeypatch.setattr(orchestrator, "append_log", lines.append)
     return lines
 
 
@@ -293,7 +296,7 @@ def test_call_site_passes_the_autostart_browser_flag(monkeypatch, captured_log):
     assert started.call_args.kwargs["open_browser"] is False
 
 
-class _StopLoop(Exception):
+class _StopLoopError(Exception):
     """Ends run_watch after its first main-loop round."""
 
 
@@ -305,16 +308,13 @@ class _FakeTime:
 
     def sleep(self, sec):
         self.sleeps.append(sec)
-        raise _StopLoop
+        raise _StopLoopError
 
     def __getattr__(self, name):
         return getattr(time, name)
 
 
 def _patch_run_watch_startup(monkeypatch):
-    import doctor
-    import heartbeat
-
     monkeypatch.setattr(doctor, "run_startup_checks", lambda: True)
     monkeypatch.setattr(heartbeat, "HeartbeatRunner", lambda: SimpleNamespace(run_due=lambda *_a: None))
     monkeypatch.setattr(heartbeat, "_log_capacity", lambda: None)
@@ -368,7 +368,7 @@ def test_run_watch_keeps_running_when_dashboard_fails(
     else:
         monkeypatch.setitem(sys.modules, "dashboard", None)
 
-    with pytest.raises(_StopLoop):
+    with pytest.raises(_StopLoopError):
         orchestrator.run_watch()
 
     # The main loop ran one round: read the queue, went to sleep.

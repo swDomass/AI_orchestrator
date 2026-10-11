@@ -798,7 +798,7 @@ USAGE_SUGGEST_VAULT_TASK_DIRS     = [
 # Maps task tag aliases to full CLI model IDs, per provider.
 # Tags are provider-bound: #claude_opus only applies to claude, not to gemini on fallback.
 CLAUDE_MODEL_ALIASES: dict[str, str] = {
-    "claude_haiku": "claude-haiku-4-5-20251001",
+    "claude_haiku": "claude-haiku-5-5",
     "claude_sonnet": "claude-sonnet-5-5",  # Sonnet 5.5 = current Sonnet tier (2026-09);
                                            # same price as Sonnet 5 ($2/$10); effort
                                            # levels recalibrated, default stays `high`.
@@ -806,6 +806,7 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
                                            # cheaper than Opus 5 ($4/$20 vs $5/$25 per
                                            # Mtok), same CLI surface.
 }
+# Claude drift-check 2026-10-11 (monthly maintenance): claude-haiku-5-5 supersedes claude-haiku-4-5-20251001 (Anthropic deprecations page: retirement not sooner than 2026-10-15; in CLI 2.1.296 binary, probed live).
 # Claude drift-check 2026-10 (quarterly): claude-sonnet-5-5 supersedes claude-sonnet-5 (Claude Code 2.1.284).
 # Claude drift-check 2026-09-25 (monthly maintenance, claude-api skill + CLI 2.1.282 binary
 # + live probe): `claude-opus-5-5` supersedes `claude-opus-5`. One behavioural difference
@@ -861,13 +862,14 @@ GEMINI_MODEL_ALIASES: dict[str, str] = {
 # 2026-10-02: `codex_5` -> gpt-6.1-sol (Codex catalog priority 1, "Latest workhorse";
 # 5.6 is listed as "Older generation"). Probe on the 29.09. Astra package: 64,696 tokens
 # vs 70,298 for gpt-6-astra, 3 real P2 each. `codex_5_4`/`codex_mini` stay on 5.6 for
-# now — Terra has no GPT-6 counterpart in the catalog, Luna is unprobed.
+# now — Terra has no GPT-6 counterpart in the catalog.
+# 2026-10-11: codex_mini -> gpt-6-luna (Codex catalog priority 4, lower token prices per Codex changelog entry of 2026-09-22; in codex-cli 0.162.1 binary, probed live). codex_5_4 stays on gpt-5.6-terra (no GPT-6 counterpart).
 # NOTE: the version-shaped keys `codex_5`/`codex_5_4` are kept stable so existing
 # queue lines keep working; rename is a separate cleanup.
 CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex_5":    "gpt-6.1-sol",
     "codex_5_4":  "gpt-5.6-terra",
-    "codex_mini": "gpt-5.6-luna",
+    "codex_mini": "gpt-6-luna",
 }
 # Mistral Vibe aliases. The VALUES are vibe's own config aliases (`active_model`
 # in ~/.vibe/config.toml), not raw model names — the provider passes them through

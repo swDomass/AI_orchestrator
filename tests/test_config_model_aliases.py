@@ -24,9 +24,9 @@ def test_gemini_tags_resolve_for_gemini():
 
 
 def test_codex_tags_resolve_for_codex():
-    assert model_id_for_provider("codex_mini", "codex") == "gpt-5.6-luna"
-    assert model_id_for_provider("codex_5", "codex") == "gpt-6.1-sol"
-    assert model_id_for_provider("codex_5_4", "codex") == "gpt-5.6-terra"
+    assert model_id_for_provider("codex_mini", "codex") == CODEX_MODEL_ALIASES["codex_mini"]
+    assert model_id_for_provider("codex_5", "codex") == CODEX_MODEL_ALIASES["codex_5"]
+    assert model_id_for_provider("codex_5_4", "codex") == CODEX_MODEL_ALIASES["codex_5_4"]
 
 
 def test_vibe_tags_resolve_for_vibe():
@@ -84,7 +84,8 @@ def test_codex_aliases_match_verified_model_cache():
     # GPT-5.6 family (2026-07-09) replaced gpt-5.5/gpt-5.4; Codex CLI 0.145.0 migrated
     # its bundled selections to Terra/Luna. All three IDs probed live on 2026-07-23;
     # codex_5 moved to gpt-6.1-sol on 2026-10-02 (probed live with `codex exec -m`).
-    assert CODEX_MODEL_ALIASES["codex_mini"] == "gpt-5.6-luna"
+    # codex_mini moved to gpt-6-luna on 2026-10-11 (probed live with codex exec -m).
+    assert CODEX_MODEL_ALIASES["codex_mini"] == "gpt-6-luna"
     assert CODEX_MODEL_ALIASES["codex_5"] == "gpt-6.1-sol"
     assert CODEX_MODEL_ALIASES["codex_5_4"] == "gpt-5.6-terra"
 

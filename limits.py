@@ -1272,7 +1272,7 @@ def _refresh_token(provider: str) -> bool:
             # Strategy 2: actual API call forces OAuth token refresh
             logger.info("  [claude] Versuche Token-Refresh via claude --print ...")
             r2 = subprocess.run(
-                [_CLAUDE_CMD, "--print", "--model", "claude-haiku-4-5-20251001", "-p", "ping"],
+                [_CLAUDE_CMD, "--print", "--model", config.CLAUDE_MODEL_ALIASES["claude_haiku"], "-p", "ping"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=30,
                 shell=sys.platform == "win32",

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import config
 import limits
 
 
@@ -39,6 +40,24 @@ def test_refresh_token_claude_falls_through_when_auth_status_shows_expired(monke
     assert len(calls) == 2
     assert calls[0][0] == [limits._CLAUDE_CMD, "auth", "status"]
     assert calls[1][0][:2] == [limits._CLAUDE_CMD, "--print"]
+
+
+def test_refresh_token_claude_strategy2_uses_configured_haiku_alias(monkeypatch):
+    """Strategy 2 must take the model from CLAUDE_MODEL_ALIASES, not a literal."""
+    monkeypatch.setitem(config.CLAUDE_MODEL_ALIASES, "claude_haiku", "sentinel-haiku-id")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if "auth" in cmd:
+            return SimpleNamespace(returncode=0, stdout="Token expired", stderr="")
+        return SimpleNamespace(returncode=0, stdout="pong", stderr="")
+
+    monkeypatch.setattr(limits.subprocess, "run", fake_run)
+
+    assert limits._refresh_token("claude") is True
+    cmd = calls[1][0]
+    assert cmd[cmd.index("--model") + 1] == "sentinel-haiku-id"
 
 
 def test_refresh_token_claude_returns_false_when_all_strategies_fail(monkeypatch):

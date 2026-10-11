@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import config
 import parallel_runner as parallel_runner_module
 import queue_manager
 from config import POLICY_APPROVAL_TIMEOUT_SEC
@@ -300,7 +301,7 @@ def test_run_single_subtask_applies_forced_claude_model(monkeypatch):
         pause_event=None,
     )
 
-    assert seen_models == ["claude-haiku-4-5-20251001"]
+    assert seen_models == [config.CLAUDE_MODEL_ALIASES["claude_haiku"]]
     assert provider._forced_model is None
     assert result.success is True
     assert result.provider_name == "claude"

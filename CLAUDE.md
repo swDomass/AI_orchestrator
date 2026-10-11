@@ -15,6 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
+# Stand 2026-10-11 spät (Windows, nach OpenRouter-Drift: −3 Gratis-Aliase, +4 Tests): 3313 passed / 0 failed / 2 skipped in 293-335 s.
 # Stand 2026-10-11 (Windows, Monats-Wartung, nach Modell-Umstellung Haiku 5.5/gpt-6-luna): 3309 passed / 0 failed / 2 skipped in 571 s; unter Parallellast bis 20 min, dann reißt der Harness-Index-Subprozess-Test seine 120-s-Grenze.
 # Stand 2026-10-09 nach 821574f (Windows, Auftraggeber): 3308 passed / 0 failed / 2 skipped. Gegenprobe im
 # Worktree docs-sync: `--collect-only` 3310 (= 3308 + 2), voller Lauf Exit 0.

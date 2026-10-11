@@ -314,7 +314,7 @@ def test_llm_check_prompt_includes_openrouter_aliases(monkeypatch):
     monkeypatch.setattr("limits.get_limits", lambda: MagicMock())
 
     _llm_check_for_newer_models()
-    assert "OpenRouter/or_minimax_free" in captured["prompt"]
+    assert "OpenRouter/or_nemotron_free" in captured["prompt"]
     assert "OpenRouter/or_glm" in captured["prompt"]
 
 

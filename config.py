@@ -415,8 +415,8 @@ SYSTEM_PROMPTS: dict[str, str] = {
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "minimax/minimax-m2.5:free"
-)
+    "OPENROUTER_DEFAULT_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
+)  # = or_nemotron_free; was minimax-m2.5:free until delisted (2026-10-11)
 
 # --- Gemini HTTP API (preferred over the deprecated CLI) ---
 # The consumer Gemini CLI (Code Assist for individuals / AI Pro / AI Ultra) was
@@ -882,33 +882,31 @@ VIBE_MODEL_ALIASES: dict[str, str] = {
     "vibe_small":  "devstral-small",       # $0.1/$0.3 per Mtok, cheap pass
 }
 # OpenRouter aliases: prefix `or_*` so they cannot collide with native CLI tags.
-# Free models for trivial single-call tasks (heartbeat, summaries). Paid flagships
+# One free model for trivial single-call tasks (heartbeat, summaries). Paid flagships
 # from Chinese open-source families for higher-quality non-agentic calls — all at
 # a fraction of Anthropic/Codex pricing. IDs verified against OpenRouter /models
-# API on 2026-05-15.
+# API on 2026-10-11.
+# 2026-10-11: removed or_minimax_free/or_deepseek_free/or_qwen_free (minimax-m2.5:free, deepseek-v4-flash:free, qwen3-coder:free no longer listed on /models); or_qwen qwen3-max (delisted) -> qwen3.7-max.
 OPENROUTER_MODEL_ALIASES: dict[str, str] = {
     # Free — $0 always (subject to OpenRouter's daily request limits)
-    "or_minimax_free":  "minimax/minimax-m2.5:free",
-    "or_deepseek_free": "deepseek/deepseek-v4-flash:free",
-    "or_qwen_free":     "qwen/qwen3-coder:free",
     "or_nemotron_free": "nvidia/nemotron-3-super-120b-a12b:free",
     # Paid flagships — pricing per MTok (prompt / completion)
-    "or_glm":      "z-ai/glm-5",                   # $0.60 / $1.92, 202k ctx
-    "or_kimi":     "moonshotai/kimi-k2.6",         # $0.73 / $3.49, 262k ctx
-    "or_qwen":     "qwen/qwen3-max",               # $0.78 / $3.90, 262k ctx
-    "or_deepseek": "deepseek/deepseek-v4-pro",     # $0.44 / $0.87, 1M ctx
-    "or_minimax":  "minimax/minimax-m2.7",         # $0.28 / $1.20, 196k ctx
+    "or_glm":      "z-ai/glm-5",                   # $0.60 / $1.92, 205k ctx
+    "or_kimi":     "moonshotai/kimi-k2.6",         # $0.65 / $3.41, 262k ctx
+    "or_qwen":     "qwen/qwen3.7-max",             # $1.475 / $4.425, 1M ctx
+    "or_deepseek": "deepseek/deepseek-v4-pro",     # $0.209 / $0.418, 1M ctx
+    "or_minimax":  "minimax/minimax-m2.7",         # $0.21 / $0.84, 205k ctx
 }
 # opencode aliases: ONLY handpicked entries. The zdr-auto-* aliases in
 # opencode.json are managed by oc_sync_zdr_aliases.py and their ORDER changes
 # (it re-ranks by benchmark score) — a tag pointing at one of those would
 # silently pick a different model over time, so they are not valid tag targets.
-# All three verified 2026-09-04 against opencode.json: present, and each
+# All three verified 2026-10-11 (and 2026-09-04) against opencode.json: present, and each
 # carries data_collection:"deny" + zdr:true.
 OPENCODE_MODEL_ALIASES: dict[str, str] = {
     "opencode_deepseek":      "openrouter/zdr-review",       # deepseek-v4-pro
     "opencode_deepseek_long": "openrouter/zdr-review-long",  # deepseek-v4-flash, 1M ctx
-    "opencode_glm":           "openrouter/zdr-review-alt",   # glm-5.2
+    "opencode_glm":           "openrouter/zdr-review-alt",   # glm-5.2 — now $0.06 / $7.0 per Mtok, output-heavy runs cost more
 }
 _MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
     "claude":     CLAUDE_MODEL_ALIASES,

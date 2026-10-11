@@ -112,11 +112,13 @@ def test_model_tag_re_covers_every_dispatcher_alias():
     20 -> 23 (2026-09-04): opencode's three handpicked ZDR aliases
     (opencode_deepseek, opencode_deepseek_long, opencode_glm) joined _TAG_MAP —
     raised deliberately, not relaxed, so the counter keeps catching a silently
-    shrunk _TAG_MAP."""
+    shrunk _TAG_MAP.
+    23 -> 20 (2026-10-11): or_minimax_free/or_deepseek_free/or_qwen_free removed
+    deliberately — their models were delisted on OpenRouter /models."""
     from dispatcher import _TAG_MAP
 
     model_aliases = {tag[1:] for tag, provider in _TAG_MAP.items() if tag[1:] != provider}
-    assert len(model_aliases) == 23  # guards against a silently shrunk _TAG_MAP too
+    assert len(model_aliases) == 20  # guards against a silently shrunk _TAG_MAP too
 
     for alias in model_aliases:
         assert queue_manager.extract_model_tag(f"Run #{alias} now") == alias

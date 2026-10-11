@@ -236,7 +236,7 @@ PASS_PROVIDER_TAG_RE = re.compile(
 )
 
 # Matches #second_opinion:<alias> — opt-in second-opinion provider for review-loop.
-# Value is a model alias (e.g. or_glm, or_minimax_free, claude_opus) or a bare
+# Value is a model alias (e.g. or_glm, or_nemotron_free, claude_opus) or a bare
 # provider name (openrouter, claude, gemini, codex). Resolution happens in the tool.
 SECOND_OPINION_TAG_RE = re.compile(r"(?i)(?<!\S)#second_opinion:([A-Za-z0-9_]+)(?=\s|$)")
 

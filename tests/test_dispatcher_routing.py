@@ -188,9 +188,9 @@ def test_openrouter_tag_selects_openrouter_when_registered(with_openrouter):
     assert provider.name == "openrouter"
 
 
-def test_or_minimax_free_tag_selects_openrouter(with_openrouter):
+def test_or_nemotron_free_tag_selects_openrouter(with_openrouter):
     limits = _make_limits()
-    provider = select_provider(f"Daily summary #or_minimax_free {_OR_OK}", limits)
+    provider = select_provider(f"Daily summary #or_nemotron_free {_OR_OK}", limits)
     assert provider is not None
     assert provider.name == "openrouter"
 
@@ -207,14 +207,14 @@ def test_or_paid_flagship_tags_select_openrouter(with_openrouter):
 def test_or_tag_falls_back_when_openrouter_unregistered(without_openrouter):
     """Without OPENROUTER_API_KEY (unregistered), tagged tasks fall through to claude."""
     limits = _make_limits()
-    provider = select_provider("Daily summary #or_minimax_free", limits)
+    provider = select_provider("Daily summary #or_nemotron_free", limits)
     assert provider is not None
     assert provider.name == "claude"
 
 
 def test_has_explicit_provider_tag_detects_openrouter_tags():
     assert has_explicit_provider_tag("Check #openrouter") is True
-    assert has_explicit_provider_tag("Check #or_minimax_free") is True
+    assert has_explicit_provider_tag("Check #or_nemotron_free") is True
     assert has_explicit_provider_tag("Check #or_glm") is True
 
 
@@ -552,7 +552,7 @@ def missing_policy(tmp_path, monkeypatch):
     return engine
 
 
-@pytest.mark.parametrize("tag", ["#openrouter", "#or_glm", "#or_minimax_free"])
+@pytest.mark.parametrize("tag", ["#openrouter", "#or_glm", "#or_nemotron_free"])
 @pytest.mark.parametrize("strict", [False, True])
 def test_bare_openrouter_tag_is_barred_under_missing_policy(
     with_openrouter, missing_policy, tag, strict,

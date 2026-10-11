@@ -36,9 +36,11 @@
   still gets it — an autouse fixture in an ordinary test file only applies to
   tests collected from THAT module.
 """
+import atexit
 import importlib
 import os
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -114,6 +116,9 @@ _REAL_VAULT_PATH = _find_real_vault_path()
 # the pre-redirect value, read nowhere else.
 os.environ["_ORCH_TEST_REAL_VAULT_PATH"] = str(_REAL_VAULT_PATH)
 
+# Every scratch directory this process creates, for the atexit cleanup below.
+_CREATED_TEMP_ROOTS: list[Path] = []
+
 # Root redirect — set BEFORE the first `import config` anywhere in this process
 # (this file included), so config.py's OWN module-level derived constants
 # (`POLICY_FILE`, `QUEUE_FILE`, …) compute correctly from the redirected value
@@ -128,6 +133,7 @@ os.environ["_ORCH_TEST_REAL_VAULT_PATH"] = str(_REAL_VAULT_PATH)
 # just the chdir half.
 if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
     _TEST_VAULT_ROOT = Path(tempfile.mkdtemp(prefix="orch_test_vault_"))
+    _CREATED_TEMP_ROOTS.append(_TEST_VAULT_ROOT)
     os.environ["ORCH_VAULT_PATH"] = str(_TEST_VAULT_ROOT)
 
 # Harness-index sources (harness_index.py, 2026-10-09): the suite must never read
@@ -137,6 +143,7 @@ if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
 # suite spawns (`python -m harness_index --update`) inherit scratch paths; the
 # autouse fixture `_isolate_harness_sources` below then narrows them per test.
 _TEST_HARNESS_ROOT = Path(tempfile.mkdtemp(prefix="orch_test_harness_"))
+_CREATED_TEMP_ROOTS.append(_TEST_HARNESS_ROOT)
 _HARNESS_ENV_PATHS = {
     "HARNESS_DB_FILE": "index/harness-index.sqlite",
     "HARNESS_CLAUDE_PROJECTS_DIR": "claude-projects",
@@ -147,6 +154,47 @@ _HARNESS_ENV_PATHS = {
 }
 for _key, _rel in _HARNESS_ENV_PATHS.items():
     os.environ[_key] = str(_TEST_HARNESS_ROOT / _rel)
+
+
+def _remove_created_temp_roots(
+    roots: list[Path], tmp_base: Path, real_vault: Path | None
+) -> list[Path]:
+    """Delete the scratch roots THIS process created; return what was deleted.
+
+    Measured 2026-10-11: 465 `orch_test_*` directories in %TEMP% in one day
+    (107 non-empty) because nothing ever removed the two `mkdtemp` results above.
+    Deletes only with ALL guards holding: known prefix, direct child of the temp
+    directory, and no overlap with the real vault in either direction. Never
+    raises (open SQLite files on Windows leave remnants via ignore_errors).
+    """
+    removed: list[Path] = []
+    for root in list(roots):
+        try:
+            if not root.name.startswith(("orch_test_vault_", "orch_test_harness_")):
+                continue
+            resolved = root.resolve()
+            if resolved.parent != tmp_base.resolve():
+                continue
+            if real_vault is not None:
+                rv = real_vault.resolve()
+                if rv == resolved or resolved in rv.parents or rv in resolved.parents:
+                    continue
+            shutil.rmtree(root, ignore_errors=True)
+            if not root.exists():  # a Windows remnant is not "deleted"
+                removed.append(root)
+        except Exception:  # cleanup must never fail the run
+            continue
+    return removed
+
+
+# Registered AFTER both directories exist; also runs in child pytest processes
+# that import this conftest, and after KeyboardInterrupt.
+atexit.register(
+    _remove_created_temp_roots,
+    _CREATED_TEMP_ROOTS,
+    Path(tempfile.gettempdir()),
+    _REAL_VAULT_PATH,
+)
 
 import replay  # noqa: E402 — must follow sys.path tweak
 

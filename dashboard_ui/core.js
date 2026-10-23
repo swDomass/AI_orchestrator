@@ -92,3 +92,9 @@ async function orchPost(path, body) {
     return {ok: false, status: 0, data: null};
   }
 }
+
+// True when only a page reload can help: server unreachable / restarted (status 0) or a
+// token mismatch (403 code 'token'). Any other 403 (forbidden origin etc.) is not this case.
+function orchNeedsReload(r) {
+  return !!(r && (r.status === 0 || (r.status === 403 && r.data && r.data.code === 'token')));
+}

@@ -19,6 +19,7 @@
 <nav class="tabs">
   <button class="tab-btn active" data-tab="main" data-action="show-tab">Übersicht</button>
   <button class="tab-btn" data-tab="harness" data-action="show-tab">Harness</button>
+  <button class="tab-btn" data-tab="queue" data-action="show-tab">Queue</button>
 </nav>
 
 <div id="tab-main">
@@ -195,9 +196,35 @@
   </div>
 </div>
 
+<div id="tab-queue" class="boot-hidden">
+  <div class="q-status" id="q-status">
+    <span id="q-path"></span>
+    <span id="q-mtime"></span>
+    <span id="q-run"></span>
+    <span id="q-hint"></span>
+    <button class="time-btn" id="q-undo" data-action="queue-undo" hidden></button>
+  </div>
+  <div class="q-banner warn" id="q-external" hidden>Die Datei wurde von außen geändert (Markierung: Zeilen mit Rand).</div>
+  <div class="q-banner warn" id="q-overwritten" hidden>Änderung vermutlich überschrieben (Obsidian); Sicherung vorhanden.</div>
+  <div class="q-banner warn" id="q-reload" hidden>
+    <span id="q-reload-msg">Verbindung verloren — Seite neu laden.</span>
+    <button class="time-btn" data-action="queue-reload-page">Seite neu laden</button>
+  </div>
+  <div class="q-banner" id="q-msg" hidden></div>
+  <div class="q-tools">
+    <input type="search" id="q-search" placeholder="Suche im Text …" autocomplete="off">
+    <button class="time-btn" id="q-new-btn" data-action="queue-new">Neuer Task</button>
+    <button class="time-btn" id="q-raw-btn" data-action="queue-raw">Rohtext</button>
+  </div>
+  <div id="q-groups"></div>
+  <div id="q-form" class="boot-hidden q-panel"></div>
+  <div id="q-raw" class="boot-hidden q-panel"></div>
+</div>
+
 <script src="/static/core.js"></script>
 <script src="/static/overview.js"></script>
 <script src="/static/harness.js"></script>
+<script src="/static/queue.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

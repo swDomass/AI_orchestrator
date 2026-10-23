@@ -17,6 +17,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import config
+
 # dispatcher._TAG_MAP is the same maßgebliche tag table queue_manager.py derives
 # PROVIDER_TAG_RE / MODEL_TAG_RE / PASS_PROVIDER_TAG_RE from (see the comment there).
 # Imported at module level, not deferred: dispatcher's own module-level imports
@@ -75,6 +77,23 @@ def _load_yaml_safe(path: Path) -> dict | None:
     except Exception as e:
         logger.warning("profiles: could not load %s: %s", path, e)
         return None
+
+
+def list_profile_names(vault: Path | None = None) -> list[str]:
+    """Names of all profile files, sorted, no duplicates.
+
+    Searches the same three directories as ``load_profile`` (vault, PROFILES_DIR,
+    repo-local ``profiles/``); a listed name resolves there unless its YAML is unreadable.
+    """
+    root = config.VAULT_PATH if vault is None else vault
+    dirs = [root / "99_System" / "AI" / "profiles", config.PROFILES_DIR, Path(__file__).parent / "profiles"]
+    names: set[str] = set()
+    for d in dirs:
+        try:
+            names.update(p.stem for p in d.glob("*.yaml") if p.is_file())
+        except OSError:
+            continue
+    return sorted(names)
 
 
 def load_profile(name: str, vault_path: Path) -> "ProfileConfig | None":

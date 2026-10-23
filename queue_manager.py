@@ -487,6 +487,27 @@ def _apply_update(transform: Callable[[str], str | None]) -> bool:
     return False
 
 
+def apply_queue_update(transform: Callable[[str], str | None]) -> bool:
+    """Public delegate to `_apply_update` (no behaviour of its own).
+
+    Contract: `transform` may run SEVERAL times (the whole pass, transform included,
+    is retried on lock/OS errors); any other exception it raises is swallowed
+    (printed, returns False), so results leave via a closure holder; True only if
+    new content was written.
+    """
+    return _apply_update(transform)
+
+
+def read_queue_text() -> str:
+    """Public delegate to `_read_queue_content` (locked read, UTF-8/cp1252 fallback)."""
+    return _read_queue_content()
+
+
+def queue_file() -> Path:
+    """The CURRENT module attribute `QUEUE_FILE` (looked up per call, so tests can patch it)."""
+    return QUEUE_FILE
+
+
 def _extract_queue_section(content: str) -> str:
     """Return the body of the '## Queue' section, or the full content as fallback."""
     match = QUEUE_SECTION_RE.search(content)

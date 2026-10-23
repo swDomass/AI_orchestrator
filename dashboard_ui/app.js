@@ -5,12 +5,13 @@ document.querySelectorAll('.boot-hidden').forEach(el => {
   el.classList.remove('boot-hidden');
 });
 
+const TABS = ['main', 'harness', 'queue'];
 function showTab(name) {
-  document.getElementById('tab-main').style.display = name === 'main' ? '' : 'none';
-  document.getElementById('tab-harness').style.display = name === 'harness' ? '' : 'none';
+  TABS.forEach(t => { document.getElementById('tab-' + t).style.display = t === name ? '' : 'none'; });
   document.querySelectorAll('.tab-btn[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
-  try { location.hash = name === 'harness' ? '#harness' : ''; } catch (e) { /* ignore */ }
+  try { location.hash = name === 'main' ? '' : '#' + name; } catch (e) { /* ignore */ }
   if (name === 'harness') loadHarness();
+  if (name === 'queue') loadQueue();
 }
 
 registerActions({
@@ -35,4 +36,9 @@ orchPost('/api/ping', {}).then(r => {
 setInterval(load, 60000);
 setInterval(refreshActiveRuns, 30000);
 setInterval(harnessTick, 300000);
+setInterval(queueTick, 5000);
+// One delegated handler for typing and changes (queue search + form); no inline or .oninput handlers.
+document.addEventListener('input', queueOnInput);
+document.addEventListener('change', queueOnInput);
 if (location.hash === '#harness') showTab('harness');
+if (location.hash === '#queue') showTab('queue');

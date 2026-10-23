@@ -3576,6 +3576,7 @@ def _start_dashboard_autostart() -> None:
         dashboard = importlib.import_module("dashboard")
         dashboard.start_autostart(
             open_browser=config.DASHBOARD_OPEN_BROWSER, warn=_warn, info=_info,
+            in_flight=lambda: _in_flight_task,
         )
     except Exception as e:  # never raises, by contract
         _warn(

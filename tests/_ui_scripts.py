@@ -6,6 +6,9 @@ from ``index.html`` so the probes stay unchanged: it appends the page's own
 scripts in the order index.html loads them.
 """
 
+import json
+import shutil
+import subprocess
 from html.parser import HTMLParser
 
 import dashboard
@@ -88,3 +91,60 @@ def index_buttons() -> list[dict[str, str]]:
 def boot_hidden_ids() -> list[str]:
     """ids of the elements index.html ships with the .boot-hidden class."""
     return _marked().boot_hidden
+
+
+NODE = shutil.which("node")
+
+# Minimal browser surface: enough for the page scripts to load and render.
+NODE_STUB = r"""
+const _els = {};
+const _docListeners = {};
+function _el(id) {
+  if (!_els[id]) {
+    _els[id] = {
+      id, innerHTML: '', textContent: '', style: {}, dataset: {}, onclick: null,
+      hidden: false, value: '',
+      classList: { toggle() {}, add() {}, remove() {} },
+      getContext() { return { canvasId: id }; },
+      appendChild(c) { (this.children = this.children || []).push(c); },
+      addEventListener() {},
+      querySelectorAll() { return []; },
+    };
+  }
+  return _els[id];
+}
+globalThis.document = {
+  getElementById: _el,
+  querySelectorAll() { return []; },
+  querySelector() { return null; },
+  addEventListener(type, fn) { (_docListeners[type] = _docListeners[type] || []).push(fn); },
+  createElement() { return _el('__new' + Object.keys(_els).length); },
+};
+globalThis.window = globalThis;
+globalThis.location = { hash: '', port: '8211', reload() { globalThis._reloaded = (globalThis._reloaded || 0) + 1; } };
+const _charts = [];
+globalThis.Chart = function (ctx, cfg) {
+  this.canvasId = ctx.canvasId; this.data = cfg.data; this.options = cfg.options;
+  _charts.push(this);
+};
+Chart.prototype.update = function () {};
+Chart.prototype.resetZoom = function () {};
+Chart.register = function () {};
+globalThis.fetch = () => new Promise(() => {});  // never resolves; we call update() ourselves
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.clearTimeout = () => {};
+"""
+
+
+def run_node(tmp_path, source: str, name: str = "page_test.js") -> dict:
+    """Write ``source`` to tmp_path, run it in node, return the last stdout line parsed as JSON."""
+    js = tmp_path / name
+    js.write_text(source, encoding="utf-8")
+    assert NODE is not None
+    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=30, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip(), "node printed nothing (a promise never settled?): " + proc.stderr[-500:]
+    result: dict = json.loads(proc.stdout.strip().splitlines()[-1])
+    return result

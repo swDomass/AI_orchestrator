@@ -79,7 +79,7 @@ def _own_files() -> list:
 
 
 def test_list_entries_serve_exact_bytes_and_content_type(port):
-    assert len(dashboard._STATIC_FILES) == 7
+    assert len(dashboard._STATIC_FILES) == 8
     # The expected type is derived from the file extension HERE, not read from
     # the table the server uses (else a wrong table entry would stay green).
     by_ext = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}

@@ -10,77 +10,25 @@ box may not) — then the page rendering stays "unverified", as before.
 """
 
 import json
-import shutil
-import subprocess
 from datetime import datetime
 
 import pytest
-from _ui_scripts import boot_hidden_ids, index_buttons, page_script
+from _ui_scripts import NODE, NODE_STUB, boot_hidden_ids, index_buttons, page_script, run_node
 
 import analytics
 import dashboard
 
-NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
-
-# Minimal browser surface: enough for the page script to load and render.
-_STUB = r"""
-const _els = {};
-const _docListeners = {};
-function _el(id) {
-  if (!_els[id]) {
-    _els[id] = {
-      id, innerHTML: '', textContent: '', style: {}, dataset: {}, onclick: null,
-      classList: { toggle() {}, add() {}, remove() {} },
-      getContext() { return { canvasId: id }; },
-      appendChild(c) { (this.children = this.children || []).push(c); },
-      addEventListener() {},
-      querySelectorAll() { return []; },
-    };
-  }
-  return _els[id];
-}
-globalThis.document = {
-  getElementById: _el,
-  querySelectorAll() { return []; },
-  querySelector() { return null; },
-  addEventListener(type, fn) { (_docListeners[type] = _docListeners[type] || []).push(fn); },
-  createElement() { return _el('__new' + Object.keys(_els).length); },
-};
-globalThis.window = globalThis;
-globalThis.location = { hash: '' };
-const _charts = [];
-globalThis.Chart = function (ctx, cfg) {
-  this.canvasId = ctx.canvasId; this.data = cfg.data; this.options = cfg.options;
-  _charts.push(this);
-};
-Chart.prototype.update = function () {};
-Chart.prototype.resetZoom = function () {};
-Chart.register = function () {};
-globalThis.fetch = () => new Promise(() => {});  // never resolves; we call update() ourselves
-globalThis.setInterval = () => 0;
-globalThis.setTimeout = () => 0;
-"""
-
 
 def _page_script() -> str:
     return page_script()
 
 
 def _run(tmp_path, payload: dict, probe: str, pre: str = "") -> dict:
-    js = tmp_path / "page_test.js"
-    js.write_text(
-        _STUB + "\n" + pre + "\n" + _page_script()
+    return run_node(
+        tmp_path, NODE_STUB + "\n" + pre + "\n" + _page_script()
         + "\nupdate(" + json.dumps(payload) + ");\n"
-        + "console.log(JSON.stringify((function(){" + probe + "})()));\n",
-        encoding="utf-8",
-    )
-    assert NODE is not None
-    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=30, check=False)
-    assert proc.returncode == 0, proc.stderr
-    result: dict = json.loads(proc.stdout.strip().splitlines()[-1])
-    return result
+        + "console.log(JSON.stringify((function(){" + probe + "})()));\n")
 
 
 def _payload() -> dict:
@@ -167,14 +115,14 @@ def test_overview_range_buttons_ask_the_server_for_that_many_days(tmp_path):
 
 
 _ACTION_NAMES = {"show-tab", "set-range", "set-limit-range", "set-harness-days", "set-harness-window",
-                 "set-harness-metric", "reset-zoom"}
+                 "set-harness-metric", "reset-zoom", "queue-reload-page", "queue-undo", "queue-new", "queue-raw"}
 _RESET_CANVAS = {"tpd-reset": "tpd-chart", "lim-short-reset": "limit-chart-short",
                  "lim-other-reset": "limit-chart-other", "lim-long-reset": "limit-chart-long"}
 
 
 def test_every_data_action_button_reaches_its_handler_through_one_listener(tmp_path):
     buttons = index_buttons()
-    assert len(buttons) == 23
+    assert len(buttons) == 28
     assert {b["data-action"] for b in buttons} == _ACTION_NAMES
     probe = """
       const buttons = @@;
@@ -194,7 +142,10 @@ def test_every_data_action_button_reaches_its_handler_through_one_listener(tmp_p
           range: [_activeRange, typeof _activeRange], limit: [_activeLimitRange, typeof _activeLimitRange],
           hDays: [_hDays, typeof _hDays], hWindow: [_hWindow, typeof _hWindow], hMetric: _hMetric,
           harness: document.getElementById('tab-harness').style.display,
-          main: document.getElementById('tab-main').style.display });
+          main: document.getElementById('tab-main').style.display,
+          queue: document.getElementById('tab-queue').style.display,
+          form: document.getElementById('q-form').style.display,
+          raw: document.getElementById('q-raw').style.display, reloaded: globalThis._reloaded || 0 });
       }
       return out;
     """.replace("@@", json.dumps(buttons))
@@ -205,7 +156,9 @@ def test_every_data_action_button_reaches_its_handler_through_one_listener(tmp_p
         ds = row["ds"]
         seen.append(ds["action"])
         if ds["action"] == "show-tab":
-            assert (row["harness"], row["main"]) == (("", "none") if ds["tab"] == "harness" else ("none", ""))
+            # (queue, harness, main) display per tab: only the chosen tab is visible
+            want = {"main": ("none", "none", ""), "harness": ("none", "", "none"), "queue": ("", "none", "none")}[ds["tab"]]
+            assert (row["queue"], row["harness"], row["main"]) == want
         elif ds["action"] == "set-range":
             n = int(ds["days"])
             assert row["range"] == [n, "number"] and row["urls"] == [f"/api/data?days={n}"]
@@ -217,6 +170,14 @@ def test_every_data_action_button_reaches_its_handler_through_one_listener(tmp_p
             assert row["hWindow"] == [int(ds["hwin"]), "number"]
         elif ds["action"] == "set-harness-metric":
             assert row["hMetric"] == ds["hmetric"]
+        elif ds["action"] == "queue-reload-page":
+            assert row["reloaded"] == 1
+        elif ds["action"] == "queue-new":
+            assert row["urls"] == ["/api/queue/meta"]       # the form first loads its choices
+        elif ds["action"] == "queue-raw":
+            assert row["urls"] == ["/api/queue?raw=1"]      # the raw view first loads the file text
+        elif ds["action"] == "queue-undo":
+            assert row["urls"] == [] and row["zoomed"] == []   # nothing loaded -> no undo, no request
         else:
             assert row["zoomed"] == [_RESET_CANVAS[row["id"]]]
     assert sorted(seen) == sorted(b["data-action"] for b in buttons)
@@ -224,7 +185,7 @@ def test_every_data_action_button_reaches_its_handler_through_one_listener(tmp_p
 
 def test_boot_hidden_elements_get_inline_display_none_and_lose_the_class(tmp_path):
     ids = boot_hidden_ids()
-    assert sorted(ids) == ["failure-empty", "h-body", "session-box", "tab-harness"]
+    assert sorted(ids) == ["failure-empty", "h-body", "q-form", "q-raw", "session-box", "tab-harness", "tab-queue"]
     pre = """
       const _bootEls = @@.map(id => {
         const e = _el(id);
@@ -235,7 +196,7 @@ def test_boot_hidden_elements_get_inline_display_none_and_lose_the_class(tmp_pat
     """.replace("@@", json.dumps(ids))
     probe = "return @@.map(id => [_el(id)._displayAtRemove, _el(id)._removed]);".replace("@@", json.dumps(ids))
     out = _run(tmp_path, _payload(), probe, pre=pre)
-    assert out == [["none", "boot-hidden"]] * 4
+    assert out == [["none", "boot-hidden"]] * len(ids)
 
 
 def test_quota_tile_colour_is_a_data_attribute_applied_through_the_cssom(tmp_path):
@@ -273,18 +234,9 @@ _META_PRE = """
 
 def _run_async(tmp_path, body: str, pre: str = _META_PRE) -> dict:
     """Load the page, then await an async ``body`` (returns a JSON-able value)."""
-    js = tmp_path / "page_async_test.js"
-    js.write_text(
-        _STUB + "\n" + pre + "\n" + _page_script()
-        + "\n(async () => {" + body + "})().then(r => console.log(JSON.stringify(r)));\n",
-        encoding="utf-8",
-    )
-    assert NODE is not None
-    proc = subprocess.run([NODE, str(js)], capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=30, check=False)
-    assert proc.returncode == 0, proc.stderr
-    result: dict = json.loads(proc.stdout.strip().splitlines()[-1])
-    return result
+    return run_node(
+        tmp_path, NODE_STUB + "\n" + pre + "\n" + _page_script()
+        + "\n(async () => {" + body + "})().then(r => console.log(JSON.stringify(r)));\n")
 
 
 def test_orchpost_sends_json_post_with_token_header(tmp_path):

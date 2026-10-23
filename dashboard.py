@@ -50,6 +50,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, cast
 
+import analytics
 import config
 from analytics import get_dashboard_data
 from config import DASHBOARD_PORT
@@ -202,6 +203,7 @@ _STATIC_FILES: dict[str, tuple[str, str]] = {
     "/static/core.js": ("core.js", _JS_TYPE),
     "/static/overview.js": ("overview.js", _JS_TYPE),
     "/static/harness.js": ("harness.js", _JS_TYPE),
+    "/static/queue.js": ("queue.js", _JS_TYPE),
     "/static/app.js": ("app.js", _JS_TYPE),
     "/static/vendor/chart.js-4.6.1/chart.umd.min.js": (
         "vendor/chart.js-4.6.1/chart.umd.min.js",
@@ -332,7 +334,7 @@ _MESSAGES = {
 class ApiError(Exception):
     """Raised by a POST route (or a gate check) to answer with a fixed status/code/text."""
 
-    def __init__(self, status: int, code: str, message: str) -> None:
+    def __init__(self, status: int, code: str, message: str, extra: dict[str, Any] | None = None) -> None:
         # Checked here, at the source: a malformed ApiError raised in a route then becomes a
         # TypeError there (→ 500 "internal"), instead of breaking the answer after the fact.
         if (not isinstance(status, int) or isinstance(status, bool) or not 400 <= status <= 599
@@ -345,6 +347,7 @@ class ApiError(Exception):
             raise TypeError("ApiError code and message must be encodable as UTF-8") from None
         super().__init__(code)
         self.status, self.code, self.message = status, code, message
+        self.extra = dict(extra or {})  # additional JSON fields of the answer (never override ok/error/code)
 
 
 class _ClientGoneError(Exception):
@@ -372,6 +375,81 @@ def post_route(path: str):
 @post_route("/api/ping")
 def _api_ping(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
+
+
+# ── Queue editor (B1): GET /api/queue[/meta], POST /api/queue/<op> ────────────
+# The editor logic lives in queue_editor.py (imported lazily: a broken module then only
+# fails the queue routes). In-process (``--watch`` autostart) the orchestrator hands over a
+# getter for its running task; without it the dashboard cannot know what runs ("standalone").
+_QUEUE_IN_FLIGHT: Callable[[], Any] | None = None
+_QUEUE_INSTANCE = secrets.token_hex(8)  # per server start (NOT the write key): the page spots a restart
+_QUEUE_STATUS = {
+    "bad_request": 400, "changed": 409, "ambiguous": 409, "edit_locked": 409, "undo_changed": 409,
+    "undo_stale": 409, "no_undo": 409, "not_utf8": 409, "sha_mismatch": 409, "running": 423,
+    "confirm_dangerous": 428, "confirm_unknown_running": 428, "stamp_in_raw": 422, "comment_in_raw": 422,
+    "backup_failed": 503, "unavailable": 503, "backup_corrupt": 500,
+}
+
+
+def _queue_editor() -> Any:
+    return importlib.import_module("queue_editor")
+
+
+def _queue_context() -> tuple[Any, str, list[Any]]:
+    """(in_flight, mode, active_runs), fresh per call. A failing getter counts as unknown (standalone)."""
+    in_flight, mode = None, "standalone"
+    if _QUEUE_IN_FLIGHT is not None:
+        try:
+            in_flight, mode = _QUEUE_IN_FLIGHT(), "inprocess"
+        except Exception:
+            logger.debug("dashboard: in-flight getter failed", exc_info=True)
+    try:
+        runs = list(analytics._load_active_runs())
+    except Exception:
+        runs = []
+    return in_flight, mode, runs
+
+
+def _queue_payload(include_raw: bool = False) -> dict[str, Any]:
+    in_flight, mode, runs = _queue_context()
+    state = _queue_editor().queue_state(in_flight=in_flight, mode=mode, include_raw=include_raw, active_runs=runs)
+    return {"ok": True, "instance": _QUEUE_INSTANCE, **state}
+
+
+def _queue_api_error(qe: Any, exc: Any) -> ApiError:
+    """QueueEditError -> ApiError with a fixed text from queue_editor.ERROR_TEXTS (never ``str(exc)``)."""
+    errs = [e._asdict() for e in exc.field_errors]
+    status = _QUEUE_STATUS.get(exc.code) or (422 if errs else 500)
+    text = qe.ERROR_TEXTS.get(exc.code) or (errs[0]["message"] if errs else _MESSAGES["internal"])
+    code = exc.code if exc.code in qe.ERROR_TEXTS or errs else "internal"
+    return ApiError(status, code, text, {"field_errors": errs} if errs else None)
+
+
+def _queue_route(op: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def route(body: dict[str, Any]) -> dict[str, Any]:
+        qe = _queue_editor()
+        in_flight, mode, runs = _queue_context()
+        try:
+            res: dict[str, Any] = qe.apply_edit(op, body, in_flight=in_flight, mode=mode, active_runs=runs)
+        except qe.QueueEditError as exc:
+            raise _queue_api_error(qe, exc) from None
+        res["queue"] = {"ok": True, "instance": _QUEUE_INSTANCE, **res["queue"]}
+        return res
+    return route
+
+
+for _op in ("add", "edit", "delete", "retry", "duplicate", "move", "raw", "undo"):
+    post_route(f"/api/queue/{_op}")(_queue_route(_op))
+
+
+@post_route("/api/queue/lint")
+def _api_queue_lint(body: dict[str, Any]) -> dict[str, Any]:
+    """Live check: {fields} | {text, ref?} | {content}; never writes."""
+    qe = _queue_editor()
+    try:
+        return cast("dict[str, Any]", qe.lint_request(body))
+    except qe.QueueEditError as exc:
+        raise _queue_api_error(qe, exc) from None
 
 
 def _json_content_type(value: str) -> bool:
@@ -447,6 +525,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json_response(parsed.query)
             elif parsed.path == "/api/harness":
                 self._harness_response(parsed.query)
+            elif parsed.path in ("/api/queue", "/api/queue/meta"):
+                self._queue_response(parsed.path, parsed.query)
             elif parsed.path in ("/", "/index.html"):
                 self._html_response()
             elif urllib.parse.urlsplit(self.path).path in _STATIC_FILES:
@@ -456,6 +536,19 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except _CLIENT_DISCONNECT_ERRORS as e:
             logger.debug("dashboard: client disconnected during %s (%s)", parsed.path, e)
+
+    def _queue_response(self, path: str, query: str) -> None:
+        """Read side of the editor: never writes; a failure is a fixed text plus code, never ``str(e)``."""
+        try:
+            if path == "/api/queue":
+                payload = _queue_payload(urllib.parse.parse_qs(query).get("raw", [""])[0] == "1")
+            else:
+                payload = {"ok": True, **_queue_editor().queue_meta()}
+        except Exception:
+            logger.exception("dashboard: queue read failed")
+            self._reply(500, {"ok": False, "error": _MESSAGES["internal"], "code": "internal"})
+            return
+        self._reply(200, payload)
 
     def _bound_port(self) -> int:
         return int(cast("tuple[str, int]", self.server.server_address)[1])
@@ -505,7 +598,7 @@ class _Handler(BaseHTTPRequestHandler):
                 status = 200
             except ApiError as e:
                 logger.debug("dashboard: POST refused (%s)", e.code)
-                status, payload = e.status, _json_bytes({"ok": False, "error": e.message, "code": e.code})
+                status, payload = e.status, _json_bytes({**e.extra, "ok": False, "error": e.message, "code": e.code})
             except _ClientGoneError:
                 raise  # not a handler fault: the outer net closes the connection silently
             except Exception:
@@ -682,6 +775,8 @@ class _ReuseServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # The write key: per server start, never logged, only reachable via GET /.
         self.write_token = secrets.token_urlsafe(32)
+        global _QUEUE_INSTANCE
+        _QUEUE_INSTANCE = secrets.token_hex(8)
         super().__init__(*args, **kwargs)
 
     def server_bind(self) -> None:
@@ -892,8 +987,11 @@ def start_autostart(
     port: int | None = None,
     warn=None,
     info=None,
+    in_flight: Callable[[], Any] | None = None,
 ) -> AutostartHandle:
     """Start the dashboard for ``--watch`` as a daemon thread. NEVER raises.
+
+    ``in_flight``: getter for the orchestrator's running task (queue editor, in-process mode).
 
     Returns at once — no join, no waiting for the bind (that happens in the
     thread). Any failure (thread start, bind, ``serve_forever`` dying later) is
@@ -905,6 +1003,8 @@ def start_autostart(
     manual paths (``python dashboard.py``, ``--dashboard``) keep their own default.
     Bound to 127.0.0.1 only (``_bind_server``).
     """
+    global _QUEUE_IN_FLIGHT
+    _QUEUE_IN_FLIGHT = in_flight
     handle = AutostartHandle()
     warn = warn or logger.warning
     info = info or logger.info

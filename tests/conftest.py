@@ -135,6 +135,10 @@ if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
     _TEST_VAULT_ROOT = Path(tempfile.mkdtemp(prefix="orch_test_vault_"))
     _CREATED_TEMP_ROOTS.append(_TEST_VAULT_ROOT)
     os.environ["ORCH_VAULT_PATH"] = str(_TEST_VAULT_ROOT)
+    # A real ORCH_QUEUE_FILE (env or .env) would make config.QUEUE_FILE ignore the
+    # redirect above and point at the REAL queue (config.py: QUEUE_FILE_PATH wins
+    # over VAULT_PATH). "" is falsy there and blocks _load_dotenv (key already set).
+    os.environ["ORCH_QUEUE_FILE"] = ""
 
 # Harness-index sources (harness_index.py, 2026-10-09): the suite must never read
 # the real ~/.claude/projects, ~/.codex/sessions, opencode.db, ledger or marker
@@ -438,6 +442,20 @@ def _isolate_openrouter_api_key(monkeypatch):
     this one and simply override the value for their own test.
     """
     monkeypatch.setattr("config.OPENROUTER_API_KEY", "", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_queue_backup_dir(tmp_path: Path, monkeypatch):
+    """Queue-editor backups (config.QUEUE_BACKUP_DIR) never land in the real logs/."""
+    monkeypatch.setattr("config.QUEUE_BACKUP_DIR", tmp_path / "queue-backups", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_queue_events_log(tmp_path: Path, monkeypatch):
+    """queue_manager.append_log (QUEUE_EVENTS_LOG_FILE is bound at import) never writes the real logs/queue-events.log."""
+    monkeypatch.setattr("queue_manager.QUEUE_EVENTS_LOG_FILE", tmp_path / "queue-events.log")
     yield
 
 

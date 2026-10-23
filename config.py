@@ -1081,6 +1081,11 @@ def _harness_path(key: str, default: Path) -> Path:
     return path if path.is_absolute() else Path(__file__).parent / path
 
 
+# Queue editor (dashboard): one backup pair per change, newest QUEUE_BACKUP_KEEP kept per queue file.
+# Read at call time (config.QUEUE_BACKUP_DIR), never bound at import, so tests can redirect it.
+QUEUE_BACKUP_DIR = _harness_path("ORCH_QUEUE_BACKUP_DIR", Path(__file__).parent / "logs" / "queue-backups")
+QUEUE_BACKUP_KEEP = 20
+
 HARNESS_DB_FILE = _harness_path("HARNESS_DB_FILE", Path(__file__).parent / "logs" / "harness-index.sqlite")
 HARNESS_CLAUDE_PROJECTS_DIR = _harness_path("HARNESS_CLAUDE_PROJECTS_DIR", Path.home() / ".claude" / "projects")
 HARNESS_OPENCODE_DB = _harness_path(

@@ -135,3 +135,38 @@
   }
   .mt-sm { margin-top: 0.8rem; }
   .boot-hidden { display: none; }
+  [hidden] { display: none !important; }
+  .q-status { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; align-items: center; color: var(--muted); font-size: 0.8rem; margin-bottom: 0.8rem; }
+  .q-banner { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.8rem; margin-bottom: 0.8rem; font-size: 0.85rem; }
+  .q-banner.warn { border-color: var(--yellow); color: var(--yellow); }
+  .q-tools { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .q-tools input { flex: 1; min-width: 12rem; background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 0.3rem 0.6rem; }
+  .q-group { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+  .q-group h3, .q-group summary { font-size: 0.9rem; margin-bottom: 0.8rem; color: var(--muted); cursor: default; }
+  .q-entry { background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.6rem; }
+  .q-entry.q-laeuft { border-left-color: var(--green); }
+  .q-entry.q-fehlgeschlagen { border-left-color: var(--red); }
+  .q-entry.q-wartet, .q-entry.q-geplant { border-left-color: var(--yellow); }
+  .q-entry.q-changed { border-color: var(--accent); border-left-color: var(--accent); }
+  .q-head { margin-bottom: 0.3rem; font-size: 0.75rem; color: var(--muted); }
+  .q-badge { display: inline-block; font-size: 0.7rem; border-radius: 4px; padding: 0.05rem 0.4rem; border: 1px solid var(--border); color: var(--muted); }
+  .q-badge.q-s-laeuft, .q-badge.q-s-erledigt { color: var(--green); border-color: var(--green); }
+  .q-badge.q-s-fehlgeschlagen { color: var(--red); border-color: var(--red); }
+  .q-badge.q-s-wartet, .q-badge.q-s-geplant { color: var(--yellow); border-color: var(--yellow); }
+  .q-badge.q-s-offen { color: var(--accent); border-color: var(--accent); }
+  .q-line { overflow-wrap: anywhere; font-size: 0.85rem; white-space: pre-wrap; }
+  .q-line.clamped { max-height: 3.6em; overflow: hidden; }
+  .q-child { color: var(--muted); padding-left: 1rem; }
+  .q-btns { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.4rem; }
+  .q-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+  .q-fld { margin-bottom: 0.5rem; }
+  .q-fld label > span { display: inline-block; min-width: 11rem; color: var(--muted); font-size: 0.8rem; }
+  .q-panel input[type=text], .q-panel input[type=date], .q-panel input[type=time], .q-panel select, .q-panel textarea { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 0.3rem 0.5rem; font: inherit; }
+  .q-panel textarea { width: 100%; box-sizing: border-box; font-family: monospace; }
+  .q-fld textarea, .q-fld input[type=text] { min-width: 20rem; }
+  .q-muted { color: var(--muted); font-size: 0.75rem; }
+  .q-err, .q-danger, .q-f-error { color: var(--red); font-size: 0.8rem; }
+  .q-f-warning { color: var(--yellow); }
+  .q-f-info { color: var(--muted); }
+  .q-prev { border-top: 1px solid var(--border); margin-top: 0.8rem; padding-top: 0.6rem; }
+  .q-prev ul, #qr-result { list-style: none; padding: 0; margin: 0.3rem 0; font-size: 0.8rem; }

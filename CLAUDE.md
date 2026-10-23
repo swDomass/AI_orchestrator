@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Stand 2026-10-23 abends (Windows, Dashboard B1 Queue-Editor nach externem Codex-Review, +363 Tests): 3823 passed / 0 failed / 2 skipped in 377-600 s; +363 über die 3460 auf 796e141 = test_queue_editor_parse 37, _build 88, _lint 28, _mutations 66, _backups 18, _integration 4, _raw 40, test_dashboard_queue_api 35, test_dashboard_queue_js 47.
+# Stand 2026-10-23 abends (Windows, Dashboard B1 Queue-Editor nach externem Codex-Review + Panels sichtbar öffnen, +367 Tests): 3827 passed / 0 failed / 2 skipped in 377-600 s; +367 über die 3460 auf 796e141 = test_queue_editor_parse 37, _build 88, _lint 28, _mutations 66, _backups 18, _integration 4, _raw 40, test_dashboard_queue_api 35, test_dashboard_queue_js 50, test_dashboard_static +1.
 # Stand 2026-10-23 (Windows, Dashboard-Fundament B0, +140 Tests): 3460 passed / 0 failed / 2 skipped in 330-609 s (über 400 s unter Last); +140 über die 3320 auf ee75217 = test_dashboard_write_gate 70, test_dashboard_static 56, test_dashboard_threading 6, test_dashboard_page_js 4 -> 12.
 # Stand 2026-10-11 abends (Windows, nach conftest-Temp-Aufräumen, +7 Tests): 3320 passed / 0 failed / 2 skipped in 275-289 s; der Lauf hinterlässt keine orch_test_*-Ordner mehr in %TEMP%.
 # Stand 2026-10-11 spät (Windows, nach OpenRouter-Drift: −3 Gratis-Aliase, +4 Tests): 3313 passed / 0 failed / 2 skipped in 293-335 s.

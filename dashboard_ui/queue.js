@@ -280,6 +280,11 @@ function queueOpenPanel(which) {
   queueEl(show).style.display = '';
   queueEl(hide).style.display = 'none';
 }
+function queueRevealPanel(which, fieldId) {   // after the markup exists: bring the panel into view, then focus its field
+  const panel = queueEl(which === 'form' ? 'q-form' : 'q-raw'), field = queueEl(fieldId);
+  if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (field && typeof field.focus === 'function') field.focus({ preventScroll: true });
+}
 function queueClosePanels() {
   queueMode = null; queueLint = null; queuePrevSeq += 1; queuePanelGen += 1;
   clearTimeout(queuePrevTimer);
@@ -447,6 +452,7 @@ async function queueOpenForm(mode, entry) {
     queueEl('qf-edit-text').value = entry.text;
   }
   queueOpenPanel('form');
+  queueRevealPanel('form', mode === 'edit' ? 'qf-edit-text' : 'qf-text');
   queueSyncForm();
   await queuePreviewNow();
 }
@@ -483,6 +489,7 @@ async function queueOpenRaw() {
     + '<button class="time-btn" data-action="queue-cancel">Verwerfen</button></div><ul id="qr-result"></ul>';
   queueEl('q-raw-text').value = data.raw;
   queueOpenPanel('raw');
+  queueRevealPanel('raw', 'q-raw-text');
 }
 async function queueRawCheck() {
   const r = await orchPost('/api/queue/lint', { content: queueEl('q-raw-text').value });

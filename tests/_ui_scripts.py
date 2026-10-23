@@ -109,6 +109,8 @@ function _el(id) {
       appendChild(c) { (this.children = this.children || []).push(c); },
       addEventListener() {},
       querySelectorAll() { return []; },
+      scrollIntoView(o) { (globalThis._scrolls = globalThis._scrolls || []).push({ id, o }); },
+      focus(o) { (globalThis._focused = globalThis._focused || []).push({ id, o }); document.activeElement = this; },
     };
   }
   return _els[id];

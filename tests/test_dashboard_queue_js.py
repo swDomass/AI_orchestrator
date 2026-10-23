@@ -752,3 +752,25 @@ def test_a_late_save_answer_closes_only_its_own_panel_and_never_a_newly_opened_o
         assert out["mode"] is None and out["html"] == ""                                            # normal case: the panel closes
     if not raw:
         assert out["written"] == "Aufraeumen"                       # queueRemember belongs to the file: it runs either way
+
+
+@pytest.mark.parametrize(("opener", "panel", "field"), [
+    ("await ACTIONS['queue-edit'](T_btn(T_pos('Alpha')));", "q-form", "qf-edit-text"),
+    ("await ACTIONS['queue-new']();", "q-form", "qf-text"),
+    ("await ACTIONS['queue-raw']();", "q-raw", "q-raw-text"),
+])
+def test_opening_a_panel_scrolls_it_into_view_and_focuses_its_field_without_scrolling(tmp_path, qfile, opener, panel, field):
+    a = _state(qfile, ROWS)
+    full = queue_editor.queue_state(in_flight=None, mode="standalone", include_raw=True)
+    full.update(ok=True, instance="i1")
+    body = LOAD + """
+      T_form(P.lint);
+      const formRoute = T_route;
+      T_route = (u, o) => u === '/api/queue?raw=1' ? {status: 200, data: P.full} : formRoute(u, o);
+      """ + opener + """
+      return {scrolls: globalThis._scrolls || [], focused: globalThis._focused || [],
+              active: document.activeElement && document.activeElement.id};"""
+    out = _run(tmp_path, body, {"a": a, "full": full, "lint": _lint(qfile, text="x"), "meta": _meta()})
+    assert out["scrolls"] == [{"id": panel, "o": {"behavior": "smooth", "block": "start"}}]
+    assert out["focused"] == [{"id": field, "o": {"preventScroll": True}}]
+    assert out["active"] == field

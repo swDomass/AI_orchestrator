@@ -283,3 +283,9 @@ def test_no_top_level_name_is_declared_twice_across_own_js():
             assert name not in seen, f"{name!r} declared in {seen[name]} and {rel}"
             seen[name] = rel
     assert {"ACTIONS", "registerActions", "escapeHtml", "showTab"} <= set(seen)
+
+
+def test_queue_panels_sit_above_the_list_in_index_html():
+    html = (pathlib.Path(dashboard.__file__).parent / "dashboard_ui" / "index.html").read_text(encoding="utf-8")
+    pos = {k: html.index(f'id="{k}"') for k in ("q-form", "q-raw", "q-groups")}
+    assert pos["q-form"] < pos["q-groups"] and pos["q-raw"] < pos["q-groups"]

@@ -25,6 +25,7 @@ entsteht.
 - Die Seite liegt in `dashboard_ui/` als klassische Skripte: `core.js` → `overview.js` →
   `harness.js` → `app.js`. Ein delegierter Klick-Listener verteilt über `data-action` und
   `registerActions`.
+  *Nachtrag 2026-10-23 (B1): zusätzlich `queue.js` vor `app.js`, siehe ADR-004.*
 - Ausgeliefert wird nur über die feste Tabelle `_STATIC_FILES` mit exaktem Pfadabgleich.
 - Chart.js 4.6.1 und chartjs-plugin-zoom 1.2.1 liegen gepinnt (SHA-256 im Test) unter
   `dashboard_ui/vendor/`.

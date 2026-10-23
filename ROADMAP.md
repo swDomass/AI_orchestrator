@@ -248,6 +248,7 @@ disappearing into the `INFO` housekeeping stream of an unattended 03:00 run.
 | #15 Obsidian CLI integration | No concrete pain point yet; wikilink + file-context injection covers today's use. |
 | #41 Cost-Cap | Bundled with a possible credit/API-provider migration. CLI subscriptions are rate-limit-bound, not $-metered, and the capacity side is already covered by the quota calibration (#44/#45). Open sub-questions: is `analytics._billing_cost_units` enough as a cost proxy, and how does `max_cost_*` combine with `max_iterations`/`max_runtime_sec`? Data keeps accumulating in `logs/runs.jsonl` + `quota-calibration.csv`, so delaying costs nothing. |
 | `state.json` + session UUID persistence for capacity-resume | Today a resume starts a fresh UUID — a deliberate trade-off, not an oversight. |
+| Dashboard operation B2–B5 | Not built yet: B2 control and approvals (pause, resume, restart, approvals with request ID), B3 settings and paths (.env editor, path overrides), B4 onboarding and double-click starter, B5 rule-file editor. |
 
 ### Known defects (tracked, unfixed)
 

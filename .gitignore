@@ -44,6 +44,7 @@ logs/
 # Lint-/Typecheck-Baselines sind aus README.md und CLAUDE.md verlinkt und
 # muessen deshalb mitgeliefert werden — sonst zeigen beide ins Leere.
 !/docs/lint-baseline-*.md
+!/docs/test-und-lint-historie.md
 /.review-loop
 /.dev-loop
 *_FUTURE_IDEAS.md

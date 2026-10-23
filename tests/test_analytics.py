@@ -349,7 +349,8 @@ class TestDashboardCache:
     def test_the_ttl_outlasts_the_page_reload(self):
         import analytics
         import dashboard
-        reload_ms = int(re.search(r"setInterval\(load, (\d+)\)", dashboard._HTML_PAGE).group(1))
+        app_js = (dashboard._UI_DIR / "app.js").read_text(encoding="utf-8")
+        reload_ms = int(re.search(r"setInterval\(load, (\d+)\)", app_js).group(1))
         assert reload_ms < analytics._CACHE_TTL * 1000
 
 

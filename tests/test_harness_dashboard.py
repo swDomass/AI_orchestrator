@@ -3,13 +3,12 @@
 The index is built with ``harness_index.open_index`` (the real schema) and filled
 either with plain INSERTs (exact numbers) or by a real ``run_update`` over
 fixture files. The endpoint is exercised through a real 127.0.0.1 server — the
-single-threaded one the orchestrator runs — to pin the "< 1 s, never raise,
+multi-threaded one the orchestrator runs — to pin the "< 1 s, never raise,
 never wait" contract for missing, empty, locked, corrupt and other-schema files.
 """
 
 import hashlib
 import json
-import re
 import shutil
 import socket
 import sqlite3
@@ -21,6 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _ui_scripts import page_script
 
 import config
 import dashboard
@@ -154,7 +154,8 @@ def test_endpoint_answers_unavailable_in_under_a_second(server_port, make, reaso
         assert elapsed < 1.0, elapsed
         assert data["harness"]["available"] is False
         assert reason in data["harness"]["reason"], data
-        # the single-threaded server is free again at once
+        # plain reachability check (the server is multi-threaded, so this no longer proves
+        # that the harness call released a busy single thread): it still answers afterwards
         started = time.monotonic()
         with urllib.request.urlopen(f"http://127.0.0.1:{server_port}/", timeout=5) as resp:
             assert resp.status == 200
@@ -415,10 +416,12 @@ const _els = {};
 function _el(id) {
   if (!_els[id]) _els[id] = { id, innerHTML: '', textContent: '', className: '', style: {}, dataset: {},
     classList: { toggle() {}, add() {}, remove() {} }, getContext() { return { canvasId: id }; },
-    appendChild(c) { (this.children = this.children || []).push(c); } };
+    appendChild(c) { (this.children = this.children || []).push(c); }, addEventListener() {},
+    querySelectorAll() { return []; } };
   return _els[id];
 }
-globalThis.document = { getElementById: _el, querySelectorAll() { return []; },
+globalThis.document = { getElementById: _el, querySelectorAll() { return []; }, querySelector() { return null; },
+                        addEventListener() {},
                         createElement() { return _el('__new' + Object.keys(_els).length); } };
 globalThis.location = { hash: '' };
 const _charts = [];
@@ -432,7 +435,7 @@ globalThis.setInterval = () => 0;
 
 
 def _run_tab(tmp_path, harness: dict, data: dict | None = None) -> dict:
-    script = re.findall(r"<script>(.*?)</script>", dashboard._HTML_PAGE, re.S)[0]
+    script = page_script()
     js = tmp_path / "tab.js"
     probe = """
       const g = id => document.getElementById(id);
@@ -656,7 +659,7 @@ def test_tab_redraws_its_quota_tiles_once_api_data_arrives_and_escapes_session(t
         "tool_trace_stats": {}, "failure_counts": {}, "failure_timeline": {}, "active_runs": [],
         "provider_meta": dashboard.provider_meta_map(["claude_five_hour"]),
     }
-    script = re.findall(r"<script>(.*?)</script>", dashboard._HTML_PAGE, re.S)[0]
+    script = page_script()
     js = tmp_path / "redraw.js"
     js.write_text(
         _STUB + script
@@ -799,7 +802,7 @@ def test_status_line_shows_broken_ledger_and_marker_lines_apart(tmp_path):
 
 
 def _run_tick(tmp_path, setup: str) -> list:
-    script = re.findall(r"<script>(.*?)</script>", dashboard._HTML_PAGE, re.S)[0]
+    script = page_script()
     js = tmp_path / "tick.js"
     js.write_text(
         _STUB + script

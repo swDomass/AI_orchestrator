@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="orch-token" content="__ORCH_TOKEN__">
+<title>AI Orchestrator Dashboard</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/vendor/chart.js-4.6.1/chart.umd.min.js"></script>
+<script src="/static/vendor/chartjs-plugin-zoom-1.2.1/chartjs-plugin-zoom.min.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>AI Orchestrator</h1>
+  <span class="ts" id="gen-ts">—</span>
+</header>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="main" data-action="show-tab">Übersicht</button>
+  <button class="tab-btn" data-tab="harness" data-action="show-tab">Harness</button>
+</nav>
+
+<div id="tab-main">
+<section class="quota-now">
+  <h3>Quoten jetzt</h3>
+  <div class="cards" id="quota-now">
+    <div class="card"><div class="value">—</div><div class="label">Noch keine Kapazitätswerte</div></div>
+  </div>
+</section>
+
+<section class="active-box">
+  <h3><span class="live-dot"></span>Active Runs <span id="active-count">(0)</span></h3>
+  <table>
+    <thead><tr>
+      <th>Tool</th><th>Task</th><th>Iter</th><th>Phase</th>
+      <th>Provider</th><th>Tokens (in / out / cache rd)</th><th>Elapsed</th>
+    </tr></thead>
+    <tbody id="active-runs-body">
+      <tr><td colspan="7" class="empty-hint">No active runs.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<div class="cards">
+  <div class="card"><div class="value" id="total-tasks">—</div><div class="label">Tasks gesamt</div></div>
+  <div class="card"><div class="value" id="success-rate">—</div><div class="label">Erfolgsrate</div></div>
+  <div class="card"><div class="value" id="avg-dur">—</div><div class="label">Ø Dauer (s)</div></div>
+  <div class="card"><div class="value" id="providers">—</div><div class="label">Aktive Provider</div></div>
+  <div class="card"><div class="value" id="suggest-today">—</div><div class="label">Vorschläge heute</div></div>
+</div>
+
+<div class="charts">
+  <div class="chart-box">
+    <h3>Tasks / Tag</h3>
+    <div class="time-btns">
+      <button class="time-btn" data-days="7" data-action="set-range">7 Tage</button>
+      <button class="time-btn active" data-days="30" data-action="set-range">30 Tage</button>
+      <button class="time-btn" data-days="90" data-action="set-range">90 Tage</button>
+    </div>
+    <canvas id="tpd-chart" height="180"></canvas>
+    <button class="zoom-reset" id="tpd-reset" data-action="reset-zoom">Zoom zurücksetzen</button>
+  </div>
+  <div class="chart-box">
+    <h3>Provider-Verteilung</h3>
+    <canvas id="pd-chart" height="180"></canvas>
+  </div>
+</div>
+
+<div class="timeline-section">
+  <div class="timeline-head">
+    <h3>Provider-Kapazität</h3>
+    <div class="time-btns">
+      <button class="time-btn" data-hours="48" data-action="set-limit-range">48 h</button>
+      <button class="time-btn active" data-hours="168" data-action="set-limit-range">7 Tage</button>
+      <button class="time-btn" data-hours="720" data-action="set-limit-range">30 Tage</button>
+    </div>
+  </div>
+  <div class="timeline-grid">
+    <div class="timeline-box">
+      <h3>5-h-Fenster (Claude 5 h, Codex 5 h)</h3>
+      <canvas id="limit-chart-short" height="140"></canvas>
+      <button class="zoom-reset" id="lim-short-reset" data-action="reset-zoom">Zoom zurücksetzen</button>
+    </div>
+    <div class="timeline-box">
+      <h3>Tagesbudget &amp; Sonstige (opencode, Gemini, weitere)</h3>
+      <canvas id="limit-chart-other" height="140"></canvas>
+      <button class="zoom-reset" id="lim-other-reset" data-action="reset-zoom">Zoom zurücksetzen</button>
+    </div>
+    <div class="timeline-box">
+      <h3>7-Tage-Fenster (Claude 7 Tage, Codex 7 Tage)</h3>
+      <canvas id="limit-chart-long" height="140"></canvas>
+      <button class="zoom-reset" id="lim-long-reset" data-action="reset-zoom">Zoom zurücksetzen</button>
+    </div>
+  </div>
+</div>
+
+<div class="billing-box">
+  <h3>Token-Verbrauch &amp; Cache-Hit-Rate</h3>
+  <div class="billing-grid" id="billing-recent"></div>
+  <div class="mt-sm"><div class="billing-grid" id="billing-total"></div></div>
+</div>
+
+<div class="tool-stats-box">
+  <h3>Tool-Action-Stats</h3>
+  <table>
+    <thead><tr>
+      <th>Tool</th><th>Runs</th><th>Completed</th><th>Erfolg</th><th>Ø Dauer (s)</th><th>Events</th>
+    </tr></thead>
+    <tbody id="tool-stats-body"></tbody>
+  </table>
+</div>
+
+<div class="failure-box">
+  <h3>Fehler-Kategorien (Taxonomy)</h3>
+  <div class="failure-grid">
+    <div>
+      <canvas id="failure-doughnut" height="220"></canvas>
+    </div>
+    <div>
+      <canvas id="failure-timeline" height="220"></canvas>
+    </div>
+  </div>
+  <div id="failure-empty" class="empty-hint boot-hidden">Keine Fehler im gewählten Zeitraum.</div>
+</div>
+
+<div class="events-box">
+  <h3>Letzte Events</h3>
+  <table>
+    <thead><tr><th>Zeit</th><th>Typ</th><th>Nachricht</th></tr></thead>
+    <tbody id="events-body"></tbody>
+  </table>
+</div>
+
+<div class="session-box boot-hidden" id="session-box">
+  <h3>Session-Stats (aktiv)</h3>
+  <div class="session-grid" id="session-grid"></div>
+</div>
+</div>
+
+<div id="tab-harness" class="boot-hidden">
+  <div class="harness-status" id="h-status">Index wird geladen …</div>
+  <div class="harness-head">
+    <div class="time-btns"><span class="lbl">Zeitraum</span>
+      <button class="time-btn" data-hdays="7" data-action="set-harness-days">7 Tage</button>
+      <button class="time-btn active" data-hdays="30" data-action="set-harness-days">30 Tage</button>
+      <button class="time-btn" data-hdays="90" data-action="set-harness-days">90 Tage</button>
+    </div>
+    <div class="time-btns"><span class="lbl">Marker-Fenster</span>
+      <button class="time-btn" data-hwin="3" data-action="set-harness-window">3 Tage</button>
+      <button class="time-btn active" data-hwin="7" data-action="set-harness-window">7 Tage</button>
+      <button class="time-btn" data-hwin="14" data-action="set-harness-window">14 Tage</button>
+    </div>
+  </div>
+  <div id="h-body" class="boot-hidden">
+    <section class="billing-box harness-box">
+      <h3>(a) Verbrauch Claude je Tag — interaktiv / Orchestrator bzw. claude -p / Subagent</h3>
+      <div class="time-btns">
+        <button class="time-btn active" data-hmetric="total" data-action="set-harness-metric">alle Token</button>
+        <button class="time-btn" data-hmetric="input" data-action="set-harness-metric">Input</button>
+        <button class="time-btn" data-hmetric="output" data-action="set-harness-metric">Output</button>
+        <button class="time-btn" data-hmetric="cache_read" data-action="set-harness-metric">Cache lesen</button>
+        <button class="time-btn" data-hmetric="cache_write" data-action="set-harness-metric">Cache schreiben</button>
+      </div>
+      <canvas id="h-usage-chart" height="150"></canvas>
+      <table id="h-usage-table"></table>
+      <div class="billing-grid mt-sm" id="h-sub-tiles"></div>
+      <h4>Modellmix (Anteil an allen Token · Anteil an Output)</h4>
+      <table id="h-family-table"></table>
+      <h4>Subagent-Aufrufe je Typ und Modell</h4>
+      <div class="empty-hint" id="h-agent-control"></div>
+      <table id="h-agent-table"></table>
+      <h4>Kosten je Tag (USD)</h4>
+      <canvas id="h-cost-chart" height="120"></canvas>
+      <div class="empty-hint">Claude: höchster <code>cost-state</code>-Wert je Sitzung, dem Starttag der Sitzung zugeordnet (nicht tagesgenau); schließt Subagenten vermutlich ein (an echten Daten ein Indiz, kein Beweis). opencode: Katalogpreis, nicht die Rechnung. Codex: keine Kosten.</div>
+    </section>
+    <section class="billing-box harness-box">
+      <h3>(b) Quoten-Spielraum (frei = 100 − verbraucht)</h3>
+      <div class="cards" id="h-quota"></div>
+    </section>
+    <section class="billing-box harness-box">
+      <h3>(c) Externe Stimmen</h3>
+      <canvas id="h-extern-chart" height="120"></canvas>
+      <div class="empty-hint" id="h-extern-null"></div>
+      <table id="h-ledger-status"></table>
+      <h4>opencode je Modell (Katalogpreis)</h4>
+      <table id="h-oc-models"></table>
+      <h4>Codex-Rollouts je Tag</h4>
+      <table id="h-codex"></table>
+    </section>
+    <section class="billing-box harness-box">
+      <h3>(d) Harness-Änderungen — vorher / nachher</h3>
+      <table id="h-markers"></table>
+    </section>
+  </div>
+</div>
+
+<script src="/static/core.js"></script>
+<script src="/static/overview.js"></script>
+<script src="/static/harness.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

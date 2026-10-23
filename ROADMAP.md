@@ -126,6 +126,7 @@ plan (2026-05-18).
 | 51 | Snapshots into an own ref namespace (`refs/orchestrator-backup/`) + retention cap | DONE |
 | 52 | opencode provider — third opt-in voice, tag-activated, capped by its own OpenRouter key | DONE (Stufe 1+2, 2026-09-04). Stufe 3 — joining `_PRIORITY` — deliberately **not** built: the cause of an observed hang is still unexplained. |
 | 53 | Per-task auto-commit — a successful run commits its own paths to `orch/<slug>-<date>` and restores them in the working tree | DONE (2026-09-11). HEAD is never moved (temp index + `commit-tree` + `update-ref`). Two rules gate it: the index must agree with HEAD, and the path must have been clean when the run started. Default ON, `GIT_AUTO_COMMIT=false` / `#no-commit` to opt out. Not built (KUER): retention for old `orch/*` branches, `#parallel`/`#worktree`, push/PR/merge, model-written commit messages. |
+| 54 | Dashboard-Bedienung B0: Fundament (`dashboard_ui/`, Vendor, CSP, Threads, Schreibschranke) | DONE (2026-10-23). Page from `dashboard_ui/` via a fixed file table, Chart.js/zoom vendored (offline), security headers, multi-threaded server, gated `POST /api/*` (only `/api/ping` so far). Base for later controls. |
 
 ### #50 — Unattended `#tool:` reactivation (2026-08-15)
 

@@ -7,3 +7,6 @@
 *.jpeg binary
 *.ico binary
 *.pdf binary
+
+# Vendorte Dashboard-Bibliotheken: Bytes unveraendert, keine Zeilenenden-Umwandlung
+dashboard_ui/vendor/** -text linguist-vendored

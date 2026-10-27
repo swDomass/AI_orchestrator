@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Stand 2026-10-27 (Windows, API-Credits ADR-005 nach externem Codex-/opencode-Review, +105 Tests): 3932 passed / 0 failed / 2 skipped in 347-427 s; +105 über die 3827 auf d82d4eb = test_claude_billing 33, _gating 21, _records 18, _refresh 2, test_claude_provider_billing 31. Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos).
+# Stand 2026-10-27 (Windows, API-Credits ADR-005 nach externem Codex-/opencode-Review, +108 Tests): 3935 passed / 0 failed / 2 skipped in 347-427 s (3932 gemessen vor dem Folge-Commit 0c0d0ea, der 3 Tests ergänzt; --collect-only danach 3937 = 3935 + 2); +108 über die 3827 auf d82d4eb = test_claude_billing 33, _gating 21, _records 18, _refresh 2, test_claude_provider_billing 34. Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos).
 # Ältere Stände und Messnotizen: docs/test-und-lint-historie.md
 # -p no:randomly: Das Flag bleibt als reproduzierbare Standardreihenfolge stehen (auch in ci.yml).
 python -m pytest tests/ -q -p no:randomly

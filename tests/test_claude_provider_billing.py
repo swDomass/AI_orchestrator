@@ -189,6 +189,26 @@ def test_text_match_in_stderr_on_failed_api_run_counts_as_credit(env):
     assert len(env.calls) == 2
 
 
+# Official texts (platform.claude.com/docs/en/about-claude/api-credits-for-subscribers and
+# /docs/en/api/rate-limits, fetched 2026-10-27): text only, no billing code, status 400.
+@pytest.mark.parametrize("text", [
+    "Your credit balance is too low to access the Anthropic API. "
+    "Please go to Plans & Billing to upgrade or purchase credits.",
+    "Credit balance too low · Add funds: https://platform.claude.com/settings/billing",
+    "You have reached your specified workspace API usage limits. "
+    "You will regain access on 2026-11-01 at 00:00 UTC.",
+], ids=["api-credit-text", "cli-credit-text", "workspace-limit-text"])
+def test_official_credit_and_workspace_limit_texts_count_as_credit(env, text):
+    env.queue.extend([
+        _proc(_init("ANTHROPIC_API_KEY"), _assistant("m_t", text),
+              _result(text, is_error=True, status=400, cost=0), rc=1),
+        _success("none"),
+    ])
+    res = ClaudeProvider().run("task")
+    assert len(env.calls) == 2 and res.billing == "abo"
+    assert _state(env)["reason"] == "credit"
+
+
 def test_only_one_repeat_even_if_abo_run_fails_too(env):
     env.queue.extend([CREDIT_FAIL, _proc(_init("none"), _result("x", is_error=True), rc=1)])
     res = ClaudeProvider().run("task")

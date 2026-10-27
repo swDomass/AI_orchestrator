@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Stand 2026-10-23 abends (Windows, Dashboard B1 Queue-Editor nach externem Codex-Review + Panels sichtbar öffnen, +367 Tests): 3827 passed / 0 failed / 2 skipped in 377-600 s; +367 über die 3460 auf 796e141 = test_queue_editor_parse 37, _build 88, _lint 28, _mutations 66, _backups 18, _integration 4, _raw 40, test_dashboard_queue_api 35, test_dashboard_queue_js 50, test_dashboard_static +1.
+# Stand 2026-10-27 (Windows, API-Credits ADR-005 nach externem Codex-/opencode-Review, +105 Tests): 3932 passed / 0 failed / 2 skipped in 347-427 s; +105 über die 3827 auf d82d4eb = test_claude_billing 33, _gating 21, _records 18, _refresh 2, test_claude_provider_billing 31. Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos).
 # Ältere Stände und Messnotizen: docs/test-und-lint-historie.md
 # -p no:randomly: Das Flag bleibt als reproduzierbare Standardreihenfolge stehen (auch in ci.yml).
 python -m pytest tests/ -q -p no:randomly
@@ -133,6 +133,6 @@ Wer an einem dieser Themen arbeitet, ohne eine passende Datei anzufassen (Antwor
 | Claude/Codex/Gemini/OpenRouter/Vibe/opencode-Provider, Liveness-Watchdog, stdin-Zustellung, Fehlerklassifikation, `auth_expired`-Saga | `providers.md` | `providers/*.py` |
 | dev-loop/review-loop/critical-review/scientific-investigation/brainstorm/security-audit/pr-babysitter, Budget-Landung, Arbeitsbaum-Gate | `tools-catalog.md` | `tools/*.py` |
 | Per-Task-Auto-Commit, HEAD-nie-bewegen, Index-Regel, Datei-Deckel, Cleanup-Guard | `git-auto-commit.md` | `git_commit.py` |
-| Quota-Kalibrierung, Analytics, Dashboard, Harness-Index (SQLite), Config-Konstanten, Memory/Noop-Filter, Heartbeat, `.env`-Parsing, Vault-Schreibschutz der Tests | `quota-and-analytics.md` | `quota_calibration.py`, `quota_state.py`, `analytics.py`, `dashboard.py`, `harness_index.py`, `dashboard_ui/**`, `config.py`, `usage_suggester.py`, `usage_budget.py`, `memory.py`, `heartbeat.py`, `tests/conftest.py` |
+| Quota-Kalibrierung, Claude-API-Guthaben (Abrechnungsweg), Analytics, Dashboard, Harness-Index (SQLite), Config-Konstanten, Memory/Noop-Filter, Heartbeat, `.env`-Parsing, Vault-Schreibschutz der Tests | `quota-and-analytics.md` | `quota_calibration.py`, `quota_state.py`, `claude_billing.py`, `analytics.py`, `dashboard.py`, `harness_index.py`, `dashboard_ui/**`, `config.py`, `usage_suggester.py`, `usage_budget.py`, `memory.py`, `heartbeat.py`, `tests/conftest.py` |
 | Doctor-Checks, `safety_hook.py`, `build_audit_pack.py`, Lint-/Typing-Baseline (`pyproject.toml`) | `scripts-and-setup.md` | `doctor.py`, `scripts/*.py`, `pyproject.toml` |
 | Telegram, Idempotency, Session-Registry, Replay/Taxonomy, Preflight, Skill-Suggester, PR/CI-Watcher, Parallel-Runner, Watchdog-Skript | `misc-infra.md` | `notifier.py`, `telegram_listener.py`, `idempotency.py`, `session_registry.py`, `replay.py`, `taxonomy.py`, `preflight.py`, `skill_suggester.py`, `skills/index.py`, `gh_helpers.py`, `ci_watcher.py`, `parallel_runner.py`, `run_orchestrator.ps1` |

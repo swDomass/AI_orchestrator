@@ -222,7 +222,11 @@ def _run_single_subtask(
             # Same one-time notice + same non-fix for the missing cooldown as
             # the tool-based branch above.
             _notify_auth_expired_once(provider.name)
-        if result.error not in ("rate_limit", "unreachable", "paused"):
+        # billing == "api": credit-billed run, subscription untouched -> no estimate.
+        if (
+            result.error not in ("rate_limit", "unreachable", "paused")
+            and getattr(result, "billing", "") != "api"
+        ):
             report_estimated_usage(
                 provider.name,
                 estimate_task_usage_pct(

@@ -6,7 +6,7 @@ Autonomous task executor for the `claude` and `codex` CLI tools — driven by a 
 
 > **Provider status (2026-09-04).** The active fallback chain is **Claude → Codex**. Gemini is still implemented (`providers/gemini.py`, HTTP API + legacy CLI) and every `#gemini*` tag still resolves, but it left `dispatcher._PRIORITY` and the shipped `tool_providers:` policy — nothing routes there by default. OpenRouter, Mistral Vibe and opencode CLI remain opt-in and never enter the chain. See [Provider status in detail](#provider-status-in-detail).
 
-**Goal:** Run routine work (code, reviews, tests, docs, refactors) from a Markdown queue without managing API keys in your project. Uses existing CLI logins (OAuth/subscription).
+**Goal:** Run routine work (code, reviews, tests, docs, refactors) from a Markdown queue without managing API keys in your project. Uses existing CLI logins (OAuth/subscription); optionally Claude can run on monthly API credits instead (`ORCH_CLAUDE_API_KEY`, ADR-005), with the subscription as fallback.
 
 ## Why this exists
 
@@ -15,7 +15,7 @@ Routine engineering work — code reviews, refactors, test loops, documentation 
 - **No orchestration across providers.** The vendor CLIs are each excellent in isolation, but none of them routes a task to another vendor with capacity-aware fallback. When Claude hits a 5 h block, the workflow shouldn't stop — it should silently fail over.
 - **Long-running autonomous loops need an audit trail.** Every dev-loop iteration, every security finding, every retry decision should be inspectable after the fact, not lost to stdout.
 - **State should live in plain Markdown**, not in a database. A human edits the queue with a text editor, version-controls it in Git, and reads every result alongside the task that produced it.
-- **Subscription-driven CLIs (OAuth, no API keys) are the cheapest way to run an autonomous agent** for a single user — provided you have a layer on top that respects quota windows, retries 429s, and knows when *not* to run.
+- **Subscription-driven CLIs (OAuth, no API keys) are the cheapest way to run an autonomous agent** for a single user — provided you have a layer on top that respects quota windows, retries 429s, and knows when *not* to run. (Optional: Claude on API credits via `ORCH_CLAUDE_API_KEY`, ADR-005 — the subscription stays the default and the fallback.)
 
 This is the orchestrator built around that reality.
 
@@ -126,6 +126,9 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `CODEX_PRIMARY_MIN_CAPACITY_PCT` | No | `10` | Per-window override for Codex primary |
 | `CODEX_SECONDARY_MIN_CAPACITY_PCT` | No | `3` | Per-window override for Codex secondary |
 | `CLAUDE_PLAN` | No | — | Claude subscription plan for local 429 fallback: `pro`, `max5`, `max20`, `custom` |
+| `ORCH_CLAUDE_API_KEY` | No | — | API key of a Console organisation with monthly credits. When set, **all** Claude CLI runs of the provider (queue tasks, tools, sub-tasks, chat, heartbeat probe) bill the credits instead of the subscription; the key is passed only to the Claude subprocess and removed from `os.environ`. Empty = subscription as before. See ADR-005. |
+| `ORCH_CLAUDE_API_RETRY_HOURS` | No | `24` | After an empty balance / invalid key the API path is blocked this long; the failed run repeats once on the subscription, the next run after expiry tries the key once. |
+| `ORCH_CLAUDE_API_RATE_RETRY_MIN` | No | `60` | Same for an API rate limit (429, e.g. a low usage tier of the Console organisation): block in minutes. |
 | `GEMINI_API_KEY` | No | *(commented out since 2026-08-15)* | Google AI Studio key. When set, the Gemini provider uses the HTTP REST API instead of the CLI (the consumer Gemini CLI was shut down 2026-06-18); without a key it falls back to the legacy `gemini` CLI (Standard/Enterprise only). **Setting the key no longer puts Gemini back in the chain** — that needs `dispatcher._PRIORITY` and `tool_providers:` as well. What the key *does* control is the capacity gate: with it set, `dispatcher._limits_ok("gemini", …)` short-circuits to `True` (the REST API exposes no pollable quota), so Gemini would be reported unconditionally available. Leaving it unset is what disarms that. |
 | `GEMINI_BASE_URL` | No | `https://generativelanguage.googleapis.com/v1beta` | Override for testing or a proxy |
 | `GEMINI_DEFAULT_MODEL` | No | `gemini-3.5-flash` | Model for HTTP mode without a `#gemini_*` tag (free-tier-safe GA Flash) |
@@ -166,6 +169,8 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `CI_WATCHER_REPOS` | No | *(empty)* | Semicolon-separated `owner/name` list for the `check-ci-failures` heartbeat. Empty list disables the handler. |
 | `CI_WATCHER_REPO_PATHS` | No | *(empty)* | Optional `owner/name=local/path[;...]` mapping so the auto-generated queue item carries a usable `cwd:` tag. |
 | `CI_WATCHER_QUEUE_COOLDOWN_HOURS` | No | `2` | Cooldown per `(repo, headSha)` before re-queueing a CI failure. |
+
+**Never put the key into `.env` as `ANTHROPIC_API_KEY`.** `.env` is loaded into `os.environ`, so the OAuth token refresher (`limits._refresh_token`, which `cclimits` depends on) would inherit it, the subscription token would no longer be refreshed, and the statusline / Stream Deck would show "expired". Use `ORCH_CLAUDE_API_KEY`. The key is not inherited by non-Claude child processes (Codex, opencode, `cclimits`, the token refresher, Telegram helpers); **the Claude subprocess itself and everything it starts (Bash tools, hooks, MCP servers) does see `ANTHROPIC_API_KEY`**, because Claude Code needs it. Residual risk: a command the model runs in a foreign repo can read the key; the damage is limited by the missing payment method / workspace limit. Without a payment method in the Console the credit balance is also the hard cost ceiling; when it runs out the orchestrator falls back to the subscription and sends one Telegram notice per episode.
 
 See `.env.example` for a complete annotated template.
 
@@ -327,6 +332,8 @@ commit's age and can therefore be pruned on the very first run. Every deletion i
 logged with ref name and sha (recoverable with `git stash apply <sha>` until `git gc`);
 deleting more than one ref in a single pass is logged at `WARNING`, because routine
 ageing retires at most one at a time.
+
+**Claude on API credits has six known limits (ADR-005, section "Bekannte Grenzen").** (a) The Claude subprocess and everything it starts (Bash tools, hooks, MCP servers) sees `ANTHROPIC_API_KEY` (see the key warning under the configuration table). (b) claude.ai connectors (Gmail, Calendar, …) are disabled in API mode — the CLI lets the key take precedence over the claude.ai login; no queue task uses them today. (c) A fallback in the middle of a run (balance runs out or the key is rejected after tool calls, or the API answers with a rate limit, 429) repeats the run on the subscription, so side effects (e.g. a Telegram brief) can happen twice; with `CLAUDE_SESSION_ENABLED` the repeat continues the session via `--resume` instead of starting a new one (unchecked: whether a transcript already exists after an early failure; if not, the repeat ends with `session_missing`). The balance case is rare (at most about once a month without a payment method); a 429 can recur at most once per 60-minute block. (d) Tool runs do not capture `cost_usd`, and their `billing` value comes from the state at start; `#parallel` parent lines carry neither `billing` nor `cost_usd`, and sub-tasks write no `runs.jsonl` entry of their own. With `billing=abo`, `cost_usd` is a computed CLI figure, not money spent; after a fallback the cost of the failed API attempt is missing from `runs.jsonl` — the Console is the truth for the balance. (e) Usage-suggester proposals, meant to use leftover subscription quota before a reset, run on the credits in API mode. (f) The `billing_error` code and the workspace-spend-limit text are not locally verified; detection also uses status 402 and text patterns, deliberately generous, including the broad pattern `billing` (a false alarm locks the credit path for up to 24 h — all Claude runs then use the subscription — and sends a wrong balance/key alert via Telegram; a blind spot would let every run fail on the API path with no fallback).
 
 **`select_provider()` is fail-closed for a bare `#vibe`/`#openrouter` tag when the policy is missing (closed 2026-09-17).** The fail-closed rule lives in `dispatcher._allows()` / `policy_allows_provider()`. The **profile branch** of `_selection_order()` has consulted it per candidate since 2026-09-04; the **tag/forced branch** has done the same since 2026-09-17 — both `_selection_order()` and `forced_provider_policy_violation()` now judge the forced provider with `_allows()` instead of testing `allowed` for truthiness. With `policy.yaml` absent, unreadable, or present without a `tool_providers:` section (`PolicyEngine`'s provider side cannot tell these apart), a bare `#vibe`/`#vibe_*`/`#openrouter`/`#or_*` tag ends terminally as `- [x] … ❌ …` with `provider_not_allowed` — same message and code as an explicit policy ban. (An *unreadable* file no longer gets that far for a queue task: since 2026-10-08 the policy check holds every task first, `check_task` raises `PolicyUnreadableError`.) `claude`/`codex`/`gemini` and **opencode** (capped via its own OpenRouter key budget) stay fail-open. Authorise an uncapped provider deliberately with a `tool_providers:` entry, a profile, or `#tool_providers:vibe,claude` on the queue line. Named limit: a `#parallel` **subtask** tagged `#vibe` under a missing policy now simply fails (no dedicated `provider_not_allowed` message on that path).
 
@@ -1001,6 +1008,8 @@ Default port: `8211` (configurable via `DASHBOARD_PORT`). If the port is already
 - **Phase 1 — SoTH + estimation** (`quota_state.py`): `_bg_refresh_loop` writes `logs/cc_quota_state.json` atomically each poll (per-window `remaining_pct` / reset times + embedded calibration constants). The Claude Code statusline and `--check-limits` read it instead of re-polling cclimits; the 429-fallback estimator uses the calibrated per-window factors.
 - **Phase 2 — live rebalancing** (opt-in, `ORCH_QUOTA_LIVE_ESTIMATE`, default off): between polls, `get_limits()` decrements the cached snapshot by the calibrated per-task estimate and re-anchors on each fresh cclimits poll; optional daily auto-recalibration of the factors from the running CSV (`ORCH_QUOTA_AUTO_RECALIBRATE`, min-samples + clamp guarded). Default off keeps cclimits the per-poll source of truth.
 
+- **Credit-billed runs (ADR-005)** count neither in the live estimate (`report_estimated_usage` is skipped for `billing="api"`; for tool runs the state at start decides), nor in the calibration, nor in the local 429 fallback: the provider records the `message.id`s of every API-billed run in `logs/claude-api-runs.jsonl`, and the claude-monitor entries with those IDs are dropped. The `cc_quota_state.json` format is unchanged; the displayed capacity stays the subscription truth.
+
 The calibrated factors are plan- and workload-specific (env-overridable, not universal constants). Full CSV schema, calibration result, limitations, and the refuted 1h/5m tier-split experiment → [`docs/architecture/components.md`](docs/architecture/components.md#quota_calibrationpy--quota_statepy).
 
 ## Security / Guardrails
@@ -1079,6 +1088,7 @@ orchestrator.py
   → limits.py              (cclimits wrapper, disk cache, 429 resilience)
   → quota_calibration.py   (Phase-0 telemetry: cclimits ↔ JSONL token pairs)
   → quota_state.py         (Phase-1 SoTH: logs/cc_quota_state.json for statusline)
+  → claude_billing.py      (Claude billing path: API credits vs. subscription, ADR-005)
   → logging_setup.py       (rotating file logger)
   → doctor.py              (setup validation / --doctor)
   → queue_linter.py        (offline queue validation / --lint-queue)

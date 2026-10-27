@@ -22,6 +22,12 @@ class RunResult:
     # quota, see limits.py).
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    # Claude-only billing facts (providers/claude.py, from the stream-json events):
+    # "api" = ran on API credits, "abo" = subscription, "" = not a Claude run.
+    # For Claude never empty: without an init event (crash/timeout before init)
+    # the intent counts (see ClaudeProvider._attempt).
+    billing: str = ""
+    cost_usd: float | None = None
 
 
 # RunResult.error is an unconstrained string: providers put stable codes there

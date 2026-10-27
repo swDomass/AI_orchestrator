@@ -1,0 +1,58 @@
+# ADR-005: Claude-Läufe über monatliche API-Credits mit Rückfall aufs Abo (`claude_billing.py`)
+
+- **Status:** accepted
+- **Datum:** 2026-10-26
+- **Betrifft:** AI_orchestrator / `claude_billing.py` (neu), `providers/claude.py`, `providers/base.py`, `dispatcher.py`, `limits.py`, `quota_calibration.py`, `config.py`, `orchestrator.py`, `parallel_runner.py`, `replay.py`
+
+## Kontext
+
+Der Orchestrator soll seine Claude-CLI-Läufe über die monatlichen API-Credits einer Console-Organisation abrechnen, damit das Abo-Kontingent für interaktive Arbeit frei bleibt. Ohne Zahlungsart in der Console ist das Guthaben zugleich die harte Kostengrenze; ist es leer, muss der Orchestrator ohne Eingriff aufs Abo zurückfallen.
+
+Gemessen (Probe 2026-10-26, Claude Code 2.1.310, ungültiger Schlüssel nur im Kindprozess): das `system/init`-Event trägt `apiKeySource: "ANTHROPIC_API_KEY"` (ohne Schlüssel: Abo-Login), das `result`-Event `is_error: true`, `api_error_status: 401`, `total_cost_usd: 0`, Exit 1. Der Abrechnungsweg ist also pro Lauf aus der CLI ablesbar. Nicht lokal belegt: der Code `billing_error` und der Text eines Workspace-Ausgabenlimits. Außerdem erneuert `cclimits` das Claude-OAuth-Token nicht; der Orchestrator tut es selbst (`limits._refresh_token`, direkter `subprocess`-Aufruf, erbt `os.environ`). `config._load_dotenv` legt jeden `.env`-Eintrag in `os.environ`.
+
+## Entscheidung
+
+Der Schlüssel heißt `ORCH_CLAUDE_API_KEY`, wird von `config` gelesen und sofort aus `os.environ` entfernt; nur `claude_billing.child_env()` gibt ihn als `ANTHROPIC_API_KEY` an den Claude-Kindprozess weiter. Der Abrechnungsweg wird aus `init.apiKeySource` abgelesen (`RunResult.billing`), nicht aus der Absicht angenommen. Ersatzregel: kommt kein `init`-Event (Absturz/Timeout davor), gilt die Absicht (`ClaudeProvider._attempt`: API, wenn der Schlüssel eingesetzt wurde, sonst Abo).
+
+- **Einspeisepunkt = `ClaudeProvider.run`.** Damit laufen alle Läufe über den Provider auf dem Guthaben (Queue-Einzelläufe, Tools, Teilaufgaben, Telegram/chat, Memory-Lektion, Usage-Suggester, Heartbeat-Modellprobe): eine Stelle, keine Sonderfälle bei den Aufrufern. Abo bleiben bewusst nur die direkten CLI-Aufrufe (`limits._refresh_token`, `doctor --version`), die das OAuth-Token für `cclimits` frisch halten.
+- **Wiederholung im Provider, nicht über `_run_with_retry`.** Ein Guthaben-/Schlüsselfehler kommt beim ersten API-Aufruf; `run()` sperrt den API-Weg und wiederholt denselben Lauf genau einmal ohne Schlüssel. Der Aufrufer sieht ein Ergebnis mit `billing="abo"`. Über die bestehende Retry-Logik liefe ein Abrechnungsfehler in `set_cooldown(5*60)` bzw. den Codex-Rückfall.
+- **Sperre 24 h, Ratenlimit 60 min.** Der Gutschrifttag ist nicht abfragbar. Guthaben-/Schlüsselfehler sperren den API-Weg für `ORCH_CLAUDE_API_RETRY_HOURS` (24); ein 429 der Console-Organisation (niedrige Nutzungsstufe, unbelegt) für `ORCH_CLAUDE_API_RATE_RETRY_MIN` (60). Danach versucht der nächste Lauf den Schlüssel einmal. Eine Telegram-Nachricht je Episode; sie endet mit dem ersten erfolgreichen API-Lauf nach Ablauf der Sperre (`clear()`; ein Lauf, der vor dem `trip()` startete und danach erfolgreich endet, löscht die frische Sperre nicht).
+- **Fehlererkennung großzügig,** nur auf dem API-Weg: Status 401/402/429, Codes `authentication_failed`/`billing_error`/`rate_limit`, Textmuster. `rate` nur bei 429/`rate_limit`-Code oder Ratenlimit-Text (beides nur, wenn kein anderer expliziter Status als 429 vorliegt); Überlastung (529/5xx, „overloaded“) ist kein Abrechnungsfehler und nimmt den normalen Cooldown-Pfad. Ein Fehlalarm sperrt den Guthaben-Weg bis zu 24 h (alle Claude-Läufe dann übers Abo, also der Stand vor dieser Änderung) und meldet per Telegram fälschlich einen Guthaben-/Schlüsselfehler; eine Blindstelle ließe dagegen jeden Lauf auf dem API-Weg ohne Rückfall scheitern (Dauer-Fehlversuch). Deshalb bewusst großzügig, inklusive des breiten Musters `billing`.
+- **Kalibrier-Filter über `message_id`.** `claude-monitor`-Einträge tragen nur `message_id`/`request_id`; deshalb schreibt der Provider die `message.id` der assistant-Events eines Guthaben-Laufs in das Ledger `logs/claude-api-runs.jsonl`. Kalibrierung und lokaler 429-Fallback verwerfen diese Einträge; Ledger-Zeilen älter als `QUOTA_RECALIBRATE_WINDOW_DAYS` (60) fallen beim Schreiben weg. Die Live-Schätzung (`report_estimated_usage`) wird für `billing="api"` nicht gerufen.
+- **Sperr-Race, laufende Läufe, Subagenten-IDs.** `trip()` verkürzt nie eine laufende längere Sperre (spätere `blocked_until` und deren `reason` gewinnen); `clear()` löscht nur, wenn keine Sperre mehr in Kraft ist, damit ein parallel erfolgreicher Lauf die frische Sperre samt Benachrichtigt-Merker nicht löscht (sonst zweite Telegram-Nachricht). Ein Zähler laufender Guthaben-Läufe (`api_run_in_flight()`) hält Kalibrierproben zurück, solange das Ledger den Lauf noch nicht kennt; Subagenten-`message.id`s kommen aus den Transkripten (siehe Belege). Der lokale 429-Rückfall (`limits._get_claude_limits_from_local`) setzt aus, solange ein Guthaben-Lauf läuft (`api_runs_in_flight() > 0`), und gibt `None` zurück; dann greift die nächste Stufe (Snapshot-Cache), wie bei der Kalibrierprobe. Scheitert in `trip()` das Schreiben von `logs/claude-api-state.json`, hält das Modul Sperre und Benachrichtigt-Merker im Speicher (bis `clear()` oder Neustart; dieser Stand gilt dann vor einer älteren Datei auf der Platte) und loggt eine Warnung, damit es bei einer Telegram-Nachricht je Episode bleibt; nach einem Neustart ist dieser reine Speicher-Zustand weg. Setzt ein Guthaben-Lauf eine Session per `--resume` fort (nur mit `CLAUDE_SESSION_ENABLED`), liest `ClaudeProvider.run()` die Transkript-IDs vorher und bucht nur die neu hinzugekommenen ins Ledger; frühere (ggf. Abo-)Nachrichten bleiben in Kalibrierung und lokalem 429-Rückfall.
+- **Gating:** `dispatcher._limits_ok`, `limits.is_cached_provider_available` und der Watch-Loop (`any_available`) zählen Claude als verfügbar, solange `claude_billing.api_active()`.
+- **Neue Zustände:** `logs/claude-api-state.json` (Sperre, Grund, Benachrichtigt-Merker); neue optionale Felder `billing`, `cost_usd` in `runs.jsonl` (alte Zeilen bleiben lesbar).
+
+## Alternativen
+
+- **(a) `ANTHROPIC_API_KEY` direkt in `.env`** — verworfen: `_load_dotenv` legt ihn in `os.environ`, `_refresh_token` und das `cclimits`-Umfeld erben ihn, das OAuth-Token wird nicht mehr erneuert, Statuszeile und Stream Deck melden „expired“.
+- **(b) `apiKeyHelper` in `~/.claude/settings.json`** — verworfen: wirkt global, auch auf interaktives Claude Code, das die Credits nicht abdecken sollen.
+- **(c) Eigener `CLAUDE_CONFIG_DIR` für den Orchestrator** — verworfen: trennt auch Transkripte, Settings und Skills; viel größerer Eingriff als der Zweck verlangt.
+- **(d) Wiederholung über `_run_with_retry`** — verworfen: ein Abrechnungsfehler würde als Provider-Fehler behandelt (Cooldown, Codex-Ausweichen).
+
+## Konsequenzen
+
+- **+** Eine Stelle kennt den Abrechnungsweg; die Abo-Pfade (`_refresh_token`, `cclimits`, `doctor`) bleiben unverändert und der Weg ist pro Lauf belegt statt angenommen.
+- **+** Nach dem Import von `config` liegt der Schlüssel nie in `os.environ`, und er steht nie in Logs oder Ausnahmetexten; die Nicht-Claude-Kindprozesse (Codex, opencode, `cclimits`, der Token-Auffrischer `_refresh_token`, Telegram-Hilfen) erben ihn nicht.
+- **−** **Der Claude-Kindprozess selbst sieht `ANTHROPIC_API_KEY`** (Claude Code braucht die Variable), und mit ihm alles, was er startet: Bash-Werkzeuge, Hooks, MCP-Server. Restrisiko: ein vom Modell in einem fremden Repo gestarteter Befehl kann den Schlüssel auslesen. Der Schaden ist begrenzt, weil die Console-Organisation keine Zahlungsart hat (Guthaben ist die Obergrenze) bzw. ein Workspace-Limit gilt. Ob `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` die Variable vor Werkzeug-Kindprozessen entfernt, ohne den Lauf selbst zu brechen, ist **ungeprüft** und hier keine Empfehlung.
+- **−** Zwei neue Dateien auf Platte (Zustand, Ledger) und eine Wiederholung im Provider: schlägt das Guthaben mitten in einem Lauf nach Werkzeugaufrufen fehl, startet der Lauf auf dem Abo neu (bei aktivem `CLAUDE_SESSION_ENABLED` und vorhandener Session-ID setzt er die Session stattdessen per `--resume` fort) und Nebenwirkungen (z. B. Telegram-Brief) entstehen doppelt.
+- **−** claude.ai-Konnektoren sind im API-Modus abgeschaltet (Probe); heute nutzt keine Queue-Aufgabe sie. Die Erkennung von `billing_error` und Workspace-Limit beruht teils auf Textmustern.
+- **−** Vom Usage-Suggester vorgeschlagene Aufgaben (Abo-Rest vor dem Reset nutzen) laufen im API-Modus über das Guthaben.
+
+## Bekannte Grenzen
+
+Gemeinsame Liste; README (Abschnitt „Claude on API credits“) nennt dieselben sechs.
+
+1. **Schlüssel im Claude-Kindprozess:** der Claude-Kindprozess und alles, was er startet (Bash, Hooks, MCP), sieht `ANTHROPIC_API_KEY`; ob `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` das ohne Lauf-Bruch verhindert, ist ungeprüft (siehe Konsequenzen).
+2. **claude.ai-Konnektoren** sind im API-Modus abgeschaltet; heute nutzt keine Queue-Aufgabe sie.
+3. **Wiederholung mitten im Lauf** (Guthaben leer, Schlüssel ungültig oder API-Ratenlimit 429 nach Werkzeugaufrufen): der Lauf läuft auf dem Abo noch einmal, Nebenwirkungen (z. B. Telegram-Brief) können doppelt entstehen; mit `CLAUDE_SESSION_ENABLED` per `--resume` in derselben Session. Guthaben-Fall selten (höchstens etwa einmal im Monat ohne Zahlungsart), 429 bis zu einmal je 60-min-Sperre. Ungeprüft: ob nach einem Fehlschlag schon beim ersten API-Aufruf ein Transkript der Session existiert; fehlt es, endet die Abo-Wiederholung mit `session_missing` (nur mit `CLAUDE_SESSION_ENABLED`).
+4. **Tool-Läufe** übernehmen `cost_usd` nicht, ihr `billing` stammt aus dem Zustand beim Start; `#parallel`-Elternzeilen tragen weder `billing` noch `cost_usd`, Teilaufgaben schreiben keinen eigenen `runs.jsonl`-Eintrag. `cost_usd` ist bei `billing=abo` ein rechnerischer Wert der CLI, kein ausgegebenes Geld; nach einem Rückfall fehlen die Kosten des gescheiterten API-Versuchs in `runs.jsonl` — die Guthaben-Wahrheit ist die Console.
+5. **Usage-Suggester:** vorgeschlagene Aufgaben (Abo-Rest vor dem Reset nutzen) laufen im API-Modus über das Guthaben.
+6. **Fehlererkennung:** der Code `billing_error` und der Text des Workspace-Ausgabenlimits sind lokal nicht belegt; erkannt wird zusätzlich über Status 402 und Textmuster, bewusst großzügig.
+
+## Belege
+
+- **Live-Probe 2026-10-26** (Claude Code 2.1.310, ungültiger Schlüssel nur im Kindprozess): `system/init.apiKeySource` ist `none` ohne Schlüssel und `ANTHROPIC_API_KEY` mit Schlüssel; ein ungültiger Schlüssel liefert HTTP 401, `authentication_failed`, den Text „Invalid API key · Fix external API key“ und `is_error: true`.
+- **Leeres Guthaben** (nicht lokal reproduziert, nur aus Fremdberichten): claude-code Issue #31537 („Credit balance too low · Add funds: https://platform.claude.com/settings/billing“, v2.1.70) und Issue #867 (API-JSON „Your credit balance is too low to access the Anthropic API…“). Die Textmuster in `providers/claude.py` stützen sich darauf.
+- **Agent-SDK-Fehlercodes**: hexdocs `claude_agent_sdk`, Abschnitt error-handling. Der Code `billing_error` steht dort, ist aber lokal nicht belegt.
+- **Transkript-Layout** (gemessen 2026-10-26): `~/.claude/projects/<projekt>/<sid>.jsonl` und `~/.claude/projects/<projekt>/<sid>/subagents/agent-*.jsonl`. Dort liegen die `message.id`s auch von Subagenten, die der Stream nicht ausgibt.

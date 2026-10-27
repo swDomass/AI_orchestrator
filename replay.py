@@ -96,6 +96,9 @@ class RunRecord:
     retry_count: int = 0
     needs_satisfied_by: list[str] = field(default_factory=list)
     log_refs: list[str] = field(default_factory=list)
+    # Claude billing path ("api" | "abo") and reported cost; None = unknown / not Claude.
+    billing: str | None = None
+    cost_usd: float | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -396,6 +399,8 @@ def build_record(
     retry_count: int = 0,
     needs_satisfied_by: Iterable[str] | None = None,
     log_refs: Iterable[str] | None = None,
+    billing: str | None = None,
+    cost_usd: float | None = None,
 ) -> RunRecord:
     """Construct a RunRecord from orchestrator-side primitives.
 
@@ -427,4 +432,6 @@ def build_record(
         retry_count=int(retry_count or 0),
         needs_satisfied_by=list(needs_satisfied_by or []),
         log_refs=list(log_refs or []),
+        billing=billing or None,
+        cost_usd=cost_usd,
     )

@@ -278,7 +278,7 @@ path set was recorded, would look like foreign work and every resume would be re
 
 ### HTTP 429 resilience
 
-When `cclimits` monitoring API returns 429, `limits.py` retries with backoff (5s/10s), then applies 3-tier fallback: (0) local JSONL via `claude-monitor` (`_get_claude_limits_from_local`, `CLAUDE_PLAN` env var, uses `token_counts.total_tokens`), (1) snapshot cache with estimated usage tracking (`_429_base_snapshot`, `_429_estimated_usage`), (2) optimistic cold-start. Polls back off to 5 minutes. `report_estimated_usage()` called after each task. State resets when 429 clears. Disk-cache (`--cache-ttl 600`) reduces normal API calls.
+When `cclimits` monitoring API returns 429, `limits.py` retries with backoff (5s/10s), then applies 3-tier fallback: (0) local JSONL via `claude-monitor` (`_get_claude_limits_from_local`, `CLAUDE_PLAN` env var, uses `token_counts.total_tokens`), (1) snapshot cache with estimated usage tracking (`_429_base_snapshot`, `_429_estimated_usage`), (2) optimistic cold-start. Polls back off to 5 minutes. `report_estimated_usage()` called after each task, except for runs billed to the API credits (see ADR 005: single/sub-task runs by `billing`, tool runs by the state at start). State resets when 429 clears. Disk-cache (`--cache-ttl 600`) reduces normal API calls.
 
 ### 3-tier token estimation
 

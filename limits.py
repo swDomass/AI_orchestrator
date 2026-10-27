@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 
+import claude_billing
 import config
 import openrouter_budget
 from config import (
@@ -1104,9 +1105,14 @@ def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
 
     No HTTP requests — immune to rate limiting on the Anthropic monitoring API.
     Returns None if claude-monitor is not installed, the plan is unknown, or data
-    is unavailable (e.g. no recent sessions).
+    is unavailable (e.g. no recent sessions). Also None while a credit-billed run is
+    in flight (its ledger entry is not written yet) - the next stage, the snapshot
+    cache, then applies.
     """
     if not plan:
+        return None
+    if claude_billing.api_runs_in_flight() > 0:
+        logger.debug("API run in flight - skipping local 429 fallback")
         return None
     token_limit = _CLAUDE_LOCAL_PLAN_LIMITS.get(plan.lower())
     if not token_limit:
@@ -1125,6 +1131,8 @@ def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
     try:
         import datetime as _dt
         entries, _ = load_usage_entries(hours_back=10, mode=CostMode.AUTO)
+        # Credit-billed runs do not count against the subscription window.
+        entries = claude_billing.filter_api_entries(entries)
         if not entries:
             logger.debug("No claude-monitor usage entries found in last 10h")
             return None
@@ -1663,7 +1671,13 @@ def is_cached_provider_available(provider_name: str) -> bool:
 
     Returns ``True`` (safe default) when the cache is empty so tools don't
     abort prematurely on first startup.
+
+    Claude in credit mode (``claude_billing.api_active()``) counts as available
+    regardless of the subscription windows. Display (``get_cached_provider_pct``)
+    stays the subscription truth.
     """
+    if provider_name == "claude" and claude_billing.api_active():
+        return True
     p = _apply_live_estimate_to_provider(provider_name, _get_cached_provider(provider_name))
     return p.available if p is not None else True
 

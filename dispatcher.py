@@ -21,6 +21,7 @@ import logging
 import re
 from typing import Callable
 
+import claude_billing
 import config
 from limits import AllLimits, ProviderLimits, is_transient_token_refresh
 from providers import (
@@ -526,6 +527,12 @@ def _limits_ok(name: str, limits: AllLimits) -> bool:
     # quota either — the consumer CLI/OAuth endpoint cclimits reads is dead. Treat
     # it as available; rate-limit recovery is cooldown-driven, exactly like OpenRouter.
     if name == "gemini" and config.GEMINI_API_KEY:
+        return True
+    # Claude in credit mode (ORCH_CLAUDE_API_KEY, not blocked) bills the monthly
+    # API credits, not the subscription — an exhausted subscription window must
+    # not bar it. An empty balance / invalid key trips claude_billing, api_active()
+    # turns False and the normal subscription gating applies again.
+    if name == "claude" and claude_billing.api_active():
         return True
     # opencode falls through to here on purpose — no special case. It IS
     # pay-per-token, but unlike OpenRouter/Vibe its cap is pollable (the

@@ -996,6 +996,30 @@ QUOTA_RECALIBRATE_PERCENTILE = float(os.getenv("ORCH_QUOTA_RECAL_PERCENTILE", "2
 # the docstring's "Phase-0 drift correction" is actually about.
 QUOTA_RECALIBRATE_WINDOW_DAYS = int(os.getenv("ORCH_QUOTA_RECAL_WINDOW_DAYS", "60"))
 
+# --- Claude API credits (billing path) ---
+# Key for running the Orchestrator's Claude CLI calls on the monthly API credits
+# instead of the subscription quota. Deliberately NOT named ANTHROPIC_API_KEY:
+# _load_dotenv() puts every .env entry into os.environ, where limits._refresh_token
+# (the OAuth keep-alive that cclimits depends on) and other child processes would
+# inherit it and the subscription token would stop being refreshed.
+ORCH_CLAUDE_API_KEY = os.getenv("ORCH_CLAUDE_API_KEY", "").strip()
+# Non-Claude child processes (Codex, opencode, cclimits, the token refresher,
+# Telegram helpers) must not inherit the secret. Only claude_billing.child_env()
+# hands it on, as ANTHROPIC_API_KEY, to the Claude provider subprocess - and that
+# process plus everything it starts (Bash tools, hooks, MCP servers) does see it,
+# because Claude Code needs the variable. Residual risk: see ADR-005.
+os.environ.pop("ORCH_CLAUDE_API_KEY", None)
+# After a billing/auth failure the API path stays blocked this long, then retries once.
+ORCH_CLAUDE_API_RETRY_HOURS = _parse_int_env("ORCH_CLAUDE_API_RETRY_HOURS", 24)
+# After a 429 on the API path (rate limit of the Console organisation, e.g. a low usage
+# tier): short block in minutes, the run repeats once on the subscription meanwhile.
+ORCH_CLAUDE_API_RATE_RETRY_MIN = _parse_int_env("ORCH_CLAUDE_API_RATE_RETRY_MIN", 60)
+CLAUDE_API_STATE_FILE = Path(__file__).parent / "logs" / "claude-api-state.json"
+CLAUDE_API_RUNS_FILE = Path(__file__).parent / "logs" / "claude-api-runs.jsonl"
+# Transcripts of the Claude CLI (message IDs incl. subagents, see ADR 005).
+CLAUDE_PROJECTS_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
 # --- Parallel Worktrees (P1) ---
 # Subdir name under the parent CWD where #worktree-tagged parallel subtasks
 # get isolated git worktrees. Kept short to stay within Windows' 260-char path

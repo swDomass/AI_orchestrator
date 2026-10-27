@@ -39,6 +39,8 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import claude_billing
+
 if TYPE_CHECKING:
     from limits import AllLimits
 
@@ -114,6 +116,9 @@ def _load_entries(load_hours: int) -> list | None:
 
     Returns ``None`` when claude-monitor is missing or its loader raises —
     callers must handle the None case as "claude-monitor unavailable".
+
+    Credit-billed runs (ledger ``logs/claude-api-runs.jsonl``) are filtered out:
+    they do not count against the subscription quota and must not shift the factors.
     """
     try:
         from claude_monitor.core.models import CostMode
@@ -131,7 +136,7 @@ def _load_entries(load_hours: int) -> list | None:
     except Exception as exc:
         logger.debug("calibration: load_usage_entries failed: %s", exc)
         return None
-    return entries
+    return claude_billing.filter_api_entries(entries)
 
 
 def _filter_entries_for_window(
@@ -357,6 +362,11 @@ def log_calibration_sample(
         if claude.error:
             return
         if not claude.windows:
+            return
+        # Transcripts of a running credit run are not in the ledger yet; a sample
+        # now would book its tokens as subscription usage for good.
+        if claude_billing.api_runs_in_flight() > 0:
+            logger.debug("calibration: API credit run in flight — skipping sample")
             return
 
         now = dt.datetime.now(dt.UTC)

@@ -43,6 +43,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime, timedelta
 
+import claude_billing
 import config
 import git_commit
 import memory as memory_module
@@ -1438,6 +1439,8 @@ class _RunSpan:
     error_code: str | None = None
     retry_count: int = 0
     needs_satisfied_by: list[str] = None  # type: ignore[assignment]
+    billing: str | None = None
+    cost_usd: float | None = None
     emitted: bool = False
 
     def __post_init__(self) -> None:
@@ -1494,6 +1497,8 @@ class _RunSpan:
                 error_code=self.error_code,
                 retry_count=self.retry_count,
                 needs_satisfied_by=self.needs_satisfied_by,
+                billing=self.billing,
+                cost_usd=self.cost_usd,
             )
             replay.append_run(record)
         except Exception as e:  # noqa: BLE001 — telemetry must never break the loop
@@ -2089,6 +2094,11 @@ def _execute_tool_task(
     # via the policy-aware dispatcher.get_provider_for_tool so other tools stay
     # unaffected and `#second_opinion:` cannot slip past tool_providers.
     second_opinion_alias = extract_second_opinion_alias(task)
+    # Tool results carry no billing path, so remember it at start. A fallback to
+    # the subscription mid-tool leaves its share unreported (under-estimate until
+    # the next poll, <= 10 min, harmless); over-estimating would show credit
+    # runs as subscription usage, which is the error this gate prevents.
+    api_at_start = provider.name == "claude" and claude_billing.api_active()
     _tool_start = time.time()
     tool_result = tool.run(
         clean_task, provider, cwd=cwd, timeout=timeout,
@@ -2098,7 +2108,7 @@ def _execute_tool_task(
     _tool_duration = time.time() - _tool_start
 
     # Track estimated usage for 429 capacity estimation
-    if (tool_result.error_code or "") not in ("rate_limit", "unreachable"):
+    if (tool_result.error_code or "") not in ("rate_limit", "unreachable") and not api_at_start:
         report_estimated_usage(provider.name, estimate_task_usage_pct(
             _tool_duration,
             input_tokens=tool_result.input_tokens,
@@ -2936,6 +2946,13 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 setattr(provider, "_forced_effort", forced_effort)
                 _span.provider = provider.name
                 _span.model = model_id or ""
+                # Tool results carry no billing path (see _execute_tool_task): record the
+                # path at start, no cost.
+                # Set on every attempt: after a Claude -> other rotation it must not linger.
+                _span.billing = (
+                    ("api" if claude_billing.api_active() else "abo")
+                    if provider.name == "claude" else None
+                )
                 try:
                     outcome = _execute_tool_task(
                         task,
@@ -3285,9 +3302,18 @@ def run_once(dry_run: bool = False, pause_event: threading.Event | None = None) 
                 setattr(provider, "_forced_model", previous_forced_model)
                 setattr(provider, "_forced_effort", previous_forced_effort)
 
+            # Billing facts for runs.jsonl (every outcome below ends the span with them).
+            _span.billing = getattr(result, "billing", "") or None
+            _span.cost_usd = getattr(result, "cost_usd", None)
+
             # Track estimated usage for 429 capacity estimation
             _task_duration = time.time() - start_time
-            if result.error not in ("rate_limit", "unreachable", "paused"):
+            # Credit-billed runs (billing == "api") do not touch the subscription:
+            # no live estimate, or the display would show phantom usage.
+            if (
+                result.error not in ("rate_limit", "unreachable", "paused")
+                and getattr(result, "billing", "") != "api"
+            ):
                 report_estimated_usage(provider.name, estimate_task_usage_pct(
                     _task_duration,
                     input_tokens=result.input_tokens,
@@ -3718,8 +3744,8 @@ def run_watch(dry_run: bool = False) -> None:
             print("\nPrüfe Reset-Zeiten...")
             limits = get_limits(force_refresh=True)
 
-            if limits.any_available():
-                # Providers are available — failure was task-specific (tool error,
+            if limits.any_available() or claude_billing.api_active():
+                # Providers are available (Claude also via API credits) — failure was task-specific (tool error,
                 # format mismatch, etc.), not capacity exhaustion.  Retry quickly
                 # so remaining queue tasks are not blocked for 50 minutes.
                 sleep_sec = 30

@@ -446,6 +446,26 @@ def _isolate_openrouter_api_key(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_claude_api_credits(tmp_path: Path, monkeypatch):
+    """Keep the Claude API-credit path (claude_billing) out of every test by default.
+
+    A real ORCH_CLAUDE_API_KEY in .env makes claude_billing.api_active() true in
+    every test process: the Claude provider then runs on the credit path and
+    writes the real logs/claude-api-state.json (a 429/auth failure blocks the
+    live orchestrator for 60 min / 24 h and sends a real Telegram message) and
+    the real logs/claude-api-runs.jsonl ledger. Measured 2026-10-26: 7
+    dispatcher tests red with a key present. State and ledger go to tmp_path.
+    Tests that need the key set it themselves (this fixture runs first).
+    """
+    monkeypatch.setattr("config.ORCH_CLAUDE_API_KEY", "", raising=False)
+    monkeypatch.setattr("config.CLAUDE_API_STATE_FILE", tmp_path / "claude-api-state.json", raising=False)
+    monkeypatch.setattr("config.CLAUDE_API_RUNS_FILE", tmp_path / "claude-api-runs.jsonl", raising=False)
+    monkeypatch.setattr("config.CLAUDE_PROJECTS_DIR", tmp_path / "claude-projects", raising=False)
+    monkeypatch.setattr("claude_billing._mem_state", [None], raising=False)  # no mirror leaks on
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_queue_backup_dir(tmp_path: Path, monkeypatch):
     """Queue-editor backups (config.QUEUE_BACKUP_DIR) never land in the real logs/."""
     monkeypatch.setattr("config.QUEUE_BACKUP_DIR", tmp_path / "queue-backups", raising=False)

@@ -2,7 +2,7 @@
 dispatcher's fallback chain — see providers/opencode.py's module docstring).
 
 Every switching branch gets its own gate: argv construction (prompt before -f,
---variant only with a forced effort, agent choice by read_only), the 50 KB
+`#effort` on the model only with a forced effort, agent choice by read_only), the 50 KB
 prompt cap in both modes, model resolution order (tag > picker > default,
 including a non-zero picker exit and garbage picker output), each error-
 classification keyword branch (policy_block explicitly NOT transient), ANSI
@@ -65,7 +65,7 @@ def test_prompt_message_sits_before_f_flag(monkeypatch):
     assert cmd[2] == opencode_mod._SHORT_MESSAGE
     assert cmd.index(opencode_mod._SHORT_MESSAGE) < f_index
     # nothing prompt-shaped trails -f except its own value
-    assert cmd[f_index + 1] not in ("--model", "--agent", "--dir", "--variant")
+    assert cmd[f_index + 1] not in ("--model", "--agent", "--standalone")
     assert len(cmd) == f_index + 2
 
 
@@ -82,34 +82,53 @@ def test_full_argv_order_matches_spec(monkeypatch):
     assert cmd[2] == opencode_mod._SHORT_MESSAGE
     assert cmd[3:5] == ["--model", "openrouter/zdr-review"]
     assert cmd[5:7] == ["--agent", "extern-review"]
-    assert cmd[7:9] == ["--dir", "D:/repo"]
-    assert cmd[9] == "-f"
+    assert cmd[7] == "--standalone"
+    assert cmd[8] == "-f"
+    assert len(cmd) == 10
+    assert "--dir" not in cmd and "--variant" not in cmd
 
 
-def test_variant_flag_absent_without_forced_effort(monkeypatch):
+def test_no_variant_suffix_without_forced_effort(monkeypatch):
     calls = []
     monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/m")
 
     OpencodeProvider().run("review this")
 
-    assert "--variant" not in calls[0][0]
+    cmd = calls[0][0]
+    assert cmd[cmd.index("--model") + 1] == "openrouter/m"
+    assert "--variant" not in cmd
 
 
-def test_variant_flag_present_with_forced_effort_raw_value(monkeypatch):
-    """#effort: values pass through raw — opencode tolerates undocumented
-    values like 'xhigh' with exit 0 (measured), so there is no mapping table."""
+def test_effort_rides_on_model_id_as_hash_suffix(monkeypatch):
+    """2.2 has no --variant; the forced effort becomes `<model>#<effort>`."""
     calls = []
     monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/m")
 
     provider = OpencodeProvider()
-    provider._forced_effort = "xhigh"
+    provider._forced_effort = "high"
     try:
         provider.run("review this")
     finally:
         provider._forced_effort = None
 
     cmd = calls[0][0]
-    assert cmd[cmd.index("--variant") + 1] == "xhigh"
+    assert cmd[cmd.index("--model") + 1] == "openrouter/m#high"
+    assert "--variant" not in cmd
+    assert cmd[-2] == "-f"
+
+
+def test_standalone_flag_precedes_f(monkeypatch):
+    """Without --standalone the work runs in the shared background service,
+    which a process kill does not reach."""
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+
+    OpencodeProvider().run("review this")
+
+    cmd = calls[0][0]
+    assert cmd.index("--standalone") < cmd.index("-f")
 
 
 def test_agent_choice_read_only_uses_extern_review(monkeypatch):
@@ -132,13 +151,164 @@ def test_agent_choice_write_mode_uses_extern_dev(monkeypatch):
     assert cmd[cmd.index("--agent") + 1] == "extern-dev"
 
 
-def test_dir_flag_omitted_without_cwd(monkeypatch):
+def test_no_dir_flag_but_cwd_and_pwd_set_with_cwd(monkeypatch):
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setenv("PWD", "D:/foreign")
+
+    OpencodeProvider().run("review this", cwd="D:/repo")
+
+    cmd, kwargs = calls[0]
+    assert "--dir" not in cmd
+    assert kwargs["cwd"] == os.path.abspath("D:/repo")
+    assert kwargs["env"]["PWD"] == os.path.abspath("D:/repo")
+
+
+def test_inherited_config_overrides_stripped_from_child_env(monkeypatch):
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR",
+                 "OPENCODE_PERMISSION", "opencode_permission"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("OPENCODE_CONFIG_PATH", "keep")
+
+    OpencodeProvider().run("review this", cwd="D:/repo")
+
+    env = calls[0][1]["env"]
+    assert not [k for k in env if k.upper() in opencode_mod._STRIPPED_ENV]
+    assert env["OPENCODE_CONFIG_PATH"] == "keep"
+
+
+def test_relative_cwd_becomes_absolute_for_cwd_and_pwd(monkeypatch):
     calls = []
     monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
 
+    OpencodeProvider().run("review this", cwd="some/rel")
+
+    kwargs = calls[0][1]
+    assert os.path.isabs(kwargs["cwd"]) and kwargs["cwd"] == os.path.abspath("some/rel")
+    assert kwargs["env"]["PWD"] == kwargs["cwd"]
+
+
+def test_pwd_removed_without_cwd_even_if_parent_exports_one(monkeypatch):
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setenv("PWD", "D:/foreign")
+
     OpencodeProvider().run("review this", cwd=None)
 
-    assert "--dir" not in calls[0][0]
+    kwargs = calls[0][1]
+    assert kwargs["cwd"] is None
+    assert "PWD" not in kwargs["env"]
+    assert os.environ["PWD"] == "D:/foreign"  # the parent env is untouched
+
+
+def _variant_provider(effort):
+    provider = OpencodeProvider()
+    provider._forced_effort = effort
+    return provider
+
+
+def test_variant_unavailable_repeats_exactly_once_without_variant(monkeypatch):
+    calls = []
+    outcomes = iter([
+        SimpleNamespace(returncode=1, stdout="",
+                        stderr="Error: Variant unavailable for openrouter/m: xhigh"),
+        SimpleNamespace(returncode=0, stdout="REVIEW", stderr=""),
+    ])
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return next(outcomes)
+
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _run)
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/m")
+
+    result = _variant_provider("xhigh").run("review this", cwd="D:/repo")
+
+    assert len(calls) == 2
+    first, second = calls[0][0], calls[1][0]
+    assert first[first.index("--model") + 1] == "openrouter/m#xhigh"
+    assert second[second.index("--model") + 1] == "openrouter/m"
+    assert second[-2] == "-f" and second[-1] == first[-1]
+    repo = os.path.abspath("D:/repo")
+    assert calls[1][1]["env"]["PWD"] == repo and calls[1][1]["cwd"] == repo
+    assert result.success is True and result.output == "REVIEW"
+
+
+def test_variant_unavailable_second_failure_is_returned_not_retried_again(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opencode_mod, "run_with_watchdog",
+        _fake_watchdog(calls, returncode=1, stdout="", stderr="Error: Variant unavailable: x"),
+    )
+
+    result = _variant_provider("x").run("review this")
+
+    assert len(calls) == 2
+    assert result.success is False
+
+
+def test_variant_unavailable_text_without_effort_does_not_repeat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opencode_mod, "run_with_watchdog",
+        _fake_watchdog(calls, returncode=1, stdout="", stderr="Variant unavailable"),
+    )
+
+    OpencodeProvider().run("review this")
+
+    assert len(calls) == 1
+
+
+def test_variant_phrase_in_successful_answer_does_not_repeat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opencode_mod, "run_with_watchdog",
+        _fake_watchdog(calls, returncode=0, stdout="the text 'Variant unavailable' is quoted"),
+    )
+
+    result = _variant_provider("high").run("review this")
+
+    assert len(calls) == 1 and result.success is True
+
+
+def test_variant_phrase_only_in_stdout_with_answer_does_not_repeat(monkeypatch):
+    """Exit 1 after a delivered answer that quotes the phrase: one paid run only."""
+    calls = []
+    monkeypatch.setattr(
+        opencode_mod, "run_with_watchdog",
+        _fake_watchdog(calls, returncode=1, stdout="review: 'Variant unavailable' is handled", stderr=""),
+    )
+
+    result = _variant_provider("high").run("review this")
+
+    assert len(calls) == 1
+    assert "review:" in result.output
+
+
+def test_variant_phrase_in_stderr_with_nonempty_stdout_does_not_repeat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opencode_mod, "run_with_watchdog",
+        _fake_watchdog(calls, returncode=1, stdout="partial answer", stderr="Variant unavailable"),
+    )
+
+    _variant_provider("high").run("review this")
+
+    assert len(calls) == 1
+
+
+def test_other_failure_with_effort_does_not_repeat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opencode_mod, "run_with_watchdog",
+        _fake_watchdog(calls, returncode=1, stdout="", stderr="boom"),
+    )
+
+    _variant_provider("high").run("review this")
+
+    assert len(calls) == 1
 
 
 def test_shell_is_never_used(monkeypatch):
@@ -577,12 +747,13 @@ def test_is_available_never_raises_on_unexpected_exception(monkeypatch):
 def test_resolve_exe_prefers_real_exe_next_to_npm_shim(monkeypatch, tmp_path):
     """The shutil.which() hit for a bare `opencode` on this machine is always
     the .CMD/.ps1 npm shim; the real binary sits at
-    <parent>/node_modules/opencode-ai/bin/opencode.exe."""
+    <parent>/node_modules/@opencode/cli/bin/opencode.exe (legacy fallback:
+    <parent>/node_modules/opencode-ai/bin/opencode.exe)."""
     npm_dir = tmp_path / "npm"
     npm_dir.mkdir()
     shim = npm_dir / "opencode.CMD"
     shim.write_text("@echo off", encoding="utf-8")
-    real_exe_dir = npm_dir / "node_modules" / "opencode-ai" / "bin"
+    real_exe_dir = npm_dir / "node_modules" / "@opencode" / "cli" / "bin"
     real_exe_dir.mkdir(parents=True)
     real_exe = real_exe_dir / "opencode.exe"
     real_exe.write_bytes(b"MZ")
@@ -590,6 +761,34 @@ def test_resolve_exe_prefers_real_exe_next_to_npm_shim(monkeypatch, tmp_path):
     monkeypatch.setattr(opencode_mod.shutil, "which", lambda name: str(shim))
 
     assert opencode_mod._resolve_exe() == str(real_exe)
+
+
+def _npm_with_exe(tmp_path, *pkg_parts):
+    npm_dir = tmp_path / "npm"
+    npm_dir.mkdir()
+    shim = npm_dir / "opencode.CMD"
+    shim.write_text("@echo off", encoding="utf-8")
+    exe_dir = npm_dir.joinpath("node_modules", *pkg_parts, "bin")
+    exe_dir.mkdir(parents=True)
+    (exe_dir / "opencode.exe").write_bytes(b"MZ")
+    return shim, exe_dir / "opencode.exe"
+
+
+def test_resolve_exe_falls_back_to_legacy_opencode_ai_layout(monkeypatch, tmp_path):
+    shim, legacy = _npm_with_exe(tmp_path, "opencode-ai")
+    monkeypatch.setattr(opencode_mod.shutil, "which", lambda name: str(shim))
+
+    assert opencode_mod._resolve_exe() == str(legacy)
+
+
+def test_resolve_exe_prefers_new_layout_when_both_exist(monkeypatch, tmp_path):
+    shim, new = _npm_with_exe(tmp_path, "@opencode", "cli")
+    legacy_dir = tmp_path / "npm" / "node_modules" / "opencode-ai" / "bin"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "opencode.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(opencode_mod.shutil, "which", lambda name: str(shim))
+
+    assert opencode_mod._resolve_exe() == str(new)
 
 
 def test_resolve_exe_none_when_real_exe_missing(monkeypatch, tmp_path):

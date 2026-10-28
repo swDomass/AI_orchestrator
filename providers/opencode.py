@@ -19,7 +19,8 @@ CLI facts, all measured 2026-09-04 against opencode 1.18.27 unless noted:
   ``shell=True``, and there a quote embedded in an argument (a task prompt can
   contain any character) breaks out of Windows' cmd.exe quoting — so this
   provider resolves past the shim to the real
-  ``<npm-root>/node_modules/opencode-ai/bin/opencode.exe`` instead of ever
+  ``<npm-root>/node_modules/@opencode/cli/bin/opencode.exe`` (opencode 1.x:
+  ``opencode-ai``) instead of ever
   spawning through cmd.exe. No resolvable ``.exe`` → ``None`` → not registered.
   Registered-but-broken (a shell escape bug in production) was judged worse
   than simply absent.
@@ -33,17 +34,25 @@ CLI facts, all measured 2026-09-04 against opencode 1.18.27 unless noted:
   ``UnknownError``, indistinguishable from an actual API-level failure by
   return code alone. Classification therefore scans the (ANSI-stripped)
   combined stdout+stderr text for keywords, not just the return code.
-* ``--variant`` exists (the 2026-08-28 note that it didn't was stale) and
-  tolerates undocumented values — ``--variant xhigh`` exits 0 — so `#effort:`
-  values are passed through raw here, no mapping table, matching the CLI's own
-  looseness.
+* opencode 2.2 (measured 2026-10-28) has neither ``--dir`` nor ``--variant``.
+  The radius is ``PWD`` (set to the cwd by the provider, and ``PWD`` beats the
+  cwd, see ``_build_env``) plus its git root; the variant is ``--model …#variant``, which 2.2 validates:
+  an unknown one (``#xhigh``) exits 1 "Variant unavailable" before any model
+  call, so ``run`` repeats once without the variant. ``--standalone`` keeps the
+  work in a private server that a process kill reaches (the shared background
+  service survives it). `#effort:` values are otherwise passed through raw.
 * opencode reports no token/cost numbers (measured: `cost=0` in 142/142 real
   log lines), so ``RunResult`` stays at the dataclass default of 0 for every
   token field — the orchestrator's char/duration estimate takes over exactly
   as it does for Codex and Vibe.
-* A real ``-f`` + ``--agent extern-review`` + ``--dir`` run returns 0 with the
+* A real ``-f`` + ``--agent extern-review`` run (cwd = repo) returns 0 with the
   agent reading the attachment through its own ``read`` tool — the delivery
   path is confirmed working end-to-end, not just plausible from the CLI help.
+  Re-measured under 2.2 on 2026-10-28 through ``OpencodeProvider.run`` itself
+  (``--standalone``, cwd + ``PWD`` from ``_build_env``, an inherited foreign
+  ``PWD`` in the parent): the session ran in the repo, a read one level up was
+  ``permission.rejected`` (external_directory), and ``#xhigh`` hit "Variant
+  unavailable" and was repeated once without the variant, successfully.
 
 Prompt delivery is a REAL FILE via ``-f``, never stdin: ``run_with_watchdog``
 is called with ``input_text=None``. That is not an omission — it structurally
@@ -56,7 +65,7 @@ Prompt cap (``config.OPENCODE_MAX_PROMPT_BYTES``, default 50 000) applies in
 BOTH read_only and write modes and is enforced BEFORE any subprocess call —
 above it: ``RunResult(success=False, error="prompt_too_large")``, never a
 silent truncation. This is not caution for its own sake: a ``-f`` file living
-outside ``--dir`` cannot be reread by either agent once attached, because
+outside the radius (see above) cannot be reread by either agent once attached, because
 ``external_directory: deny`` is the LAST matching rule in opencode's
 permission list — including for the one path (``%TEMP%/opencode/*``) that
 looked like an allowed exception on inspection (measured 2026-09-04: a re-read
@@ -155,6 +164,12 @@ def _looks_auth_failed(text: str) -> bool:
     return any(kw in text for kw in _AUTH_TEXT) or bool(_AUTH_CODE_RE.search(text))
 
 _REQUIRED_AGENTS = ("extern-review", "extern-dev")
+_VARIANT_UNAVAILABLE = "variant unavailable"
+# Inherited opencode config overrides could replace the agents' default-deny
+# permissions (e.g. OPENCODE_PERMISSION={"*":"allow"}); same list as oc_run.py.
+# OPENCODE_CONFIG_PATH is the orchestrator's own variable and stays.
+_STRIPPED_ENV = frozenset({"OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT",
+                           "OPENCODE_CONFIG_DIR", "OPENCODE_PERMISSION"})
 
 # The only part of the run guaranteed to arrive uncut (see module docstring):
 # everything else lives in the attached -f file.
@@ -179,8 +194,12 @@ def _resolve_exe() -> str | None:
             return None
         if shim.lower().endswith(".exe"):
             return shim
-        candidate = Path(shim).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
-        return str(candidate) if candidate.is_file() else None
+        # opencode 2.x ships as @opencode/cli; the 1.x layout (opencode-ai) is the fallback.
+        for pkg in ("@opencode/cli", "opencode-ai"):
+            candidate = Path(shim).parent / "node_modules" / pkg / "bin" / "opencode.exe"
+            if candidate.is_file():
+                return str(candidate)
+        return None
     except OSError:
         return None
 
@@ -272,33 +291,41 @@ class OpencodeProvider(BaseProvider):
         agent: str,
         *,
         effort: str | None,
-        cwd: str | None,
         prompt_path: str,
     ) -> list[str]:
+        # opencode 2.2 has no --dir / --variant: the radius comes from the child's
+        # cwd + PWD (see _build_env), the variant rides on the model id. Without
+        # --standalone the work runs in a shared background service that a process
+        # kill does not reach.
+        target = f"{model}#{effort}" if effort else model
         # yargs array-flag trap: -f must be LAST, with nothing prompt-shaped
         # after it, or it swallows the next token as a second filename.
-        cmd = [exe, "run", _SHORT_MESSAGE, "--model", model, "--agent", agent]
-        if effort:
-            cmd.extend(["--variant", effort])
-        if cwd:
-            cmd.extend(["--dir", cwd])
-        cmd.extend(["-f", prompt_path])
-        return cmd
+        return [exe, "run", _SHORT_MESSAGE, "--model", target, "--agent", agent,
+                "--standalone", "-f", prompt_path]
 
     @staticmethod
-    def _build_env() -> dict[str, str]:
-        """Full merged copy of the child environment.
+    def _build_env(cwd: str | None) -> dict[str, str]:
+        """Full merged copy of the child environment, with the radius pinned.
 
-        Nothing opencode-specific is injected today -- auth and model config
-        come from opencode's own auth.json/opencode.json, not env vars. Still
-        passed as an explicit copy rather than leaving ``env=None`` (which
-        would let Popen inherit the parent as-is): providers are shared
-        singletons run from parallel threads, so the moment a future per-run
-        variable is needed here, mutating ``os.environ`` directly would leak
-        one run's setting into another's. Matches the pattern in vibe.py/
-        codex.py's env handling.
+        opencode 2.2 resolves its working directory as ``process.env.PWD ??
+        process.cwd()`` -- PWD beats the cwd Popen sets. A PWD inherited from the
+        parent (Git Bash exports it) would silently move the permission radius to
+        a foreign directory, so it is set to ``cwd`` or, without a cwd, removed.
+        The ``_STRIPPED_ENV`` config/permission overrides are dropped too
+        (case-insensitive), so they cannot override the agents' default-deny.
+        Known limit: with ``cwd=None`` the radius is the orchestrator's own cwd
+        plus its git root (same as 1.x without ``--dir``).
+
+        A copy rather than ``env=None`` (inherit as-is): providers are shared
+        singletons run from parallel threads, so mutating ``os.environ`` would
+        leak one run's setting into another's.
         """
-        return os.environ.copy()
+        env = {k: v for k, v in os.environ.items() if k.upper() not in _STRIPPED_ENV}
+        if cwd:
+            env["PWD"] = cwd
+        else:
+            env.pop("PWD", None)
+        return env
 
     @staticmethod
     def _run_picker() -> str | None:
@@ -368,27 +395,49 @@ class OpencodeProvider(BaseProvider):
         model = self._resolve_model()
         agent = "extern-review" if read_only else "extern-dev"
         effort = self._forced_effort
+        # PWD and Popen cwd must name the same absolute dir.
+        cwd = os.path.abspath(cwd) if cwd else cwd
 
         print(f"  [opencode → {agent}/{model}] Führe Task aus...")
 
         prompt_path = None
         try:
             prompt_path = _write_prompt_file(task)
-            cmd = self._build_command(
-                _OPENCODE_EXE, model, agent, effort=effort, cwd=cwd, prompt_path=prompt_path
-            )
-            result = run_with_watchdog(
-                cmd,
-                # Prompt travels via the -f file written above, NOT stdin --
-                # see module docstring for why that removes the whole
-                # stdin_incomplete contract for this provider by construction.
-                input_text=None,
-                cwd=cwd,
-                idle_timeout=config.OPENCODE_IDLE_TIMEOUT_SEC,
-                hard_timeout=timeout,
-                shell=False,
-                env=self._build_env(),
-            )
+
+            def _attempt(eff: str | None):
+                cmd = self._build_command(
+                    _OPENCODE_EXE, model, agent, effort=eff, prompt_path=prompt_path
+                )
+                return run_with_watchdog(
+                    cmd,
+                    # Prompt travels via the -f file written above, NOT stdin --
+                    # see module docstring for why that removes the whole
+                    # stdin_incomplete contract for this provider by construction.
+                    input_text=None,
+                    cwd=cwd,
+                    idle_timeout=config.OPENCODE_IDLE_TIMEOUT_SEC,
+                    hard_timeout=timeout,
+                    shell=False,
+                    env=self._build_env(cwd),
+                )
+
+            result = _attempt(effort)
+            # 2.2 validates the variant before any model call (cost 0): an unknown
+            # one exits 1 "Variant unavailable". Exactly one repeat without it, so
+            # a planned run degrades to the model default instead of failing.
+            # Phrase in stderr AND empty stdout: the check fails before any model
+            # call, so stdout never holds agent text (which may quote the phrase).
+            if (
+                effort
+                and result.returncode != 0
+                and not _strip_ansi(result.stdout or "").strip()
+                and _VARIANT_UNAVAILABLE in _strip_ansi(result.stderr or "").lower()
+            ):
+                logger.warning(
+                    "[opencode] variant %r unavailable for %s -- repeating once without it",
+                    effort, model,
+                )
+                result = _attempt(None)
 
             # Stripped before classification too, not just before returning:
             # an escape sequence could in principle sit inside a matched
@@ -428,13 +477,14 @@ class OpencodeProvider(BaseProvider):
 
         except subprocess.TimeoutExpired as exc:
             kind = getattr(exc, "timeout_kind", "hard")
-            # Kein Sweeper (siehe Auftrag) -- ob der doppelte taskkill /F /T in
-            # _tree_kill hier reicht, ist ungemessen. Nur die Warnung ist der
-            # gebaute Teil.
+            # No sweeper built. State: the tree kill ends the --standalone session
+            # (measured 2026-10-28 via oc_run.py, same `taskkill /F /T`); not
+            # measured separately through this provider path.
             logger.warning(
-                "[opencode] %s-Kill -- moeglicherweise bleibt ein opencode.exe-Waise "
-                "zurueck, der die SQLite-Session-DB offenhaelt (ungemessen, ob "
-                "_tree_kill das abdeckt -- kein Sweeper darauf gebaut).",
+                "[opencode] %s-Kill -- an opencode.exe orphan may remain holding "
+                "the SQLite session DB (tree kill ends a --standalone session, "
+                "measured 2026-10-28 via oc_run.py; not measured via this "
+                "provider path -- no sweeper built).",
                 "idle" if kind == "idle" else "hard",
             )
             return RunResult(success=False, error="hang" if kind == "idle" else "timeout")

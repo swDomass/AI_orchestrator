@@ -826,6 +826,153 @@ def test_opencode_second_run_reads_nothing_and_an_update_is_read_once():
     assert run()["per_source"]["opencode"]["lines_read"] == 0
 
 
+
+# ── opencode 2.2: session_v2 / session_message ──────────────────────────────
+
+_OC_V2_SCHEMA = """
+CREATE TABLE `session_v2` (
+  `id` text PRIMARY KEY, `parent_id` text, `directory` text NOT NULL, `title` text, `agent` text, `model` text,
+  `time_created` integer NOT NULL, `time_updated` integer NOT NULL, `cost` real DEFAULT 0 NOT NULL,
+  `tokens_input` integer DEFAULT 0 NOT NULL, `tokens_output` integer DEFAULT 0 NOT NULL,
+  `tokens_reasoning` integer DEFAULT 0 NOT NULL, `tokens_cache_read` integer DEFAULT 0 NOT NULL,
+  `tokens_cache_write` integer DEFAULT 0 NOT NULL);
+CREATE TABLE `session_message` (
+  `id` text PRIMARY KEY, `session_id` text NOT NULL, `type` text NOT NULL, `seq` integer NOT NULL,
+  `time_created` integer NOT NULL, `time_updated` integer NOT NULL, `data` text NOT NULL);
+"""
+_OC_ROWS_SQL = ("SELECT id, role, model_id, cost, t_input, t_cache_read, finish FROM oc_message "
+                "WHERE role IS NOT NULL ORDER BY id")
+_OC_SESSIONS_SQL = "SELECT id, parent_id, agent, model_id, provider_id, cost FROM oc_session ORDER BY id"
+
+
+def oc_v2_assistant(cost=0.00528193008, model="zdr-review", t=None, inp=643, completed=True):
+    """The 2.2 shape of ``oc_assistant``: model nested, answer text under ``content``."""
+    old = oc_assistant(cost, model, t, inp)
+    data = {"agent": old["agent"], "cost": old["cost"], "tokens": old["tokens"], "time": old["time"],
+            "finish": old["finish"], "model": {"id": model, "providerID": "openrouter", "variant": "default"},
+            "content": [{"type": "text", "text": "CANARY_CONTENT_TEXT"}]}
+    if not completed:
+        del data["time"]["completed"]
+    return data
+
+
+def add_opencode_v2(*, extra_messages=()):
+    """2.2 tables with the SAME ids and values as ``make_opencode_db`` (a migrated history)."""
+    conn = sqlite3.connect(str(config.HARNESS_OPENCODE_DB))
+    conn.executescript(_OC_V2_SCHEMA)
+    t = _now_ms(-900)
+    conn.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 ("ses_parent", None, "C:\\CANARY_OC_DIR\\beispiel", "CANARY_OC_TITLE", "extern-review",
+                  '{"id":"zdr-review","providerID":"openrouter"}', t, t, 0.063, 105164, 5681, 6589, 1028608, 0))
+    conn.execute("INSERT INTO session_v2(id, parent_id, directory, agent, model, time_created, time_updated) "
+                 "VALUES (?,?,?,?,?,?,?)", ("ses_child", "ses_parent", "C:\\CANARY_OC_DIR\\x", None, "not json", t, t))
+    rows = [("msg_u", "ses_parent", "user", t, t, {"agent": "extern-review", "text": "CANARY_CONTENT_TEXT"}),
+            ("msg_a1", "ses_parent", "assistant", t, t + 1, oc_v2_assistant()),
+            ("msg_a2", "ses_child", "assistant", t, t + 2, oc_v2_assistant(0.01, "z-ai/glm-5.3-flash")),
+            *extra_messages]
+    for seq, (mid, sid, typ, created, updated, data) in enumerate(rows):
+        conn.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                     (mid, sid, typ, seq, created, updated, _j(data)))
+    conn.commit()
+    conn.close()
+
+
+def test_opencode_22_tables_alone_give_the_rows_of_the_1x_tables():  # test 17
+    Path(config.HARNESS_OPENCODE_DB).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(config.HARNESS_OPENCODE_DB))
+    conn.execute("CREATE TABLE project (id text PRIMARY KEY)")  # no `session`/`message` tables at all
+    conn.commit()
+    conn.close()
+    add_opencode_v2()
+    run()
+    assert q(_OC_SESSIONS_SQL) == [
+        ("ses_child", "ses_parent", None, None, None, 0.0),
+        ("ses_parent", None, "extern-review", "zdr-review", "openrouter", 0.063),
+    ]
+    assert q(_OC_ROWS_SQL) == [  # the rows of test_opencode_sessions_and_messages_are_indexed
+        ("msg_a1", "assistant", "zdr-review", 0.00528193008, 643, 112896, "tool-calls"),
+        ("msg_a2", "assistant", "z-ai/glm-5.3-flash", 0.01, 643, 112896, "tool-calls"),
+        ("msg_u", "user", None, None, None, None, None),
+    ]
+
+
+def test_opencode_migrated_history_is_not_counted_twice_and_not_reread():  # test 18
+    make_opencode_db()
+    add_opencode_v2()
+    conn = sqlite3.connect(str(config.HARNESS_OPENCODE_DB))
+    t = _now_ms(-800)
+    conn.execute("UPDATE message SET data=? WHERE id='msg_a1'", (_j(oc_assistant(cost=9.9)),))  # frozen, stale copy
+    conn.execute("INSERT INTO session(id, project_id, slug, directory, title, version, time_created, time_updated) "
+                 "VALUES ('ses_old','p1','s','d','t','1.18.35',?,?)", (t, t))
+    conn.execute("INSERT INTO message VALUES ('msg_old','ses_old',?,?,?)", (t, t, _j(oc_assistant(0.2))))
+    conn.commit()
+    conn.close()
+    first = run()
+    assert q("SELECT count(*) FROM oc_session") == [(3,)]  # ses_old exists only in the 1.x tables
+    assert q("SELECT id, cost FROM oc_message WHERE role='assistant' ORDER BY id") == [
+        ("msg_a1", 0.00528193008), ("msg_a2", 0.01), ("msg_old", 0.2)]  # 2.2 wins: no 9.9, no duplicates
+    assert first["per_source"]["opencode"]["lines_read"] == 3 + 4  # 3 sessions + msg_u/a1/a2/old
+    assert run()["per_source"]["opencode"]["lines_read"] == 0
+
+
+def test_opencode_22_reads_a_projection_so_no_answer_text_reaches_the_index(monkeypatch):  # test 19
+    make_opencode_db()
+    add_opencode_v2()
+    tables_read: set[str] = set()
+    real_open = hi._open_opencode_ro
+
+    def spy_open(p):
+        conn = real_open(p)
+
+        def auth(action, arg1, _arg2, _db, _trigger):
+            if action == sqlite3.SQLITE_READ:
+                tables_read.add(arg1)
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(auth)
+        return conn
+
+    seen: list[str] = []
+    real_values = hi._opencode_message_values
+    monkeypatch.setattr(hi, "_open_opencode_ro", spy_open)
+    monkeypatch.setattr(hi, "_opencode_message_values", lambda *a: (seen.append(str(a[-1])), real_values(*a))[1])
+    run()
+    assert {"session_v2", "session_message"} <= tables_read and "part" not in tables_read
+    assert seen and not any("CANARY_CONTENT_TEXT" in d for d in seen)
+    with db() as conn:
+        assert "CANARY_CONTENT_TEXT" not in "\n".join(conn.iterdump())
+
+
+def test_opencode_22_system_rows_add_no_roles():  # test 20
+    make_opencode_db()
+    t = _now_ms(-500)
+    add_opencode_v2(extra_messages=[
+        ("msg_sys", "ses_parent", "system", t, t, {"text": "CANARY_CONTENT_TEXT"}),
+        ("msg_idle", "ses_parent", "idle", t, t, {"outcome": "done"})])
+    run()
+    assert q("SELECT DISTINCT role FROM oc_message ORDER BY 1") == [("assistant",), ("user",)]
+    assert q("SELECT count(*) FROM oc_message WHERE id IN ('msg_sys','msg_idle')") == [(0,)]
+
+
+def test_opencode_22_incomplete_step_is_reread_without_a_new_time_updated():  # test 21
+    make_opencode_db()
+    t = _now_ms(-120)
+    t2 = t + 20_000  # newer by more than the 5 s overlap: the watermark passes the pending step, only the recheck rereads it
+    add_opencode_v2(extra_messages=[
+        ("msg_pending", "ses_parent", "assistant", t, t, oc_v2_assistant(cost=0.0, inp=0, t=t, completed=False)),
+        ("msg_newer", "ses_parent", "assistant", t2, t2, oc_v2_assistant(cost=0.5, inp=10, t=t2))])
+    run()
+    assert q("SELECT cost, completed FROM oc_message WHERE id='msg_pending'") == [(0.0, 0)]
+    conn = sqlite3.connect(str(config.HARNESS_OPENCODE_DB))
+    conn.execute("UPDATE session_message SET data=? WHERE id='msg_pending'",  # time_updated unchanged
+                 (_j(oc_v2_assistant(cost=0.25, inp=900, t=t)),))
+    conn.commit()
+    conn.close()
+    second = run()
+    assert q("SELECT cost, t_input, completed FROM oc_message WHERE id='msg_pending'") == [(0.25, 900, 1)]
+    assert second["per_source"]["opencode"]["lines_read"] == 1
+
+
 # ── ledger and markers ──────────────────────────────────────────────────────
 
 

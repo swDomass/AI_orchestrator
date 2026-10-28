@@ -463,7 +463,7 @@ VIBE_READONLY_MAX_TURNS = _parse_int_env("VIBE_READONLY_MAX_TURNS", 1)
 # 46-58s, so 300s already sits at ~5x the worst observed gap.
 OPENCODE_IDLE_TIMEOUT_SEC = _parse_int_env("OPENCODE_IDLE_TIMEOUT_SEC", 300)
 # Prompt travels via a `-f` temp file, not stdin (see providers/opencode.py).
-# A file outside --dir cannot be reread by either agent once attached
+# A file outside the radius (PWD, set to the cwd by the provider, plus its git root) cannot be reread by either agent once attached
 # (external_directory: deny is the LAST matching permission rule, measured
 # 2026-09-04 — even the seemingly-allowed %TEMP%/opencode/* path fails the
 # same way), so above this cap the run fails loudly with error=
@@ -835,8 +835,8 @@ CLAUDE_MODEL_ALIASES: dict[str, str] = {
 # they never read `_forced_effort` — there is deliberately no `supports_effort`
 # capability check. NOT Claude-exclusive since 2026-09-04: providers/opencode.py
 # reads the same property and passes the level straight through to opencode's
-# `--variant` flag, raw and unmapped (opencode tolerates unknown values; `--variant
-# xhigh` was measured at exit 0). Corrected 2026-09-05 — this comment still claimed
+# `--model ...#variant` (2.2 validates it; an unknown variant repeats the run once without it;
+# `#xhigh` was measured at exit 1 "Variant unavailable"). Corrected 2026-09-05 — this comment still claimed
 # exclusivity months after opencode joined.
 #
 # Ordered tuple, not a set: this is an ordinal scale, and lint/help messages must show

@@ -7,9 +7,11 @@ tab (``GET /api/harness``, which reads nothing but this database):
 1. Claude Code transcripts  ``HARNESS_CLAUDE_PROJECTS_DIR/<proj>/<session>.jsonl``
    plus subagent runs ``<proj>/<session>/subagents/agent-<id>.jsonl`` / ``.meta.json``
 2. Codex rollouts           ``HARNESS_CODEX_SESSIONS_DIR/YYYY/MM/DD/rollout-*.jsonl``
-3. opencode                 ``HARNESS_OPENCODE_DB`` (tables ``session`` and ``message``
-                            only, opened ``mode=ro``; ``part`` holds the text and is
-                            never read)
+3. opencode                 ``HARNESS_OPENCODE_DB`` (opened ``mode=ro``; opencode 2.2 tables
+                            ``session_v2``/``session_message``, projected in SQL to the
+                            1.x row shape so no answer text is read; 1.x tables
+                            ``session``/``message`` only for sessions missing in
+                            ``session_v2``; ``part`` is never read)
 4. extern-voice ledger      ``HARNESS_EXTERN_LEDGER`` (JSONL)
 5. harness-change markers   ``HARNESS_CHANGES_FILE`` (JSONL)
 
@@ -1267,14 +1269,51 @@ def _watermark(conn: sqlite3.Connection, key: str, floor_ms: int) -> int:
     return max(floor_ms, value - OPENCODE_OVERLAP_MS)
 
 
+def _opencode_query(src: sqlite3.Connection, v2_sql: str, old_sql: str, *, old_table: str, old_key: str,
+                    params: tuple) -> sqlite3.Cursor:
+    """Run ``v2_sql`` (opencode 2.2 tables) plus the 1.x remainder ``old_sql``.
+
+    2.2 migrated the 1.x history with the SAME ids and froze the old tables, so
+    a plain UNION would count every migrated row twice: the old part only
+    yields rows of sessions that ``session_v2`` lacks (``old_key`` is the
+    column holding the session id). A 1.x database (no 2.2 tables) is read as
+    before.
+
+    Contract: ``old_sql`` must END in a WHERE condition, because
+    ``AND <old_key> NOT IN (...)`` is appended to it. ``params`` serve both
+    statements and are doubled only in the UNION case."""
+    tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"session_v2", "session_message"} <= tables:
+        return src.execute(old_sql, params)
+    if old_table not in tables:
+        return src.execute(v2_sql, params)
+    # Known limit, migration measured 2026-10-28: 3 1.x messages in migrated sessions
+    # lack a v2 row (2 assistant steps, cost 0) -- dropped by the session filter below.
+    return src.execute(f"{v2_sql} UNION ALL {old_sql} AND {old_key} NOT IN (SELECT id FROM session_v2)",
+                       params * 2)
+
+
+# 2.2 stores the assistant step under ``session_message.data`` WITH the answer
+# text (``content[]``); the 1.x row never carried it. Projecting in SQL to the
+# 1.x ``message.data`` shape keeps the text out of this process.
+_OC_V2_DATA = (
+    "json_object('role', type, 'agent', data->>'$.agent', 'modelID', data->>'$.model.id', "
+    "'providerID', data->>'$.model.providerID', 'cost', data->'$.cost', 'tokens', data->'$.tokens', "
+    "'time', data->'$.time', 'finish', data->>'$.finish')"
+)
+_OC_MESSAGE_V2 = (f"SELECT id, session_id, time_created, time_updated, {_OC_V2_DATA} FROM session_message "
+                  "WHERE type IN ('user', 'assistant') AND ")
+_OC_MESSAGE_OLD = "SELECT id, session_id, time_created, time_updated, data FROM message WHERE "
+
+
 def _opencode_sessions(conn: sqlite3.Connection, src: sqlite3.Connection, floor_ms: int, stats: SourceStats) -> None:
     since = _watermark(conn, "oc_session_watermark", floor_ms)
     # Explicit column list: title, directory, slug, summary_diffs are never read.
-    cur = src.execute(
-        "SELECT id, parent_id, agent, model, time_created, time_updated, cost, tokens_input, "
-        "tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write "
-        "FROM session WHERE time_updated >= ? ORDER BY time_updated", (since,),
-    )
+    cols = ("id, parent_id, agent, model, time_created, time_updated, cost, tokens_input, "
+            "tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write")
+    cur = _opencode_query(src, f"SELECT {cols} FROM session_v2 WHERE time_updated >= ?",
+                          f"SELECT {cols} FROM session WHERE time_updated >= ?",
+                          old_table="session", old_key="id", params=(since,))
     newest = None
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1389,10 +1428,8 @@ def _opencode_messages(conn: sqlite3.Connection, src: sqlite3.Connection, floor_
     incomplete = {r[0] for r in conn.execute(
         "SELECT id FROM oc_message WHERE role='assistant' AND completed=0 AND created_ms >= ?",
         (recheck_floor,))}
-    cur = src.execute(
-        "SELECT id, session_id, time_created, time_updated, data FROM message "
-        "WHERE time_updated >= ? ORDER BY time_updated", (since,),
-    )
+    cur = _opencode_query(src, _OC_MESSAGE_V2 + "time_updated >= ?", _OC_MESSAGE_OLD + "time_updated >= ?",
+                          old_table="message", old_key="session_id", params=(since,))
     newest = None
     seen: set[str] = set()
     conn.execute("BEGIN IMMEDIATE")
@@ -1409,10 +1446,10 @@ def _opencode_messages(conn: sqlite3.Connection, src: sqlite3.Connection, floor_
         recheck = sorted(incomplete - seen)
         for start in range(0, len(recheck), 500):
             chunk = recheck[start:start + 500]
-            for row in src.execute(
-                "SELECT id, session_id, time_created, time_updated, data FROM message "
-                f"WHERE id IN ({', '.join('?' for _ in chunk)})", chunk,
-            ):
+            marks = ", ".join("?" for _ in chunk)
+            for row in _opencode_query(src, _OC_MESSAGE_V2 + f"id IN ({marks})",
+                                       _OC_MESSAGE_OLD + f"id IN ({marks})",
+                                       old_table="message", old_key="session_id", params=tuple(chunk)):
                 _store_opencode_message(conn, row, stats, only_if_changed=True)
         if newest is not None:
             _meta_set(conn, "oc_message_watermark", str(newest))

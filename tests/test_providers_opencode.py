@@ -13,6 +13,7 @@ raising), and temp-file cleanup.
 import json
 import os
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,7 @@ from providers.opencode import (
 )
 
 _FAKE_EXE = "C:/fake/opencode.exe"
+_REAL_SOURCES = opencode_mod._external_instruction_sources  # before the autouse stub
 
 
 def _fake_watchdog(calls, *, returncode=0, stdout="OK", stderr=""):
@@ -48,6 +50,12 @@ def _no_picker_by_default(monkeypatch):
     """OPENCODE_MODEL_PICKER defaults to "" in production; pin it per-test so
     a developer's own .env override can't leak into these tests."""
     monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "")
+
+
+@pytest.fixture(autouse=True)
+def _no_external_instructions_by_default(monkeypatch):
+    """The real machine's global opencode sources must not decide test outcomes."""
+    monkeypatch.setattr(opencode_mod, "_external_instruction_sources", lambda: [])
 
 
 # ── command construction ──────────────────────────────────────────────────────
@@ -177,6 +185,136 @@ def test_inherited_config_overrides_stripped_from_child_env(monkeypatch):
     env = calls[0][1]["env"]
     assert not [k for k in env if k.upper() in opencode_mod._STRIPPED_ENV]
     assert env["OPENCODE_CONFIG_PATH"] == "keep"
+
+
+@pytest.mark.parametrize("cwd", ["D:/repo", None])
+def test_project_config_and_claude_switches_forced_over_inherited_zero(monkeypatch, cwd):
+    """opencode 2.2 reads CONFIG_PROJECT_DISABLE ?? DISABLE_PROJECT_CONFIG: an
+    inherited =0 on either name (any case) must not survive."""
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setenv("OPENCODE_CONFIG_PROJECT_DISABLE", "0")
+    # NB: Windows upper-cases os.environ names, so this lower-case name is not
+    # distinguishable from the upper-case one there; it only matters on POSIX.
+    monkeypatch.setenv("opencode_disable_project_config", "false")
+    monkeypatch.setenv("OPENCODE_DISABLE_CLAUDE_CODE", "0")
+
+    OpencodeProvider().run("review this", cwd=cwd)
+
+    env = calls[0][1]["env"]
+    for name in ("OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_CONFIG_PROJECT_DISABLE",
+                 "OPENCODE_DISABLE_CLAUDE_CODE"):
+        assert env[name] == "1"
+    assert [k.upper() for k in env].count("OPENCODE_DISABLE_PROJECT_CONFIG") == 1
+
+
+def test_global_instruction_source_blocks_start(monkeypatch):
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setattr(opencode_mod, "_external_instruction_sources",
+                        lambda: ["C:/h/.config/opencode/AGENTS.md"])
+
+    res = OpencodeProvider().run("review this", cwd="D:/repo")
+
+    assert not res.success
+    assert res.error == "external_instructions: C:/h/.config/opencode/AGENTS.md"
+    assert calls == []
+
+
+def test_no_global_instruction_source_starts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+
+    assert OpencodeProvider().run("review this", cwd="D:/repo").success
+    assert len(calls) == 1
+
+
+def _sandbox(monkeypatch, tmp_path):
+    """Point every source location of the real function into tmp_path."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "pd"))
+    folder = tmp_path / "home" / ".config" / "opencode"
+    folder.mkdir(parents=True)
+    return folder
+
+
+def test_external_instruction_sources_finds_each_source(monkeypatch, tmp_path):
+    folder = _sandbox(monkeypatch, tmp_path)
+    assert _REAL_SOURCES() == []
+
+    (folder / "opencode.json").write_text('{"instructions": []}', encoding="utf-8")
+    (tmp_path / "pd" / "opencode").mkdir(parents=True)
+    agents = folder / "AGENTS.md"
+    agents.write_text("x", encoding="utf-8")
+    found = _REAL_SOURCES()
+    assert len(found) == 3 and str(agents) in found
+
+
+def test_jsonc_config_counts_as_source(monkeypatch, tmp_path):
+    folder = _sandbox(monkeypatch, tmp_path)
+    (folder / "opencode.jsonc").write_text("{}", encoding="utf-8")
+    assert _REAL_SOURCES() == [str(folder / "opencode.jsonc")]
+
+
+def test_unreadable_config_fails_closed_and_blocks_start(monkeypatch, tmp_path):
+    folder = _sandbox(monkeypatch, tmp_path)
+    (folder / "opencode.json").write_text("{kaputt", encoding="utf-8")
+    found = _REAL_SOURCES()
+    assert found == [f"{folder / 'opencode.json'}#unreadable"]
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    monkeypatch.setattr(opencode_mod, "_external_instruction_sources", lambda: found)
+    res = OpencodeProvider().run("review this", cwd="D:/repo")
+    assert not res.success and res.error.endswith("#unreadable") and calls == []
+
+
+def test_xdg_config_home_is_stripped_from_child_env(monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", "rel")
+    assert "XDG_CONFIG_HOME" not in OpencodeProvider._build_env("D:/repo")
+
+
+def test_xdg_config_home_is_not_followed(monkeypatch, tmp_path):
+    folder = _sandbox(monkeypatch, tmp_path)
+    xdg_folder = tmp_path / "xdg" / "opencode"
+    xdg_folder.mkdir(parents=True)
+    (xdg_folder / "AGENTS.md").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert _REAL_SOURCES() == []
+    (folder / "AGENTS.md").write_text("x", encoding="utf-8")
+    assert _REAL_SOURCES() == [str(folder / "AGENTS.md")]
+
+
+def test_relative_programdata_is_a_finding(monkeypatch, tmp_path):
+    _sandbox(monkeypatch, tmp_path)
+    monkeypatch.setenv("PROGRAMDATA", "pd")
+    assert _REAL_SOURCES() == ["pd#relative"]
+
+
+def test_empty_programdata_falls_back_to_default_not_relative(monkeypatch, tmp_path):
+    _sandbox(monkeypatch, tmp_path)
+    monkeypatch.setenv("PROGRAMDATA", "")
+    seen = []
+    monkeypatch.setattr(Path, "is_dir", lambda self: seen.append(self) or False)
+    assert _REAL_SOURCES() == []
+    assert Path(r"C:\ProgramData") / "opencode" in seen
+    assert all(p.is_absolute() or p.parts[0] != "opencode" for p in seen)
+
+
+def test_default_config_dir_without_xdg_uses_home_dot_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "pd"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    folder = tmp_path / "home" / ".config" / "opencode"
+    folder.mkdir(parents=True)
+    (folder / "AGENTS.md").write_text("x", encoding="utf-8")
+    assert _REAL_SOURCES() == [str(folder / "AGENTS.md")]
+
+
+def test_non_object_config_is_unreadable(monkeypatch, tmp_path):
+    folder = _sandbox(monkeypatch, tmp_path)
+    (folder / "opencode.json").write_text("[]", encoding="utf-8")
+    assert _REAL_SOURCES() == [f"{folder / 'opencode.json'}#unreadable"]
 
 
 def test_relative_cwd_becomes_absolute_for_cwd_and_pwd(monkeypatch):

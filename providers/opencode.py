@@ -41,6 +41,12 @@ CLI facts, all measured 2026-09-04 against opencode 1.18.27 unless noted:
   call, so ``run`` repeats once without the variant. ``--standalone`` keeps the
   work in a private server that a process kill reaches (the shared background
   service survives it). `#effort:` values are otherwise passed through raw.
+* Instructions/config (measured 2026-10-28): 2.2 loads only ``AGENTS.md`` (also
+  upwards beyond the git root under the home dir) and any project
+  ``opencode.json``/``opencode.jsonc``/``.opencode/…``, which can lift the default-deny. ``_FORCED_ENV`` switches
+  both off; the global sources no env switch reaches make ``run`` fail with
+  ``external_instructions`` (``_external_instruction_sources``). XDG_CONFIG_HOME
+  is stripped from the child env, not followed; a relative PROGRAMDATA is a find.
 * opencode reports no token/cost numbers (measured: `cost=0` in 142/142 real
   log lines), so ``RunResult`` stays at the dataclass default of 0 for every
   token field — the orchestrator's char/duration estimate takes over exactly
@@ -168,8 +174,22 @@ _VARIANT_UNAVAILABLE = "variant unavailable"
 # Inherited opencode config overrides could replace the agents' default-deny
 # permissions (e.g. OPENCODE_PERMISSION={"*":"allow"}); same list as oc_run.py.
 # OPENCODE_CONFIG_PATH is the orchestrator's own variable and stays.
+# XDG_CONFIG_HOME is stripped too: otherwise opencode reads the global config
+# (and the default-deny) from another folder than the one we check, and a
+# relative value would resolve against the task repo in the child.
 _STRIPPED_ENV = frozenset({"OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT",
-                           "OPENCODE_CONFIG_DIR", "OPENCODE_PERMISSION"})
+                           "OPENCODE_CONFIG_DIR", "OPENCODE_PERMISSION",
+                           "XDG_CONFIG_HOME"})
+
+# Always forced in the child env (inherited values are overwritten): no project
+# config (neither above nor inside the repo: those can lift the default-deny),
+# no AGENTS.md walk upwards, no .claude skill scan. Pitfall: opencode 2.2 reads
+# ``OPENCODE_CONFIG_PROJECT_DISABLE ?? OPENCODE_DISABLE_PROJECT_CONFIG``, so an
+# inherited ``OPENCODE_CONFIG_PROJECT_DISABLE=0`` would mask the second name --
+# both are set. Measured 2026-10-28, see module docstring.
+_FORCED_ENV = {"OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+               "OPENCODE_CONFIG_PROJECT_DISABLE": "1",
+               "OPENCODE_DISABLE_CLAUDE_CODE": "1"}
 
 # The only part of the run guaranteed to arrive uncut (see module docstring):
 # everything else lives in the attached -f file.
@@ -229,6 +249,56 @@ def _agents_configured(cfg: dict) -> bool:
     if not isinstance(agents, dict):
         return False
     return all(name in agents for name in _REQUIRED_AGENTS)
+
+
+def _external_instruction_sources() -> list[str]:
+    """Global instruction sources opencode 2.2 loads that no env switch turns
+    off: ``~/.config/opencode/AGENTS.md``, an ``instructions`` key in the global
+    opencode.json, and the ``opencode`` folder under ``%ProgramData%``. None exists on this machine;
+    tests monkeypatch this function. The global folder is always ``~/.config/opencode``
+    (``XDG_CONFIG_HOME`` is stripped from the child env, never followed). Project
+    config (``opencode.json``, ``opencode.jsonc``, ``.opencode/``) is switched off
+    by ``_FORCED_ENV``. A non-empty relative ``PROGRAMDATA`` is reported as
+    ``<value>#relative`` (fail closed). An ``opencode.jsonc`` is always a source, and an
+    unreadable or non-object ``opencode.json`` is reported as ``#unreadable``."""
+    found = []
+    base = Path.home() / ".config" / "opencode"
+    agents_md = base / "AGENTS.md"
+    if agents_md.is_file():
+        found.append(str(agents_md))
+    jsonc = base / "opencode.jsonc"
+    if jsonc.is_file():  # Python cannot parse JSONC: treat as a source
+        found.append(str(jsonc))
+    plain = base / "opencode.json"
+    if plain.is_file():
+        try:
+            data = json.loads(plain.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+        except Exception:  # fail closed: unreadable config may hold instructions
+            found.append(f"{plain}#unreadable")
+        else:
+            if "instructions" in data:
+                found.append(f"{plain}#instructions")
+    program_data = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+    if not Path(program_data).is_absolute():
+        found.append(f"{program_data}#relative")
+    system_dir = Path(program_data) / "opencode"
+    if system_dir.is_dir():
+        found.append(str(system_dir))
+    return found
+
+
+def _start_blocked() -> RunResult | None:
+    """Failure to return instead of starting opencode, or None to start."""
+    if _OPENCODE_EXE is None:
+        return RunResult(success=False, error="opencode CLI not found")
+    external = _external_instruction_sources()
+    if external:
+        logger.warning("[opencode] global instruction source(s) the env switches "
+                       "cannot disable, not starting: %s", external)
+        return RunResult(success=False, error=f"external_instructions: {external[0]}")
+    return None
 
 
 def _strip_ansi(text: str) -> str:
@@ -313,6 +383,7 @@ class OpencodeProvider(BaseProvider):
         a foreign directory, so it is set to ``cwd`` or, without a cwd, removed.
         The ``_STRIPPED_ENV`` config/permission overrides are dropped too
         (case-insensitive), so they cannot override the agents' default-deny.
+        ``_FORCED_ENV`` is set last, overwriting inherited values.
         Known limit: with ``cwd=None`` the radius is the orchestrator's own cwd
         plus its git root (same as 1.x without ``--dir``).
 
@@ -320,7 +391,9 @@ class OpencodeProvider(BaseProvider):
         singletons run from parallel threads, so mutating ``os.environ`` would
         leak one run's setting into another's.
         """
-        env = {k: v for k, v in os.environ.items() if k.upper() not in _STRIPPED_ENV}
+        env = {k: v for k, v in os.environ.items()
+               if k.upper() not in _STRIPPED_ENV and k.upper() not in _FORCED_ENV}
+        env.update(_FORCED_ENV)
         if cwd:
             env["PWD"] = cwd
         else:
@@ -375,8 +448,8 @@ class OpencodeProvider(BaseProvider):
         session_id: str | None = None,  # accepted but ignored (supports_sessions=False)
         resume: bool = False,            # accepted but ignored
     ) -> RunResult:
-        if _OPENCODE_EXE is None:
-            return RunResult(success=False, error="opencode CLI not found")
+        if (blocked := _start_blocked()) is not None:
+            return blocked
 
         prompt_bytes = len(task.encode("utf-8"))
         if prompt_bytes > config.OPENCODE_MAX_PROMPT_BYTES:

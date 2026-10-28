@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Stand 2026-10-28 (Windows, opencode 2.2: Provider-Kompatibilität + Härtung + harness_index, +31 Tests): 3966 passed / 0 failed / 2 skipped in 477 s; --collect-only tests/ 3968 = 3966 + 2; +31 über die 3937 auf 7bca80e, geändert nur tests/test_providers_opencode.py und tests/test_harness_index.py (b5c1d5d, dc03c84). Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos).
+# Stand 2026-10-28 abends (Windows, Doku für Externe: Beispiel-Policy, doctor-Kette + cclimits-Pflicht, safety_hook still + PowerShell, +64 Tests): 4030 passed / 0 failed / 2 skipped in 319-553 s; --collect-only tests/ 4032 = 4030 + 2; +64 über die 3966 auf e0f37b0 = test_policy_example 30, test_doctor +25, test_onboarding_docs 6, test_safety_hook +3. Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos).
 # Ältere Stände und Messnotizen: docs/test-und-lint-historie.md
 # -p no:randomly: Das Flag bleibt als reproduzierbare Standardreihenfolge stehen (auch in ci.yml).
 python -m pytest tests/ -q -p no:randomly

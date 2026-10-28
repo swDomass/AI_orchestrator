@@ -416,23 +416,31 @@ class TestHookProtocol:
 
     HOOK_SCRIPT = str(Path(__file__).resolve().parent.parent / "scripts" / "safety_hook.py")
 
-    def _run_hook(self, input_data: dict) -> dict:
+    def _run_raw(self, stdin_text: str) -> str:
+        """Run the hook with raw stdin; return stdout (exit code must be 0)."""
         result = subprocess.run(
             [sys.executable, self.HOOK_SCRIPT],
-            input=json.dumps(input_data),
+            input=stdin_text,
             capture_output=True,
             text=True,
             timeout=10,
         )
         assert result.returncode == 0, f"Hook script failed: {result.stderr}"
-        return json.loads(result.stdout)
+        return result.stdout
 
-    def test_safe_bash_approved(self):
-        resp = self._run_hook({
+    def _run_hook(self, input_data: dict) -> dict:
+        return json.loads(self._run_raw(json.dumps(input_data)))
+
+    def _assert_silent(self, input_data: dict) -> None:
+        """Allow case: no stdout at all. Silence = no decision, so the normal
+        permission flow applies; an explicit "approve" would skip the prompt."""
+        assert self._run_raw(json.dumps(input_data)) == ""
+
+    def test_safe_bash_silent(self):
+        self._assert_silent({
             "tool_name": "Bash",
             "tool_input": {"command": "python -m pytest tests/ -v"},
         })
-        assert resp["decision"] == "approve"
 
     def test_dangerous_bash_denied(self):
         resp = self._run_hook({
@@ -446,14 +454,13 @@ class TestHookProtocol:
         assert resp["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-    def test_git_commit_approved(self):
+    def test_git_commit_silent(self):
         """End-to-end counterpart to test_git_commit_is_allowed: since 2026-08-17
         a commit passes the hook instead of being denied."""
-        resp = self._run_hook({
+        self._assert_silent({
             "tool_name": "Bash",
             "tool_input": {"command": "git commit -m 'wip'"},
         })
-        assert resp["decision"] == "approve"
 
     def test_git_push_denied(self):
         resp = self._run_hook({
@@ -487,14 +494,13 @@ class TestHookProtocol:
         })
         assert resp["decision"] == "block"
 
-    def test_python_c_git_words_approved(self):
+    def test_python_c_git_words_silent(self):
         """git-command text inside another program's -c payload is not an
         invocation and must not be blocked."""
-        resp = self._run_hook({
+        self._assert_silent({
             "tool_name": "Bash",
             "tool_input": {"command": 'python -c "import os; os.system(\'git push origin main\')"'},
         })
-        assert resp["decision"] == "approve"
 
     def test_bash_c_git_push_denied(self):
         """bash -c executes its argument as a real shell command line."""
@@ -512,12 +518,33 @@ class TestHookProtocol:
         })
         assert resp["decision"] == "block"
 
-    def test_non_bash_tool_approved(self):
-        resp = self._run_hook({
+    def test_non_bash_tool_silent(self):
+        self._assert_silent({
             "tool_name": "Read",
             "tool_input": {"file_path": "/etc/passwd"},
         })
-        assert resp["decision"] == "approve"
+
+    def test_unknown_tool_with_dangerous_command_text_silent(self):
+        """Only Bash/PowerShell are inspected; another tool is never denied."""
+        self._assert_silent({
+            "tool_name": "SomeOtherTool",
+            "tool_input": {"command": "Remove-Item -Recurse -Force C:\\data"},
+        })
+
+    def test_powershell_tool_remove_item_denied(self):
+        """The PowerShell tool is inspected like Bash (matcher "Bash|PowerShell")."""
+        resp = self._run_hook({
+            "tool_name": "PowerShell",
+            "tool_input": {"command": "Remove-Item -Recurse -Force C:\\data\\x"},
+        })
+        assert resp["decision"] == "block"
+        assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_powershell_tool_safe_command_silent(self):
+        self._assert_silent({
+            "tool_name": "PowerShell",
+            "tool_input": {"command": "Get-ChildItem -Path ."},
+        })
 
     def test_git_force_push_denied(self):
         resp = self._run_hook({
@@ -526,22 +553,12 @@ class TestHookProtocol:
         })
         assert resp["decision"] == "block"
 
-    def test_invalid_json_approves(self):
-        """Broken input should not crash — defaults to approve."""
-        result = subprocess.run(
-            [sys.executable, self.HOOK_SCRIPT],
-            input="not json at all",
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0
-        resp = json.loads(result.stdout)
-        assert resp["decision"] == "approve"
+    def test_invalid_json_silent(self):
+        """Broken input should not crash — no output, exit 0 (no decision)."""
+        assert self._run_raw("not json at all") == ""
 
-    def test_empty_command_approved(self):
-        resp = self._run_hook({
+    def test_empty_command_silent(self):
+        self._assert_silent({
             "tool_name": "Bash",
             "tool_input": {"command": ""},
         })
-        assert resp["decision"] == "approve"

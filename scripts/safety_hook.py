@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook — hard-deny dangerous commands.
 
-Loaded as a PreToolUse hook in .claude/settings.local.json.
-Receives tool invocation JSON on stdin, returns a decision on stdout.
+Registered user-wide as a PreToolUse hook in ~/.claude/settings.json with the
+matcher "Bash|PowerShell" (NOT in .claude/settings.local.json). Receives tool
+invocation JSON on stdin. Deny case: prints a block decision on stdout. Allow
+case: prints NOTHING and exits 0 — "no decision", so Claude Code's normal
+permission flow still applies (an explicit "approve"/"allow" would skip the
+permission prompt; this hook may deny, never approve).
 
 Uses the shared SAFETY_DENY_PATTERNS from config.py so the same rules
 apply to both the hard hook (Claude) and the soft prompt injection
@@ -90,15 +94,16 @@ def main() -> None:
     try:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
-        # Can't parse input — allow (don't break the session)
-        json.dump({"decision": "approve"}, sys.stdout)
+        # Can't parse input — no decision (don't break the session)
         return
 
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
 
-    # Only inspect Bash commands — other tools (Read, Write, Edit, etc.) are safe
-    if tool_name == "Bash":
+    # Only inspect shell commands — other tools (Read, Write, Edit, etc.) are safe.
+    # Claude Code's PowerShell tool takes its input as `command`, same as Bash
+    # (tool definition, checked 2026-10-28).
+    if tool_name in ("Bash", "PowerShell"):
         command = tool_input.get("command", "")
         reason = check_command(command)
         if reason:
@@ -118,9 +123,8 @@ def main() -> None:
                     "permissionDecisionReason": message,
                 },
             }, sys.stdout)
-            return
 
-    json.dump({"decision": "approve"}, sys.stdout)
+    # Allow case: print nothing, exit 0 — normal permission flow decides.
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import config
 from config import QUEUE_FILE, VAULT_PATH
 
 # ── ANSI colours (stripped on non-TTY) ────────────────────────────────────────
@@ -44,7 +45,7 @@ class CheckResult:
         self.status = status       # PASS | FAIL | WARN
         self.label = label         # Short label, e.g. "Claude CLI"
         self.message = message     # One-line detail
-        self.fix_hint = fix_hint   # e.g. "npm install -g @anthropic/claude-code"
+        self.fix_hint = fix_hint   # e.g. "npm install -g @anthropic-ai/claude-code"
         self.fix_fn = fix_fn       # Optional callable that applies the fix
 
     def __repr__(self) -> str:
@@ -74,8 +75,50 @@ def _check_cli(label: str, cmd: str, install_hint: str = "") -> CheckResult:
     )
 
 
+# Provider -> label of its CLI check. The dispatcher chain decides which of these
+# are required (see _dispatcher_chain / _apply_chain_rule).
+_CLI_LABELS = {"claude": "Claude CLI", "gemini": "Gemini CLI", "codex": "Codex CLI"}
+
+
+def _dispatcher_chain() -> tuple[str, ...]:
+    """Providers of the dispatcher's default chain (``dispatcher._PRIORITY``).
+
+    Lazy import (dispatcher is heavy; same pattern as limits.display_provider_names).
+    """
+    try:
+        from dispatcher import _PRIORITY
+
+        return tuple(_PRIORITY)
+    except Exception:  # doctor must never crash on its own lookup
+        return ("claude", "codex")
+
+
+# Never downgraded: test-loop runs on Claude only and the safety hook only
+# guards Claude, so a missing Claude CLI is a FAIL even if Codex is present.
+_REQUIRED_PROVIDERS = {"claude"}
+
+
+def _apply_chain_rule(results: list) -> None:
+    """A *missing* (not found in PATH) CLI of an optional chain member is only a
+    WARN while another member is PASS; if every chain member is missing it stays
+    FAIL, and Claude (``_REQUIRED_PROVIDERS``) and any FAIL other than "not found
+    in PATH" keep their status (``_check_cli`` reports found programs as PASS). Mutates ``results`` in place."""
+    chain = [p for p in _dispatcher_chain() if p in _CLI_LABELS]
+    members = [r for r in results if r.label in {_CLI_LABELS[p] for p in chain}]
+    if not any(r.status == PASS for r in members):
+        return
+    optional = {_CLI_LABELS[p] for p in chain if p not in _REQUIRED_PROVIDERS}
+    for r in members:
+        if r.status == FAIL and r.label in optional and "not found in PATH" in r.message:
+            r.status = WARN
+            r.message += " — optional, another provider in the chain is available"
+
+
 def check_claude_cli() -> CheckResult:
-    r = _check_cli("Claude CLI", "claude", "npm install -g @anthropic/claude-code")
+    r = _check_cli(
+        "Claude CLI", "claude",
+        "npm install -g @anthropic-ai/claude-code  (or see https://code.claude.com/docs/en/setup)",
+    )
     if r.status != PASS:
         return r
     # Doctor currently checks CLI presence/version only; it does not validate auth.
@@ -83,7 +126,21 @@ def check_claude_cli() -> CheckResult:
 
 
 def check_gemini_cli() -> CheckResult:
-    return _check_cli("Gemini CLI", "gemini", "npm install -g @google/gemini-cli")
+    """Gemini left the dispatcher chain (2026-08-15): while it is not in
+    ``dispatcher._PRIORITY`` a missing CLI is a WARN "provider disabled" without
+    install advice; any other problem is a WARN with the real message. While Gemini
+    is in the chain the plain ``_check_cli`` result stands (FAIL if missing, then
+    the chain rule applies)."""
+    r = _check_cli("Gemini CLI", "gemini", "npm install -g @google/gemini-cli")
+    if r.status == PASS or "gemini" in _dispatcher_chain():
+        return r
+    if "not found in PATH" not in r.message:
+        # Broken install etc.: keep the real message; WARN only because Gemini is
+        # not in the chain (same as the missing case, never a doctor FAIL).
+        return CheckResult(WARN, "Gemini CLI", r.message, fix_hint=r.fix_hint)
+    return CheckResult(
+        WARN, "Gemini CLI", "not installed — provider disabled (not in dispatcher._PRIORITY)",
+    )
 
 
 def check_codex_cli() -> CheckResult:
@@ -92,8 +149,9 @@ def check_codex_cli() -> CheckResult:
 
 def check_vibe_cli() -> CheckResult:
     """Vibe is optional: a missing binary is a WARN, not a FAIL — the #vibe tag
-    just stays inert. Any OTHER failure keeps its original status, so an
-    installed-but-broken CLI is never disguised as "simply not installed"."""
+    just stays inert. Any FAIL other than "not found in PATH" keeps its status
+    (``_check_cli`` itself reports every found program as PASS, even when
+    ``--version`` fails)."""
     r = _check_cli("Vibe CLI", "vibe", "uv tool install mistral-vibe")
     if r.status != FAIL or "not found in PATH" not in r.message:
         return r
@@ -269,14 +327,36 @@ def check_opencode_cli() -> CheckResult:
 
 
 def check_node() -> CheckResult:
-    return _check_cli("Node.js", "node", "https://nodejs.org")
+    """Missing Node is only a WARN: ``check_cclimits`` reports the real root problem."""
+    r = _check_cli("Node.js", "node", "https://nodejs.org")
+    if r.status != FAIL:
+        return r
+    return CheckResult(
+        WARN, "Node.js",
+        "not found in PATH — needed for npm-installed CLIs such as cclimits "
+        "(required unless Claude runs on API credits); the native Claude CLI needs no Node",
+        fix_hint=r.fix_hint,
+    )
 
 
 def check_git() -> CheckResult:
     return _check_cli("Git", "git", "https://git-scm.com")
 
 
+def _cclimits_missing() -> CheckResult:
+    # Without cclimits limits.py reports every subscription provider as
+    # unavailable ("cclimits timeout"); only API-credit Claude still dispatches.
+    if config.ORCH_CLAUDE_API_KEY:
+        return CheckResult(WARN, "cclimits", "not installed — Claude runs on API credits; "
+                           "Codex still needs cclimits", fix_hint="npm install -g cclimits")
+    return CheckResult(FAIL, "cclimits", "not installed — without it no subscription provider "
+                       "(Claude/Codex) gets capacity and tasks wait",
+                       fix_hint="npm install -g cclimits (needs Node)")
+
+
 def check_cclimits() -> CheckResult:
+    if not (shutil.which("cclimits") or shutil.which("cclimits.cmd")):
+        return _cclimits_missing()
     cmd_suffix = ".cmd" if os.name == "nt" else ""
     cclimits_cmd = f"cclimits{cmd_suffix}"
     try:
@@ -503,6 +583,10 @@ def check_profiles() -> CheckResult:
         return CheckResult(WARN, "Profiles dir", f"check failed: {e}")
 
 
+# Shipped example that `--fix` copies to policy.yaml (same pattern as .env.example).
+_POLICY_EXAMPLE = Path(__file__).resolve().parent / "policy.example.yaml"
+
+
 def check_policy_file() -> CheckResult:
     """Check that policy.yaml exists and is valid YAML."""
     try:
@@ -511,35 +595,30 @@ def check_policy_file() -> CheckResult:
             return CheckResult(WARN, "Policy file", "vault not accessible — skipped")
 
         if not POLICY_FILE.exists():
-            def _fix():
-                POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
-                POLICY_FILE.write_text(
-                    "# AI Orchestrator — Policy\n\n"
-                    "auto:\n"
-                    "  - \"git add\"\n"
-                    "  - \"git commit\"\n"
-                    "  - \"pytest\"\n"
-                    "  - \"npm install\"\n"
-                    "  - \"pip install\"\n\n"
-                    "approve:\n"
-                    "  - pattern: \"git push\"\n"
-                    "    message: \"git push to remote\"\n"
-                    "  - pattern: \"npm publish\"\n"
-                    "    message: \"npm publish package\"\n\n"
-                    "deny:\n"
-                    "  - \"git push --force.*(main|master)\"\n"
-                    "  - \"rm -rf /\"\n"
-                    "  - \"DROP (TABLE|DATABASE)\"\n"
-                    "  - \"format [A-Z]:\"\n"
-                    "  - \"mkfs\"\n",
-                    encoding="utf-8",
+            if not _POLICY_EXAMPLE.is_file():
+                return CheckResult(
+                    WARN, "Policy file",
+                    f"not found: {POLICY_FILE} (and no example at {_POLICY_EXAMPLE})",
+                    fix_hint="Restore policy.example.yaml from the repository",
                 )
-                print(f"    Created policy.yaml at {POLICY_FILE}")
+
+            def _fix():
+                # Byte copy of the shipped example. "xb" never overwrites: a policy.yaml
+                # that appeared since the check ran stays exactly as it is.
+                content = _POLICY_EXAMPLE.read_bytes()
+                POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with open(POLICY_FILE, "xb") as f:
+                        f.write(content)
+                except FileExistsError:
+                    print(f"    {POLICY_FILE} already exists — left unchanged.")
+                    return
+                print(f"    Created policy.yaml at {POLICY_FILE} from {_POLICY_EXAMPLE.name}")
 
             return CheckResult(
                 WARN, "Policy file",
                 f"not found: {POLICY_FILE}",
-                fix_hint="Create policy.yaml in vault 99_System/AI/",
+                fix_hint=f"Copy {_POLICY_EXAMPLE.name} to {POLICY_FILE}",
                 fix_fn=_fix,
             )
 
@@ -552,6 +631,8 @@ def check_policy_file() -> CheckResult:
             auto_count = len(data.get("auto", []))
             approve_count = len(data.get("approve", []))
             deny_count = len(data.get("deny", []))
+            providers = data.get("tool_providers")
+            provider_count = len(providers) if isinstance(providers, dict) else 0
 
             # Tool-contract schema check (P3) — non-fatal warnings stay in details.
             contract_warnings = _validate_tool_contracts(data.get("tool_contracts"))
@@ -559,6 +640,8 @@ def check_policy_file() -> CheckResult:
                 len(data["tool_contracts"]) if isinstance(data.get("tool_contracts"), dict) else 0
             )
             details = f"{auto_count} auto, {approve_count} approve, {deny_count} deny rules"
+            if provider_count:
+                details += f", {provider_count} tool_providers entries"
             if contract_count:
                 details += f", {contract_count} tool contracts"
             if contract_warnings:
@@ -617,7 +700,8 @@ def _validate_tool_contracts(contracts_raw) -> list[str]:
 
 
 def check_model_aliases() -> CheckResult:
-    """CLI-probe every entry in CLAUDE/GEMINI/CODEX_MODEL_ALIASES.
+    """CLI-probe every entry in CLAUDE/GEMINI/CODEX_MODEL_ALIASES (Gemini only while it is in
+    ``dispatcher._PRIORITY``).
 
     Cheap definitive check — the LLM Phase B from the heartbeat is intentionally
     NOT included here so `--doctor` stays fast and side-effect-free. Verdict:
@@ -645,11 +729,15 @@ def check_model_aliases() -> CheckResult:
     # Vibe (and OpenRouter) are deliberately not probed: both are pay-per-token,
     # and a liveness ping on every `--doctor` run would spend real money to learn
     # something the CLI-presence check already covers.
+    # Gemini only while it is in the dispatcher chain: no live calls for a retired provider.
+    chain = _dispatcher_chain()
     for provider, mapping in (
         ("claude", CLAUDE_MODEL_ALIASES),
         ("gemini", GEMINI_MODEL_ALIASES),
         ("codex",  CODEX_MODEL_ALIASES),
     ):
+        if provider == "gemini" and "gemini" not in chain:
+            continue
         for tag, model_id in mapping.items():
             probes.append((provider, tag, model_id))
 
@@ -814,6 +902,8 @@ def run_doctor(fix: bool = False, yes: bool = False) -> bool:
         check_worktrees(),
     ]
 
+    _apply_chain_rule(checks)
+
     any_fail = False
     fixable = []
 
@@ -877,14 +967,12 @@ def run_startup_checks() -> bool:
             pass
 
     # At least one provider CLI must be available
-    provider_checks = [
-        ("claude", check_claude_cli()),
-        ("gemini", check_gemini_cli()),
-        ("codex", check_codex_cli()),
-    ]
+    cli_checks = {"claude": check_claude_cli, "gemini": check_gemini_cli, "codex": check_codex_cli}
+    provider_checks = [(p, cli_checks[p]()) for p in _dispatcher_chain() if p in cli_checks]
     available_providers = [name for name, r in provider_checks if r.status == PASS]
     if not available_providers:
-        print("CRITICAL: No provider CLIs found (claude, gemini, codex). Install at least one.")
+        names = ", ".join(name for name, _ in provider_checks)
+        print(f"CRITICAL: No provider CLIs found ({names}). Install at least one.")
         for name, r in provider_checks:
             print(f"  {name}: {r.message}  {r.fix_hint}")
         failed = True

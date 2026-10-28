@@ -1,0 +1,102 @@
+# AI Orchestrator - example policy
+#
+# Where it goes:  <ORCH_VAULT_PATH>/99_System/AI/policy.yaml
+# `python orchestrator.py --doctor --fix` copies this file there if (and only
+# if) no policy.yaml exists yet. It never overwrites an existing file.
+#
+# Rules are regular expressions, matched case-insensitively against the task
+# text (a plain word is a substring match). Precedence: deny > approve > auto.
+# A task that matches nothing is treated as auto.
+#
+# APPROVE needs Telegram. Without a configured bot nobody can answer, so the
+# task is held for ~10 minutes (600 s) and then retried every 10 minutes
+# until you answer or remove the task. If you do not use Telegram, leave the
+# approve section empty.
+#
+# Providers: tool_providers is an allow-list. A provider that is not listed for
+# a tool is never used for it. Gemini, OpenRouter and Vibe are deliberately
+# absent below, so they stay switched off. OpenRouter and Vibe have no cost
+# ceiling and stay barred even when no policy file exists at all.
+# A broken policy.yaml (not valid YAML, not a mapping) holds all tasks.
+
+# Allow-list of providers per #tool:<name>. "default" applies to every tool
+# that has no entry of its own - this includes every queue line without a
+# #tool: tag (policy.py, allowed-providers lookup). opencode is therefore only
+# reachable there.
+tool_providers:
+  brainstorm: [claude, codex]
+  critical-review: [claude, codex]
+  deep-security-audit: [claude, codex]
+  dev-loop: [claude, codex]
+  knowledge-transfer: [claude, codex]
+  pr-babysitter: [claude, codex]
+  research-qa: [claude, codex]
+  review-loop: [claude, codex]
+  scientific-investigation: [claude, codex]
+  security-audit: [claude, codex]
+  test-loop: [claude]
+  default: [claude, codex, opencode]
+
+# Per-tool switches. "auto" = proceed without asking. Setting plan_approval to
+# "approve" makes dev-loop wait for your Telegram answer before it executes.
+tool_phases:
+  dev-loop:
+    plan_approval: auto
+  review-loop:
+    verification: auto
+
+# Action budgets and stop conditions per tool. Unknown keys are ignored by the
+# engine; --doctor warns about them. Values below are starting points - adjust.
+tool_contracts:
+  dev-loop:
+    budget:
+      max_iterations: 10
+      max_runtime_sec: 7200
+      max_files_touched: 40
+    stop_conditions:
+      - "tests failing after the last iteration"
+    reporting_path: telegram+memory
+  review-loop:
+    budget:
+      max_iterations: 10
+      max_runtime_sec: 3600
+      max_files_touched: 30
+    reporting_path: telegram+memory
+  test-loop:
+    budget:
+      max_iterations: 10
+      max_runtime_sec: 3600
+    reporting_path: telegram+memory
+  security-audit:
+    budget:
+      max_runtime_sec: 3600
+    reporting_path: telegram+memory
+  research-qa:
+    budget:
+      max_runtime_sec: 1800
+    reporting_path: telegram+memory
+  brainstorm:
+    budget:
+      max_runtime_sec: 1800
+    reporting_path: telegram+memory
+
+# Proceed without asking (optional - unmatched tasks are auto anyway).
+auto:
+  - "git add"
+  - "git commit"
+  - "pytest"
+
+# Ask on Telegram first.
+approve:
+  - pattern: "git push"
+    message: "git push to remote"
+  - pattern: "npm publish"
+    message: "npm publish package"
+
+# Never run. The task stays in the queue and is reported.
+deny:
+  - "git push --force.*(main|master)"
+  - "rm -rf /"
+  - "DROP (TABLE|DATABASE)"
+  - "format [A-Z]:"
+  - "mkfs"

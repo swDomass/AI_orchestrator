@@ -1,6 +1,7 @@
 import subprocess
 from unittest.mock import patch
 
+import claude_billing
 import config
 import dispatcher
 import doctor
@@ -611,3 +612,10 @@ def test_run_doctor_with_claude_but_no_cclimits_fails(monkeypatch, capsys):
             monkeypatch.setattr(doctor, name, lambda: ok)
     assert doctor.run_doctor(fix=False) is False
     assert "Result: FAIL" in capsys.readouterr().out
+
+
+def test_cclimits_not_installed_with_api_key_but_switch_abo_is_fail(monkeypatch, tmp_path):
+    _cclimits_env(monkeypatch, installed=False, api_key="sk-test")
+    claude_billing.set_mode("abo", "cli")
+    r = doctor.check_cclimits()
+    assert r.status == doctor.FAIL

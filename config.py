@@ -1021,6 +1021,7 @@ ORCH_CLAUDE_API_RETRY_HOURS = _parse_int_env("ORCH_CLAUDE_API_RETRY_HOURS", 24)
 ORCH_CLAUDE_API_RATE_RETRY_MIN = _parse_int_env("ORCH_CLAUDE_API_RATE_RETRY_MIN", 60)
 CLAUDE_API_STATE_FILE = Path(__file__).parent / "logs" / "claude-api-state.json"
 CLAUDE_API_RUNS_FILE = Path(__file__).parent / "logs" / "claude-api-runs.jsonl"
+CLAUDE_BILLING_MODE_FILE = Path(__file__).parent / "logs" / "claude-billing-mode.json"
 # Transcripts of the Claude CLI (message IDs incl. subagents, see ADR 005).
 CLAUDE_PROJECTS_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
 

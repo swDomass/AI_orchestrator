@@ -180,6 +180,8 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 
 **Never put the key into `.env` as `ANTHROPIC_API_KEY`.** `.env` is loaded into `os.environ`, so the OAuth token refresher (`limits._refresh_token`, which `cclimits` depends on) would inherit it, the subscription token would no longer be refreshed, and the statusline / Stream Deck would show "expired". Use `ORCH_CLAUDE_API_KEY`. The key is not inherited by non-Claude child processes (Codex, opencode, `cclimits`, the token refresher, Telegram helpers); **the Claude subprocess itself and everything it starts (Bash tools, hooks, MCP servers) does see `ANTHROPIC_API_KEY`**, because Claude Code needs it. Residual risk: a command the model runs in a foreign repo can read the key; the damage is limited by the missing payment method / workspace limit. Without a payment method in the Console the credit balance is also the hard cost ceiling; when it runs out the orchestrator falls back to the subscription and sends one Telegram notice per episode.
 
+**Switch (ADR-006).** The billing path can be changed at runtime, without editing `.env` or restarting: `python orchestrator.py --claude-billing abo|api|status`, Telegram `/abo` / `/api`, or the button in the dashboard (Overview, section "Claude-Abrechnung"; while the switch is on `api` and a block is running, a second button "Sperre aufheben" lifts it). The choice is stored in `logs/claude-billing-mode.json`, survives restarts and applies from the next Claude run on (a run in progress keeps its path). No file = `api`, as before; a corrupt file counts as `api` too (one warning in the log). `api` without a configured key stays on the subscription, and `api` lifts a running automatic block (the 24 h / 60 min block after an empty balance) — if the balance really is empty, the next API run fails at no cost, repeats on the subscription and sends the Telegram notice again.
+
 See `.env.example` for a complete annotated template.
 
 ## Quick Start
@@ -317,6 +319,7 @@ python orchestrator.py                  # Single queue pass
 python orchestrator.py --watch          # Continuous mode
 python orchestrator.py --dry-run        # Parse queue without executing
 python orchestrator.py --check-limits   # Show provider capacity
+python orchestrator.py --claude-billing abo|api|status   # Switch / show the Claude billing path (ADR-006)
 python orchestrator.py --list-tools     # Show available #tool: handlers
 python orchestrator.py --dashboard      # Launch analytics dashboard (opens browser; --watch already serves it, see DASHBOARD_AUTOSTART)
 python orchestrator.py --doctor         # Validate setup
@@ -1014,6 +1017,7 @@ In `--watch` mode a Telegram long-poll listener starts (when `TELEGRAM_*` env va
 | `/status` | Queue size + provider status |
 | `/limits` | Detailed limits with per-window breakdown |
 | `/pause` / `/resume` | Pause / resume processing |
+| `/abo` / `/api` | Switch Claude billing to the subscription / to the API credits (ADR-006); `/status` shows the current path |
 | `/approve`, `/approve-all <cat>`, `/deny`, `/skip` | Approval flow |
 | `/reject <run_id> [criterion] [reason]` | Reject a scientific-investigation pre-registration / final gate |
 | `/unblock <id>`, `/drop <id>`, `/retry <dep-id>` | Queue-healing responses for long-blocked tasks |

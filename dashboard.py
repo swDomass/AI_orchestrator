@@ -442,6 +442,25 @@ for _op in ("add", "edit", "delete", "retry", "duplicate", "move", "raw", "undo"
     post_route(f"/api/queue/{_op}")(_queue_route(_op))
 
 
+# ── Claude billing switch: GET/POST /api/claude-billing (module imported lazily) ─────────────
+def _billing_answer(st: dict[str, Any], mod: Any, **extra: Any) -> dict[str, Any]:
+    """Status dict + German line; the API key is not part of ``status()``, so it cannot leak here."""
+    return {"ok": True, **st, **extra, "text": mod.describe(st)}
+
+
+@post_route("/api/claude-billing")
+def _api_claude_billing(body: dict[str, Any]) -> dict[str, Any]:
+    cb = importlib.import_module("claude_billing")
+    mode = body.get("mode")
+    if not isinstance(mode, str) or mode not in cb.MODES:
+        raise _refuse(400, "bad_request")
+    try:
+        st = cb.set_mode(mode, source="dashboard")
+    except OSError:
+        raise ApiError(503, "unavailable", "Schalter nicht gespeichert.") from None
+    return _billing_answer(st, cb)
+
+
 @post_route("/api/queue/lint")
 def _api_queue_lint(body: dict[str, Any]) -> dict[str, Any]:
     """Live check: {fields} | {text, ref?} | {content}; never writes."""
@@ -525,6 +544,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json_response(parsed.query)
             elif parsed.path == "/api/harness":
                 self._harness_response(parsed.query)
+            elif parsed.path == "/api/claude-billing":
+                self._billing_response()
             elif parsed.path in ("/api/queue", "/api/queue/meta"):
                 self._queue_response(parsed.path, parsed.query)
             elif parsed.path in ("/", "/index.html"):
@@ -546,6 +567,17 @@ class _Handler(BaseHTTPRequestHandler):
                 payload = {"ok": True, **_queue_editor().queue_meta()}
         except Exception:
             logger.exception("dashboard: queue read failed")
+            self._reply(500, {"ok": False, "error": _MESSAGES["internal"], "code": "internal"})
+            return
+        self._reply(200, payload)
+
+    def _billing_response(self) -> None:
+        """Read side of the billing switch: never writes; a failure is a fixed text plus code."""
+        try:
+            cb = importlib.import_module("claude_billing")
+            payload = _billing_answer(cb.status(), cb)
+        except Exception:
+            logger.exception("dashboard: claude billing read failed")
             self._reply(500, {"ok": False, "error": _MESSAGES["internal"], "code": "internal"})
             return
         self._reply(200, payload)

@@ -377,6 +377,50 @@ async function load() {
   } catch (e) { console.warn('fetch failed', e); }
 }
 
+// Claude billing switch (GET/POST /api/claude-billing). All texts via textContent.
+function renderClaudeBilling(d) {
+  const btn = document.getElementById('claude-billing-btn');
+  document.getElementById('claude-billing-text').textContent = String(d.text);
+  const toAbo = d.mode === 'api';
+  btn.textContent = toAbo ? 'Auf Abo umschalten' : 'Auf API-Guthaben umschalten';
+  btn.dataset.target = toAbo ? 'abo' : 'api';
+  btn.disabled = false;
+  const lift = document.getElementById('claude-billing-lift');
+  lift.style.display = (d.mode === 'api' && d.blocked_until) ? '' : 'none';
+  lift.disabled = false;
+}
+
+function claudeBillingFailed() {
+  document.getElementById('claude-billing-text').textContent = 'Abrechnung nicht lesbar';
+  document.getElementById('claude-billing-btn').disabled = true;
+  document.getElementById('claude-billing-lift').style.display = 'none';
+}
+
+async function loadClaudeBilling() {
+  try {
+    const r = await fetch('/api/claude-billing', {cache: 'no-store'});
+    const d = r.ok ? await r.json() : null;
+    if (d && d.ok === true) renderClaudeBilling(d); else claudeBillingFailed();
+  } catch (e) { claudeBillingFailed(); }
+}
+
+async function claudeBillingToggle(el) {
+  if (!el.dataset.target) return;
+  const msg = document.getElementById('claude-billing-msg');
+  const both = [document.getElementById('claude-billing-btn'), document.getElementById('claude-billing-lift')];
+  both.forEach(b => { b.disabled = true; });
+  msg.textContent = '';
+  const r = await orchPost('/api/claude-billing', {mode: el.dataset.target});
+  if (r.ok && r.data && r.data.ok === true) {
+    renderClaudeBilling(r.data);
+    if (r.data.lifted_block) msg.textContent = 'Sperre aufgehoben.';
+  } else {
+    msg.textContent = orchNeedsReload(r) ? 'Seite neu laden (Dashboard neu gestartet).'
+      : String((r.data && r.data.error) || 'Umschalten fehlgeschlagen.');
+  }
+  both.forEach(b => { b.disabled = false; });
+}
+
 // Chart variable is looked up when the button is clicked (initCharts assigns them later).
 function resetZoomFor(buttonId) {
   const charts = {
@@ -392,4 +436,5 @@ registerActions({
   'set-range': el => setRange(Number(el.dataset.days)),
   'set-limit-range': el => setLimitRange(Number(el.dataset.hours)),
   'reset-zoom': el => resetZoomFor(el.id),
+  'claude-billing-toggle': el => claudeBillingToggle(el),
 });

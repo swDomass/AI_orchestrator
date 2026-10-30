@@ -7,11 +7,14 @@ Single place that knows whether Claude CLI runs go over the monthly API credits
   including the one-notification-per-episode marker,
 * the ledger of message IDs of API-billed runs (``logs/claude-api-runs.jsonl``),
   which quota calibration / the local 429 fallback use to drop those entries,
+* the user's billing switch ``logs/claude-billing-mode.json`` (``api`` | ``abo``,
+  written only by ``set_mode()``; a missing/broken file counts as ``api``),
 * ``child_env()``, the only place that turns the key into ``ANTHROPIC_API_KEY``.
 
 The key never appears in logs, exception text or files. Reads of missing/corrupt
 files behave like "no state"; nothing here raises to the caller, except
-``child_env()`` without a configured key (ValueError).
+``child_env()`` without a configured key (ValueError) and ``set_mode()`` (ValueError for
+an unknown mode; OSError when writing fails or a running block cannot be removed).
 """
 
 from __future__ import annotations
@@ -89,9 +92,48 @@ def _blocked_until(state: dict | None) -> float:
         return 0.0
 
 
+MODES = ("api", "abo")
+_warned_mode_raw: list[str | None] = [None]  # last raw content warned about (no log spam)
+
+
+def _read_mode_file() -> dict | None:
+    """The switch file as dict; None when missing, unreadable or not a dict."""
+    raw = "<unreadable>"
+    data = None
+    for attempt in range(3):  # a PermissionError can be a writer's os.replace in flight
+        try:
+            raw = Path(config.CLAUDE_BILLING_MODE_FILE).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            if attempt < 2:
+                time.sleep(0.02)
+                continue
+        except (OSError, ValueError):  # ValueError: invalid UTF-8 bytes
+            pass
+        else:
+            with contextlib.suppress(ValueError):
+                data = json.loads(raw)
+        break
+    if isinstance(data, dict) and data.get("mode") in MODES:
+        return data
+    if _warned_mode_raw[0] != raw:
+        _warned_mode_raw[0] = raw
+        logger.warning("%s unusable - treated as api", Path(config.CLAUDE_BILLING_MODE_FILE).name)
+    return None
+
+
+def get_mode() -> str:
+    """The user's switch: ``"abo"`` or ``"api"`` (default; also for a broken file)."""
+    data = _read_mode_file()
+    return "abo" if data and data["mode"] == "abo" else "api"
+
+
 def api_active(now: float | None = None) -> bool:
-    """True when the key is set and no block is in force."""
+    """True when the key is set, the switch is not on ``abo`` and no block is in force."""
     if not key_configured():
+        return False
+    if get_mode() == "abo":
         return False
     now = time.time() if now is None else now
     with _LOCK:
@@ -189,6 +231,90 @@ def clear(now: float | None = None) -> None:
         except OSError:  # includes "already gone": nothing to log then
             return
     logger.info("Claude API block cleared after successful API run")
+
+
+def status(now: float | None = None) -> dict:
+    """Snapshot of the billing path for CLI/Telegram/dashboard. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        data = _read_mode_file() or {}
+        with _LOCK:
+            state = _read_state()
+        blocked = _blocked_until(state) > now
+        return {
+            "mode": data["mode"] if data else "api",
+            "source": data.get("source") if isinstance(data.get("source"), str) else None,
+            "since": data.get("since") if isinstance(data.get("since"), str) else None,
+            "key_configured": key_configured(),
+            "api_active": api_active(now),
+            "blocked_until": _blocked_until(state) if blocked else None,
+            "block_reason": str((state or {}).get("reason") or "") or None if blocked else None,
+        }
+    except Exception:
+        return {"mode": None, "source": None, "since": None, "key_configured": key_configured(),
+                "api_active": False, "blocked_until": None, "block_reason": None}
+
+
+def describe(st: dict) -> str:
+    """One German line for the current billing path (4 cases, or "nicht ermittelbar")."""
+    if st.get("mode") is None:
+        return "Claude-Abrechnung: nicht ermittelbar"
+    if st.get("mode") == "abo":
+        return "Claude-Abrechnung: Abo (Schalter)"
+    if not st.get("key_configured"):
+        return "Claude-Abrechnung: Abo — API gewählt, aber kein ORCH_CLAUDE_API_KEY in .env"
+    if st.get("blocked_until"):
+        until = datetime.fromtimestamp(float(st["blocked_until"])).strftime("%d.%m. %H:%M")
+        reason = _REASON_TEXT.get(str(st.get("block_reason")), _REASON_TEXT["credit"])
+        return f"Claude-Abrechnung: Abo — API gesperrt bis {until} ({reason})"
+    return "Claude-Abrechnung: API-Guthaben"
+
+
+def _lift_block(now: float) -> bool:
+    """Remove the block state (memory mirror + file); True when a block was in force.
+    A PermissionError (file briefly held by another process) is retried; a file that
+    still exists afterwards raises OSError if a block was in force (an expired leftover
+    is harmless: ``api_active()`` ignores it). The memory mirror is only dropped once
+    the file is gone. Missing file = fine."""
+    path = Path(config.CLAUDE_API_STATE_FILE)
+    with _LOCK:
+        was_blocked = _blocked_until(_read_state()) > now
+        for attempt in range(3):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(0.05)
+                continue
+            _mem_state[0] = None
+            return was_blocked
+        if was_blocked:
+            raise OSError("Claude API block file could not be removed")
+        _mem_state[0] = None
+        logger.debug("expired Claude API block file could not be removed - ignored")
+        return False
+
+
+def set_mode(mode: str, source: str, now: float | None = None) -> dict:
+    """Persist the switch. ``api`` first lifts a running block (file + memory mirror,
+    even an expired leftover) and only then writes the mode. ``OSError`` goes to the
+    caller - also when the block file cannot be removed; the old mode file stays."""
+    if mode not in MODES:
+        raise ValueError("unknown billing mode")
+    now = time.time() if now is None else now
+    payload = {
+        "mode": mode,
+        "since": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+        "source": source,
+    }
+    lifted = _lift_block(now) if mode == "api" else False
+    _atomic_write(Path(config.CLAUDE_BILLING_MODE_FILE), json.dumps(payload, ensure_ascii=False, indent=2))
+    logger.info("Claude billing switch set to %s (source=%s)", mode, source)
+    if lifted:
+        logger.info("Claude API block lifted by switch (source=%s)", source)
+    return {**status(now), "lifted_block": lifted}
 
 
 _in_flight = [0]  # mutable cell: no ``global`` statement

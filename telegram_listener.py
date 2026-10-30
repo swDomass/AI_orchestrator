@@ -10,6 +10,8 @@ Supported commands:
   /limits            — detailed per-provider limits
   /pause             — pause orchestrator task processing
   /resume            — resume orchestrator task processing
+  /abo               — bill Claude via the subscription
+  /api               — bill Claude via API credits (lifts a block)
   /approve [cat]     — approve pending approval request
   /approve-all <cat> — session-wide preapproval for category
   /deny              — deny pending approval request
@@ -39,6 +41,7 @@ import threading
 import urllib.parse
 import urllib.request
 
+import claude_billing
 import idempotency
 import memory as memory_module
 from config import (
@@ -133,6 +136,12 @@ def _escape_telegram_markdown(text: str) -> str:
             escaped.append("\\")
         escaped.append(ch)
     return "".join(escaped)
+
+
+def _escape_legacy_markdown(text: str) -> str:
+    """Escape only what legacy Markdown knows (backslash, underscore, asterisk,
+    backtick, opening bracket); a backslash before ``(`` or ``)`` stays visible."""
+    return "".join("\\" + ch if ch in "\\_*`[" else ch for ch in str(text))
 
 
 def _parse_command(text: str) -> tuple[str, str] | None:
@@ -342,6 +351,8 @@ class TelegramListener:
                 self._cmd_pause()
             elif command == "/resume":
                 self._cmd_resume()
+            elif command in ("/abo", "/api"):
+                self._cmd_billing(command[1:])
             elif command == "/approve":
                 self._cmd_approve(command_args)
             elif command == "/approve-all":
@@ -540,6 +551,8 @@ class TelegramListener:
             "/limits — Detaillierte Provider\\-Limits\n"
             "/pause  — Task\\-Verarbeitung pausieren\n"
             "/resume — Task\\-Verarbeitung fortsetzen\n"
+            "/abo — Claude übers Abo abrechnen\n"
+            "/api — Claude übers API\\-Guthaben \\(hebt Sperre auf\\)\n"
             "/approve \\[kategorie\\] — Ausstehende Aktion genehmigen\n"
             "/approve\\-all \\<kategorie\\> — Session\\-Freigabe für Kategorie\n"
             "/deny  — Ausstehende Aktion ablehnen\n"
@@ -575,8 +588,13 @@ class TelegramListener:
                 err = _escape_telegram_markdown(lim.error or "nicht verfügbar")
                 lines.append(f"  {name}: ❌ {err}")
 
+        try:
+            lines.append("\n" + _escape_legacy_markdown(
+                claude_billing.describe(claude_billing.status())))
+        except Exception:
+            logger.exception("Claude-Abrechnung fuer /status nicht ermittelbar")
         paused = " ⏸️ PAUSIERT" if self._pause_event.is_set() else ""
-        lines.append(f"\nOrchestrator: {'läuft' + paused}")
+        lines.append(f"Orchestrator: {'läuft' + paused}")
         send_message("\n".join(lines))
 
     def _cmd_limits(self) -> None:
@@ -604,6 +622,17 @@ class TelegramListener:
         self._pause_event.set()
         send_message("⏸️ Orchestrator *pausiert*.\nNeue Tasks werden nicht verarbeitet.\n/resume zum Fortsetzen.")
         logger.info("Orchestrator durch Telegram pausiert.")
+
+    def _cmd_billing(self, mode: str) -> None:
+        try:
+            st = claude_billing.set_mode(mode, source="telegram")
+            text = _escape_legacy_markdown(claude_billing.describe(st))
+            if st.get("lifted_block"):
+                text += "\nSperre aufgehoben."
+            send_message(text + "\nGilt ab dem nächsten Claude-Lauf.")
+        except Exception:
+            logger.exception("Claude-Abrechnungsschalter nicht gesetzt")
+            send_message("❌ Schalter nicht gespeichert.")
 
     def _cmd_resume(self) -> None:
         self._pause_event.clear()

@@ -478,3 +478,12 @@ def test_api_run_in_flight_only_during_api_attempt(env):
     ClaudeProvider().run("task")
     assert seen == [1, 0]  # API attempt counted, subscription repeat not
     assert claude_billing.api_runs_in_flight() == 0
+
+
+def test_with_key_but_switch_abo_env_is_none_and_run_is_abo(env):
+    claude_billing.set_mode("abo", "cli")
+    env.queue.append(_success("none"))
+    res = ClaudeProvider().run("task")
+    assert env.calls[0]["env"] is None  # no ANTHROPIC_API_KEY for the child
+    assert res.success and res.billing == "abo"
+    assert not env.runs.exists()

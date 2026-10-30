@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import config
+import claude_billing
 from config import QUEUE_FILE, VAULT_PATH
 
 # ── ANSI colours (stripped on non-TTY) ────────────────────────────────────────
@@ -318,7 +318,7 @@ def check_git() -> CheckResult:
 def _cclimits_missing() -> CheckResult:
     # Without cclimits limits.py reports every subscription provider as
     # unavailable ("cclimits timeout"); only API-credit Claude still dispatches.
-    if config.ORCH_CLAUDE_API_KEY:
+    if claude_billing.key_configured() and claude_billing.get_mode() == "api":
         return CheckResult(WARN, "cclimits", "not installed — Claude runs on API credits; "
                            "Codex still needs cclimits", fix_hint="npm install -g cclimits")
     return CheckResult(FAIL, "cclimits", "not installed — without it no subscription provider "

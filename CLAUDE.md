@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Stand 2026-10-30 (Windows, opencode-Modell über den Wähler statt fest zdr-review: Stufenleiter, fail-closed, Doppel-Skip, ADR-007 im Skript-Repo, +59 Tests): 4088 passed / 2 failed / 2 skipped in 1121 s; --collect-only tests/ 4092 = 4088 + 2 + 2; +59 über die 4032 auf 9037eb0, alle in tests/test_providers_opencode.py (Wähler-Leiter 45, ZDR-Prüfung vor Tag/Notnagel und Restfrist 14). Zweiter roter Test im Volllauf: tests/test_dashboard_autostart.py::test_second_dashboard_on_the_same_port_falls_back_instead_of_sharing — einzeln 3/3 grün auf Branch und master, Wackler unter Last. Der eine rote Test tests/test_git_commit.py::test_normal_run_commits_exactly_the_changed_and_new_paths (git rev-list Exit 128 bei orch/normalrun-<heute>) ist Altschaden: auch auf master 9037eb0 rot, nicht untersucht. Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos).
+# Stand 2026-10-30 abends (Windows, Claude-Abrechnungsschalter ADR-006: --claude-billing, Telegram /abo /api, Dashboard-Knopf, nach externem Codex-Review, +63 Tests): 4153 passed / 0 failed / 2 skipped in 998 s; --collect-only tests/ 4155 = 4153 + 2; +63 über die 4092 auf 9b66ba6 = test_claude_billing_mode 32, test_dashboard_claude_billing 15, test_telegram_listener +6, test_dashboard_page_js +6, test_claude_billing_gating +2, test_claude_provider_billing +1, test_doctor +1. Baseline auf 9b66ba6 war 4090/0/2 (auch test_git_commit und der Dashboard-Port-Wackler grün). Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos). Läuft parallel ein Live-Orchestrator, kann der Session-Wächter _guard_real_vault_and_docs_untouched beim letzten Test einen ERROR melden (Vault-Schreibzugriff des Live-Laufs) — dann wiederholen.
 # Ältere Stände und Messnotizen: docs/test-und-lint-historie.md
 # -p no:randomly: Das Flag bleibt als reproduzierbare Standardreihenfolge stehen (auch in ci.yml).
 python -m pytest tests/ -q -p no:randomly
@@ -36,6 +36,7 @@ python orchestrator.py                # single-shot
 python orchestrator.py --watch        # continuous + heartbeat
 python orchestrator.py --dry-run      # parse queue, no execute
 python orchestrator.py --check-limits # provider capacity
+python orchestrator.py --claude-billing abo|api|status  # Claude-Abrechnung umschalten/anzeigen (ADR-006)
 python orchestrator.py --list-tools   # available #tool: handlers
 python orchestrator.py --dashboard    # analytics web dashboard (opens browser; --watch serves it anyway, DASHBOARD_AUTOSTART)
 python orchestrator.py --lint-queue   # validate agent-queue.md

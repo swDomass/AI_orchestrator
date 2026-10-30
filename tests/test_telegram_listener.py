@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import claude_billing
+import config
 import policy as policy_module
 from config import MIN_CAPACITY_PERCENT
 from limits import AllLimits, ProviderLimits
@@ -895,3 +897,108 @@ def test_approval_replies_do_not_promise_the_task_stays_queued(mock_send, comman
     assert pending.is_set() and engine._approval_response == answer
     mock_send.assert_called_once_with(reply)
     assert "bleibt in Queue" not in mock_send.call_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# /abo  &  /api  (Claude billing switch) and the /status line
+# ---------------------------------------------------------------------------
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_abo_command_sets_switch_and_replies(mock_send):
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/abo"))
+
+    assert claude_billing.get_mode() == "abo"
+    assert config.CLAUDE_BILLING_MODE_FILE.exists()
+    text = mock_send.call_args[0][0]
+    assert "Abo" in text and "nächsten Claude" in text
+    assert "Abo (Schalter)" in text and "\\(" not in text and "\\)" not in text
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_api_command_lifts_running_block(mock_send, monkeypatch):
+    monkeypatch.setattr(config, "ORCH_CLAUDE_API_KEY", "sk-ant-test-0000")
+    monkeypatch.setattr("notifier.send_message", lambda *a, **kw: True)
+    claude_billing.trip("credit")
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/api"))
+
+    assert claude_billing.get_mode() == "api"
+    assert not config.CLAUDE_API_STATE_FILE.exists()
+    text = mock_send.call_args[0][0]
+    assert "API-Guthaben" in text and "Sperre aufgehoben." in text and "Claude-Lauf." in text
+    assert "\\." not in text and "\\-" not in text  # legacy Markdown: a backslash would show
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+def test_billing_command_oserror_replies_with_cross_and_listener_survives(mock_send, monkeypatch):
+    def boom(path, content):
+        raise PermissionError("disk")
+
+    monkeypatch.setattr(claude_billing, "_atomic_write", boom)
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/abo"))
+
+    assert "❌ Schalter nicht gespeichert" in mock_send.call_args[0][0]
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.read_queue", return_value=[])
+@patch("telegram_listener.get_limits")
+def test_status_contains_claude_billing_line(mock_limits, _mock_queue, mock_send):
+    mock_limits.return_value = _fake_limits()
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/status"))
+
+    assert "Claude-Abrechnung" in mock_send.call_args[0][0]
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.read_queue", return_value=[])
+@patch("telegram_listener.get_limits")
+def test_status_survives_billing_failure(mock_limits, _mock_queue, mock_send, monkeypatch):
+    def boom(*a, **kw):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(claude_billing, "status", boom)
+    mock_limits.return_value = _fake_limits()
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/status"))
+
+    text = mock_send.call_args[0][0]
+    assert "Orchestrator" in text and "Abrechnung" not in text
+
+
+def _status_text(mock_send, mock_limits) -> str:
+    mock_limits.return_value = _fake_limits()
+    listener, _ = _make_listener()
+    listener._handle_message(_msg("/status"))
+    return mock_send.call_args[0][0]
+
+
+@patch("telegram_listener.TELEGRAM_CHAT_ID", TEST_CHAT_ID)
+@patch("telegram_listener.send_message")
+@patch("telegram_listener.read_queue", return_value=[])
+@patch("telegram_listener.get_limits")
+def test_status_billing_line_has_no_visible_backslash_before_parentheses(
+        mock_limits, _mock_queue, mock_send, monkeypatch):
+    monkeypatch.setattr(config, "ORCH_CLAUDE_API_KEY", "sk-ant-test-0000")
+    monkeypatch.setattr("notifier.send_message", lambda *a, **kw: True)
+    claude_billing.set_mode("abo", "cli")
+    text = _status_text(mock_send, mock_limits)
+    assert "Abo (Schalter)" in text and "\\(" not in text
+
+    claude_billing.set_mode("api", "cli")
+    claude_billing.trip("credit")
+    text = _status_text(mock_send, mock_limits)
+    assert "(Guthaben leer oder Limit erreicht)" in text and "\\(" not in text
+
+    monkeypatch.setattr(config, "ORCH_CLAUDE_API_KEY", "")
+    text = _status_text(mock_send, mock_limits)
+    assert "ORCH\\_CLAUDE\\_API\\_KEY" in text  # underscores stay escaped
+

@@ -27,6 +27,7 @@ document.addEventListener('click', e => {
 
 initCharts();
 load();
+loadClaudeBilling();
 // One silent write-barrier handshake; the page looks the same either way.
 let _orchWriteOk = false;
 orchPost('/api/ping', {}).then(r => {
@@ -34,6 +35,7 @@ orchPost('/api/ping', {}).then(r => {
   if (!_orchWriteOk) console.warn('dashboard: write barrier ping failed');
 });
 setInterval(load, 60000);
+setInterval(loadClaudeBilling, 60000);
 setInterval(refreshActiveRuns, 30000);
 setInterval(harnessTick, 300000);
 setInterval(queueTick, 5000);

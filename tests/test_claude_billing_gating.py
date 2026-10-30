@@ -21,6 +21,7 @@ from test_dispatcher_routing import _make_limits
 from test_orchestrator_tool_tasks import _stub_single_shot_env
 
 import claude_billing
+import config
 import dispatcher
 import doctor
 import heartbeat
@@ -304,3 +305,23 @@ def test_watch_loop_retry_pause_after_failed_round(monkeypatch, api_active, expe
         orchestrator.run_watch()
 
     assert sum(sleeps) == expected_sleep
+
+
+# ------------------------------------------------- switch on "abo" (key present)
+
+
+def _abo_switch(monkeypatch) -> None:
+    """Key configured, user switch on abo: must behave like 'no key' (subscription capacity counts)."""
+    monkeypatch.setattr(config, "ORCH_CLAUDE_API_KEY", "sk-ant-test-0000")
+    claude_billing.set_mode("abo", "cli")
+
+
+def test_limits_ok_with_key_but_switch_abo_uses_subscription_capacity(monkeypatch):
+    _abo_switch(monkeypatch)
+    assert _limits_ok("claude", _make_limits(claude_avail=False)) is False
+    assert _limits_ok("claude", _make_limits(claude_avail=True)) is True
+
+
+def test_cached_availability_with_key_but_switch_abo_follows_exhausted_cache(exhausted_cache):
+    _abo_switch(exhausted_cache)
+    assert limits.is_cached_provider_available("claude") is False

@@ -3831,12 +3831,31 @@ def main() -> None:
             sys.exit(1)
 
 
+def _cmd_claude_billing(action: str) -> None:
+    """`--claude-billing abo|api|status`: show or set the Claude billing switch."""
+    import claude_billing  # noqa: PLC0415 - only this CLI path needs it
+    if action == "status":
+        print(claude_billing.describe(claude_billing.status()))
+        return
+    try:
+        st = claude_billing.set_mode(action, source="cli")
+    except OSError as exc:
+        print(f"Schalter nicht gespeichert: {type(exc).__name__}", file=sys.stderr)
+        sys.exit(1)
+    print(claude_billing.describe(st))
+    if st.get("lifted_block"):
+        print("Sperre aufgehoben — der nächste Claude-Lauf versucht das Guthaben.")
+    print("Gilt ab dem nächsten Claude-Lauf.")
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(description="AI Task Orchestrator")
     parser.add_argument("--watch", "-w", action="store_true",
                         help="Läuft kontinuierlich, retried automatisch")
     parser.add_argument("--check-limits", action="store_true",
                         help="Zeigt aktuelle Usage-Limits")
+    parser.add_argument("--claude-billing", choices=["abo", "api", "status"],
+                        help="Claude-Abrechnung: abo | api (hebt Sperre auf) | status")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validiert Tasks ohne auszuführen")
     parser.add_argument("--list-tools", action="store_true",
@@ -3872,6 +3891,10 @@ def _main() -> None:
         print("\nVerfügbare Tools:")
         for name, desc in list_tools().items():
             print(f"  #tool:{name:15} → {desc}")
+        return
+
+    if args.claude_billing:
+        _cmd_claude_billing(args.claude_billing)
         return
 
     if args.check_limits:

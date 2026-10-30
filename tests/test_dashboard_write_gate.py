@@ -382,7 +382,8 @@ def test_post_route_registration_rules(monkeypatch):
         dashboard.post_route("/nope")(lambda b: {})
     with pytest.raises(ValueError):
         dashboard.post_route("/api/ping")(lambda b: {})
-    assert [r for r in dashboard._POST_ROUTES if not r.startswith("/api/queue/")] == ["/api/ping"]  # queue routes: B1
+    # queue routes: B1; /api/claude-billing: billing switch
+    assert [r for r in dashboard._POST_ROUTES if not r.startswith("/api/queue/")] == ["/api/ping", "/api/claude-billing"]
 
 
 # ---- other methods, no CORS -------------------------------------------------------------------

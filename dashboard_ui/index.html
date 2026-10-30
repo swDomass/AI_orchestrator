@@ -30,6 +30,14 @@
   </div>
 </section>
 
+<section class="billing-switch">
+  <h3>Claude-Abrechnung</h3>
+  <span id="claude-billing-text">—</span>
+  <button id="claude-billing-btn" data-action="claude-billing-toggle" disabled>Umschalten</button>
+  <button id="claude-billing-lift" class="boot-hidden" data-action="claude-billing-toggle" data-target="api">Sperre aufheben</button>
+  <span id="claude-billing-msg"></span>
+</section>
+
 <section class="active-box">
   <h3><span class="live-dot"></span>Active Runs <span id="active-count">(0)</span></h3>
   <table>

@@ -460,8 +460,12 @@ def _isolate_claude_api_credits(tmp_path: Path, monkeypatch):
     the real logs/claude-api-runs.jsonl ledger. Measured 2026-10-26: 7
     dispatcher tests red with a key present. State and ledger go to tmp_path.
     Tests that need the key set it themselves (this fixture runs first).
+    The user's billing switch file (CLAUDE_BILLING_MODE_FILE) is redirected too,
+    otherwise the suite would write the real switch.
     """
     monkeypatch.setattr("config.ORCH_CLAUDE_API_KEY", "", raising=False)
+    monkeypatch.setattr("config.CLAUDE_BILLING_MODE_FILE", tmp_path / "claude-billing-mode.json", raising=False)
+    monkeypatch.setattr("claude_billing._warned_mode_raw", [None], raising=False)
     monkeypatch.setattr("config.CLAUDE_API_STATE_FILE", tmp_path / "claude-api-state.json", raising=False)
     monkeypatch.setattr("config.CLAUDE_API_RUNS_FILE", tmp_path / "claude-api-runs.jsonl", raising=False)
     monkeypatch.setattr("config.CLAUDE_PROJECTS_DIR", tmp_path / "claude-projects", raising=False)

@@ -203,7 +203,7 @@ def check_opencode_cli() -> CheckResult:
     """
     import config
     import openrouter_budget
-    from providers.opencode import _load_opencode_config, _resolve_exe
+    from providers.opencode import _load_opencode_config, _resolve_exe, _zdr_contract_violation
 
     findings: list[str] = []
 
@@ -223,38 +223,10 @@ def check_opencode_cli() -> CheckResult:
     if missing_agents:
         findings.append(f"opencode.json: Agent(en) fehlen: {', '.join(missing_agents)}")
 
-    providers_cfg = cfg.get("provider")
-    providers_cfg = providers_cfg if isinstance(providers_cfg, dict) else {}
-
-    def _zdr_contract_violation(full_id: str) -> str | None:
-        """None when *full_id* resolves to an alias carrying the full ZDR contract.
-
-        The restriction lives on the ALIAS, never on the model: under
-        `provider.openrouter` there is no provider-wide `options` block, so a raw
-        model id goes out with no data-protection option at all (A/B measured
-        2026-08-21 — same model, two throwaway aliases, only the option differing:
-        without it "pong" and exit 0, with it "No endpoints found matching your
-        data policy" and exit 1). Existence alone is therefore not enough; both
-        halves have to be there.
-        """
-        provider_name, sep, model_key = full_id.partition("/")
-        provider_entry = providers_cfg.get(provider_name) if sep else None
-        provider_entry = provider_entry if isinstance(provider_entry, dict) else {}
-        models = provider_entry.get("models")
-        entry = models.get(model_key) if isinstance(models, dict) else None
-        if not isinstance(entry, dict):
-            return "fehlt in opencode.json"
-        options = entry.get("options")
-        provider_opts = options.get("provider") if isinstance(options, dict) else None
-        provider_opts = provider_opts if isinstance(provider_opts, dict) else {}
-        if not (provider_opts.get("data_collection") == "deny" and provider_opts.get("zdr") is True):
-            return "ohne data_collection:deny + zdr:true"
-        return None
-
     alias_problems = [
         f"{alias} ({full_id}) {problem}"
         for alias, full_id in config.OPENCODE_MODEL_ALIASES.items()
-        if (problem := _zdr_contract_violation(full_id))
+        if (problem := _zdr_contract_violation(cfg, full_id))
     ]
     if alias_problems:
         findings.append("ZDR-Alias-Vertrag verletzt: " + "; ".join(alias_problems))
@@ -272,12 +244,12 @@ def check_opencode_cli() -> CheckResult:
     # at the cause. Skip when the default is byte-identical to an already-
     # checked alias target (today: default == OPENCODE_MODEL_ALIASES["opencode_
     # deepseek"] == "openrouter/zdr-review") — _zdr_contract_violation() is a
-    # pure function of (full_id, providers_cfg), so re-running it here would
+    # pure function of (cfg, full_id), so re-running it here would
     # either duplicate a finding already in alias_problems or duplicate a
     # silent pass, never add information.
     default_model = config.OPENCODE_DEFAULT_MODEL
     if default_model not in config.OPENCODE_MODEL_ALIASES.values():
-        if (default_problem := _zdr_contract_violation(default_model)):
+        if (default_problem := _zdr_contract_violation(cfg, default_model)):
             findings.append(
                 f"Standardmodell OPENCODE_DEFAULT_MODEL ({default_model}) {default_problem} "
                 "— jeder #opencode-Task ohne Alias-Tag nutzt genau dieses Modell; ein nicht "
@@ -299,7 +271,7 @@ def check_opencode_cli() -> CheckResult:
             "der Klein-Modell-Pfad kann Deckel und ZDR umgehen (gemessen: 4x Google, "
             "5x opencode Zen direkt)"
         )
-    elif (problem := _zdr_contract_violation(small_model)):
+    elif (problem := _zdr_contract_violation(cfg, small_model)):
         findings.append(
             f"small_model ({small_model}) {problem} — der Klein-Modell-Pfad laeuft "
             f"damit zwar ueber den gedeckelten Key, aber ohne Datenschutz-Zusage"

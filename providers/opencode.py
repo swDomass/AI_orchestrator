@@ -92,6 +92,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import config
@@ -147,7 +148,9 @@ _MIN_STAGE_SEC = 60
 #   per pass; a hang at the end of the ladder requeues the task up to
 #   MAX_HANG_RETRIES (2) times and each pass runs the ladder again:
 #   3 x 2 x (1 + 2) = 18 paid runs per task, capped by the daily budget and
-#   OPENCODE_MIN_REMAINING_USD (0.25).
+#   OPENCODE_MIN_REMAINING_USD (0.25). On top: one short probe per picker
+#   query (at most 3 per pass, so up to 18 probes per task; fractions of a
+#   cent each).
 #
 #   And a label is a bad thing to pay a false positive for. Hence the split
 #   below: the auth check reads STDERR ONLY, never the agent's answer. Measured
@@ -255,6 +258,36 @@ def _load_opencode_config() -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _zdr_contract_violation(cfg: dict, full_id: str) -> str | None:
+    """None when *full_id* resolves to an alias carrying the full ZDR contract.
+
+    The restriction lives on the ALIAS, never on the model: under
+    `provider.openrouter` there is no provider-wide `options` block, so a raw
+    model id goes out with no data-protection option at all (A/B measured
+    2026-08-21 — same model, two throwaway aliases, only the option differing:
+    without it "pong" and exit 0, with it "No endpoints found matching your
+    data policy" and exit 1). Existence alone is therefore not enough; both
+    halves have to be there. Pure function of ``(cfg, full_id)``; an empty or
+    broken ``cfg`` (see ``_load_opencode_config``) yields "fehlt" -- fail-closed.
+    Shared by ``doctor.check_opencode_cli`` and ``OpencodeProvider.run``.
+    """
+    providers_cfg = cfg.get("provider")
+    providers_cfg = providers_cfg if isinstance(providers_cfg, dict) else {}
+    provider_name, sep, model_key = full_id.partition("/")
+    provider_entry = providers_cfg.get(provider_name) if sep else None
+    provider_entry = provider_entry if isinstance(provider_entry, dict) else {}
+    models = provider_entry.get("models")
+    entry = models.get(model_key) if isinstance(models, dict) else None
+    if not isinstance(entry, dict):
+        return "fehlt in opencode.json"
+    options = entry.get("options")
+    provider_opts = options.get("provider") if isinstance(options, dict) else None
+    provider_opts = provider_opts if isinstance(provider_opts, dict) else {}
+    if not (provider_opts.get("data_collection") == "deny" and provider_opts.get("zdr") is True):
+        return "ohne data_collection:deny + zdr:true"
+    return None
 
 
 def _agents_configured(cfg: dict) -> bool:
@@ -418,8 +451,11 @@ class OpencodeProvider(BaseProvider):
         return env
 
     @staticmethod
-    def _ask_picker(aufgabe: str, stufe: str, cwd: str | None) -> tuple[int, str | None]:
-        """Ask the external model picker for one rung of its ladder.
+    def _ask_picker(
+        aufgabe: str, stufe: str, cwd: str | None, timeout: int,
+    ) -> tuple[int, str | None]:
+        """Ask the external model picker for one rung of its ladder (at most
+        ``timeout`` seconds).
 
         Returns ``(exit_code, model_id | None)``. The model id is set only for
         exit 0 with a clean single-token stdout. Pseudo codes for what has no exit
@@ -444,7 +480,7 @@ class OpencodeProvider(BaseProvider):
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=config.OPENCODE_PICKER_TIMEOUT_SEC, check=False,
+                timeout=timeout, check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return _PICKER_FAILED, None
@@ -455,6 +491,7 @@ class OpencodeProvider(BaseProvider):
 
     def _next_pick(
         self, aufgabe: str, stufen: list[str], cwd: str | None, tried: set[str],
+        rest: Callable[[], int | None] = lambda: None,
     ) -> tuple[str, str] | RunResult:
         """Next usable ``(stufe, model)`` from ``stufen`` (consumed in place), or
         the ``RunResult`` that ends the run without starting opencode.
@@ -469,12 +506,25 @@ class OpencodeProvider(BaseProvider):
         fail-closed (4 -> ``policy_block``, else ``unreachable``): a customer-code
         pass never runs on a model nobody vetted. Under ``open`` the next rung
         is tried. There is never a fall back to ``OPENCODE_DEFAULT_MODEL`` here.
+
+        ``rest`` gives the seconds left of the run deadline, ``None`` before the
+        first opencode start (full picker timeout). After a start every query gets
+        at most the rest; under ``_MIN_STAGE_SEC`` no further query is made.
         """
         profile = config.OPENCODE_PICKER_PROFILE
         notes: list[str] = []
         while stufen:
+            left = rest()
+            if left is not None and left < _MIN_STAGE_SEC:
+                return RunResult(
+                    success=False, error="unreachable",
+                    output=f"Wähler {aufgabe}/{profile}: Restfrist {left} s, keine weitere Abfrage",
+                )
             stufe = stufen.pop(0)
-            code, model = self._ask_picker(aufgabe, stufe, cwd)
+            timeout = config.OPENCODE_PICKER_TIMEOUT_SEC
+            if left is not None:
+                timeout = min(timeout, left)
+            code, model = self._ask_picker(aufgabe, stufe, cwd, timeout)
             logger.info("[opencode] Wähler %s/%s Stufe %s → %s", aufgabe, profile, stufe, model or "-")
             if model and model in tried:
                 notes.append(f"Stufe {stufe}: {model} doppelt")
@@ -501,6 +551,27 @@ class OpencodeProvider(BaseProvider):
             output=f"Wähler {aufgabe}/{profile}: keine Stufe belegt ({'; '.join(notes)})",
         )
 
+    def _uses_picker(self) -> bool:
+        return bool(config.OPENCODE_MODEL_PICKER) and not self._forced_model
+
+    def _zdr_block(self) -> RunResult | None:
+        """A model the picker did not hand out (forced tag, or the default without
+        a picker) was never vetted by it: under ``zdr`` its ZDR contract is checked
+        right before the start, fail-closed (config drift, unreadable
+        opencode.json). ``RunResult`` ``policy_block`` = do not start; ``None`` =
+        fine, or profile ``open`` (no check)."""
+        if self._uses_picker() or config.OPENCODE_PICKER_PROFILE != "zdr":
+            return None
+        model = self._forced_model or config.OPENCODE_DEFAULT_MODEL
+        problem = _zdr_contract_violation(_load_opencode_config(), model)
+        if problem is None:
+            return None
+        logger.warning("[opencode] %s %s unter zdr -- kein Start", model, problem)
+        return RunResult(
+            success=False, error="policy_block",
+            output=f"ZDR-Vertrag verletzt: {model} {problem}; kein opencode-Start",
+        )
+
     def run(
         self,
         task: str,
@@ -510,7 +581,7 @@ class OpencodeProvider(BaseProvider):
         session_id: str | None = None,  # accepted but ignored (supports_sessions=False)
         resume: bool = False,            # accepted but ignored
     ) -> RunResult:
-        if (blocked := _start_blocked()) is not None:
+        if (blocked := _start_blocked() or self._zdr_block()) is not None:
             return blocked
 
         prompt_bytes = len(task.encode("utf-8"))
@@ -534,7 +605,7 @@ class OpencodeProvider(BaseProvider):
         # Model resolution: forced tag > picker ladder > static default. A forced
         # tag bypasses the picker; the default is only the answer WITHOUT a picker
         # (fresh machine) -- with one configured it is never a fallback.
-        use_picker = bool(config.OPENCODE_MODEL_PICKER) and not self._forced_model
+        use_picker = self._uses_picker()
         stufen = list(_PICKER_STUFEN) if use_picker else []
 
         prompt_path = None
@@ -547,11 +618,14 @@ class OpencodeProvider(BaseProvider):
             def _left() -> int:
                 return timeout if started is None else int(timeout - (time.monotonic() - started))
 
+            def _rest() -> int | None:  # None before the first start: full picker timeout
+                return None if started is None else _left()
+
             while True:
                 if last is not None and _left() < _MIN_STAGE_SEC:
                     return last
                 if use_picker:
-                    pick = self._next_pick(aufgabe, stufen, cwd, tried)
+                    pick = self._next_pick(aufgabe, stufen, cwd, tried, rest=_rest)
                     if isinstance(pick, RunResult):
                         # Rungs used up/refused after a run that gave no result:
                         # that run's failure is the more useful answer.
@@ -587,7 +661,9 @@ class OpencodeProvider(BaseProvider):
         auth_error, timeout, a missing CLI or a start error -- those would hit
         the next model just the same or are spent on the deadline."""
         try:
-            def _attempt(eff: str | None):
+            t0 = time.monotonic()
+
+            def _attempt(eff: str | None, hard: int):
                 cmd = self._build_command(
                     _OPENCODE_EXE, model, agent, effort=eff, prompt_path=prompt_path
                 )
@@ -599,12 +675,12 @@ class OpencodeProvider(BaseProvider):
                     input_text=None,
                     cwd=cwd,
                     idle_timeout=config.OPENCODE_IDLE_TIMEOUT_SEC,
-                    hard_timeout=hard_timeout,
+                    hard_timeout=hard,
                     shell=False,
                     env=self._build_env(cwd),
                 )
 
-            result = _attempt(effort)
+            result = _attempt(effort, hard_timeout)
             # 2.2 validates the variant before any model call (cost 0): an unknown
             # one exits 1 "Variant unavailable". Exactly one repeat without it, so
             # a planned run degrades to the model default instead of failing.
@@ -615,12 +691,14 @@ class OpencodeProvider(BaseProvider):
                 and result.returncode != 0
                 and not _strip_ansi(result.stdout or "").strip()
                 and _VARIANT_UNAVAILABLE in _strip_ansi(result.stderr or "").lower()
+                # the repeat gets what is left of the deadline, not a fresh one
+                and (rest := int(hard_timeout - (time.monotonic() - t0))) > 0
             ):
                 logger.warning(
                     "[opencode] variant %r unavailable for %s -- repeating once without it",
                     effort, model,
                 )
-                result = _attempt(None)
+                result = _attempt(None, rest)
 
             # Stripped before classification too, not just before returning:
             # an escape sequence could in principle sit inside a matched

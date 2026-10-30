@@ -30,6 +30,7 @@ from providers.opencode import (
 
 _FAKE_EXE = "C:/fake/opencode.exe"
 _REAL_SOURCES = opencode_mod._external_instruction_sources  # before the autouse stub
+_REAL_ZDR_CHECK = opencode_mod._zdr_contract_violation  # before the autouse stub
 
 
 def _fake_watchdog(calls, *, returncode=0, stdout="OK", stderr=""):
@@ -57,6 +58,13 @@ def _no_picker_by_default(monkeypatch):
 def _no_external_instructions_by_default(monkeypatch):
     """The real machine's global opencode sources must not decide test outcomes."""
     monkeypatch.setattr(opencode_mod, "_external_instruction_sources", lambda: [])
+
+
+@pytest.fixture(autouse=True)
+def _zdr_contract_ok_by_default(monkeypatch):
+    """The ZDR check before a non-picker model would read the REAL opencode.json;
+    pin it to "fine" per test. The C1 tests put the real function back."""
+    monkeypatch.setattr(opencode_mod, "_zdr_contract_violation", lambda cfg, full_id: None)
 
 
 # ── command construction ──────────────────────────────────────────────────────
@@ -1445,3 +1453,217 @@ def test_policy_block_is_a_known_taxonomy_code():
     assert error_code_of("policy_block") == "policy_block"
     assert error_code_of("policy_block: No endpoints found matching your data policy") == "policy_block"
     assert is_transient("policy_block") is False
+
+
+# ── S7 round 7: ZDR check before a model the picker did not hand out (C1) ──────
+
+def _zdr_config(monkeypatch, tmp_path, ok=(), bad=()):
+    """A throwaway opencode.json: ``ok`` aliases carry the ZDR contract, ``bad``
+    exist without it. Never the real file."""
+    def _entry(contract):
+        return {"options": {"provider": {"data_collection": "deny", "zdr": True}}} if contract else {}
+    models = {k: _entry(True) for k in ok} | {k: _entry(False) for k in bad}
+    path = tmp_path / "opencode.json"
+    path.write_text(json.dumps({"provider": {"openrouter": {"models": models}}}), encoding="utf-8")
+    monkeypatch.setattr(config, "OPENCODE_CONFIG_PATH", path)
+    monkeypatch.setattr(opencode_mod, "_zdr_contract_violation", _REAL_ZDR_CHECK)
+
+
+def _assert_policy_block(result, calls, model):
+    assert calls == []
+    assert (result.success, result.error) == (False, "policy_block")
+    assert model in result.output
+
+
+@pytest.mark.parametrize("with_picker", [False, True])
+def test_forced_tag_on_non_zdr_alias_under_zdr_does_not_start(monkeypatch, tmp_path, with_picker):
+    """Group C1: a forced tag skips the picker, so the contract is checked here."""
+    _zdr_config(monkeypatch, tmp_path, ok=["zdr-review"], bad=["raw"])
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "zdr")
+    if with_picker:
+        monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "oc_pick_model.py")
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    provider = OpencodeProvider()
+    provider._forced_model = "openrouter/raw"
+
+    result = provider.run("x")
+
+    _assert_policy_block(result, calls, "openrouter/raw")
+
+
+def test_default_model_without_picker_on_non_zdr_alias_under_zdr_does_not_start(monkeypatch, tmp_path):
+    _zdr_config(monkeypatch, tmp_path, ok=["zdr-review"], bad=["raw"])
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "zdr")
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/raw")
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+
+    result = OpencodeProvider().run("x")
+
+    _assert_policy_block(result, calls, "openrouter/raw")
+
+
+def test_forced_tag_on_zdr_alias_under_zdr_starts(monkeypatch, tmp_path):
+    _zdr_config(monkeypatch, tmp_path, ok=["zdr-review-alt"])
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "zdr")
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    provider = OpencodeProvider()
+    provider._forced_model = "openrouter/zdr-review-alt"
+
+    result = provider.run("x")
+
+    assert result.success is True
+    assert [_model_of(c) for c in calls] == ["openrouter/zdr-review-alt"]
+
+
+def test_open_profile_does_not_check_the_contract(monkeypatch, tmp_path):
+    _zdr_config(monkeypatch, tmp_path, bad=["raw"])
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "open")
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+    provider = OpencodeProvider()
+    provider._forced_model = "openrouter/raw"
+
+    result = provider.run("x")
+
+    assert result.success is True
+    assert [_model_of(c) for c in calls] == ["openrouter/raw"]
+
+
+@pytest.mark.parametrize("content", [None, "{ not json", "[]"])
+def test_unreadable_opencode_config_under_zdr_does_not_start(monkeypatch, tmp_path, content):
+    """Missing file, broken JSON and a non-object all collapse to {} -> fail-closed."""
+    path = tmp_path / "opencode.json"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(config, "OPENCODE_CONFIG_PATH", path)
+    monkeypatch.setattr(opencode_mod, "_zdr_contract_violation", _REAL_ZDR_CHECK)
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "zdr")
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+
+    result = OpencodeProvider().run("x")
+
+    _assert_policy_block(result, calls, config.OPENCODE_DEFAULT_MODEL)
+
+
+def test_policy_block_is_logged_as_a_warning(monkeypatch, tmp_path, caplog):
+    _zdr_config(monkeypatch, tmp_path, bad=["raw"])
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "zdr")
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/raw")
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog([]))
+
+    with caplog.at_level("WARNING", logger=opencode_mod.logger.name):
+        OpencodeProvider().run("x")
+
+    assert any("openrouter/raw" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_picker_delivered_model_is_not_checked_again(monkeypatch, tmp_path):
+    """The picker vets its own models; the config here has none of them."""
+    _zdr_config(monkeypatch, tmp_path, bad=["raw"])
+    _picker_on(monkeypatch, "zdr")
+    _scripted_picker(monkeypatch, {"1": (0, "openrouter/not-in-config")})
+    calls = []
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
+
+    result = OpencodeProvider().run("x")
+
+    assert result.success is True
+    assert [_model_of(c) for c in calls] == ["openrouter/not-in-config"]
+
+
+def test_shared_contract_check_keeps_the_doctors_rules():
+    cfg = {"provider": {"openrouter": {"models": {
+        "good": {"options": {"provider": {"data_collection": "deny", "zdr": True}}},
+        "half": {"options": {"provider": {"data_collection": "deny"}}},
+    }}}}
+    assert _REAL_ZDR_CHECK(cfg, "openrouter/good") is None
+    assert _REAL_ZDR_CHECK(cfg, "openrouter/half") == "ohne data_collection:deny + zdr:true"
+    assert _REAL_ZDR_CHECK(cfg, "openrouter/none") == "fehlt in opencode.json"
+    assert _REAL_ZDR_CHECK(cfg, "no-slash") == "fehlt in opencode.json"
+    assert _REAL_ZDR_CHECK({}, "openrouter/good") == "fehlt in opencode.json"
+
+
+# ── S7 round 7: picker queries and variant repeat live inside the deadline (C2) ─
+
+def _clocked_picker(monkeypatch, clock, answers, advance_after_first=0):
+    """Fake picker like ``_scripted_picker``; every query except rung "1" takes
+    ``advance_after_first`` seconds of fake time. Returns the call log."""
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        stufe = _arg(cmd, "--stufe")
+        if stufe != "1":
+            clock[0] += advance_after_first
+        answer = answers.get(stufe, (5, ""))
+        return SimpleNamespace(returncode=answer[0], stdout=answer[1])
+    monkeypatch.setattr(opencode_mod.subprocess, "run", _run)
+    return calls
+
+
+def test_picker_query_after_a_run_gets_at_most_the_rest_as_timeout(monkeypatch):
+    """Group C2: the first query keeps the full picker timeout, later ones min(full, rest)."""
+    clock = _fake_clock(monkeypatch)
+    _picker_on(monkeypatch)
+    picker_calls = _clocked_picker(monkeypatch, clock, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")})
+    run_calls = _scripted_watchdog(
+        monkeypatch, [_idle_kill(), _ok()], on_call=lambda: clock.__setitem__(0, clock[0] + 100)
+    )
+
+    OpencodeProvider().run("x", timeout=190)  # 90 s left after rung 1
+
+    assert [c[1]["timeout"] for c in picker_calls] == [config.OPENCODE_PICKER_TIMEOUT_SEC, 90]
+    assert [c[1]["hard_timeout"] for c in run_calls] == [190, 90]
+
+
+def test_no_picker_query_when_a_query_ate_the_rest_below_the_minimum(monkeypatch):
+    """Rung 2 (exit 5) takes 150 s of the 200 s left; "ausweich" is not asked."""
+    clock = _fake_clock(monkeypatch)
+    _picker_on(monkeypatch)
+    picker_calls = _clocked_picker(
+        monkeypatch, clock, {"1": (0, "openrouter/m1")}, advance_after_first=150
+    )
+    run_calls = _scripted_watchdog(
+        monkeypatch, [_idle_kill()], on_call=lambda: clock.__setitem__(0, clock[0] + 100)
+    )
+
+    result = OpencodeProvider().run("x", timeout=300)  # 200 s left after rung 1
+
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2"]
+    assert picker_calls[1][1]["timeout"] == config.OPENCODE_PICKER_TIMEOUT_SEC
+    assert len(run_calls) == 1
+    assert (result.success, result.error) == (False, "hang")
+
+
+def test_variant_repeat_gets_the_rest_of_the_deadline(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/m")
+    run_calls = _scripted_watchdog(
+        monkeypatch,
+        [_fail(stderr="Error: Variant unavailable for openrouter/m: xhigh"), _ok("REVIEW")],
+        on_call=lambda: clock.__setitem__(0, clock[0] + 30),
+    )
+
+    result = _variant_provider("xhigh").run("x", timeout=100)
+
+    assert [c[1]["hard_timeout"] for c in run_calls] == [100, 70]
+    assert result.success is True
+
+
+def test_variant_repeat_is_skipped_when_the_deadline_is_used_up(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(config, "OPENCODE_DEFAULT_MODEL", "openrouter/m")
+    run_calls = _scripted_watchdog(
+        monkeypatch,
+        [_fail(stderr="Error: Variant unavailable for openrouter/m: xhigh")],
+        on_call=lambda: clock.__setitem__(0, clock[0] + 100),
+    )
+
+    result = _variant_provider("xhigh").run("x", timeout=100)
+
+    assert len(run_calls) == 1
+    assert result.success is False

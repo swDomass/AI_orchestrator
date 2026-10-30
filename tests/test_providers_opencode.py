@@ -13,6 +13,7 @@ raising), and temp-file cleanup.
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -560,75 +561,426 @@ def test_no_tag_no_picker_uses_static_default(monkeypatch):
     assert cmd[cmd.index("--model") + 1] == config.OPENCODE_DEFAULT_MODEL
 
 
+def _picker_on(monkeypatch, profile="zdr"):
+    monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "oc_pick_model.py")
+    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", profile)
+
+
+def _scripted_picker(monkeypatch, answers):
+    """Fake picker: ``answers`` maps a rung to ``(exit_code, stdout)`` or an
+    exception to raise; a rung not listed answers exit 5. Returns the call log."""
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        answer = answers.get(cmd[cmd.index("--stufe") + 1], (5, ""))
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(returncode=answer[0], stdout=answer[1])
+    monkeypatch.setattr(opencode_mod.subprocess, "run", _run)
+    return calls
+
+
+def _scripted_watchdog(monkeypatch, outcomes, on_call=None):
+    """Fake opencode runs: one entry of ``outcomes`` per start (an exception is
+    raised). Returns the call log; a start beyond the script fails the test."""
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if on_call:
+            on_call()
+        outcome = outcomes[len(calls) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _run)
+    return calls
+
+
+def _ok(text="OK"):
+    return SimpleNamespace(returncode=0, stdout=text, stderr="")
+
+
+def _fail(stdout="", stderr="", returncode=1):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _idle_kill():
+    exc = subprocess.TimeoutExpired("opencode", 1)
+    exc.timeout_kind = "idle"
+    return exc
+
+
+def _model_of(call):
+    cmd = call[0]
+    return cmd[cmd.index("--model") + 1]
+
+
+def _arg(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
+
+
 def test_picker_success_wins_over_default(monkeypatch):
     calls = []
     monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
-    monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "oc_pick_model.py")
-    monkeypatch.setattr(config, "OPENCODE_PICKER_PROFILE", "zdr")
-
-    picker_calls = []
-
-    def _fake_run(cmd, **kwargs):
-        picker_calls.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout="openrouter/zdr-review-long\n")
-    monkeypatch.setattr(opencode_mod.subprocess, "run", _fake_run)
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(monkeypatch, {"1": (0, "openrouter/zdr-review-long\n")})
 
     OpencodeProvider().run("review this")
 
-    assert picker_calls
     picker_cmd, picker_kwargs = picker_calls[0]
-    assert "--profile" in picker_cmd
-    assert picker_cmd[picker_cmd.index("--profile") + 1] == "zdr"
-    assert picker_kwargs["timeout"] == 90
+    assert picker_cmd == [
+        sys.executable, "-X", "utf8", "oc_pick_model.py", "--profile", "zdr",
+        "--aufgabe", "umsetzung", "--stufe", "1", "--dir", os.getcwd(),
+    ]
+    assert picker_kwargs["timeout"] == config.OPENCODE_PICKER_TIMEOUT_SEC
     cmd = calls[0][0]
     assert cmd[cmd.index("--model") + 1] == "openrouter/zdr-review-long"
 
 
-def test_picker_nonzero_exit_falls_back_to_default(monkeypatch):
+def test_picker_timeout_default_is_120_and_idle_default_is_600():
+    assert config.OPENCODE_PICKER_TIMEOUT_SEC == 120
+    assert config.OPENCODE_IDLE_TIMEOUT_SEC == 600
+
+
+@pytest.mark.parametrize("picker_answer,error", [
+    ((4, ""), "policy_block"),                       # was: fell back to the default
+    ((0, "some model\nwith noise"), "unreachable"),  # unusable stdout
+    (FileNotFoundError(), "unreachable"),            # picker script missing
+])
+def test_picker_failure_aborts_without_default_or_start(monkeypatch, picker_answer, error):
     calls = []
     monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
-    monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "oc_pick_model.py")
+    _picker_on(monkeypatch)
+    _scripted_picker(monkeypatch, {"1": picker_answer})
+
+    result = OpencodeProvider().run("review this")
+
+    assert calls == []
+    assert result.success is False
+    assert result.error == error
+
+
+# ── picker ladder (S7) ─────────────────────────────────────────────────────────
+
+_PICKER_AT_IMPORT = config.OPENCODE_MODEL_PICKER  # before any test fixture patches it
+
+
+def test_tests_never_start_the_real_picker():
+    """Group K: tests/conftest.py pins the picker empty before ``import config``;
+    without it a picker in .env makes every ``with_opencode`` test start the real script."""
+    assert _PICKER_AT_IMPORT == ""
+    assert os.environ.get("OPENCODE_MODEL_PICKER") == ""
+
+
+@pytest.mark.parametrize("read_only,aufgabe", [(True, "review"), (False, "umsetzung")])
+def test_task_kind_and_call_shape_follow_read_only(monkeypatch, tmp_path, read_only, aufgabe):
+    """Group A: read_only picks the task kind; call shape with an absolute --dir."""
+    _picker_on(monkeypatch, "open")
+    picker_calls = _scripted_picker(monkeypatch, {"1": (0, "openrouter/m1")})
+    _scripted_watchdog(monkeypatch, [_ok()])
+
+    OpencodeProvider().run("x", cwd=str(tmp_path), read_only=read_only)
+
+    cmd = picker_calls[0][0]
+    assert _arg(cmd, "--aufgabe") == aufgabe
+    assert _arg(cmd, "--profile") == "open"
+    assert _arg(cmd, "--stufe") == "1"
+    assert _arg(cmd, "--dir") == str(tmp_path)
+
+
+def test_picker_dir_is_made_absolute_and_falls_back_to_getcwd(monkeypatch):
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(monkeypatch, {"1": (0, "openrouter/m1")})
+    _scripted_watchdog(monkeypatch, [_ok(), _ok()])
+
+    OpencodeProvider().run("x", cwd="rel/dir")
+    OpencodeProvider().run("x")
+
+    assert _arg(picker_calls[0][0], "--dir") == os.path.abspath("rel/dir")
+    assert _arg(picker_calls[1][0], "--dir") == os.getcwd()
+
+
+@pytest.mark.parametrize("read_only,expected", [(True, True), (False, False)])
+def test_without_exploration_switch_only_for_review(monkeypatch, read_only, expected):
+    """Group L: review passes write no ledger line, so they must never get a challenger."""
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(monkeypatch, {"1": (5, ""), "2": (0, "openrouter/m2")})
+    _scripted_watchdog(monkeypatch, [_ok()])
+
+    OpencodeProvider().run("x", read_only=read_only)
+
+    assert len(picker_calls) == 2
+    for cmd, _ in picker_calls:
+        assert ("--ohne-erkundung" in cmd) is expected
+
+
+def test_rungs_are_asked_only_when_needed(monkeypatch):
+    """Group B: a rung-1 success never asks rung 2; a failed run asks it afterwards."""
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(
+        monkeypatch, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")}
+    )
+    run_calls = _scripted_watchdog(monkeypatch, [_ok()])
+    OpencodeProvider().run("x")
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1"]
+    assert len(run_calls) == 1
+
+    picker_calls.clear()
+    run_calls = _scripted_watchdog(monkeypatch, [_idle_kill(), _ok("second")])
+    result = OpencodeProvider().run("x")
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2"]
+    assert [_model_of(c) for c in run_calls] == ["openrouter/m1", "openrouter/m2"]
+    assert result.success is True and result.output == "second"
+
+
+@pytest.mark.parametrize("profile", ["zdr", "open"])
+def test_exit_5_is_not_an_error_but_the_next_rung(monkeypatch, profile):
+    """Group C: an unoccupied rung hands over to the next one under both profiles."""
+    _picker_on(monkeypatch, profile)
+    picker_calls = _scripted_picker(monkeypatch, {"1": (5, ""), "2": (0, "openrouter/m2")})
+    run_calls = _scripted_watchdog(monkeypatch, [_ok()])
+
+    result = OpencodeProvider().run("x")
+
+    assert result.success is True
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2"]
+    assert _model_of(run_calls[0]) == "openrouter/m2"
+
+
+@pytest.mark.parametrize("answer,error", [
+    ((4, ""), "policy_block"),
+    ((3, ""), "unreachable"),
+    ((6, ""), "unreachable"),
+    ((2, ""), "unreachable"),
+    ((1, ""), "unreachable"),
+    ((0, "two tokens"), "unreachable"),
+    (subprocess.TimeoutExpired("picker", 120), "unreachable"),
+    (OSError("gone"), "unreachable"),
+])
+def test_zdr_is_fail_closed_on_every_picker_failure(monkeypatch, answer, error):
+    """Group D: under zdr nothing but exit 5 may lead on; no start, no default, no rung 2."""
+    _picker_on(monkeypatch, "zdr")
+    picker_calls = _scripted_picker(
+        monkeypatch, {"1": answer, "2": (0, "openrouter/m2")}
+    )
+    run_calls = _scripted_watchdog(monkeypatch, [])
+
+    result = OpencodeProvider().run("x")
+
+    assert run_calls == []
+    assert len(picker_calls) == 1
+    assert (result.success, result.error) == (False, error)
+    assert config.OPENCODE_DEFAULT_MODEL not in result.output
+
+
+@pytest.mark.parametrize("profile", ["zdr", "open"])
+def test_exit_12_stale_prices_aborts_under_both_profiles(monkeypatch, profile):
+    """Group E: unlike exit 5, exit 12 does not move on to rung 2 -- not even under open."""
+    _picker_on(monkeypatch, profile)
+    picker_calls = _scripted_picker(monkeypatch, {"1": (12, ""), "2": (0, "openrouter/m2")})
+    run_calls = _scripted_watchdog(monkeypatch, [])
+
+    result = OpencodeProvider().run("x")
+
+    assert run_calls == []
+    assert len(picker_calls) == 1
+    assert (result.success, result.error) == (False, "unreachable")
+
+
+@pytest.mark.parametrize("profile", ["zdr", "open"])
+def test_all_rungs_unoccupied_is_unreachable_never_the_default(monkeypatch, profile):
+    """Group F."""
+    _picker_on(monkeypatch, profile)
+    picker_calls = _scripted_picker(monkeypatch, {})
+    run_calls = _scripted_watchdog(monkeypatch, [])
+
+    result = OpencodeProvider().run("x")
+
+    assert run_calls == []
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2", "ausweich"]
+    assert (result.success, result.error) == (False, "unreachable")
+    assert "keine Stufe belegt" in result.output
+
+
+@pytest.mark.parametrize("answer", [
+    (3, ""), (6, ""), (4, ""), (1, ""), (0, "two tokens"), subprocess.TimeoutExpired("picker", 120),
+])
+def test_open_profile_moves_on_after_a_picker_failure(monkeypatch, answer):
+    """Group G: under open a failing rung is skipped (the data-protection gate is zdr's)."""
+    _picker_on(monkeypatch, "open")
+    picker_calls = _scripted_picker(monkeypatch, {"1": answer, "2": (0, "openrouter/m2")})
+    run_calls = _scripted_watchdog(monkeypatch, [_ok()])
+
+    result = OpencodeProvider().run("x")
+
+    assert result.success is True
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2"]
+    assert _model_of(run_calls[0]) == "openrouter/m2"
+
+
+def test_open_profile_still_fails_closed_when_every_rung_fails(monkeypatch):
+    _picker_on(monkeypatch, "open")
+    _scripted_picker(monkeypatch, {"1": (3, ""), "2": (6, ""), "ausweich": (3, "")})
+    run_calls = _scripted_watchdog(monkeypatch, [])
+
+    result = OpencodeProvider().run("x")
+
+    assert run_calls == []
+    assert (result.success, result.error) == (False, "unreachable")
+
+
+@pytest.mark.parametrize("outcome,error", [
+    (_fail(stderr="429 too many requests"), "rate_limit"),
+    (_fail(stderr="401 unauthorized"), "auth_error"),
+    (subprocess.TimeoutExpired("opencode", 1), "timeout"),
+    (FileNotFoundError(), "opencode CLI not found"),
+    (OSError("cannot start"), "cannot start"),
+])
+def test_no_next_rung_after_rate_limit_auth_timeout_or_missing_cli(monkeypatch, outcome, error):
+    """Group H (stay): the next model would meet the same wall or the deadline is spent."""
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(
+        monkeypatch, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")}
+    )
+    run_calls = _scripted_watchdog(monkeypatch, [outcome, _ok()])
+
+    result = OpencodeProvider().run("x")
+
+    assert (result.success, result.error) == (False, error)
+    assert len(run_calls) == 1
+    assert len(picker_calls) == 1
+
+
+@pytest.mark.parametrize("outcome", [
+    _idle_kill(),                                     # hang
+    _fail(returncode=0, stdout=""),                   # empty output
+    _fail(stderr="UnknownError: boom"),               # unclassified
+    _fail(stderr="Zero data retention required"),     # policy_block from opencode
+])
+def test_next_rung_after_hang_empty_output_unclassified_or_policy_block(monkeypatch, outcome):
+    """Group H (go on)."""
+    _picker_on(monkeypatch)
+    _scripted_picker(monkeypatch, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")})
+    run_calls = _scripted_watchdog(monkeypatch, [outcome, _ok("fine")])
+
+    result = OpencodeProvider().run("x")
+
+    assert result.success is True and result.output == "fine"
+    assert [_model_of(c) for c in run_calls] == ["openrouter/m1", "openrouter/m2"]
+
+
+def test_failure_of_the_last_started_run_is_returned_when_no_rung_is_left(monkeypatch):
+    _picker_on(monkeypatch)
+    _scripted_picker(monkeypatch, {"1": (0, "openrouter/m1")})  # 2 and ausweich unoccupied
+    _scripted_watchdog(monkeypatch, [_idle_kill()])
+
+    result = OpencodeProvider().run("x")
+
+    assert (result.success, result.error) == (False, "hang")
+
+
+def test_repeated_model_on_a_later_rung_is_skipped_and_the_fallback_is_asked(monkeypatch):
+    """ADR-007: rung 2 answers the model rung 1 already ran -> never started twice."""
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(monkeypatch, {
+        "1": (0, "openrouter/m1"), "2": (0, "openrouter/m1"), "ausweich": (0, "openrouter/m3"),
+    })
+    run_calls = _scripted_watchdog(monkeypatch, [_idle_kill(), _ok("fine")])
+
+    result = OpencodeProvider().run("x")
+
+    assert result.success is True and result.output == "fine"
+    assert [_model_of(c) for c in run_calls] == ["openrouter/m1", "openrouter/m3"]
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2", "ausweich"]
+
+
+def test_every_remaining_rung_repeated_returns_the_last_result(monkeypatch):
+    """All later rungs repeat -> like 'no rung occupied': the failed run is the answer."""
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(monkeypatch, {
+        "1": (0, "openrouter/m1"), "2": (0, "openrouter/m1"), "ausweich": (0, "openrouter/m1"),
+    })
+    run_calls = _scripted_watchdog(monkeypatch, [_idle_kill()])
+
+    result = OpencodeProvider().run("x")
+
+    assert (result.success, result.error) == (False, "hang")
+    assert len(run_calls) == 1
+    assert len(picker_calls) == 3
+
+
+def test_forced_tag_skips_the_picker_and_never_moves_on(monkeypatch):
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(monkeypatch, {"1": (0, "openrouter/m1")})
+    run_calls = _scripted_watchdog(monkeypatch, [_idle_kill(), _ok()])
+    provider = OpencodeProvider()
+    provider._forced_model = "openrouter/forced"
+    try:
+        result = provider.run("x")
+    finally:
+        provider._forced_model = None
+
+    assert picker_calls == []
+    assert [_model_of(c) for c in run_calls] == ["openrouter/forced"]
+    assert result.error == "hang"
+
+
+def _fake_clock(monkeypatch):
+    clock = [1000.0]
     monkeypatch.setattr(
-        opencode_mod.subprocess, "run",
-        lambda *a, **kw: SimpleNamespace(returncode=4, stdout=""),
+        opencode_mod, "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: None),
+    )
+    return clock
+
+
+def test_ladder_shares_one_deadline_between_rungs(monkeypatch):
+    """Group I: rung 2 only gets what rung 1 left over."""
+    clock = _fake_clock(monkeypatch)
+    _picker_on(monkeypatch)
+    _scripted_picker(monkeypatch, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")})
+    run_calls = _scripted_watchdog(
+        monkeypatch, [_idle_kill(), _ok()], on_call=lambda: clock.__setitem__(0, clock[0] + 100)
     )
 
-    OpencodeProvider().run("review this")
+    OpencodeProvider().run("x", timeout=500)
 
-    cmd = calls[0][0]
-    assert cmd[cmd.index("--model") + 1] == config.OPENCODE_DEFAULT_MODEL
+    assert [c[1]["hard_timeout"] for c in run_calls] == [500, 400]
 
 
-def test_picker_garbage_output_falls_back_to_default(monkeypatch):
-    """Multi-line / whitespace-containing stdout does not look like a single
-    model-id token and must be discarded even at exit 0."""
-    calls = []
-    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
-    monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "oc_pick_model.py")
-    monkeypatch.setattr(
-        opencode_mod.subprocess, "run",
-        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="some model\nwith noise"),
+def test_no_further_rung_below_60_seconds_remaining(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    _picker_on(monkeypatch)
+    picker_calls = _scripted_picker(
+        monkeypatch, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")}
+    )
+    run_calls = _scripted_watchdog(
+        monkeypatch, [_idle_kill(), _ok()], on_call=lambda: clock.__setitem__(0, clock[0] + 100)
     )
 
-    OpencodeProvider().run("review this")
+    result = OpencodeProvider().run("x", timeout=150)  # 50 s left after rung 1
 
-    cmd = calls[0][0]
-    assert cmd[cmd.index("--model") + 1] == config.OPENCODE_DEFAULT_MODEL
+    assert len(run_calls) == 1
+    assert len(picker_calls) == 1  # not even asked
+    assert (result.success, result.error) == (False, "hang")
 
 
-def test_picker_raising_falls_back_to_default(monkeypatch):
-    calls = []
-    monkeypatch.setattr(opencode_mod, "run_with_watchdog", _fake_watchdog(calls))
-    monkeypatch.setattr(config, "OPENCODE_MODEL_PICKER", "missing_script.py")
+def test_ladder_logs_each_rung_and_warns_on_picker_exit(monkeypatch, caplog):
+    """Group J."""
+    _picker_on(monkeypatch, "open")
+    _scripted_picker(monkeypatch, {"1": (3, ""), "2": (0, "openrouter/m2")})
+    _scripted_watchdog(monkeypatch, [_ok()])
 
-    def _raise(*a, **kw):
-        raise FileNotFoundError()
-    monkeypatch.setattr(opencode_mod.subprocess, "run", _raise)
+    with caplog.at_level("INFO", logger="providers.opencode"):
+        OpencodeProvider().run("x", read_only=True)
 
-    OpencodeProvider().run("review this")
-
-    cmd = calls[0][0]
-    assert cmd[cmd.index("--model") + 1] == config.OPENCODE_DEFAULT_MODEL
+    infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "[opencode] Wähler review/open Stufe 2 → openrouter/m2" in infos
+    assert any("Stufe 1" in m and "Exit 3" in m for m in warnings)
+    assert any("extern-review/openrouter/m2" in m for m in infos)
 
 
 # ── error classification ────────────────────────────────────────────────────────

@@ -140,6 +140,10 @@ if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
     # over VAULT_PATH). "" is falsy there and blocks _load_dotenv (key already set).
     os.environ["ORCH_QUEUE_FILE"] = ""
 
+# A picker set in .env would make every test with `with_opencode` start the real
+# oc_pick_model.py (a probe call). "" is falsy in config and blocks _load_dotenv.
+os.environ["OPENCODE_MODEL_PICKER"] = ""
+
 # Harness-index sources (harness_index.py, 2026-10-09): the suite must never read
 # the real ~/.claude/projects, ~/.codex/sessions, opencode.db, ledger or marker
 # file, nor write the real logs/harness-index.sqlite. Set as environment variables

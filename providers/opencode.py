@@ -105,6 +105,16 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # token -- no whitespace, no multi-line noise, capped so a runaway/garbage
 # response can't be treated as a model id.
 _PICKER_TOKEN_RE = re.compile(r"^\S{1,200}$")
+# Picker ladder (S7). Exit codes of oc_pick_model.py that matter here; the
+# pseudo codes stand for "no exit code" (timeout/OSError) and "exit 0, unusable stdout".
+_PICKER_STUFEN = ("1", "2", "ausweich")
+_PICKER_CONFIG = 4
+_PICKER_UNOCCUPIED = 5
+_PICKER_STALE_PRICES = 12
+_PICKER_FAILED = -1
+_PICKER_UNUSABLE = -2
+# Less remaining total time than this: no further rung (a rung needs minutes).
+_MIN_STAGE_SEC = 60
 
 # --- Error classification: the two directions are NOT symmetric ---------------
 #
@@ -128,9 +138,16 @@ _PICKER_TOKEN_RE = re.compile(r"^\S{1,200}$")
 #   false auth_error "stamps the task terminally failed and no retry ever
 #   happens". Measured, it does not: `grep -rn auth_error` finds no consumer
 #   outside taxonomy.py's category map, and an UNclassified error reaches the
-#   same non-transient outcome via error_code_of() == "". The difference between
-#   auth_error and a generic failure is therefore ONLY the label in analytics --
-#   the task's fate is identical either way.
+#   same non-transient outcome via error_code_of() == "". For the orchestrator,
+#   auth_error and a generic failure differ only by label.
+#   Inside the picker ladder the class does decide the fate: hang, empty output,
+#   an unclassified error and policy_block from opencode go on to the next rung;
+#   rate_limit, auth_error, timeout, prompt_too_large and a missing CLI do not.
+#   Cost: worst case ladder (3 rungs) x MAX_RETRIES_PER_PROVIDER (2) paid runs
+#   per pass; a hang at the end of the ladder requeues the task up to
+#   MAX_HANG_RETRIES (2) times and each pass runs the ladder again:
+#   3 x 2 x (1 + 2) = 18 paid runs per task, capped by the daily budget and
+#   OPENCODE_MIN_REMAINING_USD (0.25).
 #
 #   And a label is a bad thing to pay a false positive for. Hence the split
 #   below: the auth check reads STDERR ONLY, never the agent's answer. Measured
@@ -401,43 +418,88 @@ class OpencodeProvider(BaseProvider):
         return env
 
     @staticmethod
-    def _run_picker() -> str | None:
-        """Invoke the (optional) external model picker; None on anything but
-        a clean single-token success.
+    def _ask_picker(aufgabe: str, stufe: str, cwd: str | None) -> tuple[int, str | None]:
+        """Ask the external model picker for one rung of its ladder.
+
+        Returns ``(exit_code, model_id | None)``. The model id is set only for
+        exit 0 with a clean single-token stdout. Pseudo codes for what has no exit
+        code: ``_PICKER_FAILED`` (timeout/OSError), ``_PICKER_UNUSABLE`` (exit 0,
+        stdout not a single token). The caller decides what each code means --
+        this function never falls back to anything.
 
         ``config.OPENCODE_MODEL_PICKER`` defaults to "" -- the picker script
         lives in ``~/.claude/scripts`` and is simply absent on a fresh
-        machine, which is the NORMAL case, not a degraded one.
+        machine, which is the NORMAL case; ``run`` does not call this then.
         """
-        picker = config.OPENCODE_MODEL_PICKER
-        if not picker:
-            return None
+        directory = os.path.abspath(cwd) if cwd else os.getcwd()
+        cmd = [
+            sys.executable, "-X", "utf8", config.OPENCODE_MODEL_PICKER,
+            "--profile", config.OPENCODE_PICKER_PROFILE,
+            "--aufgabe", aufgabe, "--stufe", stufe, "--dir", directory,
+        ]
+        if aufgabe == "review":
+            # Review passes write no ledger line, so a challenger probe would
+            # never be measured -- the picker must not spend them on it.
+            cmd.append("--ohne-erkundung")
         try:
             result = subprocess.run(
-                [sys.executable, "-X", "utf8", picker, "--profile", config.OPENCODE_PICKER_PROFILE],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
+                cmd, capture_output=True, text=True,
+                timeout=config.OPENCODE_PICKER_TIMEOUT_SEC, check=False,
             )
         except (OSError, subprocess.SubprocessError):
-            return None
+            return _PICKER_FAILED, None
         if result.returncode != 0:
-            return None
+            return result.returncode, None
         token = (result.stdout or "").strip()
-        return token if _PICKER_TOKEN_RE.match(token) else None
+        return (0, token) if _PICKER_TOKEN_RE.match(token) else (_PICKER_UNUSABLE, None)
 
-    def _resolve_model(self) -> str:
-        """Resolution order: forced tag (``#opencode_<alias>``, already
-        resolved to a full CLI id upstream via ``config.model_id_for_provider``)
-        > picker script > static default. The default is the NORMAL outcome
-        for a fresh setup, not a last resort -- see ``_run_picker``."""
-        if self._forced_model:
-            return self._forced_model
-        picked = self._run_picker()
-        if picked:
-            return picked
-        return config.OPENCODE_DEFAULT_MODEL
+    def _next_pick(
+        self, aufgabe: str, stufen: list[str], cwd: str | None, tried: set[str],
+    ) -> tuple[str, str] | RunResult:
+        """Next usable ``(stufe, model)`` from ``stufen`` (consumed in place), or
+        the ``RunResult`` that ends the run without starting opencode.
+
+        ``tried`` holds the models this run already handed out: the three rung
+        calls are not atomic (a parallel pass can shift the picker's exploration
+        beat in between), so a repeated model is skipped like exit 5, never
+        started twice (ADR-007).
+
+        Exit 5 (rung unoccupied) always means "next rung". Exit 12 (price data
+        stale) aborts under every profile. Under ``zdr`` any other failure aborts
+        fail-closed (4 -> ``policy_block``, else ``unreachable``): a customer-code
+        pass never runs on a model nobody vetted. Under ``open`` the next rung
+        is tried. There is never a fall back to ``OPENCODE_DEFAULT_MODEL`` here.
+        """
+        profile = config.OPENCODE_PICKER_PROFILE
+        notes: list[str] = []
+        while stufen:
+            stufe = stufen.pop(0)
+            code, model = self._ask_picker(aufgabe, stufe, cwd)
+            logger.info("[opencode] Wähler %s/%s Stufe %s → %s", aufgabe, profile, stufe, model or "-")
+            if model and model in tried:
+                notes.append(f"Stufe {stufe}: {model} doppelt")
+                logger.info("[opencode] Wähler %s/%s Stufe %s: %s schon versucht, übersprungen", aufgabe, profile, stufe, model)
+                continue
+            if model:
+                tried.add(model)
+                return stufe, model
+            if code != 0:
+                logger.warning("[opencode] Wähler %s/%s Stufe %s: Exit %s", aufgabe, profile, stufe, code)
+            note = f"Stufe {stufe}: Exit {code}"
+            if code == _PICKER_UNOCCUPIED:
+                notes.append(note + " (unbelegt)")
+                continue
+            if code == _PICKER_STALE_PRICES or profile == "zdr":
+                return RunResult(
+                    success=False,
+                    error="policy_block" if code == _PICKER_CONFIG and profile == "zdr" else "unreachable",
+                    output=f"Wähler {aufgabe}/{profile} {note}; kein opencode-Start",
+                )
+            notes.append(note)
+        return RunResult(
+            success=False, error="unreachable",
+            output=f"Wähler {aufgabe}/{profile}: keine Stufe belegt ({'; '.join(notes)})",
+        )
 
     def run(
         self,
@@ -465,18 +527,66 @@ class OpencodeProvider(BaseProvider):
                 ),
             )
 
-        model = self._resolve_model()
         agent = "extern-review" if read_only else "extern-dev"
-        effort = self._forced_effort
+        aufgabe = "review" if read_only else "umsetzung"
         # PWD and Popen cwd must name the same absolute dir.
         cwd = os.path.abspath(cwd) if cwd else cwd
-
-        print(f"  [opencode → {agent}/{model}] Führe Task aus...")
+        # Model resolution: forced tag > picker ladder > static default. A forced
+        # tag bypasses the picker; the default is only the answer WITHOUT a picker
+        # (fresh machine) -- with one configured it is never a fallback.
+        use_picker = bool(config.OPENCODE_MODEL_PICKER) and not self._forced_model
+        stufen = list(_PICKER_STUFEN) if use_picker else []
 
         prompt_path = None
         try:
             prompt_path = _write_prompt_file(task)
+            started: float | None = None  # first opencode start; the deadline runs from it
+            last: RunResult | None = None
+            tried: set[str] = set()  # models the picker already handed out in this run
 
+            def _left() -> int:
+                return timeout if started is None else int(timeout - (time.monotonic() - started))
+
+            while True:
+                if last is not None and _left() < _MIN_STAGE_SEC:
+                    return last
+                if use_picker:
+                    pick = self._next_pick(aufgabe, stufen, cwd, tried)
+                    if isinstance(pick, RunResult):
+                        # Rungs used up/refused after a run that gave no result:
+                        # that run's failure is the more useful answer.
+                        return last or pick
+                    model = pick[1]
+                    if last is not None and _left() < _MIN_STAGE_SEC:
+                        return last  # the picker itself ate the remaining time
+                else:
+                    model = self._forced_model or config.OPENCODE_DEFAULT_MODEL
+
+                logger.info("[opencode → %s/%s] Führe Task aus...", agent, model)
+                left = _left()  # first rung: the full timeout, before the clock starts
+                if started is None:
+                    started = time.monotonic()
+                result, advance = self._execute(
+                    model, agent, effort=self._forced_effort, cwd=cwd,
+                    prompt_path=prompt_path, hard_timeout=left,
+                )
+                if result.success or not advance or not use_picker:
+                    return result
+                last = result
+        finally:
+            if prompt_path:
+                _unlink_quiet(prompt_path)
+
+    def _execute(
+        self, model: str, agent: str, *, effort: str | None, cwd: str | None,
+        prompt_path: str, hard_timeout: int,
+    ) -> tuple[RunResult, bool]:
+        """One opencode run. ``(result, advance)``: ``advance`` is True when a
+        failure without result is worth a different model (hang, empty output,
+        unclassified error, policy_block from opencode). Never for rate_limit,
+        auth_error, timeout, a missing CLI or a start error -- those would hit
+        the next model just the same or are spent on the deadline."""
+        try:
             def _attempt(eff: str | None):
                 cmd = self._build_command(
                     _OPENCODE_EXE, model, agent, effort=eff, prompt_path=prompt_path
@@ -489,7 +599,7 @@ class OpencodeProvider(BaseProvider):
                     input_text=None,
                     cwd=cwd,
                     idle_timeout=config.OPENCODE_IDLE_TIMEOUT_SEC,
-                    hard_timeout=timeout,
+                    hard_timeout=hard_timeout,
                     shell=False,
                     env=self._build_env(cwd),
                 )
@@ -519,22 +629,23 @@ class OpencodeProvider(BaseProvider):
             stderr = _strip_ansi(result.stderr or "").strip()
 
             if result.returncode == 0 and output:
-                return RunResult(success=True, output=output)
+                return RunResult(success=True, output=output), False
 
             # exit 1 is ambiguous by itself (see module docstring) -- classify
             # from the actual content instead of trusting the return code.
             combined = f"{output} {stderr}".lower()
 
             if "data policy" in combined or "zero data retention" in combined:
-                return RunResult(success=False, error="policy_block", output=output or stderr)
+                return RunResult(success=False, error="policy_block", output=output or stderr), True
             if _looks_rate_limited(combined):
-                return RunResult(success=False, error="rate_limit", output=output or stderr)
+                return RunResult(success=False, error="rate_limit", output=output or stderr), False
             # stderr only, deliberately narrower than the two checks above --
             # the reasoning is in the comment block over _AUTH_TEXT: this code
-            # buys a label, not a different fate, so it must not be earned by
-            # words the agent itself wrote.
+            # buys a label (inside the ladder a generic failure
+            # advances to the next rung, auth_error does not), so it must not be
+            # earned by words the agent itself wrote.
             if _looks_auth_failed(stderr.lower()):
-                return RunResult(success=False, error="auth_error", output=output or stderr)
+                return RunResult(success=False, error="auth_error", output=output or stderr), False
 
             # The agent's answer belongs in `output`, never in `error`. The old
             # `error=stderr or output` put a whole review text into the field
@@ -546,7 +657,7 @@ class OpencodeProvider(BaseProvider):
                 success=False,
                 error=stderr or (f"exit {result.returncode} without stderr" if output else "empty output"),
                 output=output or stderr,
-            )
+            ), True
 
         except subprocess.TimeoutExpired as exc:
             kind = getattr(exc, "timeout_kind", "hard")
@@ -560,11 +671,9 @@ class OpencodeProvider(BaseProvider):
                 "provider path -- no sweeper built).",
                 "idle" if kind == "idle" else "hard",
             )
-            return RunResult(success=False, error="hang" if kind == "idle" else "timeout")
+            idle = kind == "idle"
+            return RunResult(success=False, error="hang" if idle else "timeout"), idle
         except FileNotFoundError:
-            return RunResult(success=False, error="opencode CLI not found")
+            return RunResult(success=False, error="opencode CLI not found"), False
         except (OSError, ValueError) as e:
-            return RunResult(success=False, error=str(e))
-        finally:
-            if prompt_path:
-                _unlink_quiet(prompt_path)
+            return RunResult(success=False, error=str(e)), False

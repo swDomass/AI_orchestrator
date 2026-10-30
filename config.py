@@ -457,11 +457,12 @@ VIBE_READONLY_MAX_TURNS = _parse_int_env("VIBE_READONLY_MAX_TURNS", 1)
 # required agents (extern-review/extern-dev) exist in opencode.json — see
 # providers/opencode.py. Never part of the fallback chain (Stufe 3, not
 # built): activation needs an explicit #opencode / #opencode_<alias> tag.
-# Byte-only liveness like Vibe/Codex (no NDJSON tool-aware signal) — 300s
-# instead of the CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC default of 1200s because
-# measured normal runs finish in 8-21s with the longest observed silence at
-# 46-58s, so 300s already sits at ~5x the worst observed gap.
-OPENCODE_IDLE_TIMEOUT_SEC = _parse_int_env("OPENCODE_IDLE_TIMEOUT_SEC", 300)
+# Byte-only liveness like Vibe/Codex (no NDJSON tool-aware signal) — 600s
+# instead of the CLI_IDLE_TIMEOUT_NO_LIVENESS_SEC default of 1200s. Was 300s
+# (normal runs of the old default model finished in 8-21s); the picker now also
+# hands out slower models: /dev-loop measurement, 300s would have killed 8 of 36
+# successful glm runs.
+OPENCODE_IDLE_TIMEOUT_SEC = _parse_int_env("OPENCODE_IDLE_TIMEOUT_SEC", 600)
 # Prompt travels via a `-f` temp file, not stdin (see providers/opencode.py).
 # A file outside the radius (PWD, set to the cwd by the provider, plus its git root) cannot be reread by either agent once attached
 # (external_directory: deny is the LAST matching permission rule, measured
@@ -475,10 +476,14 @@ OPENCODE_MAX_PROMPT_BYTES = _parse_int_env("OPENCODE_MAX_PROMPT_BYTES", 50_000)
 # "zdr" restricts picks to opencode.json aliases carrying
 # data_collection:"deny" AND zdr:true — the only aliases safe for customer code.
 OPENCODE_PICKER_PROFILE = os.getenv("OPENCODE_PICKER_PROFILE", "zdr")
-# Absolute path to oc_pick_model.py. Empty by default and NOT a last resort:
-# the picker lives in ~/.claude/scripts and is simply absent on a fresh
-# machine, where OPENCODE_DEFAULT_MODEL below is the normal resolution path.
+# Absolute path to oc_pick_model.py. Empty by default: the picker lives in
+# ~/.claude/scripts and is simply absent on a fresh machine. With a picker set
+# it decides every run (ladder 1 -> 2 -> ausweich, exits fail-closed under zdr).
 OPENCODE_MODEL_PICKER = os.getenv("OPENCODE_MODEL_PICKER", "")
+# Each picker call (it probes the candidate once) must finish within this.
+OPENCODE_PICKER_TIMEOUT_SEC = _parse_int_env("OPENCODE_PICKER_TIMEOUT_SEC", 120)
+# Notnagel ONLY without a picker (OPENCODE_MODEL_PICKER empty). With a picker
+# there is no fall back to it -- a failing picker aborts the run instead.
 OPENCODE_DEFAULT_MODEL = os.getenv("OPENCODE_DEFAULT_MODEL", "openrouter/zdr-review")
 # opencode's own config file — read-only from here, never written to. Machine-
 # local agent/model setup stays with the user; see doctor's WARN-only check.

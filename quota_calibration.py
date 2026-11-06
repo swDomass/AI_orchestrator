@@ -117,26 +117,17 @@ def _load_entries(load_hours: int) -> list | None:
     Returns ``None`` when claude-monitor is missing or its loader raises —
     callers must handle the None case as "claude-monitor unavailable".
 
-    Credit-billed runs (ledger ``logs/claude-api-runs.jsonl``) are filtered out:
+    Credit-billed runs (ledger ``logs/claude-api-runs.jsonl``) and folders in
+    ``config.QUOTA_EXCLUDE_DIRS`` are filtered out (``claude_billing.load_subscription_entries``):
     they do not count against the subscription quota and must not shift the factors.
     """
     try:
-        from claude_monitor.core.models import CostMode
-        from claude_monitor.data.reader import load_usage_entries
+        return claude_billing.load_subscription_entries(load_hours)
     except ImportError:
         return None
     except Exception as exc:
-        # claude-monitor is installed but broken (e.g. dep conflict on import) —
-        # mirror _get_claude_limits_from_local's logging style.
-        logger.debug("calibration: claude-monitor import raised: %s", exc)
+        logger.debug("calibration: loading usage entries failed: %s", exc)
         return None
-
-    try:
-        entries, _ = load_usage_entries(hours_back=load_hours, mode=CostMode.AUTO)
-    except Exception as exc:
-        logger.debug("calibration: load_usage_entries failed: %s", exc)
-        return None
-    return claude_billing.filter_api_entries(entries)
 
 
 def _filter_entries_for_window(

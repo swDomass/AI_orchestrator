@@ -1119,9 +1119,7 @@ def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
         logger.debug("CLAUDE_PLAN=%r not recognised — skipping local fallback", plan)
         return None
     try:
-        from claude_monitor.core.models import CostMode
         from claude_monitor.data.analyzer import SessionAnalyzer
-        from claude_monitor.data.reader import load_usage_entries
     except ImportError:
         logger.debug("claude-monitor not installed — skipping local fallback")
         return None
@@ -1130,9 +1128,8 @@ def _get_claude_limits_from_local(plan: str) -> "ProviderLimits | None":
         return None
     try:
         import datetime as _dt
-        entries, _ = load_usage_entries(hours_back=10, mode=CostMode.AUTO)
-        # Credit-billed runs do not count against the subscription window.
-        entries = claude_billing.filter_api_entries(entries)
+        # Credit-billed runs and excluded folders (other account) do not count.
+        entries = claude_billing.load_subscription_entries(10)
         if not entries:
             logger.debug("No claude-monitor usage entries found in last 10h")
             return None

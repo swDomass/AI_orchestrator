@@ -469,6 +469,7 @@ def _isolate_claude_api_credits(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("config.CLAUDE_API_STATE_FILE", tmp_path / "claude-api-state.json", raising=False)
     monkeypatch.setattr("config.CLAUDE_API_RUNS_FILE", tmp_path / "claude-api-runs.jsonl", raising=False)
     monkeypatch.setattr("config.CLAUDE_PROJECTS_DIR", tmp_path / "claude-projects", raising=False)
+    monkeypatch.setattr("config.QUOTA_EXCLUDE_DIRS", [], raising=False)  # a real .env must not change tests
     monkeypatch.setattr("claude_billing._mem_state", [None], raising=False)  # no mirror leaks on
     yield
 

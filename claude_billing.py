@@ -444,3 +444,55 @@ def filter_api_entries(entries: list) -> list:
     if not ids:
         return entries
     return [e for e in entries if getattr(e, "message_id", None) not in ids]
+
+
+def _project_slug(path: str) -> str:
+    """Folder name Claude Code uses under ``projects/`` for a working directory."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def load_subscription_entries(hours_back: int) -> list:
+    """Usage entries that count against this subscription, from claude-monitor.
+
+    Drops credit-billed runs (``filter_api_entries``) and, when
+    ``config.QUOTA_EXCLUDE_DIRS`` is set, every project folder whose name equals the
+    slug of an excluded path or starts with ``<slug>-`` (sub-folders). Known limit:
+    that prefix also matches sibling folders such as ``LE_Python_alt`` for ``LE_Python``.
+    Raises ImportError / loader exceptions to the caller.
+    """
+    from claude_monitor.core.models import CostMode  # noqa: PLC0415 - lazy: optional dependency
+    from claude_monitor.data.reader import load_usage_entries  # noqa: PLC0415
+
+    slugs = [_project_slug(p).lower() for p in config.QUOTA_EXCLUDE_DIRS]
+    if not slugs:
+        entries, _ = load_usage_entries(hours_back=hours_back, mode=CostMode.AUTO)
+        return filter_api_entries(entries)
+    merged: list = []
+    root = Path(config.CLAUDE_PROJECTS_DIR)
+    reader_log = logging.getLogger("claude_monitor.data.reader")  # INFO "Processed ..." per folder
+    prev_level = reader_log.level
+    reader_log.setLevel(max(prev_level, logging.WARNING))
+    try:
+        for folder in sorted(root.iterdir()) if root.is_dir() else []:
+            name = folder.name.lower()
+            if not folder.is_dir() or any(name == s or name.startswith(s + "-") for s in slugs):
+                continue
+            if next(folder.rglob("*.jsonl"), None) is None:  # nothing to load: skip the call
+                continue
+            part, _ = load_usage_entries(data_path=str(folder), hours_back=hours_back, mode=CostMode.AUTO)
+            merged.extend(part)
+    finally:
+        reader_log.setLevel(prev_level)
+    merged.sort(key=lambda e: e.timestamp)
+    seen: set[tuple[str, str]] = set()
+    unique: list = []
+    for e in merged:
+        key = (getattr(e, "message_id", None) or "", getattr(e, "request_id", None) or "")
+        # claude_monitor.data.reader._create_unique_hash dedupes only with both ids present; missing ones
+        # become message_id="" / request_id="unknown" in the entry, so those must not collapse into one key.
+        if key[0] and key[1] and key[1] != "unknown":
+            if key in seen:
+                continue
+            seen.add(key)
+        unique.append(e)
+    return filter_api_entries(unique)

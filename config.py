@@ -1024,6 +1024,15 @@ CLAUDE_API_RUNS_FILE = Path(__file__).parent / "logs" / "claude-api-runs.jsonl"
 CLAUDE_BILLING_MODE_FILE = Path(__file__).parent / "logs" / "claude-billing-mode.json"
 # Transcripts of the Claude CLI (message IDs incl. subagents, see ADR 005).
 CLAUDE_PROJECTS_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+# Folders whose Claude sessions run under a different account (e.g. a work login) but
+# write their transcripts into the shared projects dir above. Their sessions must not
+# count in the local estimate of this subscription (claude_billing.load_subscription_entries).
+# ORCH_QUOTA_EXCLUDE_DIRS: absolute paths separated by ";". Empty = nothing excluded.
+# Must match the folder list of the launcher that selects the other account - both pull together.
+# A trailing path separator is stripped (it would change the slug and silently disable the exclusion).
+QUOTA_EXCLUDE_DIRS: list[str] = [
+    q for p in os.getenv("ORCH_QUOTA_EXCLUDE_DIRS", "").split(";") if (q := p.strip().rstrip("\\/"))
+]
 
 
 # --- Parallel Worktrees (P1) ---

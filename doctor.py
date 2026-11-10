@@ -164,7 +164,7 @@ def check_vibe_cli() -> CheckResult:
 
 def check_opencode_cli() -> CheckResult:
     """opencode is optional (Stufe 2, tag-activated) — every finding here is a
-    WARN, never a FAIL, same posture as check_vibe_cli(). Six independent
+    WARN, never a FAIL, same posture as check_vibe_cli(). Seven independent
     checks, because the point of this one is opencode's real ZDR/budget
     contract, not just "is the binary there":
 
@@ -181,7 +181,8 @@ def check_opencode_cli() -> CheckResult:
        restriction actually lives (on the alias, not the raw model id), so a
        tag resolving straight to a bare model id would ship without it.
     3b. ``config.OPENCODE_DEFAULT_MODEL`` (what a ``#opencode`` task without an
-       alias tag actually uses) passes the same contract check as the tag
+       alias tag actually uses, but only while ``OPENCODE_MODEL_PICKER`` is
+       unset) passes the same contract check as the tag
        aliases above — a target opencode cannot resolve does not error, it
        hangs at init (measured 2026-09-04: no exit, no output, watchdog
        idle-kill instead of a diagnosable failure). Skipped when it is
@@ -196,6 +197,13 @@ def check_opencode_cli() -> CheckResult:
        ``AllLimits.opencode`` is permanently ``available=False`` and opencode
        never routes (see ``limits._opencode_budget_snapshot()``'s
        ``"uncapped_key"`` branch).
+
+    6. ``config.OPENCODE_MODEL_PICKER``, when set, points at an existing
+       file — otherwise ``python <path>`` exits 2 on every run and (under either
+       profile) each ``#opencode`` task without a tag ends without a start.
+       Under zdr the first rung aborts, under open ``_next_pick`` walks all
+       rungs and ends ``unreachable``. While a
+       picker is set, the default-model finding of 3b says "unused".
 
     opencode.json is READ ONLY here — same as providers/opencode.py's own
     ``_load_opencode_config()`` — never written to (machine-local setup stays
@@ -232,7 +240,8 @@ def check_opencode_cli() -> CheckResult:
         findings.append("ZDR-Alias-Vertrag verletzt: " + "; ".join(alias_problems))
 
     # config.OPENCODE_DEFAULT_MODEL is what every #opencode task WITHOUT an
-    # alias tag actually resolves to — unlike the three checks above, an
+    # alias tag actually resolves to, but only while OPENCODE_MODEL_PICKER is
+    # unset (with a picker it is unused, see `use` below) — unlike the three checks above, an
     # unresolvable target here does not surface as an error at all: measured
     # 2026-09-04, three otherwise-identical runs in the same empty directory —
     # a nonexistent `--model` produced no exit and no output (last log line
@@ -250,12 +259,27 @@ def check_opencode_cli() -> CheckResult:
     default_model = config.OPENCODE_DEFAULT_MODEL
     if default_model not in config.OPENCODE_MODEL_ALIASES.values():
         if (default_problem := _zdr_contract_violation(cfg, default_model)):
+            use = (
+                "greift nur ohne OPENCODE_MODEL_PICKER (heute gesetzt, also ungenutzt)"
+                if config.OPENCODE_MODEL_PICKER
+                else "jeder #opencode-Task ohne Alias-Tag nutzt genau dieses Modell"
+            )
             findings.append(
                 f"Standardmodell OPENCODE_DEFAULT_MODEL ({default_model}) {default_problem} "
-                "— jeder #opencode-Task ohne Alias-Tag nutzt genau dieses Modell; ein nicht "
+                f"— {use}; ein nicht "
                 "aufloesbares Modell haengt (kein Fehler, Idle-Timeout + Hang-Retry bis "
                 "MAX_HANG_RETRIES, dann blockiert), statt sauber zu scheitern"
             )
+
+    # A set-but-missing picker script makes `python <path>` exit 2 on every run;
+    # under either profile each #opencode task without a tag then ends as
+    # unreachable without a start (zdr aborts at the first rung, open walks all).
+    picker = config.OPENCODE_MODEL_PICKER
+    if picker and not Path(picker).is_file():
+        findings.append(
+            f"Waehler OPENCODE_MODEL_PICKER ({picker}) fehlt — jeder #opencode-Auftrag "
+            "ohne Tag endet ohne Start"
+        )
 
     # The small model is THE documented bypass: opencode picks it itself when
     # `small_model` is unset, and 9 measured runs went straight to Google resp.

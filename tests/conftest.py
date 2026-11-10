@@ -143,6 +143,10 @@ if not os.environ.get("_ORCH_TEST_DISABLE_MEMORY_DOCS_ISOLATION"):
 # A picker set in .env would make every test with `with_opencode` start the real
 # oc_pick_model.py (a probe call). "" is falsy in config and blocks _load_dotenv.
 os.environ["OPENCODE_MODEL_PICKER"] = ""
+# Same for the timeouts: tests pin the defaults (120 / 600), a .env or shell value
+# would turn them red. "" -> _parse_int_env falls back to the default.
+os.environ["OPENCODE_PICKER_TIMEOUT_SEC"] = ""
+os.environ["OPENCODE_IDLE_TIMEOUT_SEC"] = ""
 
 # Harness-index sources (harness_index.py, 2026-10-09): the suite must never read
 # the real ~/.claude/projects, ~/.codex/sessions, opencode.db, ledger or marker

@@ -258,6 +258,42 @@ def test_check_opencode_cli_no_duplicate_finding_when_default_matches_alias():
     assert r.message.count("zdr-review-alt") == 1
 
 
+def test_check_opencode_cli_warns_when_picker_file_is_missing(tmp_path):
+    # Gegenprobe: Prüfung streichen -> PASS statt WARN; Pfad der Meldung weglassen -> Pfad-Assert rot.
+    missing = str(tmp_path / "oc_pick_model.py")
+    p1, p2, p3, p4 = _patch_opencode_check(_valid_opencode_cfg())
+    with p1, p2, p3, p4, patch.object(config, "OPENCODE_MODEL_PICKER", missing):
+        r = doctor.check_opencode_cli()
+    assert r.status == doctor.WARN
+    assert "OPENCODE_MODEL_PICKER" in r.message
+    assert missing in r.message
+
+
+def test_check_opencode_cli_no_picker_finding_when_file_exists(tmp_path):
+    # Gegenprobe: is_file() durch "picker nicht leer" ersetzen -> WARN trotz vorhandener Datei.
+    picker = tmp_path / "oc_pick_model.py"
+    picker.write_text("", encoding="utf-8")
+    p1, p2, p3, p4 = _patch_opencode_check(_valid_opencode_cfg())
+    with p1, p2, p3, p4, patch.object(config, "OPENCODE_MODEL_PICKER", str(picker)):
+        r = doctor.check_opencode_cli()
+    assert r.status == doctor.PASS
+
+
+def test_default_model_finding_says_unused_when_a_picker_is_set(tmp_path):
+    # Gegenprobe: alten Text ("jeder #opencode-Task ... nutzt genau dieses Modell") wiederherstellen.
+    picker = tmp_path / "oc_pick_model.py"
+    picker.write_text("", encoding="utf-8")
+    p1, p2, p3, p4 = _patch_opencode_check(_valid_opencode_cfg())
+    with (
+        p1, p2, p3, p4,
+        patch.object(config, "OPENCODE_MODEL_PICKER", str(picker)),
+        patch.object(config, "OPENCODE_DEFAULT_MODEL", "openrouter/does-not-exist-default"),
+    ):
+        r = doctor.check_opencode_cli()
+    assert "ungenutzt" in r.message
+    assert "nutzt genau dieses Modell" not in r.message
+
+
 def test_check_opencode_cli_warns_on_missing_small_model():
     """4. Top-level small_model unset — the small-model path can bypass both
     the $ cap and ZDR (measured: 4x Google, 5x opencode Zen)."""

@@ -647,7 +647,9 @@ def test_picker_success_wins_over_default(monkeypatch):
     assert cmd[cmd.index("--model") + 1] == "openrouter/zdr-review-long"
 
 
+# Gegenprobe: Pinnung in conftest.py streichen + OPENCODE_PICKER_TIMEOUT_SEC=200 in der Umgebung -> rot.
 def test_picker_timeout_default_is_120_and_idle_default_is_600():
+    """conftest.py pins both env vars to "" so a .env/shell value cannot turn this red."""
     assert config.OPENCODE_PICKER_TIMEOUT_SEC == 120
     assert config.OPENCODE_IDLE_TIMEOUT_SEC == 600
 
@@ -989,6 +991,28 @@ def test_ladder_logs_each_rung_and_warns_on_picker_exit(monkeypatch, caplog):
     assert "[opencode] Wähler review/open Stufe 2 → openrouter/m2" in infos
     assert any("Stufe 1" in m and "Exit 3" in m for m in warnings)
     assert any("extern-review/openrouter/m2" in m for m in infos)
+
+
+# Gegenprobe: `_picker_code_text` gibt immer f"Exit {code}" zurück -> "Exit -1"/"Exit -2" im Log und im Output, rot.
+@pytest.mark.parametrize("answer,text", [
+    (subprocess.TimeoutExpired("picker", 120), "keine Antwort"),
+    ((0, "two tokens"), "Ausgabe unbrauchbar"),
+])
+def test_picker_pseudo_codes_are_not_logged_as_exit(monkeypatch, caplog, answer, text):
+    """-1/-2 are no exit codes: log warning (open) and result note (zdr) say it in words."""
+    _picker_on(monkeypatch, "open")
+    _scripted_picker(monkeypatch, {"1": answer, "2": (0, "openrouter/m2")})
+    _scripted_watchdog(monkeypatch, [_ok()])
+    with caplog.at_level("WARNING", logger="providers.opencode"):
+        OpencodeProvider().run("x")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("Stufe 1" in m and text in m for m in warnings)
+    assert not any("Exit -" in m for m in warnings)
+
+    _picker_on(monkeypatch, "zdr")
+    _scripted_picker(monkeypatch, {"1": answer})
+    result = OpencodeProvider().run("x")
+    assert text in result.output and "Exit -" not in result.output
 
 
 # ── error classification ────────────────────────────────────────────────────────
@@ -1336,8 +1360,8 @@ def test_rate_limit_stays_generous_on_prose_by_design():
     """"Berechne 429 mal 3" still counts as a rate limit, and that is deliberate.
 
     The asymmetry, re-measured 2026-09-04 (the first version of this docstring
-    had the mechanism wrong): orchestrator.py:711 bails out of the in-run
-    backoff for TRANSIENT_ERRORS only. So rate_limit costs exactly ONE paid
+    had the mechanism wrong): `_run_with_retry` in orchestrator.py bails out
+    of the in-run backoff for TRANSIENT_ERRORS only. So rate_limit costs exactly ONE paid
     opencode run, while every non-transient classification — auth_error and the
     generic fallback alike — runs the full MAX_RETRIES_PER_PROVIDER = 2. A
     missed real rate limit is therefore the expensive direction (2 paid runs,
@@ -1636,6 +1660,26 @@ def test_no_picker_query_when_a_query_ate_the_rest_below_the_minimum(monkeypatch
     assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2"]
     assert picker_calls[1][1]["timeout"] == config.OPENCODE_PICKER_TIMEOUT_SEC
     assert len(run_calls) == 1
+    assert (result.success, result.error) == (False, "hang")
+
+
+# Gegenprobe: `return last` nach dem Wähler (`_left() < _MIN_STAGE_SEC` hinter _next_pick) streichen -> zweiter Start, rot.
+def test_picker_that_ate_the_rest_ends_the_ladder_without_a_second_start(monkeypatch):
+    """Rung 2 is answered (a model) but its query took 50 s of the 100 s left: no 2nd start."""
+    clock = _fake_clock(monkeypatch)
+    _picker_on(monkeypatch)
+    picker_calls = _clocked_picker(
+        monkeypatch, clock, {"1": (0, "openrouter/m1"), "2": (0, "openrouter/m2")},
+        advance_after_first=50,
+    )
+    run_calls = _scripted_watchdog(
+        monkeypatch, [_idle_kill(), _ok()], on_call=lambda: clock.__setitem__(0, clock[0] + 100)
+    )
+
+    result = OpencodeProvider().run("x", timeout=200)  # 100 s left after rung 1, 50 after the query
+
+    assert len(run_calls) == 1
+    assert [_arg(c[0], "--stufe") for c in picker_calls] == ["1", "2"]
     assert (result.success, result.error) == (False, "hang")
 
 

@@ -117,6 +117,15 @@ _PICKER_UNUSABLE = -2
 # Less remaining total time than this: no further rung (a rung needs minutes).
 _MIN_STAGE_SEC = 60
 
+
+def _picker_code_text(code: int) -> str:
+    """Log/note wording for a picker result code; the pseudo codes are no exit codes."""
+    if code == _PICKER_FAILED:
+        return "keine Antwort (Timeout/Startfehler)"
+    if code == _PICKER_UNUSABLE:
+        return "Ausgabe unbrauchbar"
+    return f"Exit {code}"
+
 # --- Error classification: the two directions are NOT symmetric ---------------
 #
 # `exit 1` is ambiguous here (an unknown model alias yields a generic
@@ -130,7 +139,7 @@ _MIN_STAGE_SEC = 60
 #   cooldown, so the task rotates on and every attempt is another PAID run. Kept
 #   deliberately generous — only digit boundaries are added, so "14290" or
 #   "4029" no longer match while a bare "429" still does.
-# * auth_error is NOT transient -> orchestrator.py:711 bails out of the in-run
+# * auth_error is NOT transient -> `_run_with_retry` in orchestrator.py bails out of the in-run
 #   backoff for TRANSIENT_ERRORS only, so a NON-transient code runs the full
 #   MAX_RETRIES_PER_PROVIDER (2) attempts: a false auth_error costs TWO paid
 #   opencode runs where rate_limit costs one.
@@ -141,16 +150,6 @@ _MIN_STAGE_SEC = 60
 #   outside taxonomy.py's category map, and an UNclassified error reaches the
 #   same non-transient outcome via error_code_of() == "". For the orchestrator,
 #   auth_error and a generic failure differ only by label.
-#   Inside the picker ladder the class does decide the fate: hang, empty output,
-#   an unclassified error and policy_block from opencode go on to the next rung;
-#   rate_limit, auth_error, timeout, prompt_too_large and a missing CLI do not.
-#   Cost: worst case ladder (3 rungs) x MAX_RETRIES_PER_PROVIDER (2) paid runs
-#   per pass; a hang at the end of the ladder requeues the task up to
-#   MAX_HANG_RETRIES (2) times and each pass runs the ladder again:
-#   3 x 2 x (1 + 2) = 18 paid runs per task, capped by the daily budget and
-#   OPENCODE_MIN_REMAINING_USD (0.25). On top: one short probe per picker
-#   query (at most 3 per pass, so up to 18 probes per task; fractions of a
-#   cent each).
 #
 #   And a label is a bad thing to pay a false positive for. Hence the split
 #   below: the auth check reads STDERR ONLY, never the agent's answer. Measured
@@ -164,6 +163,22 @@ _MIN_STAGE_SEC = 60
 #   degrades to a generic error -- same retries, same outcome, one less label.
 #   NOT measured, named as the gap: which stream opencode uses for an actual
 #   401/403 (provoking one needs the machine config, which stays untouched).
+#
+#   Inside the picker ladder the class does decide the fate: hang, empty output,
+#   an unclassified error and policy_block from opencode go on to the next rung;
+#   rate_limit, auth_error, timeout, prompt_too_large and a missing CLI do not.
+#   Cost: worst case ladder (3 rungs) x MAX_RETRIES_PER_PROVIDER (2) paid runs
+#   per pass; a hang at the end of the ladder requeues the task up to
+#   MAX_HANG_RETRIES (2) times and each pass runs the ladder again:
+#   3 x 2 x (1 + 2) = 18 paid runs per task, capped by the daily budget and
+#   OPENCODE_MIN_REMAINING_USD (0.25). On top: one short probe per picker
+#   query (at most 3 per run() call, one per rung; run() runs up to
+#   2 x (1 + 2) = 6 times per task, so up to 18 probes; fractions of a cent
+#   each). The count holds for the regular ladder path of the orchestrator:
+#   it always calls the picker with --ohne-erkundung for review and never
+#   explores for umsetzung, so each picker query costs at most one probe. The
+#   picker's own no-database fallback (run() inside the picker) probes
+#   differently and is not counted here.
 _RATE_LIMIT_TEXT = (
     "rate limit", "too many requests", "quota",
     # The 402 family. OpenRouter's own wording is "requires more credits", but
@@ -534,8 +549,8 @@ class OpencodeProvider(BaseProvider):
                 tried.add(model)
                 return stufe, model
             if code != 0:
-                logger.warning("[opencode] Wähler %s/%s Stufe %s: Exit %s", aufgabe, profile, stufe, code)
-            note = f"Stufe {stufe}: Exit {code}"
+                logger.warning("[opencode] Wähler %s/%s Stufe %s: %s", aufgabe, profile, stufe, _picker_code_text(code))
+            note = f"Stufe {stufe}: {_picker_code_text(code)}"
             if code == _PICKER_UNOCCUPIED:
                 notes.append(note + " (unbelegt)")
                 continue

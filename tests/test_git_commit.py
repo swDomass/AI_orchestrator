@@ -373,7 +373,10 @@ def test_skip_no_snapshot_without_snap_before(repo):
     assert outcome.skipped == "no_snapshot"
 
 
-def test_skip_not_a_repo(tmp_path):
+def test_skip_not_a_repo(tmp_path, monkeypatch):
+    # Liegt tmp_path in einem Repo (PYTEST_DEBUG_TEMPROOT=<repo>\.scratch), fände git das
+    # umgebende Repo; die Obergrenze stoppt die Suche an tmp_path.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     plain = tmp_path / "plain"
     plain.mkdir()
     outcome = git_commit.commit_run_result(str(plain), "Task", "claude", {"a": (0.0, 1)})

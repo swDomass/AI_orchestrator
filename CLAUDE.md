@@ -15,7 +15,7 @@ Autonomous task orchestrator routing work across Claude Code and Codex CLI, plus
 ## Commands
 
 ```bash
-# Stand 2026-10-30 abends (Windows, Claude-Abrechnungsschalter ADR-006: --claude-billing, Telegram /abo /api, Dashboard-Knopf, nach externem Codex-Review, +63 Tests): 4153 passed / 0 failed / 2 skipped in 998 s; --collect-only tests/ 4155 = 4153 + 2; +63 über die 4092 auf 9b66ba6 = test_claude_billing_mode 32, test_dashboard_claude_billing 15, test_telegram_listener +6, test_dashboard_page_js +6, test_claude_billing_gating +2, test_claude_provider_billing +1, test_doctor +1. Baseline auf 9b66ba6 war 4090/0/2 (auch test_git_commit und der Dashboard-Port-Wackler grün). Nicht mit PYTEST_DEBUG_TEMPROOT im Repo laufen lassen (2 git-Tests brauchen ein tmp außerhalb jedes Repos). Läuft parallel ein Live-Orchestrator, kann der Session-Wächter _guard_real_vault_and_docs_untouched beim letzten Test einen ERROR melden (Vault-Schreibzugriff des Live-Laufs) — dann wiederholen.
+# Stand 2026-11-18 (Windows, Monats-Wartung: codex_5 -> gpt-6.2-sol, or_nemotron_free/OPENROUTER_DEFAULT_MODEL -> nemotron-3-ultra-550b-a55b:free, ProgramData-Test nur unter Windows (Linux-CI seit 30.10. rot), safe_test_dir unter tmp_path statt im Laufwerksstamm, git-Tests mit GIT_CEILING_DIRECTORIES, +0 Tests): 4180 passed / 0 failed / 2 skipped in 756 s. PYTEST_DEBUG_TEMPROOT im Repo ist erlaubt: die 2 git-Tests (test_skip_not_a_repo, test_gate_blocks_a_directory_that_is_no_repo) fangen das per GIT_CEILING_DIRECTORIES selbst ab.
 # Ältere Stände und Messnotizen: docs/test-und-lint-historie.md
 # -p no:randomly: Das Flag bleibt als reproduzierbare Standardreihenfolge stehen (auch in ci.yml).
 python -m pytest tests/ -q -p no:randomly

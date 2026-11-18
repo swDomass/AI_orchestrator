@@ -300,6 +300,10 @@ def test_relative_programdata_is_a_finding(monkeypatch, tmp_path):
     assert _REAL_SOURCES() == ["pd#relative"]
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason=r"Path(r'C:\ProgramData') ist unter Linux relativ; Codepfad ist Windows-spezifisch",
+)
 def test_empty_programdata_falls_back_to_default_not_relative(monkeypatch, tmp_path):
     _sandbox(monkeypatch, tmp_path)
     monkeypatch.setenv("PROGRAMDATA", "")

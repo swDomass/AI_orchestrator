@@ -385,10 +385,10 @@ def test_describe_hash_drift_is_none_when_unchanged(tmp_path):
     assert conftest._describe_hash_drift(p, h, h) is None
 
 
-def test_memory_allows_paths_outside_real_vault_even_with_resolve_failure(monkeypatch):
+def test_memory_allows_paths_outside_real_vault_even_with_resolve_failure(monkeypatch, tmp_path):
     """The OSError fallback must not become a blanket refusal — paths genuinely
     outside the real vault must still be allowed even when resolve() fails."""
-    safe_subdir = Path("/tmp/safe_test_dir")  # definitely outside the real vault
+    safe_subdir = tmp_path / "safe_test_dir"  # outside the real vault, nothing in the drive root
     monkeypatch.setattr(memory_module, "_MEMORY_ROOT", safe_subdir)
     monkeypatch.setattr(memory_module, "_TASK_RESULTS_DIR", safe_subdir / "task_results")
     monkeypatch.setattr(memory_module, "_ARCHIVE_DIR", safe_subdir / "archive")

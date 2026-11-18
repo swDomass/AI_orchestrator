@@ -104,6 +104,9 @@ def test_gate_passes_a_clean_repo(monkeypatch, clean_repo):
 
 def test_gate_blocks_a_directory_that_is_no_repo(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestrator, "get_tool", lambda _n: _FakeTool("dev-loop", True))
+    # Liegt tmp_path in einem Repo (PYTEST_DEBUG_TEMPROOT=<repo>\.scratch), fände git das
+    # umgebende Repo; die Obergrenze stoppt die Suche an tmp_path.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     plain = tmp_path / "plain"
     plain.mkdir()
     msg = orchestrator._worktree_gate_violation("Task #tool:dev-loop", "dev-loop", str(plain))

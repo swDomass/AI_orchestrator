@@ -143,7 +143,7 @@ All configuration lives in `.env` (auto-loaded, no external dotenv library neede
 | `GEMINI_MAX_OUTPUT_TOKENS` | No | `16384` | Output cap for HTTP mode; generous because gemini-3.x thinking tokens count toward it |
 | `OPENROUTER_API_KEY` | No | — | OpenRouter API key. When set, enables `#openrouter`/`#or_*` tags as an opt-in pay-per-token provider for non-agentic tasks (heartbeat checks, summaries). Never enters the default fallback chain. |
 | `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | Override for testing or self-hosted proxy |
-| `OPENROUTER_DEFAULT_MODEL` | No | `nvidia/nemotron-3-super-120b-a12b:free` | Model used by `#openrouter` without a specific `#or_*` alias |
+| `OPENROUTER_DEFAULT_MODEL` | No | `nvidia/nemotron-3-ultra-550b-a55b:free` | Model used by `#openrouter` without a specific `#or_*` alias |
 | `VIBE_MAX_PRICE_USD` | No | `0.50` | Per-run cost ceiling for the Mistral Vibe provider (vibe interrupts itself above it) |
 | `VIBE_MAX_TURNS` | No | `12` | Assistant-turn budget for tool-enabled Vibe runs (`read_file`/`grep` only) |
 | `VIBE_READONLY_MAX_TURNS` | No | `1` | Turn budget when all tools are disabled — a single turn is all that can happen |
@@ -382,7 +382,7 @@ The orchestrator does not write results into the queue file: a finished line is 
 | Claude model | `#claude_haiku`, `#claude_sonnet`, `#claude_opus` | `- [ ] Task #claude_haiku` |
 | Reasoning effort (**Claude only**) | `#effort:low\|medium\|high\|xhigh\|max` → `claude --effort` | `- [ ] Classify inbox #claude_opus #effort:low` |
 | Gemini model *(retired — parses, but barred by the example policy)* | `#gemini_pro`, `#gemini_flash`, `#gemini_flash_lite` | `- [ ] Iterate #gemini_flash` |
-| Codex model | `#codex_5` (gpt-6.1-sol), `#codex_5_4` (gpt-5.6-terra), `#codex_mini` (gpt-6-luna) | `- [ ] Run #codex_mini` |
+| Codex model | `#codex_5` (gpt-6.2-sol), `#codex_5_4` (gpt-5.6-terra), `#codex_mini` (gpt-6-luna) | `- [ ] Run #codex_mini` |
 | OpenRouter model (opt-in, requires `OPENROUTER_API_KEY`) | Free: `#or_nemotron_free`. Paid flagships: `#or_glm`, `#or_kimi`, `#or_qwen`, `#or_deepseek`, `#or_minimax`. Generic: `#openrouter` (default model). | `- [ ] Daily summary #or_nemotron_free` |
 | Vibe / Mistral (opt-in, requires the `vibe` CLI) | `#vibe` — routes to Vibe using its configured model. Reviewer only: never writes files, never enters the fallback chain, and if the CLI is missing the task is **parked rather than handed to an executor**. | `- [ ] Second opinion #vibe` |
 | Vibe model choice | `#second_opinion:vibe_medium` (mistral-medium-3.5) / `#second_opinion:vibe_small` (devstral-small). Since 2026-08-15 the bare task tags `#vibe_medium`/`#vibe_small` force the model too — `MODEL_TAG_RE` is generated from `dispatcher._TAG_MAP` and covers all 20 model aliases (plus 6 bare provider-selection tags via the separate `PROVIDER_TAG_RE`, 26 routing tags total (2026-10-11: −3 OpenRouter free aliases, delisted)). | `- [ ] Review #tool:review-loop #second_opinion:vibe_small` |

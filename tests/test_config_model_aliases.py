@@ -91,8 +91,9 @@ def test_codex_aliases_match_verified_model_cache():
     # its bundled selections to Terra/Luna. All three IDs probed live on 2026-07-23;
     # codex_5 moved to gpt-6.1-sol on 2026-10-02 (probed live with `codex exec -m`).
     # codex_mini moved to gpt-6-luna on 2026-10-11 (probed live with codex exec -m).
+    # codex_5 moved to gpt-6.2-sol on 2026-11-18 (catalog priority 1; probed live).
     assert CODEX_MODEL_ALIASES["codex_mini"] == "gpt-6-luna"
-    assert CODEX_MODEL_ALIASES["codex_5"] == "gpt-6.1-sol"
+    assert CODEX_MODEL_ALIASES["codex_5"] == "gpt-6.2-sol"
     assert CODEX_MODEL_ALIASES["codex_5_4"] == "gpt-5.6-terra"
 
 
@@ -102,7 +103,7 @@ def test_codex_aliases_match_verified_model_cache():
 
 
 def test_openrouter_free_aliases_resolve_for_openrouter():
-    assert model_id_for_provider("or_nemotron_free", "openrouter") == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert model_id_for_provider("or_nemotron_free", "openrouter") == "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 
 @pytest.mark.parametrize("tag", ["or_minimax_free", "or_deepseek_free", "or_qwen_free"])

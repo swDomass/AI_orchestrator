@@ -218,7 +218,8 @@ def check_opencode_cli() -> CheckResult:
     if _resolve_exe() is None:
         shim = shutil.which("opencode")
         if shim:
-            expected = Path(shim).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+            base = Path(shim).parent / "node_modules"
+            expected = " oder ".join(str(base / pkg / "bin" / "opencode.exe") for pkg in ("@opencode/cli", "opencode-ai"))
             findings.append(f"nur npm-Shim gefunden ({shim}), erwartete Datei fehlt: {expected}")
         else:
             findings.append("opencode nicht im PATH gefunden")

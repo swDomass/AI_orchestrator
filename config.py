@@ -415,8 +415,8 @@ SYSTEM_PROMPTS: dict[str, str] = {
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
-)  # = or_nemotron_free; was minimax-m2.5:free until delisted (2026-10-11)
+    "OPENROUTER_DEFAULT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"
+)  # = or_nemotron_free; was minimax-m2.5:free until delisted (2026-10-11); super-120b-a12b:free delisted (2026-11-18)
 
 # --- Gemini HTTP API (preferred over the deprecated CLI) ---
 # The consumer Gemini CLI (Code Assist for individuals / AI Pro / AI Ultra) was
@@ -869,10 +869,11 @@ GEMINI_MODEL_ALIASES: dict[str, str] = {
 # vs 70,298 for gpt-6-astra, 3 real P2 each. `codex_5_4`/`codex_mini` stay on 5.6 for
 # now — Terra has no GPT-6 counterpart in the catalog.
 # 2026-10-11: codex_mini -> gpt-6-luna (Codex catalog priority 4, lower token prices per Codex changelog entry of 2026-09-22; in codex-cli 0.162.1 binary, probed live). codex_5_4 stays on gpt-5.6-terra (no GPT-6 counterpart).
+# 2026-11-18: `codex_5` -> gpt-6.2-sol (Codex catalog priority 1 in ~/.codex/models_cache.json; gpt-6.1-sol only priority 5; probed live with `codex exec -m gpt-6.2-sol`).
 # NOTE: the version-shaped keys `codex_5`/`codex_5_4` are kept stable so existing
 # queue lines keep working; rename is a separate cleanup.
 CODEX_MODEL_ALIASES: dict[str, str] = {
-    "codex_5":    "gpt-6.1-sol",
+    "codex_5":    "gpt-6.2-sol",
     "codex_5_4":  "gpt-5.6-terra",
     "codex_mini": "gpt-6-luna",
 }
@@ -891,10 +892,11 @@ VIBE_MODEL_ALIASES: dict[str, str] = {
 # from Chinese open-source families for higher-quality non-agentic calls — all at
 # a fraction of Anthropic/Codex pricing. IDs verified against OpenRouter /models
 # API on 2026-10-11.
+# 2026-11-18: or_nemotron_free -> nemotron-3-ultra-550b-a55b:free (super-120b-a12b:free no longer listed on /models).
 # 2026-10-11: removed or_minimax_free/or_deepseek_free/or_qwen_free (minimax-m2.5:free, deepseek-v4-flash:free, qwen3-coder:free no longer listed on /models); or_qwen qwen3-max (delisted) -> qwen3.7-max.
 OPENROUTER_MODEL_ALIASES: dict[str, str] = {
     # Free — $0 always (subject to OpenRouter's daily request limits)
-    "or_nemotron_free": "nvidia/nemotron-3-super-120b-a12b:free",
+    "or_nemotron_free": "nvidia/nemotron-3-ultra-550b-a55b:free",
     # Paid flagships — pricing per MTok (prompt / completion)
     "or_glm":      "z-ai/glm-5",                   # $0.60 / $1.92, 205k ctx
     "or_kimi":     "moonshotai/kimi-k2.6",         # $0.65 / $3.41, 262k ctx

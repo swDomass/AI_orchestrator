@@ -257,6 +257,13 @@ def _git_pattern(rest: str) -> str:
     return rf"{_CMD_START}{_GIT_BIN}(?:\s+{_GIT_GLOBAL_OPT})*\s+{rest}"
 
 
+# Orchestrator marker: set in os.environ by the orchestrator process so every child
+# (Claude, tools, scripts) counts as unattended even if Claude Code reports ATTENDED=1.
+ORCH_UNATTENDED_ENV = "ORCH_UNATTENDED"
+_PUSH_DESC = "git push (unattended runs must not change remote state)"
+# Descriptions of patterns the hook skips in attended sessions. Everything else stays denied.
+SAFETY_ATTENDED_ALLOWED: frozenset[str] = frozenset({_PUSH_DESC})
+
 # Hard-deny patterns — used by Claude Code PreToolUse hook (scripts/safety_hook.py)
 # AND injected into prompts for all providers (Gemini, Codex have no hook system).
 # Each entry: (regex_pattern, human-readable description)
@@ -271,8 +278,30 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     (r"Remove-Item\s.*-Recurse.*-Force", "PowerShell recursive force delete"),
     (r"rd\s+/[sq]", "Windows rd /s /q recursive delete"),
     # Git destructive operations
-    (_git_pattern(r"push\s+.*--force"), "git push --force"),
-    (_git_pattern(r"push\s+.*-f\b"), "git push -f (force)"),
+    # Force forms stand alone in attended sessions (see the push entry below), so they
+    # cover more than the literal flags. `[\s\S]*` instead of `.*` so a line
+    # continuation (backslash+newline, PowerShell backtick) cannot hide the flag.
+    #   --for      prefix of --force, --force-with-lease, --force-if-includes (+ abbreviations);
+    #              `(?!mat)` keeps `--format` out
+    #   -f cluster single dash, lowercase only (git push has no -F; keeps PowerShell
+    #              -First/-FilePath out), not after a word char/dash: -f, -fu, -uf;
+    #              not --follow-tags, --no-verify, feature-fix
+    #   --m        git accepts any unique abbreviation: --m, --mi, ... --mirror
+    #              (a force update per git docs; `git push -h` has no other --m option)
+    #   +refspec   leading `+` plus any non-space, optionally quoted, also right after `push`
+    (_git_pattern(r"push\s+[\s\S]*--for(?!mat)"), "git push --force"),
+    (_git_pattern(r"push\s+[\s\S]*(?-i:(?<![\w-])-[a-z0-9]*f)"), "git push -f (force)"),
+    (_git_pattern(r"push\s+[\s\S]*--m(?:i|\b)"), "git push --mirror (force)"),
+    (_git_pattern(r"push\s+(?:[\s\S]*?\s)?[\"']?\+\S"), "git push +refspec (force)"),
+    # Remote deletion, blocked in every session type (user decision 2026-11-24 after
+    # review: delete + re-create acts like a force push). Same `[\s\S]*` scan as above.
+    #   --de       prefix of --delete (not --dry-run);  -d cluster as the -f cluster
+    #   :refspec   leading `:` (optionally quoted), `HEAD:main` does not count
+    #   --pru      prefix of --prune (not --progress)
+    (_git_pattern(r"push\s+[\s\S]*--de"), "git push --delete (remote deletion)"),
+    (_git_pattern(r"push\s+[\s\S]*(?-i:(?<![\w-])-[a-z0-9]*d)"), "git push -d (remote deletion)"),
+    (_git_pattern(r"push\s+(?:[\s\S]*?\s)?[\"']?:[^\s\"']"), "git push :refspec (remote deletion)"),
+    (_git_pattern(r"push\s+[\s\S]*--pru"), "git push --prune (remote deletion)"),
     (_git_pattern(r"reset\s+--hard"), "git reset --hard"),
     (_git_pattern(r"clean\s+-[a-zA-Z]*f"), "git clean -f (untracked file deletion)"),
     (_git_pattern(r"checkout\s+--\s+\."), "git checkout -- . (discard all changes)"),
@@ -285,7 +314,34 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     # inside the session. The asymmetry that remains is deliberate: a commit is local
     # and revertible (`git reset`), a push leaves the machine and cannot be taken back.
     # Placed after the force-push patterns so those keep reporting the specific reason.
-    (_git_pattern(r"push(?![\w-])"), "git push (unattended runs must not change remote state)"),
+    #
+    # Revised 2026-11-24 (user decision): a plain push is blocked only when the session
+    # is NOT attended. scripts/safety_hook.py skips the patterns named in
+    # SAFETY_ATTENDED_ALLOWED when CLAUDE_CODE_SESSION_ATTENDED == "1" (Claude Code sets
+    # it for every child and hook process; `--print`, child and background sessions get
+    # "0") and no ORCH_UNATTENDED marker is set (the orchestrator sets it, see
+    # ORCH_UNATTENDED_ENV). The force and deletion patterns above stand alone and were
+    # widened accordingly: deleting on the server is blocked everywhere, because delete
+    # plus re-create acts like a force push. Known limits: a force via
+    # `-c remote.<x>.push=+...` / `-c remote.<x>.mirror=true` in the same command, via a
+    # variable (`$F`) or a git alias is not seen; quoting tricks such as `'':feature` or
+    # `''+main` (empty quotes before the character) are not recognised either. False
+    # alarms: the force and deletion patterns scan the whole rest of the command after
+    # `push`, including follow-up commands and lines, so any later word that looks like
+    # a feature blocks: a short option with `f`/`d` (`tail -f`, `git branch -d x`,
+    # `docker compose up -d`, lowercase PowerShell `select -first 5`), a long option
+    # starting with `--for`, `--m`, `--de` or `--pru` (`--decorate`, `--depth`,
+    # `--mixed`, `git fetch --prune`), or a word starting with `+` or `:`. Workaround:
+    # run the push as its own command. Accepted on purpose: a false alarm is cheaper
+    # than a blind spot (no command-boundary logic).
+    # Legacy limits, unrecognised before this change and also unattended: `VAR=… git
+    # push`, `time`/`if`/`!`/`{ … }` before git, `sudo`/`env`/`nohup`, `git -P`/`-p`,
+    # `--no-advice`, `--config-env`, `--glob-pathspecs`, `git.exe`, `cmd /c`, a quoted
+    # `-c` value with quotes inside (`-c core.sshCommand="ssh -i k"`).
+    # Subagents of an attended session count as attended (their tool calls run in the
+    # same process, CLAUDE_CODE_SESSION_ATTENDED=1): only the rule "push only when the
+    # user says so" holds there.
+    (_git_pattern(r"push(?![\w-])"), _PUSH_DESC),
     # Database destruction
     (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE/SCHEMA"),
     (r"TRUNCATE\s+TABLE", "TRUNCATE TABLE"),

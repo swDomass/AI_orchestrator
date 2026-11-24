@@ -1,9 +1,12 @@
 """Tests for the safety hook script and config deny patterns."""
 
+import importlib
 import json
+import os
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,11 +14,12 @@ import pytest
 
 # Import config patterns
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import SAFETY_DENY_PATTERNS, SAFETY_RULES
+from config import _PUSH_DESC, SAFETY_DENY_PATTERNS, SAFETY_RULES
 
 # Import hook's check function directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from safety_hook import check_command
+import safety_hook
+from safety_hook import check_command, is_attended
 
 # ---------------------------------------------------------------------------
 # config.py: SAFETY_DENY_PATTERNS + SAFETY_RULES
@@ -408,6 +412,173 @@ class TestFallbackPatternsStayInSync:
 
 
 # ---------------------------------------------------------------------------
+# Attended sessions: plain push allowed, force forms and everything else denied
+# ---------------------------------------------------------------------------
+
+PUSH_ALLOWED_WHEN_ATTENDED = [
+    "git push",
+    "git push origin main",
+    "git push -u origin main",
+    'git -C "D:/r" push origin main',
+    "git push --follow-tags",
+    "git push --no-verify origin main",
+    "git push origin feature-fix",
+    "git push origin main:release+1",
+    # Near misses of the force/deletion patterns: must stay allowed when attended.
+    "git push --dry-run origin main",
+    "git push --progress origin main",
+    "git push --recurse-submodules=on-demand origin main",
+    "git push origin HEAD:main",
+    "git push origin refs/heads/a:refs/heads/b",
+    "git push 2>&1 | Select-Object -First 5",
+    "git push origin main 2>&1 | Out-File -FilePath x.log",
+    "git push origin main; git log -1 --format=%h",
+]
+
+# Pure force forms: the reason must be a force pattern, never the plain-push one.
+FORCE_FORMS = [
+    "git push --force",
+    "git push --force-with-lease origin main",
+    "git push --force-if-includes origin main",
+    "git push --forc origin main",
+    "git push -f",
+    "git push -fu origin main",
+    "git push -uf origin main",
+    "git push origin +main",
+    "git push +main",
+    "git push origin '+HEAD:main'",
+    'git push origin "+main"',
+    "git push --mirror",
+    "git push --mirr",
+    "git push --m origin",
+    'git push origin +"main"',
+    "git push origin main \\\n --force",
+    "git push origin main `\n -f",
+]
+
+# Deletion on the server, denied in every session type (user decision 2026-11-24).
+DELETE_FORMS = [
+    "git push origin --delete feature",
+    "git push origin --del feature",
+    "git push origin -d feature",
+    "git push -ud origin feature",
+    "git push origin :feature",
+    "git push origin ':feature'",
+    "git push --prune origin 'refs/heads/*:refs/heads/*'",
+    "git push origin --delete feature && git push origin feature",
+]
+
+# Patterns that fire behind an allowed push (the attended skip must keep scanning).
+FOLLOWUP_DENIED = [
+    "git push origin main && git reset --hard HEAD~1",
+    "git push origin main; DROP TABLE users",
+    "git push && rm -rf /tmp/x",
+]
+
+
+class TestIsAttended:
+    """is_attended is fail-closed: only the exact value "1" without a marker."""
+
+    @pytest.mark.parametrize("environ, expected", [
+        ({"CLAUDE_CODE_SESSION_ATTENDED": "1"}, True),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": "1", "ORCH_UNATTENDED": ""}, True),
+        ({}, False),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": "0"}, False),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": "true"}, False),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": " 1"}, False),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": ""}, False),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": "1", "ORCH_UNATTENDED": "1"}, False),
+        ({"CLAUDE_CODE_SESSION_ATTENDED": "1", "ORCH_UNATTENDED": "0"}, False),
+        ({"ORCH_UNATTENDED": "1"}, False),
+    ])
+    def test_table(self, environ, expected):
+        assert is_attended(environ) is expected
+
+
+class TestAttendedCheck:
+    @pytest.mark.parametrize("cmd", PUSH_ALLOWED_WHEN_ATTENDED)
+    def test_plain_push_allowed_when_attended(self, cmd):
+        assert check_command(cmd, attended=True) is None, cmd
+
+    @pytest.mark.parametrize("cmd", PUSH_ALLOWED_WHEN_ATTENDED)
+    def test_plain_push_denied_by_default(self, cmd):
+        """Default (unattended) keeps the old behaviour."""
+        assert check_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("cmd", FORCE_FORMS + DELETE_FORMS + FOLLOWUP_DENIED)
+    def test_force_delete_and_followups_denied_when_attended(self, cmd):
+        assert check_command(cmd, attended=True) is not None, cmd
+
+    @pytest.mark.parametrize("cmd", FORCE_FORMS + DELETE_FORMS)
+    def test_force_and_delete_denied_by_default_with_own_reason(self, cmd):
+        """The reason must NOT be the plain-push one: otherwise a missing force or
+        deletion pattern would go unnoticed (the plain-push entry catches everything
+        unattended)."""
+        reason = check_command(cmd)
+        assert reason is not None and reason != _PUSH_DESC, cmd
+
+    @pytest.mark.parametrize("cmd", FOLLOWUP_DENIED)
+    def test_followups_denied_by_default(self, cmd):
+        assert check_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("cmd", DELETE_FORMS)
+    def test_deletion_reason_names_remote_deletion(self, cmd):
+        reason = check_command(cmd, attended=True)
+        assert reason is not None and reason.startswith("git ") and "remote deletion" in reason
+
+    def test_skip_keeps_scanning(self):
+        """The skipped push must not hide a later pattern's reason."""
+        reason = check_command("git push; DROP TABLE x", attended=True)
+        assert reason is not None and "DROP" in reason
+
+    def test_force_reports_force_reason_not_plain_push(self):
+        reason = check_command("git push -fu origin main", attended=True)
+        assert reason is not None and "force" in reason.lower()
+
+
+class TestAttendedFallback:
+    """The hand-mirrored fallback must behave the same when config is unimportable.
+
+    Unlike TestFallbackPatternsStayInSync._fallback_check, the checks run INSIDE
+    the patched import so the reloaded fallback globals are really in effect."""
+
+    @staticmethod
+    @contextmanager
+    def _fallback_module():
+        try:
+            with patch.dict(sys.modules, {"config": None}):
+                yield importlib.reload(safety_hook)
+        finally:
+            importlib.reload(safety_hook)
+
+    def test_fallback_constants(self):
+        with self._fallback_module() as hook:
+            assert sorted(hook.SAFETY_ATTENDED_ALLOWED) == ["git push"]
+            assert hook.ORCH_UNATTENDED_ENV == "ORCH_UNATTENDED"
+            assert hook.is_attended({"CLAUDE_CODE_SESSION_ATTENDED": "1"}) is True
+            assert hook.is_attended({"CLAUDE_CODE_SESSION_ATTENDED": "1", "ORCH_UNATTENDED": "0"}) is False
+
+    def test_fallback_allows_plain_push_when_attended(self):
+        with self._fallback_module() as hook:
+            for cmd in PUSH_ALLOWED_WHEN_ATTENDED:
+                assert hook.check_command(cmd, attended=True) is None, cmd
+                assert hook.check_command(cmd) is not None, cmd
+
+    def test_fallback_denies_force_delete_and_followups_always(self):
+        with self._fallback_module() as hook:
+            for cmd in FORCE_FORMS + DELETE_FORMS + FOLLOWUP_DENIED:
+                assert hook.check_command(cmd, attended=True) is not None, cmd
+                assert hook.check_command(cmd) is not None, cmd
+
+    def test_fallback_force_and_delete_have_own_reason_by_default(self):
+        """Fallback counterpart: the reason is never the plain "git push" one."""
+        with self._fallback_module() as hook:
+            for cmd in FORCE_FORMS + DELETE_FORMS:
+                reason = hook.check_command(cmd)
+                assert reason is not None and reason != "git push", cmd
+
+
+# ---------------------------------------------------------------------------
 # Hook script end-to-end (stdin/stdout JSON protocol)
 # ---------------------------------------------------------------------------
 
@@ -416,7 +587,16 @@ class TestHookProtocol:
 
     HOOK_SCRIPT = str(Path(__file__).resolve().parent.parent / "scripts" / "safety_hook.py")
 
-    def _run_raw(self, stdin_text: str) -> str:
+    @staticmethod
+    def _clean_env(**extra: str) -> dict[str, str]:
+        """os.environ without the attended/marker variables (the suite itself may run
+        inside a Claude session and inherit ATTENDED=1), plus explicit extras."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CLAUDE_CODE_SESSION_ATTENDED", "ORCH_UNATTENDED")}
+        env.update(extra)
+        return env
+
+    def _run_raw(self, stdin_text: str, env: dict[str, str] | None = None) -> str:
         """Run the hook with raw stdin; return stdout (exit code must be 0)."""
         result = subprocess.run(
             [sys.executable, self.HOOK_SCRIPT],
@@ -424,12 +604,16 @@ class TestHookProtocol:
             capture_output=True,
             text=True,
             timeout=10,
+            env=self._clean_env() if env is None else env,
         )
         assert result.returncode == 0, f"Hook script failed: {result.stderr}"
         return result.stdout
 
     def _run_hook(self, input_data: dict) -> dict:
-        return json.loads(self._run_raw(json.dumps(input_data)))
+        out = self._run_raw(json.dumps(input_data))
+        # Empty stdout = the hook allowed the command; fail on the assertion, not on json.
+        assert out, "hook printed no decision (command was allowed)"
+        return json.loads(out)
 
     def _assert_silent(self, input_data: dict) -> None:
         """Allow case: no stdout at all. Silence = no decision, so the normal
@@ -562,3 +746,65 @@ class TestHookProtocol:
             "tool_name": "Bash",
             "tool_input": {"command": ""},
         })
+
+    # --- attended / unattended protocol (explicit child environment) -------------
+
+    @staticmethod
+    def _bash(command: str) -> str:
+        return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+
+    def test_attended_plain_push_is_silent(self):
+        env = self._clean_env(CLAUDE_CODE_SESSION_ATTENDED="1")
+        assert self._run_raw(self._bash("git push origin main"), env=env) == ""
+
+    def test_unattended_plain_push_denied(self):
+        out = self._run_raw(self._bash("git push origin main"))
+        assert out, "hook printed no decision (command was allowed)"
+        assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize("extra", [
+        {"CLAUDE_CODE_SESSION_ATTENDED": "1", "ORCH_UNATTENDED": "1"},
+        {"CLAUDE_CODE_SESSION_ATTENDED": "1", "ORCH_UNATTENDED": "0"},
+        {"CLAUDE_CODE_SESSION_ATTENDED": "0"},
+    ])
+    def test_marker_or_zero_denies_push(self, extra):
+        out = self._run_raw(self._bash("git push origin main"), env=self._clean_env(**extra))
+        assert out, "hook printed no decision (command was allowed)"
+        assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize("cmd", [
+        "git push --force",
+        "git push origin --delete feature",
+        "git push origin main && git reset --hard",
+        # DROP sits AFTER the plain-push pattern in the list: only caught if the
+        # attended skip keeps scanning (reset --hard above sits before it).
+        "git push origin main; DROP TABLE users",
+    ])
+    def test_attended_force_and_followup_denied(self, cmd):
+        env = self._clean_env(CLAUDE_CODE_SESSION_ATTENDED="1")
+        out = self._run_raw(self._bash(cmd), env=env)
+        assert out, "hook printed no decision (command was allowed)"
+        assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_signal_set_while_importing_config_is_ignored(self, tmp_path):
+        """The attended signal is read BEFORE `config` is imported: config loads .env
+        into os.environ on import, and a .env must never make a session attended.
+        Copy of the hook next to a stand-in config.py that sets the signal on import."""
+        (tmp_path / "scripts").mkdir()
+        hook = tmp_path / "scripts" / "safety_hook.py"
+        hook.write_text(Path(self.HOOK_SCRIPT).read_text(encoding="utf-8"), encoding="utf-8")
+        (tmp_path / "config.py").write_text(
+            "import os\n"
+            "os.environ['CLAUDE_CODE_SESSION_ATTENDED'] = '1'\n"
+            "SAFETY_DENY_PATTERNS = [(r'git\\s+push', 'git push stand-in')]\n"
+            "SAFETY_ATTENDED_ALLOWED = frozenset({'git push stand-in'})\n"
+            "ORCH_UNATTENDED_ENV = 'ORCH_UNATTENDED'\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, str(hook)], input=self._bash("git push origin main"),
+            capture_output=True, text=True, timeout=10, env=self._clean_env(), check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout, "hook printed no decision: the import-time signal was honoured"
+        assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"

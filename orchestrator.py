@@ -3778,6 +3778,19 @@ def run_watch(dry_run: bool = False) -> None:
         listener.stop()
 
 
+def _mark_unattended_process() -> None:
+    """Mark this process (and so every child) as an unattended orchestrator run.
+
+    Claude Code can report a session as attended (`CLAUDE_CODE_SESSION_ATTENDED=1`)
+    even for `--print`, e.g. with `CLAUDE_CODE_ENTRYPOINT=claude-vscode` and no
+    parent session (live probe 2026-11-24). The safety hook therefore also refuses
+    a plain push whenever this marker is set. Children inherit it: Claude via
+    `providers/claude.py` (`env=None`) or `claude_billing.child_env()` (copies
+    `os.environ`).
+    """
+    os.environ[config.ORCH_UNATTENDED_ENV] = "1"
+
+
 def main() -> None:
     """Entry point: install the logging + crash net, then run the real main.
 
@@ -3789,6 +3802,8 @@ def main() -> None:
     crashes left `grep -c "path is on mount" logs/orchestrator.log == 0` and the
     only copy of the traceback was the terminal the user happened to have open.
     """
+    # FIRST statement, before anything can spawn a child: see _mark_unattended_process.
+    _mark_unattended_process()
     setup_logging()
     # Explicit, not a hidden side effect of setup_logging(): the thread hook is a
     # global process-wide mutation and an embedder/test may not want it.

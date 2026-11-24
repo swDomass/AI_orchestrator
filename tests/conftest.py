@@ -413,6 +413,24 @@ def _isolate_replay_store(tmp_path: Path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_orch_unattended_marker(monkeypatch):
+    """Start every test without the ORCH_UNATTENDED marker, and restore "absent" after it.
+
+    Tests that call `orchestrator.main()` (tests/test_claude_billing_mode.py,
+    tests/test_orchestrator_crash_breaker.py) set the marker in `os.environ`;
+    without this it would leak process-wide into later tests (and into hook
+    subprocesses they spawn).
+
+    `delenv(raising=False)` alone is not enough: with the variable already absent
+    monkeypatch (pytest 9) records nothing, so a value set later by the test is
+    never undone at teardown. Hence `setenv` first (monkeypatch records "absent"
+    as the old state), then `delenv` -- teardown removes whatever the test set."""
+    monkeypatch.setenv("ORCH_UNATTENDED", "")
+    monkeypatch.delenv("ORCH_UNATTENDED")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_gemini_api_key(monkeypatch):
     """Default GEMINI_API_KEY to empty so the suite is hermetic against a real
     key in the developer's .env.

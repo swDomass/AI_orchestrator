@@ -144,7 +144,12 @@ run needs, as four separate changes:
    the commit half**: the hook is registered for every Bash call and never tested
    for "unattended", so it hit interactive sessions exactly as hard, with no way to
    override it from inside one — and a commit is local and revertible while a push
-   is not. Today only `git push` is hard-denied; the only remaining lever against
+   is not. Since 2026-11-24 (user decision) even that is limited to unattended
+   runs: plain `git push` passes only with `CLAUDE_CODE_SESSION_ATTENDED == "1"`
+   and without the `ORCH_UNATTENDED` marker that `orchestrator.main()` sets;
+   force-push and deleting on the server (`--delete`, `-d`, `:branch`, `--prune`) stay
+   denied everywhere. Of the two git-state writes only push is still denied, and only
+   in unattended runs; the only remaining lever against
    commits in a night run is `approve:` in `policy.yaml`. The prompt layer never
    restricted either (`SAFETY_RULES` mentions push only), so hook and prompt now
    agree.

@@ -80,6 +80,11 @@ except ImportError:
         # No `commit` entry — dropped 2026-08-17 together with config.py's, see the
         # rationale there. Only the irreversible half (push) stays blocked.
         (_fallback_git_pattern(r"push(?![\w-])"), "git push"),
+        # Publishing approval only via Telegram (mirrors config.py, same regex and reason).
+        (
+            r"^(?![\s\S]*--probelauf)(?=[\s\S]*(?:wl_socialmedia\.posten|posten[\\/]+befehl\.py)[\s\S]*\bfreigabe\b)",
+            "posten freigabe ohne --probelauf (nur über Telegram)",
+        ),
         (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE"),
         (r"format\s+[A-Za-z]:", "format drive"),
         (r"mkfs\b", "mkfs"),

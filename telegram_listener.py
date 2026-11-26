@@ -28,6 +28,7 @@ Supported commands:
   /brainstorm <topic>— queue brainstorm task
   /pr-fix <key>      — queue dev-loop for PR <owner/repo#N> (used by PR-Babysitter report-only)
   /pr-ignore <key>   — suppress PR <owner/repo#N> until its state changes
+  /posten_<Kennung>[_<plattform>] — Freigabe: startet den konfigurierten Upload-Befehl (ADR-007)
 
 Any other text is forwarded to the best available AI provider and the
 response is sent back to the same chat.
@@ -36,15 +37,21 @@ response is sent back to the same chat.
 import collections
 import json
 import logging
+import os
 import re
+import subprocess
 import threading
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 import claude_billing
 import idempotency
 import memory as memory_module
 from config import (
+    FREIGABE_POSTEN_BEFEHL,
+    FREIGABE_POSTEN_CWD,
+    FREIGABE_POSTEN_PYTHON,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TELEGRAM_CHAT_THINKING_SEC,
@@ -63,6 +70,33 @@ logger = logging.getLogger("telegram-listener")
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 _SHUTDOWN_TAG_RE = re.compile(r"(?i)(?<!\S)#shutdown(?=\s|$)")
+
+# /posten_<12 Hex>[_<plattform>] — Freigabe-Befehl (ADR-007). Telegram-Befehle bestehen
+# aus [a-z0-9_]; _parse_command hat den Text schon kleingeschrieben.
+_POSTEN_RE = re.compile(r"/posten_([0-9a-f]{12})(?:_(google|facebook|youtube|pinterest|instagram))?")
+_POSTEN_TIMEOUT_SEC = 1800
+# Ergebnis-Codes des Posten-Prozesses, der sein Ergebnis selbst meldet (Telegram-Bericht
+# kommt vom Tor): 0 ok, 3 abgelehnt, 4 unklar, 5 Fehler gemeldet. Exit 1 ist ein Absturz
+# (Traceback) und jeder andere Code ebenso: dann meldet der Listener das Ende von stderr.
+_POSTEN_SELF_REPORTED_EXITS = frozenset({0, 3, 4, 5})
+# Der Kindprozess schreibt UTF-8 (Emoji im Bericht); ohne das nimmt er unter Windows cp1252.
+_POSTEN_ENV_UTF8 = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+# A forwarded or bot-relayed message is never a direct approval (R4-O 1).
+_POSTEN_FORWARD_KEYS = ("forward_origin", "forward_date", "forward_from", "forward_from_chat", "via_bot")
+# Secrets that must not travel back through Telegram in the stderr tail (R4-O 2).
+_POSTEN_SECRET_RE = re.compile(
+    r"Bearer\s+\S+"
+    r"|access_token=[^&\s]+"
+    r"|ya29\.[\w.-]+"
+    r"|1//[\w-]{20,}"
+    r"|EAA[A-Za-z0-9]{20,}"
+    r"|pina_[A-Za-z0-9]{20,}"
+    r"|\d{6,}:[A-Za-z0-9_-]{30,}"
+)
+
+
+def _redact_posten_secrets(text: str) -> str:
+    return _POSTEN_SECRET_RE.sub("<geschwärzt>", text)
 
 
 # ---- Slash command catalog (task-creation commands) ----
@@ -224,6 +258,8 @@ class TelegramListener:
         self._task_limiter = _RateLimiter(max_calls=10, window_sec=60)
         # Per-chat last-used cwd (RAM only) for slash commands that may omit it.
         self._last_cwd_per_chat: dict[str, str] = {}
+        # Single-Flight fuer /posten_...: hoechstens ein Upload-Prozess gleichzeitig.
+        self._posten_lock = threading.Lock()
 
     def start(self) -> None:
         if not TELEGRAM_ENABLED:
@@ -341,6 +377,8 @@ class TelegramListener:
                 self._cmd_slash_tool(command, command_args, msg)
             elif not self._cmd_limiter.allow():
                 send_message("⏳ Zu viele Befehle. Bitte kurz warten.")
+            elif command.startswith("/posten"):
+                self._cmd_posten(command, command_args, msg)
             elif command == "/help":
                 self._cmd_help()
             elif command == "/status":
@@ -563,6 +601,7 @@ class TelegramListener:
             "/cancel\\-shutdown — Geplanten Shutdown abbrechen\n"
             "/pr\\-fix \\<owner/repo\\#N\\> — PR\\-Fix zur Queue \\(dev\\-loop\\)\n"
             "/pr\\-ignore \\<owner/repo\\#N\\> — PR bis zur nächsten Statusänderung ignorieren\n"
+            "/posten\\_\\<Kennung\\>\\[\\_\\<plattform\\>\\] — Freigabe: Upload der Vorschau starten\n"
             "/help   — Diese Hilfe\n\n"
             "\\#shutdown in Text → Shutdown einplanen\n"
             "Beliebiger Text → sofortige KI\\-Antwort"
@@ -638,6 +677,110 @@ class TelegramListener:
         self._pause_event.clear()
         send_message("▶️ Orchestrator *läuft wieder*.")
         logger.info("Orchestrator durch Telegram fortgesetzt.")
+
+    # ------------------------------------------------------------------
+    # Freigabe-Befehl /posten_<Kennung>[_<plattform>] (ADR-007)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _posten_paths() -> tuple[tuple[str, str, str] | None, str]:
+        """Configured paths, resolved per call (the checked values are the started values).
+
+        Returns (paths, "") or (None, reason suffix).
+        """
+        raw = (FREIGABE_POSTEN_PYTHON, FREIGABE_POSTEN_BEFEHL, FREIGABE_POSTEN_CWD)
+        if not all(raw):
+            return None, ""
+        if not all(Path(p).is_absolute() for p in raw):
+            return None, " (Pfad muss absolut sein)"
+        python, befehl, cwd = (str(Path(p).resolve()) for p in raw)
+        if not (Path(python).is_file() and Path(befehl).is_file() and Path(cwd).is_dir()):
+            return None, ""
+        return (python, befehl, cwd), ""
+
+    def _cmd_posten(self, command: str, args: str, msg: dict) -> None:
+        """Start the configured upload command for one preview ID. No AI, no shell."""
+        if any(msg.get(key) for key in _POSTEN_FORWARD_KEYS):
+            send_message("❌ Freigabe nur direkt tippen, nicht weiterleiten.")
+            return
+        match = _POSTEN_RE.fullmatch(command)
+        if not match:
+            send_message("❌ Unbekannte Freigabe-Kennung.")
+            return
+        if args.strip():
+            send_message("❌ Freigabe-Befehl ohne Zusatz senden.")
+            return
+        kennung, plattform = match.group(1), match.group(2)
+        paths, problem = self._posten_paths()
+        if paths is None:
+            send_message(f"❌ Freigabe-Befehl nicht eingerichtet{problem}.")
+            return
+        python, befehl, cwd = paths
+        if not self._posten_lock.acquire(blocking=False):
+            send_message("⏳ Upload läuft schon – warte auf die Rückmeldung.")
+            return
+        argv = [python, "-X", "utf8", befehl, "freigabe", kennung]
+        if plattform:
+            argv += ["--plattform", plattform]
+        argv += ["--nachricht-id", str(msg.get("message_id", 0))]
+        # Start the worker first, acknowledge afterwards (R4-O 5): the receipt must not
+        # claim a start that did not happen. Once started, the worker owns the lock; it
+        # waits for the receipt so that a result never arrives before it.
+        acknowledged = threading.Event()
+        try:
+            threading.Thread(
+                target=self._run_posten, args=(kennung, plattform, argv, cwd, acknowledged),
+                daemon=True,
+            ).start()
+        except BaseException as e:
+            self._posten_lock.release()
+            if not isinstance(e, Exception):
+                raise
+            logger.warning("Freigabe %s: Thread-Start fehlgeschlagen (%s)", kennung, type(e).__name__)
+            send_message(f"❌ Freigabe {kennung}: Upload konnte nicht gestartet werden "
+                         f"({_escape_telegram_markdown(type(e).__name__)}).")
+            return
+        suffix = f" – nur {plattform}" if plattform else ""
+        try:
+            send_message(f"Freigabe {kennung} erhalten – Upload startet{suffix}.")
+        finally:
+            acknowledged.set()
+
+    def _run_posten(self, kennung: str, plattform: str | None, argv: list[str], cwd: str,
+                    acknowledged: threading.Event | None = None) -> None:
+        """Worker thread: run the upload command, report only unexpected outcomes."""
+        try:
+            if acknowledged is not None:
+                acknowledged.wait(10)  # bounded: a hung receipt must not block the upload forever
+            try:
+                res = subprocess.run(
+                    argv, cwd=cwd, timeout=_POSTEN_TIMEOUT_SEC, shell=False, check=False,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    env={**os.environ, **_POSTEN_ENV_UTF8},
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("Freigabe %s (%s): Timeout", kennung, plattform or "alle")
+                send_message(f"❌ Freigabe {kennung}: nach 30 min abgebrochen – "
+                             "Stand unklar, bitte in den Apps nachsehen.")
+                return
+            except Exception as e:
+                logger.warning("Freigabe %s (%s): Start fehlgeschlagen (%s)",
+                               kennung, plattform or "alle", type(e).__name__)
+                send_message(f"❌ Freigabe {kennung}: Start fehlgeschlagen "
+                             f"({_escape_telegram_markdown(type(e).__name__)}).")
+                return
+            logger.info("Freigabe %s (%s): Exit %s", kennung, plattform or "alle", res.returncode)
+            if res.returncode in _POSTEN_SELF_REPORTED_EXITS:
+                return
+            stderr = _redact_posten_secrets(res.stderr or "")
+            lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+            tail = "\n".join(lines[-5:])[-800:]
+            text = f"❌ Freigabe {kennung}: Befehl endete mit Exit {res.returncode}"
+            if tail:
+                text += "\n" + _escape_telegram_markdown(tail)
+            send_message(text)
+        finally:
+            self._posten_lock.release()
 
     def _cmd_approve(self, category: str) -> None:
         # First check whether the args refer to a scientific-investigation

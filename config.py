@@ -342,6 +342,23 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     # same process, CLAUDE_CODE_SESSION_ATTENDED=1): only the rule "push only when the
     # user says so" holds there.
     (_git_pattern(r"push(?![\w-])"), _PUSH_DESC),
+    # Publishing approval (user decision 2026-11-26, Runde 2, ADR-007): the live upload of a
+    # WL-SocialMedia post package is released ONLY by the Telegram command /posten_<id>
+    # (telegram_listener.py starts it directly, not through this hook). An agent with a
+    # shell must not release a package itself. Blocks every command that names the posten
+    # tool (`wl_socialmedia.posten` or `posten/befehl.py`, either slash) and then the word
+    # `freigabe` (the subcommand always follows the tool, so a mere `grep freigabe
+    # posten/befehl.py` is allowed) without `--probelauf` anywhere. `[\s\S]*` so a line
+    # continuation (backslash+newline, PowerShell backtick) cannot hide a part. Not blocked:
+    # klaeren, freischalten, anmelden, `freigabe --probelauf`. Known limits (guard against
+    # accidents, not against an adversary): `--probelauf` anywhere in the same command
+    # (`echo --probelauf; … freigabe K`), the tool started via a variable or a `cd posten`
+    # + `python befehl.py freigabe`, or an import from Python. Duplicated on purpose in
+    # scripts/safety_hook.py (fallback list). Denied in every session type.
+    (
+        r"^(?![\s\S]*--probelauf)(?=[\s\S]*(?:wl_socialmedia\.posten|posten[\\/]+befehl\.py)[\s\S]*\bfreigabe\b)",
+        "posten freigabe ohne --probelauf (nur über Telegram)",
+    ),
     # Database destruction
     (r"DROP\s+(TABLE|DATABASE|SCHEMA)", "DROP TABLE/DATABASE/SCHEMA"),
     (r"TRUNCATE\s+TABLE", "TRUNCATE TABLE"),
@@ -359,13 +376,15 @@ SAFETY_DENY_PATTERNS: list[tuple[str, str]] = [
     (r"wget\s.*(_TOKEN|_SECRET|_KEY|PASSWORD)", "Exfiltrating secrets via wget"),
 ]
 
-# Prompt-injectable safety rules: compact 4-liner (full pattern list stays in
+# Prompt-injectable safety rules: compact list (full pattern list stays in
 # SAFETY_DENY_PATTERNS for the Claude Code PreToolUse hook — no need to repeat
 # every variant in the prompt).
 SAFETY_RULES = (
     "Safety rules (MUST follow — violations will be blocked):\n"
     "- NEVER run: rm -rf, git push --force/-f, git reset --hard, "
     "git clean -f, DROP TABLE, format/mkfs/diskpart\n"
+    "- NEVER run `wl_socialmedia.posten ... freigabe` or `posten/befehl.py freigabe` "
+    "without `--probelauf` (real publishing only via the Telegram command)\n"
     "- NEVER push to remote unless the task explicitly says to\n"
     "- NEVER modify files outside the working directory unless explicitly asked\n"
     "- If unsure whether destructive: skip and report what you would have done"
@@ -575,6 +594,14 @@ ALLOWED_CWD_ROOTS: list[Path] = (
     if _env_cwd_roots
     else []  # empty = allow all paths; configure via ALLOWED_CWD_ROOTS in .env
 )
+
+# --- Telegram /posten_<Kennung>: Freigabe-Befehl (ADR-007) ---
+# Fest konfigurierter Subprozess, den der Listener auf /posten_<12 Hex>[_<plattform>]
+# startet (ohne Shell, ohne KI). Leer = nicht eingerichtet; der Orchestrator kennt
+# kein Zielprojekt, nur diese drei Werte.
+FREIGABE_POSTEN_PYTHON = os.getenv("ORCH_FREIGABE_POSTEN_PYTHON", "").strip()  # Interpreter
+FREIGABE_POSTEN_BEFEHL = os.getenv("ORCH_FREIGABE_POSTEN_BEFEHL", "").strip()  # Einstiegsdatei
+FREIGABE_POSTEN_CWD = os.getenv("ORCH_FREIGABE_POSTEN_CWD", "").strip()  # Arbeitsordner
 
 # Max task length accepted via Telegram /task command (characters)
 TELEGRAM_MAX_TASK_LENGTH = 500

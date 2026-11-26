@@ -1025,6 +1025,7 @@ In `--watch` mode a Telegram long-poll listener starts (when `TELEGRAM_*` env va
 | `/reject <run_id> [criterion] [reason]` | Reject a scientific-investigation pre-registration / final gate |
 | `/unblock <id>`, `/drop <id>`, `/retry <dep-id>` | Queue-healing responses for long-blocked tasks |
 | `/pr-fix <owner/repo#N>`, `/pr-ignore <owner/repo#N>` | PR-Babysitter report-only mode: queue a fix task or silence the PR |
+| `/posten_<12 hex>[_<platform>]` | Approval command (ADR-007): starts the fixed upload command from `ORCH_FREIGABE_POSTEN_PYTHON`/`_BEFEHL`/`_CWD` (no shell, no AI, one run at a time); only unexpected exits are reported back |
 | `/pick N` | Accept usage suggestion (1–3) |
 | `/decline` | Decline suggestions |
 | `/cancel-shutdown` | Cancel pending shutdown |

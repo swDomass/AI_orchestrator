@@ -14,7 +14,7 @@ import pytest
 
 # Import config patterns
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import _PUSH_DESC, SAFETY_DENY_PATTERNS, SAFETY_RULES
+from config import _PUSH_DESC, SAFETY_ATTENDED_ALLOWED, SAFETY_DENY_PATTERNS, SAFETY_RULES
 
 # Import hook's check function directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -808,3 +808,91 @@ class TestHookProtocol:
         assert result.returncode == 0, result.stderr
         assert result.stdout, "hook printed no decision: the import-time signal was honoured"
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------------------
+# Publishing approval of a post package only via Telegram (Kern-K5, 2026-11-26)
+# ---------------------------------------------------------------------------
+# These tests only hand strings to check_command()/the hook's stdin; no such command is
+# ever run in a shell.
+
+POSTEN_REASON = "posten freigabe ohne --probelauf (nur über Telegram)"
+
+POSTEN_FREIGABE_DENIED = [
+    "python -m wl_socialmedia.posten freigabe ab12cd34ef56",
+    "uv run python -X utf8 -m wl_socialmedia.posten freigabe ab12cd34ef56 --plattform google",
+    "python src/wl_socialmedia/posten/befehl.py freigabe ab12cd34ef56",
+    r"python .\src\wl_socialmedia\posten\befehl.py freigabe ab12cd34ef56",
+    r"D:\py\python.exe D:\wl\src\wl_socialmedia\posten\befehl.py FREIGABE ab12cd34ef56",
+    "cd /d/wl && python -m wl_socialmedia.posten freigabe ab12cd34ef56 && echo fertig",
+    # line continuation (bash backslash, PowerShell backtick) must not hide a part
+    "python -m wl_socialmedia.posten \\\n  freigabe ab12cd34ef56",
+    "python -m wl_socialmedia.posten `\n  freigabe ab12cd34ef56",
+    "python -m wl_socialmedia.posten freigabe ab12cd34ef56 `\n  --plattform google",
+    'bash -c "python -m wl_socialmedia.posten freigabe ab12cd34ef56"',
+    'powershell -Command "python -m wl_socialmedia.posten freigabe ab12cd34ef56"',
+    "python -m wl_socialmedia.posten.befehl freigabe ab12cd34ef56",
+]
+
+POSTEN_FREIGABE_ALLOWED = [
+    "python -m wl_socialmedia.posten freigabe ab12cd34ef56 --probelauf",
+    "python -m wl_socialmedia.posten freigabe --probelauf --paket output/POSTEN-x",
+    r"python .\src\wl_socialmedia\posten\befehl.py freigabe --probelauf --paket p",
+    "python -m wl_socialmedia.posten freigabe `\n  --probelauf --paket p",
+    "python -m wl_socialmedia.posten klaeren ab12cd34ef56",
+    "python -m wl_socialmedia.posten freischalten google --stufe live --beleg x",
+    "python -m wl_socialmedia.posten anmelden google",
+    "python src/wl_socialmedia/posten/befehl.py anmelden facebook",
+    # no connection to the tool, or the word only before the tool name
+    "grep -n freigabe src/wl_socialmedia/posten/befehl.py",
+    "python -m pytest tests/test_posten_freigabe.py -q",
+    "python -m wl_socialmedia.kette paket --senden",
+    "echo freigabe",
+    "cat docs/adr/007-freigabe-befehl-posten.md",
+    "python -m wl_socialmedia.postenx status",
+]
+
+
+class TestPostenFreigabeOnlyViaTelegram:
+    @pytest.mark.parametrize("cmd", POSTEN_FREIGABE_DENIED)
+    def test_denied(self, cmd):
+        assert check_command(cmd) == POSTEN_REASON
+
+    @pytest.mark.parametrize("cmd", POSTEN_FREIGABE_DENIED)
+    def test_denied_when_attended_too(self, cmd):
+        # Not in SAFETY_ATTENDED_ALLOWED: an interactive session may not release either.
+        assert check_command(cmd, attended=True) == POSTEN_REASON
+
+    @pytest.mark.parametrize("cmd", POSTEN_FREIGABE_ALLOWED)
+    def test_allowed(self, cmd):
+        assert check_command(cmd) is None
+
+    def test_reason_is_not_an_attended_exception(self):
+        assert POSTEN_REASON not in SAFETY_ATTENDED_ALLOWED
+        assert any(desc == POSTEN_REASON for _, desc in SAFETY_DENY_PATTERNS)
+
+    # Checks run INSIDE the patched import (TestAttendedFallback._fallback_module): the older
+    # TestFallbackPatternsStayInSync._fallback_check reloads the config-backed module in its
+    # `finally` before the caller checks, so it would silently test config.py instead.
+    @pytest.mark.parametrize("cmd", POSTEN_FREIGABE_DENIED)
+    def test_fallback_list_blocks_the_same(self, cmd):
+        with TestAttendedFallback._fallback_module() as hook:
+            assert hook.check_command(cmd) == POSTEN_REASON
+
+    @pytest.mark.parametrize("cmd", POSTEN_FREIGABE_ALLOWED)
+    def test_fallback_list_allows_the_same(self, cmd):
+        with TestAttendedFallback._fallback_module() as hook:
+            assert hook.check_command(cmd) is None
+
+    @pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+    def test_hook_denies_through_the_stdin_protocol(self, tool):
+        hook = TestHookProtocol()
+        out = hook._run_hook({"tool_name": tool, "tool_input": {
+            "command": "python -m wl_socialmedia.posten freigabe ab12cd34ef56"}})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert POSTEN_REASON in out["reason"]
+
+    def test_hook_stays_silent_for_the_dry_run(self):
+        hook = TestHookProtocol()
+        hook._assert_silent({"tool_name": "Bash", "tool_input": {
+            "command": "python -m wl_socialmedia.posten freigabe --probelauf --paket p"}})
